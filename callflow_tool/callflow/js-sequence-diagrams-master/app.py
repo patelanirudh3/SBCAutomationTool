@@ -273,7 +273,7 @@ def FindTargetName(MyNodeName, myMethod, current_line):
 def GetInfo(data, line, NodeName):
         print("THE LINE currently being proccessed for getting data is :" + line)
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
         #####2 feb change
         met_list = met[0].strip().split("/")
         data["event"] = met_list[0].upper()
@@ -640,7 +640,7 @@ def GetInfo(data, line, NodeName):
 ##################################################
 def GetInfoaboutAllows(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
         #data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -661,7 +661,7 @@ def GetInfoaboutAllows(data, line, NodeName, Dict):
 
 def GetInfoaboutreliable(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
         #data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -689,7 +689,7 @@ def GetInfoaboutreliable(data, line, NodeName, Dict):
 
 def GetInfoAboutTransport(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
         #data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -722,7 +722,7 @@ def GetInfoAboutTransport(data, line, NodeName, Dict):
 ###SRTP
 def GetInfoaboutSRTP(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
         #data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -751,7 +751,7 @@ def GetInfoaboutSRTP(data, line, NodeName, Dict):
 def GetInfoaboutfeaturetag(data, line, NodeName, Dict):
         print("~~~~~~~~PRINTING LINE~~~~", line)
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
        # data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -773,7 +773,7 @@ def GetInfoaboutfeaturetag(data, line, NodeName, Dict):
 
 def GetInfoAboutClientTimeOut(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
        # data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -795,7 +795,7 @@ def GetInfoAboutClientTimeOut(data, line, NodeName, Dict):
 
 def GetInfoAboutTimeLapseBeforeBye(data, line, NodeName, Dict):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
        # data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -825,7 +825,7 @@ def GetInfoAboutTimeLapseBeforeBye(data, line, NodeName, Dict):
 
 def GetTrasnport(data, line, NodeName):
         parts = re.split(":", line)
-        met = re.split("\[", parts[1])
+        met = re.split(r"\[", parts[1])
        # data["event"] = met[0]
         parts = re.split("->", line)
         start = line.find("[") + 1
@@ -1206,4 +1206,18 @@ def savetestcasetoDB():
         return jsonify({"response": "OK"})
         pass
 if __name__ == '__main__':
-        app.run(host=config.CONTROLLERIP, port=7000)
+        import socket
+        host = config.CONTROLLERIP
+        port = 7000
+        # If CONTROLLERIP is not valid on this machine (e.g. lab IP on a laptop), bind to localhost
+        try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind((host, 0))  # port 0 = just check if host is valid
+                s.close()
+        except OSError:
+                if host != "127.0.0.1":
+                        print("Binding to %s not valid on this host. Using 127.0.0.1 for local access." % host)
+                        host = "127.0.0.1"
+                else:
+                        raise
+        app.run(host=host, port=port)

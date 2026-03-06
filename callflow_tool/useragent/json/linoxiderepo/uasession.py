@@ -150,6 +150,12 @@ class UASession:
     def getRAck(self):
         return self.__rAck
 
+    def setRealm(self, realm):
+        self.__realm = realm
+
+    def setURI(self, uri):
+        self.__uri = uri
+
     def setNonce(self, nonce):
         self.__nonce = nonce
 

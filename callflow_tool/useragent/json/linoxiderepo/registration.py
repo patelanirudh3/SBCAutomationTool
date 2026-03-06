@@ -68,6 +68,12 @@ class UARegistration:
     def getToHeader(self):
         return self.__toHeader
 
+    def setRealm(self, realm):
+        self.__realm = realm
+
+    def setURI(self, uri):
+        self.__uri = uri
+
     def setNonce(self, nonce):
         self.__nonce = nonce
 

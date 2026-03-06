@@ -68,8 +68,8 @@ def build200Subscribe(uaSession:UASession):
     return subscribe200_msg
 
 def recv200Subscribe(uaSession:UASession, recv_subscribe):
-    recv_200subscribe = recv_200subscribe.split(CRLF+CRLF)
-    subscribe200_msg = parseHeaders(recv_subscribe[0])
+    recv_200subscribe = recv_subscribe.split(CRLF+CRLF)
+    subscribe200_msg = parseHeaders(recv_200subscribe[0])
     return subscribe200_msg
 
 

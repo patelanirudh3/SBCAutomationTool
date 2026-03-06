@@ -1,5 +1,4 @@
 import glob
-import imp
 import json
 import os
 import sys

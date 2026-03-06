@@ -1,5 +1,5 @@
-from asynchat import simple_producer
-import socket, ssl
+import socket
+import ssl
 from sipconstants import Transport 
 import time
 class SignalingSocket:
@@ -126,9 +126,7 @@ class SignalingSocket:
             except Exception as e:
                 print ("Socket exception: %s" %str(e))
                 ret_code = False
-            finally:
-                # print("return code is:" + f'{ret_code}')
-                return ret_code
+            return ret_code
         elif self.__transType == Transport.TLS.value:
             message = message.encode('utf-8')
             self.__ssl_clientsockId.sendall(bytes(message))

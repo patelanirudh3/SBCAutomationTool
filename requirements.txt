@@ -1,0 +1,23 @@
+# ============================================================
+# SBCAutomationTool — Root Requirements
+# Python 3.11+ required
+# ============================================================
+
+# ── Traffic engine (callflow_tool/traffic/) ──────────────────
+pyyaml>=6.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+websockets>=11.0
+
+# ── Existing useragent / callflow dependencies ───────────────
+pylibsrtp>=0.10.0         # SRTP in media.py
+
+# ── Orchestrator / callflow tool ────────────────────────────
+flask>=2.2.0
+flask-cors>=3.0.10
+paramiko>=2.9.3           # SSH/SFTP to VMs
+psycopg2-binary>=2.9.0    # PostgreSQL
+requests>=2.28.0
+
+# ── Utilities ────────────────────────────────────────────────
+cryptography>=38.0.0      # TLS / SSL context
