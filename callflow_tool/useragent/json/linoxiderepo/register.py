@@ -37,10 +37,18 @@ def buildInitialRegister(frm_user, proxy_domain, transport, eph_port):
     host_ip = getMyHostIP()
     expires = 3600
     hdr_contact = f'<sip:{frm_user}@{host_ip}:{eph_port};transport={transport};avaya-sc-enabled>;q=1;expires={expires};'
+    hdr_contact += 'avaya-actions="presence.initiate-pubsub,presence.redirect";'
+    hdr_contact += '+avaya.gmtoffset="0:00";+avaya.js-ver="1.0";'
+    hdr_contact += '+avaya.model="J179";+avaya.sn="n/a";'
+    hdr_contact += '+avaya.firmware="FW_S_J179_R4_0_4_0_3b4033.bin";'
+    hdr_contact += '+av.ip.mode=4;+av.sdp.anat;+av.sip.sig=4;+av.sip.media=4;'
+    hdr_contact += '+av.sip.max-sim-reg=5;'
     hdr_contact += f'+sip.instance="<urn:uuid:b8b68b4c-4052-4253-b35d-d46b49364c87>";reg-id=1'
     registerReq.addHeader(SipHeaders.CONTACT.value, hdr_contact)
-    hdr_allow = f'UPDATE'
+    hdr_allow = 'INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,MESSAGE,REFER,INFO,PUBLISH,UPDATE'
     registerReq.addHeader(SipHeaders.ALLOW.value, hdr_allow)
+    registerReq.addHeader(SipHeaders.SUPPORTED.value, 'eventlist,feature-ref,replaces,sdp-anat,tdialog')
+    registerReq.addHeader('User-Agent', 'Avaya J179 IP Phone 4.0.11.0.1 10981904bda0')
     registerReq.addHeader(SipHeaders.MAXFORWARDS.value, 70)
     registerReq.addHeader(SipHeaders.CONTENTLENGTH.value, 0)
     hdr_cseq = f'1 REGISTER'

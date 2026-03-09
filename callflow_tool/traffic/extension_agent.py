@@ -358,7 +358,7 @@ class ExtensionAgent:
             self._deregister_event_queue(q_200, "200")
 
     async def unregister(self) -> None:
-        """REGISTER with Expires: 0. Uses stored registration state from register()."""
+        """REGISTER with Expires: 0. Handles 401 re-challenge if nonce expired."""
         if self._reg_session is None:
             log.debug("ext=%s not registered, skipping unregister", self.ext)
             return
@@ -368,15 +368,48 @@ class ExtensionAgent:
         )
 
         q_200 = self._wait_for_event("200")
+        q_401 = self._wait_for_event("401")
         try:
             await self._send(unreg_msg)
-            await asyncio.wait_for(q_200.get(), timeout=self.config.register_timeout)
-            log.info("ext=%s unregistered", self.ext)
-            self.registered.clear()
+
+            done_task = asyncio.create_task(q_200.get(), name=f"unreg-200-{self.ext}")
+            auth_task = asyncio.create_task(q_401.get(), name=f"unreg-401-{self.ext}")
+
+            first_done, pending = await asyncio.wait(
+                [done_task, auth_task],
+                timeout=float(self.config.register_timeout),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            if not first_done:
+                log.warning("ext=%s unregister timed out", self.ext)
+            elif auth_task in first_done and not auth_task.cancelled():
+                raw_401 = auth_task.result()
+                recv401Unauthorised(self._reg_session, raw_401)
+                retry_msg = _register.buildUnregister(
+                    self._reg_session, self.ext, self.config.domain, self.config.sip_transport
+                )
+                q_200_retry = self._wait_for_event("200")
+                try:
+                    await self._send(retry_msg)
+                    await asyncio.wait_for(q_200_retry.get(), timeout=float(self.config.register_timeout))
+                    log.info("ext=%s unregistered (after 401 re-auth)", self.ext)
+                    self.registered.clear()
+                except asyncio.TimeoutError:
+                    log.warning("ext=%s unregister 200 OK timed out (after re-auth)", self.ext)
+                finally:
+                    self._deregister_event_queue(q_200_retry, "200")
+            else:
+                log.info("ext=%s unregistered", self.ext)
+                self.registered.clear()
         except asyncio.TimeoutError:
             log.warning("ext=%s unregister 200 OK timed out", self.ext)
         finally:
             self._deregister_event_queue(q_200, "200")
+            self._deregister_event_queue(q_401, "401")
             self._reg_session = None
 
     async def flush_register(self) -> None:
@@ -396,14 +429,17 @@ class ExtensionAgent:
         reg_session.setRealm(self.config.domain)
         reg_session.setURI(f"sip:{self.config.domain}")
 
-        # Build an initial REGISTER(Expires:0) by reusing the standard builder
-        # then overwriting the Expires header value.
+        # Build initial REGISTER then convert to de-registration:
+        # RFC 3261 §10.2.2: Contact: * with Expires: 0 removes ALL bindings.
+        # (Using specific Contact with expires=3600 param would NOT work because
+        # the per-contact expires param overrides the Expires header.)
         reg_msg = _register.buildInitialRegister(
             self.ext,
             self.config.domain,
             self.config.sip_transport,
             self._local_port,
         )
+        reg_msg.replaceHeader("Contact", "*")
         reg_msg.replaceHeader("Expires", "0")
         reg_session.setCurrRegMessage(reg_msg)
 
@@ -440,6 +476,7 @@ class ExtensionAgent:
                 auth_msg = _register.buildFinalRegister(
                     reg_session, self.ext, self.config.domain, self.config.sip_transport
                 )
+                auth_msg.replaceHeader("Contact", "*")
                 auth_msg.replaceHeader("Expires", "0")
                 reg_session.setCurrRegMessage(auth_msg)
 
