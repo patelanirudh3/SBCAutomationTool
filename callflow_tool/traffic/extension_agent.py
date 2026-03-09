@@ -96,6 +96,47 @@ class DialogState:
     invite_msg: Optional[SipMessage] = None
     prov_msg: Optional[SipMessage] = None
 
+    # RTP media coordinates (populated from SDP answer / SDP offer)
+    rtp_remote_ip:   str = ""   # remote RTP IP  (from their SDP c= line)
+    rtp_remote_port: int = 0    # remote RTP port (from their SDP m=audio line)
+
+
+# ---------------------------------------------------------------------------
+# SDP media-coordinate extractor (module-level, used by multiple methods)
+# ---------------------------------------------------------------------------
+
+def _parse_sdp_media(sdp_body: str) -> tuple:
+    """
+    Extract (ip, port) from an SDP body.
+
+    Parses the session-level c= line for IP and the first m=audio line
+    for port.  Returns ("", 0) on any parse failure so callers can
+    treat a missing/unparseable SDP as "no valid remote RTP endpoint".
+
+    Edge cases handled:
+      - CRLF or LF line endings
+      - Trailing whitespace / extra tokens after IP
+      - m=audio port 0 (media declined) or 9 (RFC 4566 discard)
+      - Missing c= or m= lines → returns ("", 0)
+    """
+    ip   = ""
+    port = 0
+    for line in sdp_body.splitlines():
+        line = line.strip()
+        if line.startswith("c=IN IP4 "):
+            # c=IN IP4 <addr>   (may have trailing text on malformed SDPs)
+            ip = line[9:].split()[0] if len(line) > 9 else ""
+        elif line.startswith("m=audio "):
+            # m=audio <port> <proto> <fmt …>
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    port = int(parts[1])
+                except ValueError:
+                    port = 0
+            break   # only first m=audio matters
+    return ip, port
+
 
 # ---------------------------------------------------------------------------
 # ExtensionAgent
@@ -594,16 +635,16 @@ class ExtensionAgent:
     # UAC: Send INVITE
     # ------------------------------------------------------------------
 
-    async def send_invite(self, callee_ext: str) -> DialogState:
+    async def send_invite(self, callee_ext: str, rtp_port: int = 9) -> DialogState:
         """
         Build and send an INVITE (Require: 100rel).
+        rtp_port: local UDP port allocated by RtpStream (default 9 = discard).
         Returns a DialogState for tracking the call.
         """
         call_id = _util.createCallID()
         local_tag = _util.createFromTag()
 
-        # Build SDP (minimal audio-only)
-        sdp_body = self._build_sdp()
+        sdp_body = self._build_sdp(rtp_port)
 
         invite = SipMessage()
         branch = _util.createBranchID()
@@ -803,9 +844,13 @@ class ExtensionAgent:
     async def handle_incoming_invite(self, raw_msg: str) -> DialogState:
         """
         Parse an incoming INVITE and send 100 Trying + 180 Ringing.
+        Also extracts remote RTP endpoint from the SDP offer so the
+        absorber knows the SBC media address (informational; UAS minimal
+        does not send RTP back).
         Returns a DialogState for the new incoming dialog.
         """
-        invite = parseHeaders(raw_msg.split(CRLF + CRLF)[0])
+        parts  = raw_msg.split(CRLF + CRLF, 1)
+        invite = parseHeaders(parts[0])
         call_id = invite.getCallID()
         remote_tag = invite.getFromTag()
         local_tag = _util.createFromTag()
@@ -827,6 +872,17 @@ class ExtensionAgent:
             is_reliable=True,
         )
         self.active_dialogs[call_id] = dialog
+
+        # Extract remote RTP endpoint from INVITE SDP offer (SBC media address)
+        if len(parts) > 1 and parts[1].strip():
+            ip, port = _parse_sdp_media(parts[1])
+            if ip and port > 0:
+                dialog.rtp_remote_ip   = ip
+                dialog.rtp_remote_port = port
+                log.debug(
+                    "ext=%s remote RTP from INVITE SDP: %s:%d",
+                    self.ext, ip, port,
+                )
 
         # Send 100 Trying (stateless)
         await self._send_provisional(invite, "100", "Trying", local_tag, include_contact=False)
@@ -880,10 +936,13 @@ class ExtensionAgent:
     # UAS: Send 200 OK to INVITE
     # ------------------------------------------------------------------
 
-    async def send_200_invite(self, dialog: DialogState) -> None:
-        """Send 200 OK to an incoming INVITE (after PRACK exchange)."""
+    async def send_200_invite(self, dialog: DialogState, rtp_port: int = 9) -> None:
+        """
+        Send 200 OK to an incoming INVITE (after PRACK exchange).
+        rtp_port: local UDP port allocated by RtpAbsorber (default 9 = discard).
+        """
         invite = dialog.invite_msg
-        sdp_body = self._build_sdp()
+        sdp_body = self._build_sdp(rtp_port)
 
         resp = SipMessage()
         resp.setResponseLine("SIP/2.0 200 OK")
@@ -962,15 +1021,18 @@ class ExtensionAgent:
         log.debug("ext=%s handled BYE → 200 (call_id=%s)", self.ext, dialog.call_id)
 
     # ------------------------------------------------------------------
-    # SDP builder (minimal audio-only for signaling tests)
-    # No RTP is sent — hold_time uses asyncio.sleep. Phase 1 spec.
+    # SDP builder — real UDP port when RTP is active, 9 (discard) otherwise
     # ------------------------------------------------------------------
 
-    def _build_sdp(self) -> str:
+    def _build_sdp(self, rtp_port: int = 9) -> str:
         """
-        Build a minimal SDP for signaling tests. No RTP is actually sent
-        during hold_time (per Phase 1 spec — asyncio.sleep replaces RTP).
-        Media port 0 signals that media is not active.
+        Build a G.711 audio SDP.
+
+        rtp_port: OS-assigned local UDP port from RtpStream / RtpAbsorber.
+                  Defaults to 9 (RFC 4566 discard) so legacy call paths
+                  that omit the argument are still safe.
+
+        a=ptime:20 matches CM Codec Set (Frames Per Pkt=2, Packet Size=20ms).
         """
         return (
             "v=0\r\n"
@@ -978,11 +1040,12 @@ class ExtensionAgent:
             "s=-\r\n"
             f"c=IN IP4 {self._local_host}\r\n"
             "t=0 0\r\n"
-            "m=audio 9 RTP/AVP 0 8 101\r\n"
+            f"m=audio {rtp_port} RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n"
             "a=fmtp:101 0-15\r\n"
+            "a=ptime:20\r\n"
             "a=sendrecv\r\n"
         )
 
@@ -1009,7 +1072,8 @@ class ExtensionAgent:
     def parse_200_invite(self, raw_msg: str, dialog: DialogState) -> None:
         """
         Parse 200 OK to INVITE.
-        Extracts remote tag, remote Contact (for BYE), Route set.
+        Extracts remote tag, remote Contact (for BYE), Route set,
+        and remote RTP endpoint (ip:port) from the SDP answer body.
         """
         parts = raw_msg.split(CRLF + CRLF, 1)
         resp = parseHeaders(parts[0])
@@ -1027,3 +1091,14 @@ class ExtensionAgent:
         dialog.record_routes = resp.getRecordRoutes(True) or []
         dialog.route_set = list(reversed(dialog.record_routes))
         dialog.state = "SUCCESSFULRESP_RCVD"
+
+        # Extract remote RTP endpoint from SDP answer (SBC/CM media address)
+        if len(parts) > 1 and parts[1].strip():
+            ip, port = _parse_sdp_media(parts[1])
+            if ip and port > 0:
+                dialog.rtp_remote_ip   = ip
+                dialog.rtp_remote_port = port
+                log.debug(
+                    "ext=%s remote RTP from 200 OK SDP: %s:%d",
+                    self.ext, ip, port,
+                )

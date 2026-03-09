@@ -7,15 +7,22 @@ UAC mode:
   - Token-bucket rate controller fires INVITEs at config.cps calls/sec
   - Linear ramp-up over config.ramp_up_seconds before hitting full CPS
   - execute_call() coroutine: INVITE → 100 → 180 → PRACK → 200 → ACK
-                              → hold (asyncio.sleep) → BYE → 200 BYE
+                              → RTP stream (hold_time) → BYE → 200 BYE
   - Extension pairs cycle sequentially — no 1:1 binding
 
 UAS mode:
   - All agents run auto-answer loops listening for inbound INVITEs
   - On INVITE: 100 → 180 → wait PRACK → 200 PRACK → 200 OK → wait ACK
-                         → wait BYE → 200 BYE
+                         → RTP absorb → wait BYE → 200 BYE
 
-No RTP is sent during hold_time. asyncio.sleep replaces RTP per Phase 1 spec.
+RTP (G.711 PCMU, 20 ms ptime, 160 B/pkt, 50 pps):
+  - UAC allocates a real UDP socket before INVITE; port is in SDP offer.
+    After ACK, streams silence to the SBC media endpoint (from 200 OK SDP)
+    for hold_time_seconds, then sends BYE.
+  - UAS allocates a real UDP port before 200 OK; port is in SDP answer.
+    After ACK, absorbs (discards) incoming RTP until BYE arrives.
+  - If RTP socket allocation fails, the call continues without media
+    (port 9 / discard in SDP) so signalling tests are never blocked.
 All structured logging uses JSON events for call_id, ext, event, sip_code, ts.
 """
 
@@ -31,6 +38,7 @@ from typing import Optional
 from .extension_agent import ExtensionAgent, DialogState
 from .config import VMConfig
 from .sip_engine import classify_message
+from .rtp_stream import RtpStream, RtpAbsorber
 
 log = logging.getLogger(__name__)
 
@@ -236,20 +244,32 @@ class CallEngine:
         """
         Single call coroutine:
           INVITE → 100 Trying → 180 Ringing (reliable) → PRACK → 200 PRACK
-                → 200 OK INVITE → ACK → hold → BYE → 200 BYE
+                → 200 OK INVITE → ACK → RTP stream (hold_time) → BYE → 200 BYE
 
         Handles:
           - 407 Proxy-Auth at INVITE (re-sends with credentials)
           - Timeouts at each step (marks call as failed)
+          - RTP socket allocation failures (degrades to port-9 / no media)
           - Structured JSON logging at every event
         """
         call_start = time.monotonic()
         dialog: Optional[DialogState] = None
         call_id = "pending"
+        rtp_stream: Optional[RtpStream] = None
 
         try:
+            # ── Allocate RTP send socket (port goes into SDP offer) ───────
+            try:
+                rtp_stream = await RtpStream.create(agent._local_host)
+            except Exception as exc:
+                log.warning(
+                    "ext=%s RTP socket alloc failed (%s) — using port 9 (no media)",
+                    agent.ext, exc,
+                )
+            rtp_port = rtp_stream.local_port if rtp_stream else 9
+
             # ── INVITE ───────────────────────────────────────────────────
-            dialog = await agent.send_invite(callee)
+            dialog = await agent.send_invite(callee, rtp_port=rtp_port)
             call_id = dialog.call_id
             self._active_calls.add(call_id)
             _log_call_event(call_id, agent.ext, "INVITE_SENT", callee=callee)
@@ -335,8 +355,17 @@ class CallEngine:
             await agent.send_ack(dialog)
             _log_call_event(call_id, agent.ext, "ACK_SENT")
 
-            # ── Hold time (no RTP per Phase 1 spec) ──────────────────────
-            await asyncio.sleep(self._config.hold_time_seconds)
+            # ── RTP stream for hold_time (G.711 PCMU silence, 50 pps) ────
+            # rtp_stream.run() falls back to asyncio.sleep automatically
+            # when remote_port is 0 / 9 (SDP not yet parsed or discard).
+            if rtp_stream:
+                await rtp_stream.run(
+                    dialog.rtp_remote_ip,
+                    dialog.rtp_remote_port,
+                    float(self._config.hold_time_seconds),
+                )
+            else:
+                await asyncio.sleep(self._config.hold_time_seconds)
             hold_ms = (time.monotonic() * 1000) - dialog.ack_sent_ms
 
             # ── BYE ──────────────────────────────────────────────────────
@@ -408,6 +437,8 @@ class CallEngine:
             self._calls_failed += 1
 
         finally:
+            if rtp_stream:
+                await rtp_stream.close()
             if call_id in self._active_calls:
                 self._active_calls.discard(call_id)
             if dialog and dialog.call_id in agent.active_dialogs:
@@ -605,14 +636,28 @@ class UasAutoAnswer:
     async def _handle_call(self, agent: ExtensionAgent, raw_invite: str) -> None:
         """
         Full UAS call sequence for one inbound call.
-        INVITE → 100+180 → wait PRACK → 200 PRACK → 200 OK → wait ACK → wait BYE → 200 BYE
+        INVITE → 100+180 → wait PRACK → 200 PRACK → 200 OK (with real RTP port)
+               → wait ACK → absorb RTP → wait BYE → 200 BYE
         """
         call_start = time.monotonic()
         dialog: Optional[DialogState] = None
         call_id = "pending"
         timeout = float(self._config.register_timeout * 4)
+        rtp_absorber: Optional[RtpAbsorber] = None
+        absorb_task: Optional[asyncio.Task] = None
+        result: Optional[CallResult] = None
 
         try:
+            # ── Allocate RTP absorber before 200 OK (port goes in SDP) ───
+            try:
+                rtp_absorber = await RtpAbsorber.create(agent._local_host)
+            except Exception as exc:
+                log.warning(
+                    "ext=%s RTP absorber alloc failed (%s) — using port 9 (no media)",
+                    agent.ext, exc,
+                )
+            rtp_port = rtp_absorber.local_port if rtp_absorber else 9
+
             # ── Handle INVITE: sends 100 + 180 ───────────────────────────
             dialog = await agent.handle_incoming_invite(raw_invite)
             call_id = dialog.call_id
@@ -627,8 +672,8 @@ class UasAutoAnswer:
             finally:
                 agent._deregister_event_queue(prack_q, "PRACK")
 
-            # ── Send 200 OK to INVITE ────────────────────────────────────
-            await agent.send_200_invite(dialog)
+            # ── Send 200 OK to INVITE (with real RTP port in SDP) ────────
+            await agent.send_200_invite(dialog, rtp_port=rtp_port)
             _log_call_event(call_id, agent.ext, "UAS_200_SENT")
 
             # ── Wait for ACK ─────────────────────────────────────────────
@@ -639,6 +684,13 @@ class UasAutoAnswer:
                 _log_call_event(call_id, agent.ext, "UAS_ACK_RCVD")
             finally:
                 agent._deregister_event_queue(ack_q, "ACK")
+
+            # ── Start RTP absorber (discard incoming media from SBC) ──────
+            if rtp_absorber:
+                absorb_task = asyncio.create_task(
+                    rtp_absorber.run(),
+                    name=f"rtp-absorb-{call_id}",
+                )
 
             # ── Wait for BYE ──────────────────────────────────────────────
             # BYE arrives after UAC hold_time_seconds
@@ -681,7 +733,15 @@ class UasAutoAnswer:
                 total_ms=(time.monotonic() - call_start) * 1000,
             )
 
-        if self._on_complete:
+        finally:
+            # Cancel absorber task and close RTP socket for every exit path
+            if absorb_task and not absorb_task.done():
+                absorb_task.cancel()
+                await asyncio.gather(absorb_task, return_exceptions=True)
+            if rtp_absorber:
+                await rtp_absorber.close()
+
+        if result and self._on_complete:
             try:
                 await self._on_complete(result)
             except Exception:
