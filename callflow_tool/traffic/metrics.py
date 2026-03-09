@@ -364,25 +364,59 @@ def build_app(
 # Server startup helper
 # ---------------------------------------------------------------------------
 
+async def _serve_nofail(server: "uvicorn.Server") -> None:
+    """
+    Wrapper around server.serve() that converts SystemExit / OSError into a
+    logged warning instead of crashing the entire process.
+    """
+    try:
+        await server.serve()
+    except (SystemExit, OSError) as exc:
+        log.warning("Metrics HTTP server stopped unexpectedly: %s", exc)
+
+
 async def start_server(
     collector: MetricsCollector,
     config,
     stop_callback: Optional[Callable] = None,
-) -> asyncio.Task:
+) -> "asyncio.Task | None":
     """
     Start the FastAPI/uvicorn server as an asyncio task.
-    Returns the server task so the caller can cancel it on shutdown.
+    Returns the server task (or None if unavailable / port already in use).
 
-    The server binds to 0.0.0.0:config.metrics_port.
+    Tries config.metrics_port first, then auto-selects the next free port so
+    that running two instances on the same machine never crashes either one.
     """
     if not _FASTAPI_AVAILABLE:
         log.warning("Metrics server not started: fastapi/uvicorn not installed")
         return None
 
+    import socket as _socket
+
+    # Find an available port starting from config.metrics_port
+    port = config.metrics_port
+    for _ in range(10):
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                _s.bind(("0.0.0.0", port))
+                break          # port is free
+            except OSError:
+                log.warning(
+                    "Metrics port %d is in use, trying %d", port, port + 1
+                )
+                port += 1
+    else:
+        log.warning(
+            "Could not find a free metrics port near %d — metrics HTTP server disabled",
+            config.metrics_port,
+        )
+        return None
+
     app = build_app(collector, config, stop_callback)
 
     # Push loop: send metrics to WebSocket subscribers every interval
-    push_task = asyncio.create_task(
+    asyncio.create_task(
         collector.run_push_loop(),
         name="metrics-push-loop",
     )
@@ -391,21 +425,21 @@ async def start_server(
     server_config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
-        port=config.metrics_port,
+        port=port,
         log_level="warning",
         loop="none",   # use the existing asyncio event loop
     )
     server = uvicorn.Server(server_config)
 
     server_task = asyncio.create_task(
-        server.serve(),
+        _serve_nofail(server),
         name="metrics-http-server",
     )
 
     log.info(
         "Metrics server starting on http://0.0.0.0:%d "
         "| WS /metrics/stream | GET /metrics",
-        config.metrics_port,
+        port,
     )
 
     return server_task

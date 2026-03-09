@@ -36,7 +36,7 @@ def buildInitialRegister(frm_user, proxy_domain, transport, eph_port):
     registerReq.addHeader(SipHeaders.VIA.value, hdr_via)
     host_ip = getMyHostIP()
     expires = 3600
-    hdr_contact = f'<sip:{frm_user}@{host_ip}:{eph_port};transport={transport}>;q=1;expires={expires};'
+    hdr_contact = f'<sip:{frm_user}@{host_ip}:{eph_port};transport={transport};avaya-sc-enabled>;q=1;expires={expires};'
     hdr_contact += f'+sip.instance="<urn:uuid:b8b68b4c-4052-4253-b35d-d46b49364c87>";reg-id=1'
     registerReq.addHeader(SipHeaders.CONTACT.value, hdr_contact)
     hdr_allow = f'UPDATE'

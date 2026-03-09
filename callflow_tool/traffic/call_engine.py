@@ -93,16 +93,19 @@ class CallEngine:
         uac_agents: dict[str, ExtensionAgent],
         config: VMConfig,
         on_call_complete=None,
+        max_calls: int = 0,
     ) -> None:
         """
         Args:
             uac_agents:         ext_str → ExtensionAgent for UAC extensions.
             config:             VMConfig.
             on_call_complete:   Optional async callable(CallResult) for metrics.
+            max_calls:          Stop after this many calls attempted (0 = unlimited).
         """
         self._agents = uac_agents
         self._config = config
         self._on_complete = on_call_complete
+        self._max_calls = max_calls
         self._index = 0
         self.stop_event = asyncio.Event()
         self._active_calls: set[str] = set()   # call_ids currently in-flight
@@ -141,12 +144,30 @@ class CallEngine:
         step = 0
 
         log.info(
-            "CallEngine starting: %d CPS, %ds ramp-up, %ds hold, max_concurrent=%d",
+            "CallEngine starting: %d CPS, %ds ramp-up, %ds hold, max_concurrent=%d%s",
             cfg.cps, cfg.ramp_up_seconds, cfg.hold_time_seconds,
             cfg.effective_max_concurrent,
+            f", max_calls={self._max_calls}" if self._max_calls else "",
         )
 
         while not self.stop_event.is_set():
+            # Hard call limit (0 = unlimited)
+            if self._max_calls > 0 and self._calls_attempted >= self._max_calls:
+                log.info(
+                    "max_calls=%d reached — waiting for %d in-flight call(s) to finish…",
+                    self._max_calls, len(self._active_calls),
+                )
+                # Drain: wait up to (hold_time + register_timeout) for active calls
+                drain_timeout = float(self._config.hold_time_seconds + self._config.register_timeout * 2 + 5)
+                deadline = asyncio.get_event_loop().time() + drain_timeout
+                while self._active_calls and asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.2)
+                if self._active_calls:
+                    log.warning("max_calls drain timed out — %d calls still active", len(self._active_calls))
+                log.info("max_calls=%d reached — stopping engine", self._max_calls)
+                self.stop_event.set()
+                break
+
             # Rate limiting: respect max concurrent ceiling
             max_cc = cfg.effective_max_concurrent
             if max_cc > 0 and len(self._active_calls) >= max_cc:
@@ -236,7 +257,19 @@ class CallEngine:
             timeout = float(self._config.register_timeout * 2)
 
             # ── Wait for provisional + handle 407 + handle final failures ───
-            _FINAL_FAIL = ("404", "403", "408", "480", "486", "487", "488", "500", "502", "503", "504")
+            # Comprehensive list of 4xx/5xx/6xx codes that can be returned
+            # for an INVITE — must match what _dispatch_loop delivers by key.
+            _FINAL_FAIL = (
+                # 4xx Client Errors
+                "400", "401", "403", "404", "405", "406", "408",
+                "410", "413", "414", "415", "416", "420", "421", "422", "423",
+                "480", "481", "482", "483", "484", "485", "486", "487", "488",
+                "489", "491", "493", "494",
+                # 5xx Server Errors
+                "500", "501", "502", "503", "504", "505",
+                # 6xx Global Failures
+                "600", "603", "604", "606",
+            )
             prov_q = agent._wait_for_event("100", "180", "183", "407", *_FINAL_FAIL)
             try:
                 got_180 = False

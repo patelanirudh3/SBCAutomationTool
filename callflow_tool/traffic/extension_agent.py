@@ -379,6 +379,88 @@ class ExtensionAgent:
             self._deregister_event_queue(q_200, "200")
             self._reg_session = None
 
+    async def flush_register(self) -> None:
+        """
+        Send REGISTER(Expires:0) from scratch at startup to evict any stale
+        binding left by a previous run on a different ephemeral port.
+
+        Flow mirrors register(): initial REGISTER → 401 challenge → auth → 200 OK.
+        Accepts 200, 404, 403, 481 as successful outcomes (all mean "no stale binding").
+        Never raises — errors are logged and silently swallowed.
+        """
+        from registration import UARegistration  # existing module
+
+        reg_session = UARegistration()
+        reg_session.setUserName(self.ext)
+        reg_session.setPassword(self.config.sip_password)
+        reg_session.setRealm(self.config.domain)
+        reg_session.setURI(f"sip:{self.config.domain}")
+
+        # Build an initial REGISTER(Expires:0) by reusing the standard builder
+        # then overwriting the Expires header value.
+        reg_msg = _register.buildInitialRegister(
+            self.ext,
+            self.config.domain,
+            self.config.sip_transport,
+            self._local_port,
+        )
+        reg_msg.replaceHeader("Expires", "0")
+        reg_session.setCurrRegMessage(reg_msg)
+
+        _FLUSH_DONE = ("200", "404", "403", "481")
+        q_401 = self._wait_for_event("401")
+        q_done = self._wait_for_event(*_FLUSH_DONE)
+
+        try:
+            await self._send(reg_msg)
+            log.debug("ext=%s sent flush REGISTER(Expires:0)", self.ext)
+
+            # Wait for either a 401 challenge or an immediate final response
+            done_task = asyncio.create_task(q_done.get(), name=f"flush-done-{self.ext}")
+            auth_task = asyncio.create_task(q_401.get(),  name=f"flush-401-{self.ext}")
+
+            first_done, pending = await asyncio.wait(
+                [done_task, auth_task],
+                timeout=float(self.config.register_timeout),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            if not first_done:
+                log.debug("ext=%s flush REGISTER timed out (no prior registration)", self.ext)
+                return
+
+            completed = next(iter(first_done))
+            if completed is auth_task and not auth_task.cancelled():
+                # Got 401 — re-auth and send Expires:0 again
+                raw_401 = auth_task.result()
+                recv401Unauthorised(reg_session, raw_401)
+                auth_msg = _register.buildFinalRegister(
+                    reg_session, self.ext, self.config.domain, self.config.sip_transport
+                )
+                auth_msg.replaceHeader("Expires", "0")
+                reg_session.setCurrRegMessage(auth_msg)
+
+                q_done2 = self._wait_for_event(*_FLUSH_DONE)
+                try:
+                    await self._send(auth_msg)
+                    await asyncio.wait_for(q_done2.get(), timeout=float(self.config.register_timeout))
+                    log.debug("ext=%s flush REGISTER(auth) done", self.ext)
+                except asyncio.TimeoutError:
+                    log.debug("ext=%s flush REGISTER(auth) timed out", self.ext)
+                finally:
+                    self._deregister_event_queue(q_done2, *_FLUSH_DONE)
+            else:
+                log.debug("ext=%s flush REGISTER done (code accepted)", self.ext)
+
+        except Exception as exc:
+            log.debug("ext=%s flush_register error (ignored): %s", self.ext, exc)
+        finally:
+            self._deregister_event_queue(q_401, "401")
+            self._deregister_event_queue(q_done, *_FLUSH_DONE)
+
     # ------------------------------------------------------------------
     # SUBSCRIBE
     # ------------------------------------------------------------------

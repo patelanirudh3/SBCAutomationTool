@@ -33,23 +33,68 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import logging
+import logging.handlers
 import os
 import signal
 import sys
 import time
 
 # ---------------------------------------------------------------------------
-# Configure structured logging before any imports
+# Configure structured logging: console + rotating file
 # ---------------------------------------------------------------------------
 
-def _setup_logging(level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-8s %(name)-30s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
+_LOG_FMT  = "%(asctime)s %(levelname)-8s %(name)-35s %(message)s"
+_DATE_FMT = "%Y-%m-%dT%H:%M:%S"
 
+
+def _setup_logging(level: str = "INFO", log_file: str = "") -> None:
+    """
+    Configure root logger with:
+      - StreamHandler (console) at the requested level
+      - RotatingFileHandler (file) at DEBUG — captures everything for post-run analysis
+    If log_file is empty no file handler is added (e.g. during pre-config startup).
+    """
+    numeric = getattr(logging, level.upper(), logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)          # root must pass DEBUG; handlers filter
+
+    # Remove any handlers added by a previous call (e.g. early bootstrap call)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        h.close()
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(numeric)
+    console.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_DATE_FMT))
+    root.addHandler(console)
+
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=20 * 1024 * 1024,   # 20 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setLevel(logging.DEBUG)        # file always captures DEBUG+
+        fh.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_DATE_FMT))
+        root.addHandler(fh)
+        logging.getLogger("traffic.main").info(
+            "Log file: %s (DEBUG+)", log_file
+        )
+
+
+def _auto_log_file(vm_id: str, log_dir: str = "logs") -> str:
+    """Generate a timestamped log file path: logs/traffic_<vm_id>_YYYYMMDD_HHMMSS.log"""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(log_dir, f"traffic_{vm_id}_{ts}.log")
+
+
+# Bootstrap console-only logging until config (and vm_id) are available.
 _setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("traffic.main")
 
@@ -96,6 +141,40 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load config and validate, then exit without starting traffic",
     )
+    p.add_argument(
+        "--log-file",
+        metavar="PATH",
+        default=os.environ.get("LOG_FILE", ""),
+        help=(
+            "Write logs to this file (DEBUG level). "
+            "Auto-generated as logs/traffic_<vm_id>_<timestamp>.log if not set."
+        ),
+    )
+    p.add_argument(
+        "--log-dir",
+        metavar="DIR",
+        default=os.environ.get("LOG_DIR", "logs"),
+        help="Directory for auto-generated log files (default: logs/)",
+    )
+    p.add_argument(
+        "--max-calls",
+        type=int,
+        default=int(os.environ.get("MAX_CALLS", "0")),
+        metavar="N",
+        help="Stop UAC after N call attempts (0 = unlimited)",
+    )
+    p.add_argument(
+        "--pre-phase-only",
+        action="store_true",
+        default=os.environ.get("PRE_PHASE_ONLY", "").lower() in ("1", "true", "yes"),
+        help="Run REGISTER + SUBSCRIBE only, then wait for Ctrl+C (no calls sent)",
+    )
+    p.add_argument(
+        "--no-unregister",
+        action="store_true",
+        default=os.environ.get("NO_UNREGISTER", "").lower() in ("1", "true", "yes"),
+        help="Skip REGISTER(Expires:0) unregistration on shutdown (leave extensions registered)",
+    )
     return p.parse_args()
 
 
@@ -136,7 +215,13 @@ def _create_agents(config: VMConfig) -> dict[str, ExtensionAgent]:
 # Main coroutine
 # ---------------------------------------------------------------------------
 
-async def run(config: VMConfig, skip_subscribe: bool = False) -> int:
+async def run(
+    config: VMConfig,
+    skip_subscribe: bool = False,
+    max_calls: int = 0,
+    pre_phase_only: bool = False,
+    no_unregister: bool = False,
+) -> int:
     """
     Full lifecycle coroutine. Returns exit code (0 = success).
     """
@@ -186,7 +271,7 @@ async def run(config: VMConfig, skip_subscribe: bool = False) -> int:
         )
     except RuntimeError as exc:
         log.critical("Pre-phase failed: %s", exc)
-        await _shutdown(agents, None, None, collector, server_task, config)
+        await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
         return 1
 
     collector.update_counts(
@@ -195,6 +280,21 @@ async def run(config: VMConfig, skip_subscribe: bool = False) -> int:
         subscribed=pre_result.subscribed,
     )
 
+    # ── PRE-PHASE-ONLY: stop here, keep registrations alive ──────────────
+    if pre_phase_only:
+        role = "UAC" if config.is_uac else "UAS"
+        log.info("=" * 60)
+        log.info(
+            "PRE-PHASE-ONLY mode (%s) — REGISTER + SUBSCRIBE complete. "
+            "Extensions are registered and subscribed. Press Ctrl+C to unregister and exit.",
+            role,
+        )
+        log.info("=" * 60)
+        collector.set_phase("READY_PRE_PHASE_ONLY")
+        await stop_event.wait()
+        await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
+        return 0
+
     # ── TRAFFIC PHASE ─────────────────────────────────────────────────────
     collector.set_phase("TRAFFIC")
     collector.set_running(True)
@@ -202,7 +302,11 @@ async def run(config: VMConfig, skip_subscribe: bool = False) -> int:
     uas_engine = None
 
     if config.is_uac:
-        engine = CallEngine(agents, config, on_call_complete=collector.record_call)
+        engine = CallEngine(
+            agents, config,
+            on_call_complete=collector.record_call,
+            max_calls=max_calls,
+        )
         log.info(
             "UAC mode | %d CPS | %ds hold | ~%d concurrent | ramp=%ds",
             config.cps, config.hold_time_seconds,
@@ -237,7 +341,7 @@ async def run(config: VMConfig, skip_subscribe: bool = False) -> int:
     collector.set_running(False)
     log.info("Initiating graceful shutdown…")
 
-    await _shutdown(agents, engine, uas_engine, collector, server_task, config)
+    await _shutdown(agents, engine, uas_engine, collector, server_task, config, no_unregister=no_unregister)
 
     elapsed = time.monotonic() - overall_start
     snap = collector.latest
@@ -256,6 +360,7 @@ async def _shutdown(
     collector: MetricsCollector,
     server_task,
     config: VMConfig,
+    no_unregister: bool = False,
 ) -> None:
     """
     Graceful shutdown sequence:
@@ -280,19 +385,22 @@ async def _shutdown(
     if uas_engine:
         await uas_engine.stop()
 
-    # 4. Unregister all extensions
-    log.info("Unregistering %d extensions…", len(agents))
-    unrg_tasks = [
-        asyncio.create_task(a.unregister(), name=f"unreg-{a.ext}")
-        for a in agents.values()
-    ]
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*unrg_tasks, return_exceptions=True),
-            timeout=float(config.register_timeout * 2),
-        )
-    except asyncio.TimeoutError:
-        log.warning("Some unregistrations timed out")
+    # 4. Unregister all extensions (skip if --no-unregister)
+    if no_unregister:
+        log.info("--no-unregister set: skipping REGISTER(Expires:0) — extensions remain registered on server")
+    else:
+        log.info("Unregistering %d extensions…", len(agents))
+        unrg_tasks = [
+            asyncio.create_task(a.unregister(), name=f"unreg-{a.ext}")
+            for a in agents.values()
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*unrg_tasks, return_exceptions=True),
+                timeout=float(config.register_timeout * 2),
+            )
+        except asyncio.TimeoutError:
+            log.warning("Some unregistrations timed out")
 
     # 5. Close all transports
     log.info("Closing transports…")
@@ -325,7 +433,7 @@ async def _shutdown(
 
 def main() -> None:
     args = _parse_args()
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level)   # console only until vm_id is known
 
     log.info("=" * 60)
     log.info("SBC Traffic Engine — Phase 1")
@@ -337,6 +445,10 @@ def main() -> None:
     except (ValueError, FileNotFoundError) as exc:
         log.critical("Config error: %s", exc)
         sys.exit(1)
+
+    # Re-configure logging now that vm_id is known — add file handler
+    log_file = args.log_file or _auto_log_file(config.vm_id, args.log_dir)
+    _setup_logging(args.log_level, log_file=log_file)
 
     # Dry run: validate and exit
     if args.dry_run:
@@ -355,12 +467,23 @@ def main() -> None:
 
     # Run
     try:
-        exit_code = asyncio.run(run(config, skip_subscribe=args.skip_subscribe))
+        exit_code = asyncio.run(run(
+            config,
+            skip_subscribe=args.skip_subscribe,
+            max_calls=args.max_calls,
+            pre_phase_only=args.pre_phase_only,
+            no_unregister=args.no_unregister,
+        ))
     except KeyboardInterrupt:
         log.info("Interrupted by user")
         exit_code = 0
 
-    sys.exit(exit_code)
+    # Hard-kill this process so uvicorn/asyncio background threads cannot hold
+    # ports open after shutdown. os._exit() bypasses Python atexit handlers and
+    # thread cleanup — exactly what we want here to ensure the metrics port is
+    # released immediately for the next run.
+    log.info("Process PID %d exiting (code %d)", os.getpid(), exit_code)
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":

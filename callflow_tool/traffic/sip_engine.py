@@ -91,6 +91,7 @@ class _UdpProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         try:
             message = data.decode("utf-8", errors="replace")
+            log.debug("SIP RECV ← %s:%d\n%s", addr[0], addr[1], message.rstrip())
             self._queue.put_nowait(message)
         except Exception:
             log.exception("UDP datagram_received decode error from %s", addr)
@@ -141,6 +142,10 @@ class UdpSipTransport(AsyncSipTransport):
     async def send(self, message: str) -> None:
         if self._transport is None or self._transport.is_closing():
             raise RuntimeError("UDP transport not connected")
+        log.debug(
+            "SIP SEND → %s:%d\n%s",
+            self._remote_host, self._remote_port, message.rstrip(),
+        )
         self._transport.sendto(message.encode("utf-8"))
 
     @property
@@ -239,6 +244,10 @@ class TcpSipTransport(AsyncSipTransport):
     async def send(self, message: str) -> None:
         if self._writer is None or self._writer.is_closing():
             raise RuntimeError("TCP transport not connected")
+        log.debug(
+            "SIP SEND → %s:%d\n%s",
+            self._remote_host, self._remote_port, message.rstrip(),
+        )
         self._writer.write(message.encode("utf-8"))
         await self._writer.drain()
 
@@ -304,7 +313,12 @@ class TcpSipTransport(AsyncSipTransport):
                         break
                     complete_msg, consumed = msg
                     buffer = buffer[consumed:]
-                    await self._queue.put(complete_msg.decode("utf-8", errors="replace"))
+                    decoded = complete_msg.decode("utf-8", errors="replace")
+                    log.debug(
+                        "SIP RECV ← %s:%d\n%s",
+                        self._remote_host, self._remote_port, decoded.rstrip(),
+                    )
+                    await self._queue.put(decoded)
 
             except asyncio.CancelledError:
                 return

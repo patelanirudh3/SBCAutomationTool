@@ -222,6 +222,29 @@ async def wait_all_subscribed(agents: list[ExtensionAgent], timeout: float = 120
 # Top-level runner
 # ---------------------------------------------------------------------------
 
+async def _flush_stale_registrations(agents: list[ExtensionAgent], config: VMConfig) -> None:
+    """
+    Send REGISTER(Expires:0) for every extension to clear any stale binding
+    left by a previous run on a different ephemeral port.
+
+    Errors and 404/481 responses are silently ignored — if there was no prior
+    registration that is fine, we just continue.
+    """
+    log.info("=" * 60)
+    log.info("PRE-PHASE 0/2 — FLUSH stale registrations (%d extensions)", len(agents))
+    log.info("=" * 60)
+
+    semaphore = asyncio.Semaphore(config.register_rate)
+
+    async def _flush_one(agent: ExtensionAgent) -> None:
+        async with semaphore:
+            # flush_register() never raises — errors are swallowed internally
+            await agent.flush_register()
+
+    await asyncio.gather(*[_flush_one(a) for a in agents])
+    log.info("Flush complete — all extensions cleared from server")
+
+
 async def run_pre_phase(
     agents: list[ExtensionAgent],
     config: VMConfig,
@@ -229,6 +252,8 @@ async def run_pre_phase(
 ) -> PrePhaseResult:
     """
     Full pre-phase pipeline:
+      0. Flush stale registrations (REGISTER Expires:0) — clears orphaned
+         bindings left by any previous run on a different ephemeral port.
       1. Register all extensions (barrier)
       2. Subscribe all extensions (barrier, unless skip_subscribe=True)
       3. Log "ALL EXTENSIONS READY"
@@ -246,6 +271,9 @@ async def run_pre_phase(
     """
     total = len(agents)
     start = time.monotonic()
+
+    # ── Phase 0: FLUSH stale registrations ───────────────────────────────
+    await _flush_stale_registrations(agents, config)
 
     # ── Phase 1: REGISTER ────────────────────────────────────────────────
     log.info("=" * 60)
