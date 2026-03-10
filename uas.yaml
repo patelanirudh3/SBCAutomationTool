@@ -4,9 +4,9 @@
 vm_role: UAS
 vm_id: uas-local
 uac_ext_start: 4001000
-uac_ext_end: 4001000
-uas_ext_start: 4001001
-uas_ext_end: 4001001
+uac_ext_end: 4001004
+uas_ext_start: 4001005
+uas_ext_end: 4001009
 sbc_host: 10.133.63.117
 sbc_port: 5060
 sip_transport: TCP

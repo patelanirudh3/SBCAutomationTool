@@ -4,9 +4,9 @@
 vm_role: UAC
 vm_id: uac-local
 uac_ext_start: 4001000
-uac_ext_end: 4001000
-uas_ext_start: 4001001
-uas_ext_end: 4001001
+uac_ext_end: 4001004
+uas_ext_start: 4001005
+uas_ext_end: 4001009
 sbc_host: 10.133.63.117
 sbc_port: 5060
 sip_transport: TCP
@@ -16,6 +16,7 @@ cps: 1
 hold_time_seconds: 10
 metrics_port: 8082
 coordinator_url: http://localhost:8080
+peer_stop_url: http://localhost:8081/api/test/stop
 register_rate: 2
 register_timeout: 5
 register_retry: 3

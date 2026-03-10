@@ -11,6 +11,7 @@ All fields can be supplied via:
 
 from __future__ import annotations
 
+import math
 import os
 import logging
 from dataclasses import dataclass, field, fields
@@ -46,6 +47,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_concurrent_calls": 0,    # 0 = unlimited (derived from CPS × hold_time)
     "local_host": "",             # empty = auto-detect
     "local_port": 0,              # 0 = OS-assigned per extension
+    "peer_stop_url": "",          # UAC POSTs here when traffic complete (e.g. UAS /api/test/stop)
 }
 
 # ENV VAR name mapping: field_name -> ENV_VAR_NAME
@@ -74,6 +76,7 @@ _ENV_MAP: dict[str, str] = {
     "max_concurrent_calls": "MAX_CONCURRENT_CALLS",
     "local_host":         "LOCAL_HOST",
     "local_port":         "LOCAL_PORT",
+    "peer_stop_url":      "PEER_STOP_URL",
 }
 
 # Fields that should be coerced to int
@@ -113,6 +116,7 @@ class VMConfig:
     max_concurrent_calls: int = field(default=0)      # 0 = CPS × hold_time
     local_host: str         = field(default="")       # empty = auto-detect
     local_port: int         = field(default=0)        # 0 = OS-assigned per ext
+    peer_stop_url: str      = field(default="")       # UAC POSTs here when done (UAS /api/test/stop)
 
     # ------------------------------------------------------------------
     # Derived helpers (not serialised as config)
@@ -124,6 +128,13 @@ class VMConfig:
     @property
     def uas_ext_count(self) -> int:
         return self.uas_ext_end - self.uas_ext_start + 1
+
+    @property
+    def pool_wrap_count(self) -> int:
+        """LCM of UAC and UAS extension counts — calls per full pool wrap."""
+        uac = self.uac_ext_count
+        uas = self.uas_ext_count
+        return (uac * uas) // math.gcd(uac, uas) if uac and uas else 0
 
     @property
     def effective_max_concurrent(self) -> int:

@@ -74,28 +74,26 @@ ramp_up_seconds: 30
 metrics_interval: 10
 metrics_port: 8080
 coordinator_url: http://coordinator:8080
+peer_stop_url: http://uas-host:8081/api/test/stop   # UAC only: signal UAS when done
 ```
 
-### 3. Run UAC VM
+### 3. Run UAS VM (start first)
 
 ```bash
-# Via YAML
-python -m callflow_tool.traffic.main --config config_uac.yaml
-
-# Via environment variables (no YAML needed)
-VM_ROLE=UAC VM_ID=uac-vm-1 SBC_HOST=10.133.39.157 SIP_DOMAIN=sbc.company.com \
-UAC_EXT_START=1001 UAC_EXT_END=1250 UAS_EXT_START=2001 UAS_EXT_END=2250 \
-CPS=6 HOLD_TIME_SECONDS=180 \
-python -m callflow_tool.traffic.main
+python -m callflow_tool.traffic.main --config uas.yaml
 ```
 
-### 4. Run UAS VM
+### 4. Run UAC VM (after UAS is ready)
 
 ```bash
-VM_ROLE=UAS VM_ID=uas-vm-1 SBC_HOST=10.133.39.157 SIP_DOMAIN=sbc.company.com \
-UAS_EXT_START=2001 UAS_EXT_END=2250 \
-python -m callflow_tool.traffic.main
+# With pool-wraps: max_calls = pool_wraps × LCM(uac_count, uas_count)
+python -m callflow_tool.traffic.main --config uac.yaml --pool-wraps 1
+
+# Or explicit max-calls
+python -m callflow_tool.traffic.main --config uac.yaml --max-calls 5
 ```
+
+When UAC completes, it POSTs to `peer_stop_url` (UAS /api/test/stop) so UAS unregisters and exits cleanly.
 
 ### 5. Validate Config (dry run)
 
@@ -126,6 +124,7 @@ python -m callflow_tool.traffic.main --config config.yaml --dry-run
 | `METRICS_INTERVAL` | `10` | Metrics snapshot interval (seconds) |
 | `METRICS_PORT` | `8080` | FastAPI metrics server port |
 | `COORDINATOR_URL` | `http://localhost:8080` | GUI coordinator URL |
+| `PEER_STOP_URL` | *(empty)* | UAC POSTs here when done (e.g. UAS http://host:port/api/test/stop) |
 | `REGISTER_RATE` | `50` | Max REGISTER/sec during pre-phase |
 | `REGISTER_EXPIRES` | `3600` | Registration expiry (seconds) |
 | `REGISTER_RETRY` | `3` | Max REGISTER retry attempts |

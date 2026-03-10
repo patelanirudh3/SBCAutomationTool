@@ -41,6 +41,12 @@ import signal
 import sys
 import time
 
+try:
+    import requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Configure structured logging: console + rotating file
 # ---------------------------------------------------------------------------
@@ -161,7 +167,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("MAX_CALLS", "0")),
         metavar="N",
-        help="Stop UAC after N call attempts (0 = unlimited)",
+        help="Stop UAC after N call attempts (0 = unlimited or derived from --pool-wraps)",
+    )
+    p.add_argument(
+        "--pool-wraps",
+        type=int,
+        default=int(os.environ.get("POOL_WRAPS", "0")),
+        metavar="N",
+        help="Derive max_calls = N × LCM(uac_count, uas_count). Overrides --max-calls when > 0.",
     )
     p.add_argument(
         "--pre-phase-only",
@@ -246,9 +259,12 @@ async def run(
     collector = MetricsCollector(config.vm_id, config.metrics_interval)
     collector.set_phase("INIT")
 
+    async def _stop_callback() -> None:
+        stop_event.set()
+
     # ── Start metrics HTTP server ─────────────────────────────────────────
     server_task = await start_server(
-        collector, config, stop_callback=lambda: stop_event.set()
+        collector, config, stop_callback=_stop_callback
     )
 
     # ── Create agents ─────────────────────────────────────────────────────
@@ -321,9 +337,20 @@ async def run(
             [engine_task, stop_waiter],
             return_when=asyncio.FIRST_COMPLETED,
         )
+        engine_finished_first = engine_task in done
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+
+        # UAC finished naturally (max_calls): signal UAS to stop via peer_stop_url
+        if engine_finished_first:
+            peer_url = getattr(config, "peer_stop_url", "") or ""
+            if peer_url and _REQUESTS_AVAILABLE:
+                try:
+                    log.info("Traffic complete — POST %s to signal UAS shutdown", peer_url)
+                    await asyncio.to_thread(requests.post, peer_url, timeout=5)
+                except Exception as exc:
+                    log.warning("POST %s failed: %s (UAS may need manual stop)", peer_url, exc)
 
     else:
         # UAS mode: start auto-answer on all agents
@@ -465,12 +492,23 @@ def main() -> None:
         )
         sys.exit(0)
 
+    # Derive max_calls from pool_wraps when set (UAC only); else use --max-calls
+    max_calls = args.max_calls
+    if args.pool_wraps > 0 and config.is_uac:
+        pool_wrap = config.pool_wrap_count
+        max_calls = args.pool_wraps * pool_wrap
+        log.info(
+            "pool_wraps=%d x LCM(uac=%d, uas=%d)=%d -> max_calls=%d",
+            args.pool_wraps, config.uac_ext_count, config.uas_ext_count,
+            pool_wrap, max_calls,
+        )
+
     # Run
     try:
         exit_code = asyncio.run(run(
             config,
             skip_subscribe=args.skip_subscribe,
-            max_calls=args.max_calls,
+            max_calls=max_calls,
             pre_phase_only=args.pre_phase_only,
             no_unregister=args.no_unregister,
         ))
