@@ -284,7 +284,7 @@ class ExtensionAgent:
                 for q in list(queues):
                     await q.put(raw)
                     delivered = True
-                if delivered and event_code in ("407", "200", "202"):
+                if delivered and event_code in ("407", "200", "200_PRACK", "200_INVITE", "202"):
                     log.debug("ext=%s dispatched %s to %d handler(s)", self.ext, event_code, len(queues))
 
                 # Also deliver to wildcard listeners (empty string key)

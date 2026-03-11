@@ -351,21 +351,21 @@ class CallEngine:
                 await agent.send_prack(dialog)
                 _log_call_event(call_id, agent.ext, "PRACK_SENT")
 
-                prack_200_q = agent._wait_for_event("200")
+                prack_200_q = agent._wait_for_event("200_PRACK")
                 try:
                     await asyncio.wait_for(prack_200_q.get(), timeout=timeout)
                     _log_call_event(call_id, agent.ext, "200_PRACK", sip_code="200")
                 finally:
-                    agent._deregister_event_queue(prack_200_q, "200")
+                    agent._deregister_event_queue(prack_200_q, "200_PRACK")
 
             # ── Wait for 200 OK to INVITE ─────────────────────────────
-            inv_200_q = agent._wait_for_event("200")
+            inv_200_q = agent._wait_for_event("200_INVITE")
             try:
                 raw_200 = await asyncio.wait_for(inv_200_q.get(), timeout=timeout)
                 agent.parse_200_invite(raw_200, dialog)
                 _log_call_event(call_id, agent.ext, "200_INVITE", sip_code="200")
             finally:
-                agent._deregister_event_queue(inv_200_q, "200")
+                agent._deregister_event_queue(inv_200_q, "200_INVITE")
 
             # ── ACK ───────────────────────────────────────────────────
             await agent.send_ack(dialog)

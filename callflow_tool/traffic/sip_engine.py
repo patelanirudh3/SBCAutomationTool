@@ -419,14 +419,28 @@ def create_transport(
 # Ported from messagebuffer.py::getMessageEvtAndMessage()
 # ---------------------------------------------------------------------------
 
+def _cseq_method(raw: str) -> str:
+    """Extract CSeq method from headers (e.g. 'PRACK', 'INVITE'). Returns '' if not found."""
+    for line in raw.split(CRLF):
+        if line.strip().lower().startswith("cseq:"):
+            parts = line.split(":", 1)[1].strip().split()
+            return parts[-1].upper() if len(parts) >= 2 else ""
+    return ""
+
+
 def classify_message(raw: str) -> tuple[str, str]:
     """
     Return (event_code, raw_message) where event_code is the SIP method
     (for requests) or response code (for responses).
 
+    For 200 responses, distinguishes 200 PRACK vs 200 INVITE via CSeq:
+      "SIP/2.0 200 OK" + CSeq: N PRACK  → ("200_PRACK", raw)
+      "SIP/2.0 200 OK" + CSeq: N INVITE → ("200_INVITE", raw)
+      "SIP/2.0 200 OK" + other CSeq    → ("200", raw)
+
     Examples:
       "INVITE sip:..." → ("INVITE", raw)
-      "SIP/2.0 200 OK" → ("200", raw)
+      "SIP/2.0 200 OK" → ("200", raw) or ("200_PRACK"/"200_INVITE")
       "SIP/2.0 401 ..."→ ("401", raw)
     """
     first_line = raw.split(CRLF, 1)[0].strip()
@@ -434,6 +448,12 @@ def classify_message(raw: str) -> tuple[str, str]:
     if first_line.startswith("SIP/2.0"):
         parts = first_line.split(" ", 2)
         code = parts[1] if len(parts) > 1 else "UNKNOWN"
+        if code == "200":
+            cseq_method = _cseq_method(raw)
+            if cseq_method == "PRACK":
+                return "200_PRACK", raw
+            if cseq_method == "INVITE":
+                return "200_INVITE", raw
         return code, raw
     else:
         method = first_line.split(" ", 1)[0].strip()
