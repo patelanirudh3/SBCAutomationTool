@@ -13,9 +13,12 @@ sip_transport: TCP
 domain: avaya.com
 sip_password: "123456"
 cps: 1
-hold_time_seconds: 10
+hold_time_seconds: 15
 metrics_port: 8081
 coordinator_url: http://localhost:8080
 register_rate: 2
 register_timeout: 5
 register_retry: 3
+rtp_burst_seconds: 2
+rtp_burst_pps: 50
+rtp_keepalive_interval: 5

@@ -1,33 +1,28 @@
 """
 traffic/rtp_stream.py
 =====================
-Lightweight asyncio RTP sender (UAC) and absorber (UAS) for media-plane
-load testing.
+Unified asyncio RTP endpoint for bidirectional media-plane load testing.
 
 RFC 3550 RTP + G.711 MU-law (PCMU, PT=0) — matches CM Codec Set:
   - 8 000 Hz sample rate
-  - 20 ms ptime  →  160 bytes payload  →  50 pps per call
-  - Silence payload: 0x7F × 160  (MU-law +0 dBm0, ITU-T G.711)
+  - 20 ms ptime  ->  160 bytes payload  ->  50 pps at full rate
+  - Silence payload: 0x7F x 160  (MU-law +0 dBm0, ITU-T G.711)
   - No silence suppression (matches CM "Silence Suppression: n")
 
-UAC side → RtpStream.create(local_ip)
-              stream.run(remote_ip, remote_port, hold_seconds)
-              stream.close()
+3-Phase send pattern (per call, per direction):
+  BURST_START  : rtp_burst_pps for rtp_burst_seconds  (establish media path)
+  KEEPALIVE    : 1 pkt / rtp_keepalive_interval       (prevent SBC timeout)
+  BURST_END    : rtp_burst_pps for rtp_burst_seconds  (verify path before BYE)
 
-UAS side → RtpAbsorber.create(local_ip)
-              absorber.run()   ← cancel on BYE
-              absorber.close()
-
-Both classes bind a real OS UDP port so it can be advertised in SDP.
-If the negotiated remote_port is 0 or 9 (RFC 4566 discard), RtpStream
-falls back to asyncio.sleep so hold_time is still honoured cleanly.
+Both UAC and UAS use the same RtpEndpoint class — one UDP socket per call leg
+that sends (3-phase) and receives (counting protocol).
 
 Corner cases handled:
-  - CancelledError (SIGTERM / early BYE)  → packet loop exits, re-raises
-  - sendto errors                         → loop breaks, no crash
-  - remote_port 0 / 9                     → sleep fallback
-  - close() called multiple times         → idempotent
-  - N concurrent calls                    → each gets a distinct OS port
+  - CancelledError (SIGTERM / early BYE)  -> loop exits, re-raises
+  - sendto errors                         -> loop breaks, no crash
+  - remote_port 0 / 9                     -> sleep fallback
+  - close() called multiple times         -> idempotent
+  - N concurrent calls                    -> each gets a distinct OS port
 """
 
 from __future__ import annotations
@@ -36,6 +31,8 @@ import asyncio
 import logging
 import random
 import struct
+import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -46,8 +43,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PT_PCMU      = 0           # G.711 MU-law payload type (RFC 3551)
-_PTIME        = 0.020       # 20 ms per packet
-_TS_INC       = 160         # timestamp increment per packet (8000 Hz × 20 ms)
+_PTIME_SEC    = 0.020       # 20 ms per packet
+_TS_INC       = 160         # timestamp increment per packet (8000 Hz x 20 ms)
 _PCMU_SILENCE = bytes([0x7F] * 160)  # MU-law silence (positive zero, 160 bytes)
 
 
@@ -58,8 +55,8 @@ _PCMU_SILENCE = bytes([0x7F] * 160)  # MU-law silence (positive zero, 160 bytes)
 def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
     """
     Build a minimal RFC 3550 RTP packet.
-      Byte 1 : V=2  P=0  X=0  CC=0   → 0x80
-      Byte 2 : M=0  PT=0 (PCMU)      → 0x00
+      Byte 1 : V=2  P=0  X=0  CC=0   -> 0x80
+      Byte 2 : M=0  PT=0 (PCMU)      -> 0x00
       Bytes 3-4  : sequence number
       Bytes 5-8  : timestamp
       Bytes 9-12 : SSRC
@@ -75,65 +72,114 @@ def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Shared asyncio DatagramProtocol: silently absorbs all inbound datagrams
+# RTP stats dataclass
 # ---------------------------------------------------------------------------
 
-class _NullProtocol(asyncio.DatagramProtocol):
-    """No-op protocol — all datagrams are silently discarded."""
-    def datagram_received(self, data: bytes, addr: Tuple) -> None: pass
-    def error_received(self, exc: Exception)               -> None: pass
-    def connection_lost(self, exc: Optional[Exception])    -> None: pass
+@dataclass(frozen=True)
+class RtpStats:
+    """Immutable snapshot of an RtpEndpoint's send/receive counters."""
+    tx_pkts: int
+    rx_pkts: int
+    first_rx_ms: float
+    last_rx_ms: float
 
 
 # ---------------------------------------------------------------------------
-# RtpStream — UAC sender
+# Counting DatagramProtocol — lightweight receive counter
 # ---------------------------------------------------------------------------
 
-class RtpStream:
+class _CountingProtocol(asyncio.DatagramProtocol):
     """
-    UAC-side G.711 PCMU RTP sender.
+    Counts incoming datagrams and records first/last receive timestamps.
+    No payload inspection, no allocation per packet — effectively zero overhead.
+    """
+    __slots__ = ("packets_received", "first_recv_ts", "last_recv_ts")
+
+    def __init__(self) -> None:
+        self.packets_received: int = 0
+        self.first_recv_ts: float = 0.0
+        self.last_recv_ts: float = 0.0
+
+    def datagram_received(self, data: bytes, addr: Tuple) -> None:
+        now = time.monotonic()
+        if self.packets_received == 0:
+            self.first_recv_ts = now
+        self.last_recv_ts = now
+        self.packets_received += 1
+
+    def error_received(self, exc: Exception) -> None:
+        pass
+
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# RtpEndpoint — unified bidirectional endpoint (replaces RtpStream + RtpAbsorber)
+# ---------------------------------------------------------------------------
+
+class RtpEndpoint:
+    """
+    Bidirectional G.711 PCMU RTP endpoint — used by both UAC and UAS.
+
+    Binds one OS-assigned UDP port (advertised in SDP).  Sends using the
+    3-phase heartbeat pattern and receives via _CountingProtocol.
 
     Usage (one instance per active call leg):
-        stream = await RtpStream.create(local_ip)
-        # advertise stream.local_port in SDP m=audio line
-        await stream.run(remote_ip, remote_port, hold_seconds)
-        await stream.close()          # always call; idempotent
+        ep = await RtpEndpoint.create(local_ip)
+        # advertise ep.local_port in SDP m=audio line
+        await ep.run(remote_ip, remote_port, hold_seconds, burst_sec, burst_pps, ka_interval)
+        stats = ep.stats
+        await ep.close()
     """
 
-    __slots__ = ("_transport", "_local_port", "_closed")
+    __slots__ = ("_transport", "_protocol", "_local_port", "_closed", "_tx_pkts")
 
     def __init__(
         self,
         transport: asyncio.DatagramTransport,
+        protocol: _CountingProtocol,
         local_port: int,
     ) -> None:
-        self._transport  = transport
+        self._transport = transport
+        self._protocol  = protocol
         self._local_port = local_port
-        self._closed     = False
+        self._closed    = False
+        self._tx_pkts   = 0
 
     # ------------------------------------------------------------------
 
     @classmethod
-    async def create(cls, local_ip: str) -> "RtpStream":
+    async def create(cls, local_ip: str) -> "RtpEndpoint":
         """
         Bind a UDP socket on an OS-assigned ephemeral port.
         Raises OSError if the bind fails (caller logs and falls back).
         """
         loop = asyncio.get_running_loop()
-        transport, _ = await loop.create_datagram_endpoint(
-            _NullProtocol,
-            local_addr=(local_ip, 0),   # port=0 → OS assigns
+        transport, protocol = await loop.create_datagram_endpoint(
+            _CountingProtocol,
+            local_addr=(local_ip, 0),
         )
         sock = transport.get_extra_info("socket")
         port = sock.getsockname()[1]
-        log.debug("RtpStream: bound %s:%d", local_ip, port)
-        return cls(transport, port)
+        log.debug("RtpEndpoint: bound %s:%d", local_ip, port)
+        return cls(transport, protocol, port)
 
     # ------------------------------------------------------------------
 
     @property
     def local_port(self) -> int:
         return self._local_port
+
+    @property
+    def stats(self) -> RtpStats:
+        """Snapshot of send/receive counters.  Safe to read after run() completes."""
+        return RtpStats(
+            tx_pkts=self._tx_pkts,
+            rx_pkts=self._protocol.packets_received,
+            first_rx_ms=self._protocol.first_recv_ts * 1000 if self._protocol.first_recv_ts else 0.0,
+            last_rx_ms=self._protocol.last_recv_ts * 1000 if self._protocol.last_recv_ts else 0.0,
+        )
 
     # ------------------------------------------------------------------
 
@@ -142,159 +188,192 @@ class RtpStream:
         remote_ip: str,
         remote_port: int,
         duration_seconds: float,
+        burst_seconds: float = 2.0,
+        burst_pps: int = 50,
+        keepalive_interval: float = 5.0,
     ) -> None:
         """
-        Send G.711 PCMU silence to (remote_ip, remote_port) for
-        duration_seconds at 50 pps (one 172-byte RTP packet every 20 ms).
+        3-phase send loop:
+          BURST_START  -> burst_pps for burst_seconds
+          KEEPALIVE    -> 1 pkt / keepalive_interval
+          BURST_END    -> burst_pps for burst_seconds
 
-        Timing: deadline-based pacing compensates for per-iteration overhead
-        so the overall send rate stays close to 50 pps even under load.
-
-        Falls back to asyncio.sleep (no packets sent) when:
-          - remote_port is 0 (media declined by remote)
-          - remote_port is 9 (RFC 4566 discard / black-hole)
-          - remote_ip is empty
-
-        Handles asyncio.CancelledError cleanly: exits the loop, re-raises
-        so the caller's task infrastructure sees the cancellation.
+        Falls back to asyncio.sleep when remote endpoint is invalid (port 0/9).
+        Handles CancelledError cleanly — re-raises for task infrastructure.
         """
         if not remote_ip or remote_port <= 0 or remote_port == 9:
             log.debug(
-                "RtpStream: remote %s:%d — discard/invalid, sleeping %.1fs",
+                "RtpEndpoint: remote %s:%d — discard/invalid, sleeping %.1fs",
                 remote_ip, remote_port, duration_seconds,
             )
             await asyncio.sleep(duration_seconds)
             return
 
-        loop      = asyncio.get_running_loop()
-        ssrc      = random.randint(1, 0xFFFFFFFF)
-        seq       = random.randint(0, 0xFFFF)
-        ts        = random.randint(0, 0xFFFFFFFF)
-        deadline  = loop.time() + duration_seconds
-        next_send = loop.time()
-        sent      = 0
+        loop = asyncio.get_running_loop()
+        ssrc = random.randint(1, 0xFFFFFFFF)
+        seq  = random.randint(0, 0xFFFF)
+        ts   = random.randint(0, 0xFFFFFFFF)
+        dest = (remote_ip, remote_port)
+
+        call_deadline = loop.time() + duration_seconds
+        burst_end_start = call_deadline - burst_seconds
 
         try:
-            while True:
-                if loop.time() >= deadline:
+            # ── Phase 1: BURST_START ──────────────────────────────────
+            seq, ts = await self._send_burst(
+                dest, ssrc, seq, ts,
+                min(loop.time() + burst_seconds, call_deadline),
+                burst_pps, loop,
+            )
+
+            # ── Phase 2: KEEPALIVE ────────────────────────────────────
+            while loop.time() < burst_end_start:
+                remaining = burst_end_start - loop.time()
+                sleep_for = min(keepalive_interval, remaining)
+                if sleep_for <= 0:
+                    break
+                await asyncio.sleep(sleep_for)
+
+                if loop.time() >= call_deadline:
                     break
 
                 pkt = _pack_rtp(seq, ts, ssrc)
                 try:
-                    self._transport.sendto(pkt, (remote_ip, remote_port))
-                    sent += 1
+                    self._transport.sendto(pkt, dest)
+                    self._tx_pkts += 1
                 except Exception as exc:
-                    log.debug("RtpStream: sendto error: %s — stopping", exc)
-                    # Socket may have closed; sleep out the remainder
-                    remaining = deadline - loop.time()
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
+                    log.debug("RtpEndpoint: keepalive sendto error: %s", exc)
                     break
 
-                seq       = (seq + 1) & 0xFFFF
-                ts        = (ts  + _TS_INC) & 0xFFFFFFFF
+                seq = (seq + 1) & 0xFFFF
+                ts  = (ts + _TS_INC) & 0xFFFFFFFF
 
-                # Drift-correcting sleep: target is fixed 20 ms grid
-                next_send += _PTIME
-                sleep_for  = next_send - loop.time()
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
+            # ── Phase 3: BURST_END ────────────────────────────────────
+            if loop.time() < call_deadline:
+                seq, ts = await self._send_burst(
+                    dest, ssrc, seq, ts,
+                    call_deadline,
+                    burst_pps, loop,
+                )
 
         except asyncio.CancelledError:
             log.debug(
-                "RtpStream: cancelled after %d packets → %s:%d",
-                sent, remote_ip, remote_port,
+                "RtpEndpoint: cancelled after %d tx / %d rx -> %s:%d",
+                self._tx_pkts, self._protocol.packets_received,
+                remote_ip, remote_port,
             )
-            raise  # propagate so task infrastructure handles it correctly
+            raise
 
         log.debug(
-            "RtpStream: done — %d packets sent → %s:%d (%.1fs)",
-            sent, remote_ip, remote_port, duration_seconds,
+            "RtpEndpoint: done — tx=%d rx=%d -> %s:%d (%.1fs)",
+            self._tx_pkts, self._protocol.packets_received,
+            remote_ip, remote_port, duration_seconds,
         )
 
     # ------------------------------------------------------------------
 
-    async def close(self) -> None:
-        """Close the underlying UDP socket.  Safe to call multiple times."""
-        if not self._closed:
-            self._closed = True
-            try:
-                self._transport.close()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# RtpAbsorber — UAS receiver (minimal: bind a real port, discard packets)
-# ---------------------------------------------------------------------------
-
-class RtpAbsorber:
-    """
-    UAS-side RTP absorber (Phase 2 minimal).
-
-    Binds a real UDP port so the SBC/CM can send media to a valid endpoint.
-    All incoming datagrams are silently discarded by _NullProtocol.
-    No statistics or RTCP are generated.
-
-    Usage (one instance per active call leg):
-        absorber = await RtpAbsorber.create(local_ip)
-        # advertise absorber.local_port in 200 OK SDP m=audio line
-        task = asyncio.create_task(absorber.run())
-        # on BYE received:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await absorber.close()        # always call; idempotent
-    """
-
-    __slots__ = ("_transport", "_local_port", "_closed")
-
-    def __init__(
+    async def _send_burst(
         self,
-        transport: asyncio.DatagramTransport,
-        local_port: int,
+        dest: Tuple[str, int],
+        ssrc: int,
+        seq: int,
+        ts: int,
+        deadline: float,
+        pps: int,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Tuple[int, int]:
+        """
+        Send at `pps` packets/sec until `deadline`.
+        Returns updated (seq, ts).  Drift-correcting pacing.
+        """
+        interval = 1.0 / pps
+        next_send = loop.time()
+
+        while loop.time() < deadline:
+            pkt = _pack_rtp(seq, ts, ssrc)
+            try:
+                self._transport.sendto(pkt, dest)
+                self._tx_pkts += 1
+            except Exception as exc:
+                log.debug("RtpEndpoint: burst sendto error: %s — stopping burst", exc)
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                break
+
+            seq = (seq + 1) & 0xFFFF
+            ts  = (ts + _TS_INC) & 0xFFFFFFFF
+
+            next_send += interval
+            sleep_for = next_send - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        return seq, ts
+
+    # ------------------------------------------------------------------
+
+    async def run_until_cancelled(
+        self,
+        remote_ip: str,
+        remote_port: int,
+        burst_seconds: float = 2.0,
+        burst_pps: int = 50,
+        keepalive_interval: float = 5.0,
     ) -> None:
-        self._transport  = transport
-        self._local_port = local_port
-        self._closed     = False
-
-    # ------------------------------------------------------------------
-
-    @classmethod
-    async def create(cls, local_ip: str) -> "RtpAbsorber":
         """
-        Bind a UDP socket on an OS-assigned ephemeral port.
-        Raises OSError if the bind fails (caller logs and falls back).
+        UAS variant: runs indefinitely until externally cancelled.
+        Sends BURST_START, then KEEPALIVE forever.  No BURST_END (BYE
+        cancels the task, which is the signal to stop).
+
+        On cancellation the caller reads .stats for verification.
         """
+        if not remote_ip or remote_port <= 0 or remote_port == 9:
+            log.debug(
+                "RtpEndpoint: remote %s:%d — discard/invalid, waiting for cancel",
+                remote_ip, remote_port,
+            )
+            try:
+                while True:
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                return
+            return
+
         loop = asyncio.get_running_loop()
-        transport, _ = await loop.create_datagram_endpoint(
-            _NullProtocol,
-            local_addr=(local_ip, 0),
-        )
-        sock = transport.get_extra_info("socket")
-        port = sock.getsockname()[1]
-        log.debug("RtpAbsorber: bound %s:%d", local_ip, port)
-        return cls(transport, port)
+        ssrc = random.randint(1, 0xFFFFFFFF)
+        seq  = random.randint(0, 0xFFFF)
+        ts   = random.randint(0, 0xFFFFFFFF)
+        dest = (remote_ip, remote_port)
 
-    # ------------------------------------------------------------------
-
-    @property
-    def local_port(self) -> int:
-        return self._local_port
-
-    # ------------------------------------------------------------------
-
-    async def run(self) -> None:
-        """
-        Keep the absorber alive until cancelled.
-        _NullProtocol.datagram_received() handles all incoming packets
-        (no-op); this coroutine exists purely so the caller can cancel it
-        when the call ends (BYE received).
-        """
         try:
+            # ── BURST_START ───────────────────────────────────────────
+            burst_deadline = loop.time() + burst_seconds
+            seq, ts = await self._send_burst(
+                dest, ssrc, seq, ts,
+                burst_deadline, burst_pps, loop,
+            )
+
+            # ── KEEPALIVE (forever until cancelled) ───────────────────
             while True:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(keepalive_interval)
+
+                pkt = _pack_rtp(seq, ts, ssrc)
+                try:
+                    self._transport.sendto(pkt, dest)
+                    self._tx_pkts += 1
+                except Exception:
+                    pass
+
+                seq = (seq + 1) & 0xFFFF
+                ts  = (ts + _TS_INC) & 0xFFFFFFFF
+
         except asyncio.CancelledError:
-            pass
+            log.debug(
+                "RtpEndpoint: UAS cancelled — tx=%d rx=%d -> %s:%d",
+                self._tx_pkts, self._protocol.packets_received,
+                remote_ip, remote_port,
+            )
 
     # ------------------------------------------------------------------
 
@@ -306,3 +385,11 @@ class RtpAbsorber:
                 self._transport.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases (import sites that haven't migrated)
+# ---------------------------------------------------------------------------
+
+RtpStream = RtpEndpoint
+RtpAbsorber = RtpEndpoint

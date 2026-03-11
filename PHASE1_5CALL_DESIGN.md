@@ -5,8 +5,8 @@
 ### Configuration
 - **UAC**: ext 4001000–4001004 (5 extensions)
 - **UAS**: ext 4001005–4001009 (5 extensions)
-- **Pool wrap**: LCM(5,5) = 5 calls per wrap
-- **Command**: `--pool-wraps 1` → max_calls = 5
+- **traffic_mode**: `smoke`, **call_count**: `5` (set in `uac.yaml`)
+- **Derived**: max_calls=5, pool_wraps=ceil(5/LCM(5,5))=1 (internal log only)
 
 ### Results
 | Metric | UAC | UAS |
@@ -25,16 +25,36 @@
 
 ---
 
-## 2. Implemented Mechanisms
+## 2. Traffic Run Control
 
-### 2.1 Pool-Wrap max_calls Derivation
-```
-max_calls = pool_wraps × LCM(uac_ext_count, uas_ext_count)
-```
-- `--pool-wraps 1` → 1 full cycle of extension pairing
-- `--max-calls N` still overridable when `--pool-wraps` not set
+### 2.1 Three Traffic Modes
 
-### 2.2 UAC → UAS Signaling
+The UAC YAML sets `traffic_mode`. The engine always fires calls at `cps` calls/second — `traffic_mode` only controls when the traffic phase ends.
+
+| Mode | YAML field | max_calls derived | Typical use |
+|------|-----------|------------------|------------|
+| **smoke** | `call_count: N` | = `call_count` | Dev / quick verification |
+| **timed** | `duration_hours: H` | = `cps × H × 3600` | BHCC (1.0h) or sub-hour (0.25h = 15 min) |
+| **unlimited** | *(none)* | 0 — run until stopped | Open-ended / manual stop |
+
+**CLI override**: `--max-calls N` always wins over `traffic_mode` in YAML (useful for a quick run without editing the file).
+
+### 2.2 max_calls & pool_wraps relationship
+
+```
+smoke:   max_calls = call_count
+timed:   max_calls = cps × duration_hours × 3600
+         pool_wraps = ceil(max_calls / LCM(uac_ext_count, uas_ext_count))  ← internal only
+```
+
+`pool_wraps` is never user-configured. The engine logs it for observability:
+```
+traffic_mode=smoke max_calls=5 | LCM(5,5)=5 -> pool_wraps=1 (internal)
+```
+
+Extensions remain **registered and subscribed** for the entire traffic run regardless of mode. Unregister only happens on shutdown after all calls complete.
+
+### 2.3 UAC → UAS Signaling
 - **peer_stop_url** in uac.yaml: `http://localhost:8081/api/test/stop`
 - When UAC finishes (engine completes), POST to peer_stop_url
 - UAS metrics server exposes POST /api/test/stop → triggers stop_event → shutdown
@@ -146,7 +166,8 @@ max_calls = pool_wraps × LCM(uac_ext_count, uas_ext_count)
 
 ### 6.3 Config Fields (Customizable)
 
-#### UAC / UAS
+#### UAC / UAS — Connection & Signaling
+
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | vm_role | UAC \| UAS | — | ✅ |
@@ -167,6 +188,19 @@ max_calls = pool_wraps × LCM(uac_ext_count, uas_ext_count)
 | register_rate | int | 50 | — |
 | register_timeout | int | 5 | — |
 | register_retry | int | 3 | — |
+
+#### UAC Only — Traffic Run Control (GUI picks one mode)
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| traffic_mode | smoke \| timed \| unlimited | unlimited | Selects stop criterion |
+| call_count | int | 0 | **smoke**: exact call total |
+| duration_hours | float | 0.0 | **timed**: 1.0=BHCC, 0.25=15 min, 24.0=overnight |
+
+Rules enforced at config load:
+- `traffic_mode=smoke` requires `call_count > 0`
+- `traffic_mode=timed` requires `duration_hours > 0`
+- UAS YAML never sets these — UAS stops only on UAC's stop signal
 
 #### VM Pairing
 | Field | Type | Purpose |
@@ -219,15 +253,31 @@ max_calls = pool_wraps × LCM(uac_ext_count, uas_ext_count)
 
 ## 9. Quick Reference
 
-### Run 5 Calls (Same Machine)
+### Smoke Test — 5 calls (uac.yaml: traffic_mode=smoke, call_count=5)
 ```bash
-# Terminal 1
+# Terminal 1: UAS first
 python -m callflow_tool.traffic.main --config uas.yaml --log-level INFO
 
-# Terminal 2 (after UAS ready)
-python -m callflow_tool.traffic.main --config uac.yaml --log-level INFO --pool-wraps 1
+# Terminal 2: UAC (traffic_mode + call_count read from uac.yaml)
+python -m callflow_tool.traffic.main --config uac.yaml --log-level INFO
 ```
 
+### BHCC 1 Hour (uac.yaml: traffic_mode=timed, duration_hours=1.0)
+```bash
+python -m callflow_tool.traffic.main --config uas.yaml --log-level INFO
+python -m callflow_tool.traffic.main --config uac.yaml --log-level INFO
+```
+
+### CLI Override (ignore YAML traffic_mode, run exactly N calls)
+```bash
+python -m callflow_tool.traffic.main --config uac.yaml --max-calls 10
+```
+
+### Key: what goes where
+- `traffic_mode`, `call_count`, `duration_hours` → **uac.yaml** (written by GUI, never in uas.yaml)
+- `--max-calls` → **CLI only** (dev/override, highest priority)
+- `pool_wraps` → **internal log only**, never configured by user
+
 ### Config Files
-- `uac.yaml`: UAC config, peer_stop_url: http://localhost:8081/api/test/stop
-- `uas.yaml`: UAS config, metrics_port: 8081
+- `uac.yaml`: all UAC config including `traffic_mode` + `peer_stop_url`
+- `uas.yaml`: UAS config, `metrics_port: 8081` (no run control fields needed)

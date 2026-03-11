@@ -7,22 +7,26 @@ UAC mode:
   - Token-bucket rate controller fires INVITEs at config.cps calls/sec
   - Linear ramp-up over config.ramp_up_seconds before hitting full CPS
   - execute_call() coroutine: INVITE → 100 → 180 → PRACK → 200 → ACK
-                              → RTP stream (hold_time) → BYE → 200 BYE
+                              → RTP 3-phase (hold_time) → BYE → 200 BYE
   - Extension pairs cycle sequentially — no 1:1 binding
 
 UAS mode:
   - All agents run auto-answer loops listening for inbound INVITEs
   - On INVITE: 100 → 180 → wait PRACK → 200 PRACK → 200 OK → wait ACK
-                         → RTP absorb → wait BYE → 200 BYE
+                         → RTP 3-phase (until BYE) → 200 BYE
 
-RTP (G.711 PCMU, 20 ms ptime, 160 B/pkt, 50 pps):
-  - UAC allocates a real UDP socket before INVITE; port is in SDP offer.
-    After ACK, streams silence to the SBC media endpoint (from 200 OK SDP)
-    for hold_time_seconds, then sends BYE.
-  - UAS allocates a real UDP port before 200 OK; port is in SDP answer.
-    After ACK, absorbs (discards) incoming RTP until BYE arrives.
-  - If RTP socket allocation fails, the call continues without media
-    (port 9 / discard in SDP) so signalling tests are never blocked.
+RTP — bidirectional 3-phase heartbeat (G.711 PCMU, 20 ms ptime):
+  Both sides allocate a real UDP port, send BURST_START → KEEPALIVE →
+  BURST_END, and count received packets via _CountingProtocol.
+  UAC: run(duration=hold_time) then BYE; reads stats for verification.
+  UAS: run_until_cancelled(); BYE cancels the task; reads stats.
+  If RTP socket allocation fails, call continues with port 9 (no media).
+
+Talk-path verification events:
+  MEDIA_VERIFIED  — rtp_rx_pkts > 0 on this side
+  MEDIA_FAILED    — rtp_rx_pkts == 0 on this side
+  MEDIA_PARTIAL   — rx > 0 but duration < 50% of hold_time
+
 All structured logging uses JSON events for call_id, ext, event, sip_code, ts.
 """
 
@@ -38,7 +42,7 @@ from typing import Optional
 from .extension_agent import ExtensionAgent, DialogState
 from .config import VMConfig
 from .sip_engine import classify_message
-from .rtp_stream import RtpStream, RtpAbsorber
+from .rtp_stream import RtpEndpoint, RtpStats
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +71,22 @@ def _log_call_event(
     log.info("CALL_EVENT %s", json.dumps(record))
 
 
+def _classify_media(stats: RtpStats, hold_seconds: float) -> str:
+    """
+    Determine talk-path verification event from RTP receive stats.
+      MEDIA_VERIFIED — rx > 0 and duration covers >= 50% of hold_time
+      MEDIA_PARTIAL  — rx > 0 but duration < 50% of hold_time
+      MEDIA_FAILED   — rx == 0
+    """
+    if stats.rx_pkts == 0:
+        return "MEDIA_FAILED"
+    if stats.last_rx_ms > 0 and stats.first_rx_ms > 0:
+        rx_duration_s = (stats.last_rx_ms - stats.first_rx_ms) / 1000.0
+        if rx_duration_s < hold_seconds * 0.5:
+            return "MEDIA_PARTIAL"
+    return "MEDIA_VERIFIED"
+
+
 # ---------------------------------------------------------------------------
 # Call result (fed into metrics)
 # ---------------------------------------------------------------------------
@@ -81,6 +101,9 @@ class CallResult:
     pdd_ms: float = 0.0        # INVITE → first 180/183
     hold_ms: float = 0.0       # ACK → BYE
     total_ms: float = 0.0      # INVITE → 200 BYE
+    rtp_tx_pkts: int = 0
+    rtp_rx_pkts: int = 0
+    media_verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -244,31 +267,32 @@ class CallEngine:
         """
         Single call coroutine:
           INVITE → 100 Trying → 180 Ringing (reliable) → PRACK → 200 PRACK
-                → 200 OK INVITE → ACK → RTP stream (hold_time) → BYE → 200 BYE
+                → 200 OK INVITE → ACK → RTP 3-phase (hold_time) → BYE → 200 BYE
 
         Handles:
           - 407 Proxy-Auth at INVITE (re-sends with credentials)
           - Timeouts at each step (marks call as failed)
           - RTP socket allocation failures (degrades to port-9 / no media)
+          - Talk-path verification via RtpEndpoint.stats
           - Structured JSON logging at every event
         """
         call_start = time.monotonic()
         dialog: Optional[DialogState] = None
         call_id = "pending"
-        rtp_stream: Optional[RtpStream] = None
+        rtp_ep: Optional[RtpEndpoint] = None
 
         try:
-            # ── Allocate RTP send socket (port goes into SDP offer) ───────
+            # ── Allocate RTP endpoint (port goes into SDP offer) ──────
             try:
-                rtp_stream = await RtpStream.create(agent._local_host)
+                rtp_ep = await RtpEndpoint.create(agent._local_host)
             except Exception as exc:
                 log.warning(
                     "ext=%s RTP socket alloc failed (%s) — using port 9 (no media)",
                     agent.ext, exc,
                 )
-            rtp_port = rtp_stream.local_port if rtp_stream else 9
+            rtp_port = rtp_ep.local_port if rtp_ep else 9
 
-            # ── INVITE ───────────────────────────────────────────────────
+            # ── INVITE ────────────────────────────────────────────────
             dialog = await agent.send_invite(callee, rtp_port=rtp_port)
             call_id = dialog.call_id
             self._active_calls.add(call_id)
@@ -276,18 +300,13 @@ class CallEngine:
 
             timeout = float(self._config.register_timeout * 2)
 
-            # ── Wait for provisional + handle 407 + handle final failures ───
-            # Comprehensive list of 4xx/5xx/6xx codes that can be returned
-            # for an INVITE — must match what _dispatch_loop delivers by key.
+            # ── Wait for provisional + handle 407 + handle final failures
             _FINAL_FAIL = (
-                # 4xx Client Errors
                 "400", "401", "403", "404", "405", "406", "408",
                 "410", "413", "414", "415", "416", "420", "421", "422", "423",
                 "480", "481", "482", "483", "484", "485", "486", "487", "488",
                 "489", "491", "493", "494",
-                # 5xx Server Errors
                 "500", "501", "502", "503", "504", "505",
-                # 6xx Global Failures
                 "600", "603", "604", "606",
             )
             prov_q = agent._wait_for_event("100", "180", "183", "407", *_FINAL_FAIL)
@@ -310,16 +329,13 @@ class CallEngine:
                         got_180 = True
 
                     elif event_code == "407":
-                        # Re-authenticate and resend INVITE
                         _log_call_event(call_id, agent.ext, "AUTH_407", sip_code="407")
                         await self._handle_407_invite(agent, dialog, raw)
-                        # Continue waiting for provisional after re-INVITE
 
                     elif event_code in _FINAL_FAIL or (
                         event_code.isdigit() and len(event_code) == 3
                         and event_code[0] in ("4", "5", "6")
                     ):
-                        # RFC 3261: must send ACK for all final responses (4xx/5xx/6xx)
                         await agent.send_ack_for_failure(dialog, raw)
                         _log_call_event(
                             call_id, agent.ext, "CALL_FAILED",
@@ -330,7 +346,7 @@ class CallEngine:
             finally:
                 agent._deregister_event_queue(prov_q, "100", "180", "183", "407", *_FINAL_FAIL)
 
-            # ── PRACK (if 100rel) ────────────────────────────────────────
+            # ── PRACK (if 100rel) ─────────────────────────────────────
             if dialog.is_reliable and dialog.rseq:
                 await agent.send_prack(dialog)
                 _log_call_event(call_id, agent.ext, "PRACK_SENT")
@@ -342,7 +358,7 @@ class CallEngine:
                 finally:
                     agent._deregister_event_queue(prack_200_q, "200")
 
-            # ── Wait for 200 OK to INVITE ────────────────────────────────
+            # ── Wait for 200 OK to INVITE ─────────────────────────────
             inv_200_q = agent._wait_for_event("200")
             try:
                 raw_200 = await asyncio.wait_for(inv_200_q.get(), timeout=timeout)
@@ -351,24 +367,26 @@ class CallEngine:
             finally:
                 agent._deregister_event_queue(inv_200_q, "200")
 
-            # ── ACK ──────────────────────────────────────────────────────
+            # ── ACK ───────────────────────────────────────────────────
             await agent.send_ack(dialog)
             _log_call_event(call_id, agent.ext, "ACK_SENT")
 
-            # ── RTP stream for hold_time (G.711 PCMU silence, 50 pps) ────
-            # rtp_stream.run() falls back to asyncio.sleep automatically
-            # when remote_port is 0 / 9 (SDP not yet parsed or discard).
-            if rtp_stream:
-                await rtp_stream.run(
+            # ── RTP 3-phase (BURST → KEEPALIVE → BURST) ──────────────
+            cfg = self._config
+            if rtp_ep:
+                await rtp_ep.run(
                     dialog.rtp_remote_ip,
                     dialog.rtp_remote_port,
-                    float(self._config.hold_time_seconds),
+                    float(cfg.hold_time_seconds),
+                    burst_seconds=float(cfg.rtp_burst_seconds),
+                    burst_pps=cfg.rtp_burst_pps,
+                    keepalive_interval=float(cfg.rtp_keepalive_interval),
                 )
             else:
-                await asyncio.sleep(self._config.hold_time_seconds)
+                await asyncio.sleep(cfg.hold_time_seconds)
             hold_ms = (time.monotonic() * 1000) - dialog.ack_sent_ms
 
-            # ── BYE ──────────────────────────────────────────────────────
+            # ── BYE ───────────────────────────────────────────────────
             await agent.send_bye(dialog)
             _log_call_event(call_id, agent.ext, "BYE_SENT")
 
@@ -379,7 +397,22 @@ class CallEngine:
             finally:
                 agent._deregister_event_queue(bye_200_q, "200")
 
-            # ── Call complete ─────────────────────────────────────────────
+            # ── Talk-path verification ────────────────────────────────
+            rtp_tx = 0
+            rtp_rx = 0
+            media_ok = False
+            if rtp_ep:
+                st = rtp_ep.stats
+                rtp_tx = st.tx_pkts
+                rtp_rx = st.rx_pkts
+                media_ok = rtp_rx > 0
+                media_event = _classify_media(st, float(cfg.hold_time_seconds))
+                _log_call_event(
+                    call_id, agent.ext, media_event,
+                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uac",
+                )
+
+            # ── Call complete ─────────────────────────────────────────
             total_ms = (time.monotonic() - call_start) * 1000
             pdd_ms = (dialog.ringing_recv_ms - dialog.invite_sent_ms) if dialog else 0
             result = CallResult(
@@ -390,6 +423,9 @@ class CallEngine:
                 pdd_ms=pdd_ms,
                 hold_ms=hold_ms,
                 total_ms=total_ms,
+                rtp_tx_pkts=rtp_tx,
+                rtp_rx_pkts=rtp_rx,
+                media_verified=media_ok,
             )
             self._calls_completed += 1
             _log_call_event(
@@ -418,7 +454,6 @@ class CallEngine:
             _log_call_event(call_id, agent.ext if agent else "?", "CALL_TIMEOUT")
 
         except asyncio.CancelledError:
-            # Graceful shutdown: send BYE if call is established
             if dialog and dialog.state == "ESTABLISHED":
                 try:
                     await asyncio.wait_for(agent.send_bye(dialog), timeout=5.0)
@@ -437,8 +472,8 @@ class CallEngine:
             self._calls_failed += 1
 
         finally:
-            if rtp_stream:
-                await rtp_stream.close()
+            if rtp_ep:
+                await rtp_ep.close()
             if call_id in self._active_calls:
                 self._active_calls.discard(call_id)
             if dialog and dialog.call_id in agent.active_dialogs:
@@ -574,9 +609,10 @@ class UasAutoAnswer:
     """
     UAS-side engine. Each ExtensionAgent runs an auto-answer loop.
     On any inbound INVITE: 100 → 180 → wait PRACK → 200 PRACK → 200 OK
-                         → wait ACK → wait BYE → 200 BYE
+                         → wait ACK → RTP 3-phase (until BYE) → 200 BYE
 
-    No INVITE is ever fired from UAS side.
+    RTP is bidirectional: UAS sends (BURST_START → KEEPALIVE) and receives
+    (counted via _CountingProtocol).  No INVITE is ever fired from UAS side.
     """
 
     def __init__(
@@ -637,33 +673,33 @@ class UasAutoAnswer:
         """
         Full UAS call sequence for one inbound call.
         INVITE → 100+180 → wait PRACK → 200 PRACK → 200 OK (with real RTP port)
-               → wait ACK → absorb RTP → wait BYE → 200 BYE
+               → wait ACK → RTP 3-phase (until BYE) → 200 BYE
         """
         call_start = time.monotonic()
         dialog: Optional[DialogState] = None
         call_id = "pending"
         timeout = float(self._config.register_timeout * 4)
-        rtp_absorber: Optional[RtpAbsorber] = None
-        absorb_task: Optional[asyncio.Task] = None
+        rtp_ep: Optional[RtpEndpoint] = None
+        rtp_task: Optional[asyncio.Task] = None
         result: Optional[CallResult] = None
 
         try:
-            # ── Allocate RTP absorber before 200 OK (port goes in SDP) ───
+            # ── Allocate RTP endpoint before 200 OK (port goes in SDP) ──
             try:
-                rtp_absorber = await RtpAbsorber.create(agent._local_host)
+                rtp_ep = await RtpEndpoint.create(agent._local_host)
             except Exception as exc:
                 log.warning(
-                    "ext=%s RTP absorber alloc failed (%s) — using port 9 (no media)",
+                    "ext=%s RTP endpoint alloc failed (%s) — using port 9 (no media)",
                     agent.ext, exc,
                 )
-            rtp_port = rtp_absorber.local_port if rtp_absorber else 9
+            rtp_port = rtp_ep.local_port if rtp_ep else 9
 
-            # ── Handle INVITE: sends 100 + 180 ───────────────────────────
+            # ── Handle INVITE: sends 100 + 180 ───────────────────────
             dialog = await agent.handle_incoming_invite(raw_invite)
             call_id = dialog.call_id
             _log_call_event(call_id, agent.ext, "UAS_INVITE_RCVD")
 
-            # ── Wait for PRACK ───────────────────────────────────────────
+            # ── Wait for PRACK ────────────────────────────────────────
             prack_q = agent._wait_for_event("PRACK")
             try:
                 raw_prack = await asyncio.wait_for(prack_q.get(), timeout=timeout)
@@ -672,11 +708,11 @@ class UasAutoAnswer:
             finally:
                 agent._deregister_event_queue(prack_q, "PRACK")
 
-            # ── Send 200 OK to INVITE (with real RTP port in SDP) ────────
+            # ── Send 200 OK to INVITE (with real RTP port in SDP) ─────
             await agent.send_200_invite(dialog, rtp_port=rtp_port)
             _log_call_event(call_id, agent.ext, "UAS_200_SENT")
 
-            # ── Wait for ACK ─────────────────────────────────────────────
+            # ── Wait for ACK ──────────────────────────────────────────
             ack_q = agent._wait_for_event("ACK")
             try:
                 await asyncio.wait_for(ack_q.get(), timeout=timeout)
@@ -685,28 +721,54 @@ class UasAutoAnswer:
             finally:
                 agent._deregister_event_queue(ack_q, "ACK")
 
-            # ── Start RTP absorber (discard incoming media from SBC) ──────
-            if rtp_absorber:
-                absorb_task = asyncio.create_task(
-                    rtp_absorber.run(),
-                    name=f"rtp-absorb-{call_id}",
+            # ── Start RTP endpoint (bidirectional: send + receive) ────
+            cfg = self._config
+            if rtp_ep:
+                rtp_task = asyncio.create_task(
+                    rtp_ep.run_until_cancelled(
+                        dialog.rtp_remote_ip,
+                        dialog.rtp_remote_port,
+                        burst_seconds=float(cfg.rtp_burst_seconds),
+                        burst_pps=cfg.rtp_burst_pps,
+                        keepalive_interval=float(cfg.rtp_keepalive_interval),
+                    ),
+                    name=f"rtp-uas-{call_id}",
                 )
 
-            # ── Wait for BYE ──────────────────────────────────────────────
-            # BYE arrives after UAC hold_time_seconds
+            # ── Wait for BYE ──────────────────────────────────────────
             bye_q = agent._wait_for_event("BYE")
             try:
-                hold_timeout = float(self._config.hold_time_seconds + 30)
+                hold_timeout = float(cfg.hold_time_seconds + 30)
                 raw_bye = await asyncio.wait_for(bye_q.get(), timeout=hold_timeout)
                 await agent.handle_bye(raw_bye, dialog)
                 _log_call_event(call_id, agent.ext, "UAS_BYE_RCVD")
             finally:
                 agent._deregister_event_queue(bye_q, "BYE")
 
+            # ── Cancel RTP task and collect stats ─────────────────────
+            rtp_tx = 0
+            rtp_rx = 0
+            media_ok = False
+            if rtp_task and not rtp_task.done():
+                rtp_task.cancel()
+                await asyncio.gather(rtp_task, return_exceptions=True)
+            if rtp_ep:
+                st = rtp_ep.stats
+                rtp_tx = st.tx_pkts
+                rtp_rx = st.rx_pkts
+                media_ok = rtp_rx > 0
+                media_event = _classify_media(st, float(cfg.hold_time_seconds))
+                _log_call_event(
+                    call_id, agent.ext, media_event,
+                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uas",
+                )
+
             total_ms = (time.monotonic() - call_start) * 1000
             result = CallResult(
                 call_id=call_id, caller="remote", callee=agent.ext,
                 success=True, total_ms=total_ms,
+                rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
+                media_verified=media_ok,
             )
             _log_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE", total_ms=round(total_ms, 2))
 
@@ -734,12 +796,11 @@ class UasAutoAnswer:
             )
 
         finally:
-            # Cancel absorber task and close RTP socket for every exit path
-            if absorb_task and not absorb_task.done():
-                absorb_task.cancel()
-                await asyncio.gather(absorb_task, return_exceptions=True)
-            if rtp_absorber:
-                await rtp_absorber.close()
+            if rtp_task and not rtp_task.done():
+                rtp_task.cancel()
+                await asyncio.gather(rtp_task, return_exceptions=True)
+            if rtp_ep:
+                await rtp_ep.close()
 
         if result and self._on_complete:
             try:

@@ -56,7 +56,7 @@ pip install -r requirements.txt
 ### 2. Create a Config File (optional)
 
 ```yaml
-# config.yaml
+# uac.yaml example
 vm_role: UAC
 vm_id: uac-vm-1
 uac_ext_start: 1001
@@ -72,28 +72,33 @@ cps: 6
 hold_time_seconds: 180
 ramp_up_seconds: 30
 metrics_interval: 10
-metrics_port: 8080
+metrics_port: 8082
 coordinator_url: http://coordinator:8080
-peer_stop_url: http://uas-host:8081/api/test/stop   # UAC only: signal UAS when done
+peer_stop_url: http://uas-host:8081/api/test/stop   # signal UAS when UAC finishes
+
+# Traffic run control — pick ONE mode (GUI populates this)
+traffic_mode: smoke    # smoke | timed | unlimited
+call_count: 10         # smoke: exact call total
+# duration_hours: 1.0  # timed: hours (0.25=15min, 1.0=BHCC, 24.0=overnight)
 ```
 
 ### 3. Run UAS VM (start first)
 
 ```bash
-python -m callflow_tool.traffic.main --config uas.yaml
+python -m callflow_tool.traffic.main --config uas.yaml --log-level INFO
 ```
 
 ### 4. Run UAC VM (after UAS is ready)
 
 ```bash
-# With pool-wraps: max_calls = pool_wraps × LCM(uac_count, uas_count)
-python -m callflow_tool.traffic.main --config uac.yaml --pool-wraps 1
+# traffic_mode is set in uac.yaml — no extra CLI flags needed
+python -m callflow_tool.traffic.main --config uac.yaml --log-level INFO
 
-# Or explicit max-calls
+# CLI override: run exactly N calls regardless of YAML traffic_mode
 python -m callflow_tool.traffic.main --config uac.yaml --max-calls 5
 ```
 
-When UAC completes, it POSTs to `peer_stop_url` (UAS /api/test/stop) so UAS unregisters and exits cleanly.
+When UAC completes its traffic run, it POSTs to `peer_stop_url` so UAS unregisters and exits cleanly.
 
 ### 5. Validate Config (dry run)
 
@@ -125,6 +130,9 @@ python -m callflow_tool.traffic.main --config config.yaml --dry-run
 | `METRICS_PORT` | `8080` | FastAPI metrics server port |
 | `COORDINATOR_URL` | `http://localhost:8080` | GUI coordinator URL |
 | `PEER_STOP_URL` | *(empty)* | UAC POSTs here when done (e.g. UAS http://host:port/api/test/stop) |
+| `TRAFFIC_MODE` | `unlimited` | `smoke` \| `timed` \| `unlimited` — how UAC determines when to stop |
+| `CALL_COUNT` | `0` | smoke mode: exact number of call attempts |
+| `DURATION_HOURS` | `0.0` | timed mode: hours to run (0.25=15 min, 1.0=BHCC, 24.0=overnight) |
 | `REGISTER_RATE` | `50` | Max REGISTER/sec during pre-phase |
 | `REGISTER_EXPIRES` | `3600` | Registration expiry (seconds) |
 | `REGISTER_RETRY` | `3` | Max REGISTER retry attempts |
@@ -135,14 +143,35 @@ python -m callflow_tool.traffic.main --config config.yaml --dry-run
 
 ---
 
-## Concurrent Call Math
+## Traffic Modes & Call Math
+
+The UAC config sets `traffic_mode` (smoke / timed / unlimited). The engine always fires calls at `cps` calls/second; `traffic_mode` only controls when it stops.
+
+### Three Modes
+
+| Mode | YAML fields | max_calls derived |
+|------|-------------|------------------|
+| **smoke** | `call_count: N` | = `call_count` |
+| **timed** | `duration_hours: H` | = `cps × H × 3600` |
+| **unlimited** | *(none)* | 0 (run until Ctrl+C or POST /api/test/stop) |
+
+CLI `--max-calls N` overrides all three at launch time (useful for quick dev runs without editing YAML).
+
+Pool wraps are **internal** — the engine logs them for observability but they are never user-configured:
+```
+pool_wraps = ceil(max_calls / LCM(uac_ext_count, uas_ext_count))
+```
+
+### Concurrent Call & BHCC Math
 
 ```
-Per VM:      6 CPS × 180s hold  =  1,080 concurrent calls
-2 UAC VMs:  12 CPS × 180s hold  =  2,160 concurrent calls on SBC
-BHCC:       12 CPS × 3,600s     = 43,200 calls/hour  ✓  (target: 40,000)
+Per VM (timed, BHCC):  6 CPS × 3,600s =  21,600 call attempts in 1 hour
+Concurrent sessions:   6 CPS × 180s hold = 1,080 simultaneous calls
 
-SBC must support ≥ 2,200 simultaneous sessions (2,160 + 10% headroom).
+2 UAC VMs:  12 CPS × 180s hold = 2,160 concurrent calls on SBC
+BHCC:       12 CPS × 3,600s   = 43,200 calls/hour  (target: 40,000 ✓)
+
+SBC must support >= 2,200 simultaneous sessions (2,160 + 10% headroom).
 ```
 
 ---

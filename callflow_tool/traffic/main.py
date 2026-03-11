@@ -36,6 +36,7 @@ import asyncio
 import datetime
 import logging
 import logging.handlers
+import math
 import os
 import signal
 import sys
@@ -167,14 +168,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("MAX_CALLS", "0")),
         metavar="N",
-        help="Stop UAC after N call attempts (0 = unlimited or derived from --pool-wraps)",
-    )
-    p.add_argument(
-        "--pool-wraps",
-        type=int,
-        default=int(os.environ.get("POOL_WRAPS", "0")),
-        metavar="N",
-        help="Derive max_calls = N × LCM(uac_count, uas_count). Overrides --max-calls when > 0.",
+        help=(
+            "CLI override: stop UAC after exactly N call attempts. "
+            "Takes priority over traffic_mode in the YAML config. "
+            "0 = derive from YAML traffic_mode (smoke/timed) or run unlimited."
+        ),
     )
     p.add_argument(
         "--pre-phase-only",
@@ -492,16 +490,31 @@ def main() -> None:
         )
         sys.exit(0)
 
-    # Derive max_calls from pool_wraps when set (UAC only); else use --max-calls
-    max_calls = args.max_calls
-    if args.pool_wraps > 0 and config.is_uac:
-        pool_wrap = config.pool_wrap_count
-        max_calls = args.pool_wraps * pool_wrap
+    # ── Derive max_calls (UAC only) ───────────────────────────────────────────
+    # Priority:
+    #   1. --max-calls N  (CLI, always overrides — quick dev/smoke override)
+    #   2. traffic_mode=smoke   → max_calls = call_count             (YAML/GUI)
+    #   3. traffic_mode=timed   → max_calls = CPS × duration_hours × 3600  (YAML/GUI)
+    #   4. traffic_mode=unlimited or nothing  → max_calls = 0  (run until stopped)
+    max_calls = args.max_calls   # 0 if not provided at CLI
+
+    if max_calls == 0 and config.is_uac:
+        if config.traffic_mode == "smoke":
+            max_calls = config.call_count
+        elif config.traffic_mode == "timed":
+            max_calls = int(config.cps * config.duration_hours * 3600)
+
+    # Log the resolved values for observability; pool_wraps is internal-only
+    if max_calls > 0 and config.pool_wrap_count > 0:
+        pool_wraps = math.ceil(max_calls / config.pool_wrap_count)
         log.info(
-            "pool_wraps=%d x LCM(uac=%d, uas=%d)=%d -> max_calls=%d",
-            args.pool_wraps, config.uac_ext_count, config.uas_ext_count,
-            pool_wrap, max_calls,
+            "traffic_mode=%s max_calls=%d | LCM(%d,%d)=%d -> pool_wraps=%d (internal)",
+            config.traffic_mode, max_calls,
+            config.uac_ext_count, config.uas_ext_count,
+            config.pool_wrap_count, pool_wraps,
         )
+    elif max_calls == 0:
+        log.info("traffic_mode=%s -> unlimited (run until stopped)", config.traffic_mode)
 
     # Run
     try:

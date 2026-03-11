@@ -48,6 +48,15 @@ _DEFAULTS: dict[str, Any] = {
     "local_host": "",             # empty = auto-detect
     "local_port": 0,              # 0 = OS-assigned per extension
     "peer_stop_url": "",          # UAC POSTs here when traffic complete (e.g. UAS /api/test/stop)
+    "rtp_burst_seconds": 2,       # duration of start/end burst phases
+    "rtp_burst_pps": 50,          # packet rate during bursts (= 1000 / ptime_ms)
+    "rtp_keepalive_interval": 5,  # seconds between keepalive packets (must be < SBC inactivity timer)
+    # ── Traffic run control ──────────────────────────────────────────────────
+    # The GUI (or YAML) sets exactly ONE of the three modes below.
+    # CLI --max-calls overrides all three at launch time.
+    "traffic_mode": "unlimited",  # "smoke" | "timed" | "unlimited"
+    "call_count": 0,              # smoke: exact number of calls to attempt (> 0)
+    "duration_hours": 0.0,        # timed: run duration in hours (decimals ok: 0.25 = 15 min)
 }
 
 # ENV VAR name mapping: field_name -> ENV_VAR_NAME
@@ -77,6 +86,12 @@ _ENV_MAP: dict[str, str] = {
     "local_host":         "LOCAL_HOST",
     "local_port":         "LOCAL_PORT",
     "peer_stop_url":      "PEER_STOP_URL",
+    "rtp_burst_seconds":  "RTP_BURST_SECONDS",
+    "rtp_burst_pps":      "RTP_BURST_PPS",
+    "rtp_keepalive_interval": "RTP_KEEPALIVE_INTERVAL",
+    "traffic_mode":       "TRAFFIC_MODE",
+    "call_count":         "CALL_COUNT",
+    "duration_hours":     "DURATION_HOURS",
 }
 
 # Fields that should be coerced to int
@@ -85,7 +100,12 @@ _INT_FIELDS = {
     "sbc_port", "cps", "hold_time_seconds", "ramp_up_seconds",
     "metrics_interval", "metrics_port", "register_rate", "register_expires",
     "register_retry", "register_timeout", "max_concurrent_calls", "local_port",
+    "rtp_burst_seconds", "rtp_burst_pps", "rtp_keepalive_interval",
+    "call_count",
 }
+
+# Fields that should be coerced to float
+_FLOAT_FIELDS = {"duration_hours"}
 
 
 @dataclass
@@ -117,6 +137,13 @@ class VMConfig:
     local_host: str         = field(default="")       # empty = auto-detect
     local_port: int         = field(default=0)        # 0 = OS-assigned per ext
     peer_stop_url: str      = field(default="")       # UAC POSTs here when done (UAS /api/test/stop)
+    rtp_burst_seconds: int  = field(default=2)        # burst phase duration (seconds)
+    rtp_burst_pps: int      = field(default=50)       # burst packet rate (= 1000/ptime)
+    rtp_keepalive_interval: int = field(default=5)    # seconds between keepalive packets
+    # Traffic run control — GUI or YAML sets one mode; CLI --max-calls overrides all
+    traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"
+    call_count: int         = field(default=0)            # smoke: exact call total (> 0)
+    duration_hours: float   = field(default=0.0)          # timed: hours (0.25 = 15 min)
 
     # ------------------------------------------------------------------
     # Derived helpers (not serialised as config)
@@ -183,6 +210,26 @@ class VMConfig:
         if self.sbc_port <= 0 or self.sbc_port > 65535:
             errors.append(f"sbc_port out of range: {self.sbc_port}")
 
+        if self.rtp_burst_seconds < 0:
+            errors.append(f"rtp_burst_seconds must be >= 0, got {self.rtp_burst_seconds}")
+
+        if self.rtp_burst_pps <= 0:
+            errors.append(f"rtp_burst_pps must be > 0, got {self.rtp_burst_pps}")
+
+        if self.rtp_keepalive_interval <= 0:
+            errors.append(f"rtp_keepalive_interval must be > 0, got {self.rtp_keepalive_interval}")
+
+        if self.traffic_mode not in ("smoke", "timed", "unlimited"):
+            errors.append(
+                f"traffic_mode must be 'smoke', 'timed', or 'unlimited', got '{self.traffic_mode}'"
+            )
+
+        if self.traffic_mode == "smoke" and self.call_count <= 0:
+            errors.append("traffic_mode='smoke' requires call_count > 0")
+
+        if self.traffic_mode == "timed" and self.duration_hours <= 0:
+            errors.append("traffic_mode='timed' requires duration_hours > 0")
+
         if errors:
             raise ValueError("VMConfig validation failed:\n  " + "\n  ".join(errors))
 
@@ -227,6 +274,9 @@ def load_config(yaml_path: str | None = None) -> VMConfig:
     for key in _INT_FIELDS:
         if key in values and values[key] is not None:
             values[key] = int(values[key])
+    for key in _FLOAT_FIELDS:
+        if key in values and values[key] is not None:
+            values[key] = float(values[key])
 
     # Build dataclass (only pass known fields)
     known = {f.name for f in fields(VMConfig)}
