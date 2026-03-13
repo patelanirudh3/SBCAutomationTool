@@ -13,17 +13,19 @@ sip_transport: TCP
 domain: avaya.com
 sip_password: "123456"
 cps: 1
-hold_time_seconds: 15
+hold_time_seconds: 6
+ramp_up_seconds: 5
 metrics_port: 8082
 coordinator_url: http://localhost:8080
 peer_stop_url: http://localhost:8081/api/test/stop
 # --- Traffic run control (GUI sets one mode) ---
 traffic_mode: smoke   # smoke | timed | unlimited
-call_count: 5         # smoke: exact calls to attempt
+call_count: 15         # smoke: exact calls to attempt
 # duration_hours: 1.0 # timed: 1.0=BHCC, 0.25=15min, 24.0=overnight
-register_rate: 2
+register_rate: 10
 register_timeout: 5
 register_retry: 3
 rtp_burst_seconds: 2
 rtp_burst_pps: 50
-rtp_keepalive_interval: 5
+rtp_keepalive_interval: 3
+pool_wrap_delay_seconds: 2

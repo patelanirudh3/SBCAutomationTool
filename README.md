@@ -276,6 +276,29 @@ Send `SIGTERM` or `SIGINT` (Ctrl+C) to the process:
 
 ---
 
+## Troubleshooting
+
+### Leftover process / metrics port in use
+
+If you see **"Metrics port 8081 is in use, trying 8082"** or cannot delete log files (process holds them), a previous traffic run did not exit cleanly. UAC now POSTs to ports 8081, 8082, 8083 when signaling UAS shutdown, so UAS should receive the stop even if it bound to a fallback port.
+
+**To kill leftover processes (Windows):**
+```bash
+taskkill /F /IM python.exe
+```
+
+**To kill by port (find PID first):**
+```bash
+netstat -ano | findstr :8081
+taskkill /F /PID <pid>
+```
+
+### UAS not stopping
+
+Ensure `peer_stop_url` in uac.yaml points to the UAS host and metrics port (e.g. `http://localhost:8081/api/test/stop`). UAC will try 8081, 8082, 8083 if the configured port fails.
+
+---
+
 ## Existing Callflow Tool (unchanged)
 
 The Flask-based callflow orchestrator continues to work as before:

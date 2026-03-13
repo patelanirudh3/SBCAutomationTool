@@ -7,6 +7,12 @@ import authenticate
 import socket
 from hashlib import md5
 import copy
+import uuid
+
+
+def _instance_uuid(ext: str) -> str:
+    """Deterministic per-extension UUID so each ext looks like a distinct device."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ext}.avaya.com"))
 
 def sendInitialRegister(regSession:UARegistration, frm_user, proxy_domain, transport):
     sock_obj = regSession.getSigSocket()
@@ -43,7 +49,7 @@ def buildInitialRegister(frm_user, proxy_domain, transport, eph_port):
     hdr_contact += '+avaya.firmware="FW_S_J179_R4_0_4_0_3b4033.bin";'
     hdr_contact += '+av.ip.mode=4;+av.sdp.anat;+av.sip.sig=4;+av.sip.media=4;'
     hdr_contact += '+av.sip.max-sim-reg=5;'
-    hdr_contact += f'+sip.instance="<urn:uuid:b8b68b4c-4052-4253-b35d-d46b49364c87>";reg-id=1'
+    hdr_contact += f'+sip.instance="<urn:uuid:{_instance_uuid(frm_user)}>";reg-id=1'
     registerReq.addHeader(SipHeaders.CONTACT.value, hdr_contact)
     hdr_allow = 'INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,MESSAGE,REFER,INFO,PUBLISH,UPDATE'
     registerReq.addHeader(SipHeaders.ALLOW.value, hdr_allow)

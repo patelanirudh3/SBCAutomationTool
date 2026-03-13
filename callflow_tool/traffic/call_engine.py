@@ -104,6 +104,8 @@ class CallResult:
     rtp_tx_pkts: int = 0
     rtp_rx_pkts: int = 0
     media_verified: bool = False
+    rtp_local_port: int = 0    # UDP port used for RTP (0 if none)
+    pool_wrap_index: int = 0   # which pool wrap (0-based)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,8 @@ class CallEngine:
         self.stop_event = asyncio.Event()
         self._active_calls: set[str] = set()   # call_ids currently in-flight
         self._calls_attempted = 0
+        self._first_call_launch_time: float = 0.0  # for pool wrap delay
+        self._peak_active_calls = 0
         self._calls_completed = 0
         self._calls_failed = 0
 
@@ -205,6 +209,21 @@ class CallEngine:
                 await asyncio.sleep(0.05)
                 continue
 
+            # Pool wrap delay: before starting a new wrap, wait so extensions from
+            # the first call of the previous wrap are free (hold_time + 2s gap)
+            pool_count = cfg.pool_wrap_count
+            if pool_count > 0 and self._calls_attempted > 0 and self._calls_attempted % pool_count == 0:
+                delay_sec = cfg.hold_time_seconds + getattr(cfg, "pool_wrap_delay_seconds", 2)
+                elapsed = time.monotonic() - self._first_call_launch_time
+                sleep_for = max(0.0, delay_sec - elapsed)
+                if sleep_for > 0:
+                    log.info(
+                        "Pool wrap delay: sleeping %.1fs before wrap %d (hold=%ds + %ds gap)",
+                        sleep_for, (self._calls_attempted // pool_count) + 1,
+                        cfg.hold_time_seconds, getattr(cfg, "pool_wrap_delay_seconds", 2),
+                    )
+                    await asyncio.sleep(sleep_for)
+
             # Linear ramp-up: interval decreases from full_interval×10 → full_interval
             if step < ramp_steps:
                 ramp_factor = 1.0 + 9.0 * (1.0 - step / ramp_steps)
@@ -220,9 +239,13 @@ class CallEngine:
                 await asyncio.sleep(interval)
                 continue
 
+            if self._calls_attempted == 0:
+                self._first_call_launch_time = time.monotonic()
             self._calls_attempted += 1
+            pool_count = cfg.pool_wrap_count
+            wrap_idx = (self._calls_attempted - 1) // pool_count if pool_count else 0
             task = asyncio.create_task(
-                self._execute_call(agent, str(callee)),
+                self._execute_call(agent, str(callee), wrap_idx),
                 name=f"call-{caller}-{callee}-{self._calls_attempted}",
             )
             task.add_done_callback(lambda t: None)  # suppress "never awaited" warning
@@ -263,7 +286,7 @@ class CallEngine:
     # Full SIP call sequence (UAC)
     # ------------------------------------------------------------------
 
-    async def _execute_call(self, agent: ExtensionAgent, callee: str) -> None:
+    async def _execute_call(self, agent: ExtensionAgent, callee: str, pool_wrap_index: int = 0) -> None:
         """
         Single call coroutine:
           INVITE → 100 Trying → 180 Ringing (reliable) → PRACK → 200 PRACK
@@ -296,6 +319,8 @@ class CallEngine:
             dialog = await agent.send_invite(callee, rtp_port=rtp_port)
             call_id = dialog.call_id
             self._active_calls.add(call_id)
+            if len(self._active_calls) > self._peak_active_calls:
+                self._peak_active_calls = len(self._active_calls)
             _log_call_event(call_id, agent.ext, "INVITE_SENT", callee=callee)
 
             timeout = float(self._config.register_timeout * 2)
@@ -426,6 +451,8 @@ class CallEngine:
                 rtp_tx_pkts=rtp_tx,
                 rtp_rx_pkts=rtp_rx,
                 media_verified=media_ok,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                pool_wrap_index=pool_wrap_index,
             )
             self._calls_completed += 1
             _log_call_event(
@@ -440,6 +467,8 @@ class CallEngine:
                 call_id=call_id, caller=agent.ext, callee=callee,
                 success=False, failure_reason=str(exc),
                 total_ms=(time.monotonic() - call_start) * 1000,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                pool_wrap_index=pool_wrap_index,
             )
             self._calls_failed += 1
             _log_call_event(call_id, agent.ext, "CALL_FAILED", reason=str(exc))
@@ -449,6 +478,8 @@ class CallEngine:
                 call_id=call_id, caller=agent.ext if agent else "?", callee=callee,
                 success=False, failure_reason="timeout",
                 total_ms=(time.monotonic() - call_start) * 1000,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                pool_wrap_index=pool_wrap_index,
             )
             self._calls_failed += 1
             _log_call_event(call_id, agent.ext if agent else "?", "CALL_TIMEOUT")
@@ -468,6 +499,8 @@ class CallEngine:
                 call_id=call_id, caller=agent.ext if agent else "?", callee=callee,
                 success=False, failure_reason=f"exception: {exc}",
                 total_ms=(time.monotonic() - call_start) * 1000,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                pool_wrap_index=pool_wrap_index,
             )
             self._calls_failed += 1
 
@@ -769,6 +802,7 @@ class UasAutoAnswer:
                 success=True, total_ms=total_ms,
                 rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
                 media_verified=media_ok,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
             )
             _log_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE", total_ms=round(total_ms, 2))
 
@@ -780,6 +814,7 @@ class UasAutoAnswer:
                 call_id=call_id, caller="remote", callee=agent.ext,
                 success=False, failure_reason="timeout",
                 total_ms=(time.monotonic() - call_start) * 1000,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
             )
 
         except asyncio.CancelledError:
@@ -793,6 +828,7 @@ class UasAutoAnswer:
                 call_id=call_id, caller="remote", callee=agent.ext,
                 success=False, failure_reason=str(exc),
                 total_ms=(time.monotonic() - call_start) * 1000,
+                rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
             )
 
         finally:

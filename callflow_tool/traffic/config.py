@@ -51,6 +51,7 @@ _DEFAULTS: dict[str, Any] = {
     "rtp_burst_seconds": 2,       # duration of start/end burst phases
     "rtp_burst_pps": 50,          # packet rate during bursts (= 1000 / ptime_ms)
     "rtp_keepalive_interval": 5,  # seconds between keepalive packets (must be < SBC inactivity timer)
+    "pool_wrap_delay_seconds": 2,  # delay before starting next pool wrap (extensions free from BYE)
     # ── Traffic run control ──────────────────────────────────────────────────
     # The GUI (or YAML) sets exactly ONE of the three modes below.
     # CLI --max-calls overrides all three at launch time.
@@ -89,6 +90,7 @@ _ENV_MAP: dict[str, str] = {
     "rtp_burst_seconds":  "RTP_BURST_SECONDS",
     "rtp_burst_pps":      "RTP_BURST_PPS",
     "rtp_keepalive_interval": "RTP_KEEPALIVE_INTERVAL",
+    "pool_wrap_delay_seconds": "POOL_WRAP_DELAY_SECONDS",
     "traffic_mode":       "TRAFFIC_MODE",
     "call_count":         "CALL_COUNT",
     "duration_hours":     "DURATION_HOURS",
@@ -101,7 +103,7 @@ _INT_FIELDS = {
     "metrics_interval", "metrics_port", "register_rate", "register_expires",
     "register_retry", "register_timeout", "max_concurrent_calls", "local_port",
     "rtp_burst_seconds", "rtp_burst_pps", "rtp_keepalive_interval",
-    "call_count",
+    "pool_wrap_delay_seconds", "call_count",
 }
 
 # Fields that should be coerced to float
@@ -140,6 +142,7 @@ class VMConfig:
     rtp_burst_seconds: int  = field(default=2)        # burst phase duration (seconds)
     rtp_burst_pps: int      = field(default=50)       # burst packet rate (= 1000/ptime)
     rtp_keepalive_interval: int = field(default=5)    # seconds between keepalive packets
+    pool_wrap_delay_seconds: int = field(default=2)  # delay before next pool wrap (extensions free)
     # Traffic run control — GUI or YAML sets one mode; CLI --max-calls overrides all
     traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"
     call_count: int         = field(default=0)            # smoke: exact call total (> 0)

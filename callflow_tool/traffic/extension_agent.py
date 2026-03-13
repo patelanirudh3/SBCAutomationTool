@@ -236,6 +236,24 @@ class ExtensionAgent:
             await self._transport.close()
 
     # ------------------------------------------------------------------
+    # Port synchronisation (TCP reconnect may change the ephemeral port)
+    # ------------------------------------------------------------------
+
+    def _sync_local_port(self) -> None:
+        """Keep _local_port in sync with the transport's actual bound port.
+        After a TCP reconnect the OS assigns a new ephemeral port; SIP
+        Contact / Via headers must reflect the real source port or the
+        SBC will RST the connection on mismatch."""
+        if self._transport is not None:
+            tp = self._transport.local_port
+            if tp and tp != self._local_port:
+                log.debug(
+                    "ext=%s port changed %d → %d (transport reconnected)",
+                    self.ext, self._local_port, tp,
+                )
+                self._local_port = tp
+
+    # ------------------------------------------------------------------
     # Send helpers
     # ------------------------------------------------------------------
 
@@ -350,16 +368,14 @@ class ExtensionAgent:
         """
         from registration import UARegistration  # existing module
 
+        self._sync_local_port()
+
         reg_session = UARegistration()
         reg_session.setUserName(self.ext)
         reg_session.setPassword(self.config.sip_password)
-        # Set realm and URI to match this network's domain.
-        # recv401Unauthorised will overwrite realm from the challenge, but set
-        # sensible defaults now so calcDigestResp works even if parsing fails.
         reg_session.setRealm(self.config.domain)
         reg_session.setURI(f"sip:{self.config.domain}")
 
-        # Build initial REGISTER (reuse existing builder)
         reg_msg = _register.buildInitialRegister(
             self.ext,
             self.config.domain,
@@ -381,7 +397,7 @@ class ExtensionAgent:
             recv401Unauthorised(reg_session, raw_401)
             log.debug("ext=%s got 401, retrying with auth", self.ext)
 
-            # Build and send authenticated REGISTER
+            self._sync_local_port()
             auth_reg_msg = _register.buildFinalRegister(
                 reg_session, self.ext, self.config.domain, self.config.sip_transport
             )
@@ -404,6 +420,7 @@ class ExtensionAgent:
             log.debug("ext=%s not registered, skipping unregister", self.ext)
             return
 
+        self._sync_local_port()
         unreg_msg = _register.buildUnregister(
             self._reg_session, self.ext, self.config.domain, self.config.sip_transport
         )
@@ -464,6 +481,7 @@ class ExtensionAgent:
         """
         from registration import UARegistration  # existing module
 
+        self._sync_local_port()
         reg_session = UARegistration()
         reg_session.setUserName(self.ext)
         reg_session.setPassword(self.config.sip_password)
@@ -511,9 +529,9 @@ class ExtensionAgent:
 
             completed = next(iter(first_done))
             if completed is auth_task and not auth_task.cancelled():
-                # Got 401 — re-auth and send Expires:0 again
                 raw_401 = auth_task.result()
                 recv401Unauthorised(reg_session, raw_401)
+                self._sync_local_port()
                 auth_msg = _register.buildFinalRegister(
                     reg_session, self.ext, self.config.domain, self.config.sip_transport
                 )
@@ -550,6 +568,7 @@ class ExtensionAgent:
         """
         from uasession import UASession  # existing module
 
+        self._sync_local_port()
         ua = UASession()
         ua.setUserName(self.ext)
         ua.setUserDisplayName(self.ext)
@@ -641,6 +660,7 @@ class ExtensionAgent:
         rtp_port: local UDP port allocated by RtpStream (default 9 = discard).
         Returns a DialogState for tracking the call.
         """
+        self._sync_local_port()
         call_id = _util.createCallID()
         local_tag = _util.createFromTag()
 

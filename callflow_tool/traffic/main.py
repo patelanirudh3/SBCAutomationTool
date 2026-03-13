@@ -41,6 +41,7 @@ import os
 import signal
 import sys
 import time
+from urllib.parse import urlparse, urlunparse
 
 try:
     import requests
@@ -113,7 +114,7 @@ from .config import load_config, VMConfig
 from .extension_agent import ExtensionAgent
 from .pre_phase import run_pre_phase
 from .call_engine import CallEngine, UasAutoAnswer
-from .metrics import MetricsCollector, start_server
+from .metrics import MetricsCollector, start_server, write_traffic_summary
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +322,7 @@ async def run(
             on_call_complete=collector.record_call,
             max_calls=max_calls,
         )
+        collector.set_concurrent_provider(lambda: engine.active_call_count)
         log.info(
             "UAC mode | %d CPS | %ds hold | ~%d concurrent | ramp=%ds",
             config.cps, config.hold_time_seconds,
@@ -335,20 +337,9 @@ async def run(
             [engine_task, stop_waiter],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        engine_finished_first = engine_task in done
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-
-        # UAC finished naturally (max_calls): signal UAS to stop via peer_stop_url
-        if engine_finished_first:
-            peer_url = getattr(config, "peer_stop_url", "") or ""
-            if peer_url and _REQUESTS_AVAILABLE:
-                try:
-                    log.info("Traffic complete — POST %s to signal UAS shutdown", peer_url)
-                    await asyncio.to_thread(requests.post, peer_url, timeout=5)
-                except Exception as exc:
-                    log.warning("POST %s failed: %s (UAS may need manual stop)", peer_url, exc)
 
     else:
         # UAS mode: start auto-answer on all agents
@@ -378,6 +369,34 @@ async def run(
     return 0
 
 
+def _post_peer_stop(peer_url: str, fallback_ports: tuple[int, ...] = (8081, 8082, 8083)) -> None:
+    """
+    POST to peer_stop_url to signal UAS shutdown.
+    Tries configured port first, then 8081, 8082, 8083 (UAS may have bound to a different port if configured port was in use).
+    """
+    parsed = urlparse(peer_url)
+    try:
+        port = int(parsed.port or 8081)
+    except (TypeError, ValueError):
+        port = 8081
+    # Build list: [configured_port] + fallbacks (avoid duplicates, preserve order)
+    seen = {port}
+    ports_to_try = [port]
+    for p in fallback_ports:
+        if p not in seen:
+            seen.add(p)
+            ports_to_try.append(p)
+    for p in ports_to_try:
+        url = urlunparse(parsed._replace(netloc=f"{parsed.hostname or 'localhost'}:{p}"))
+        try:
+            log.info("Signaling UAS shutdown — POST %s", url)
+            requests.post(url, timeout=3)
+            return  # one success is enough
+        except Exception as exc:
+            log.debug("POST %s failed: %s", url, exc)
+    log.warning("POST to peer_stop_url failed on all ports %s (UAS may need manual stop)", ports_to_try)
+
+
 async def _shutdown(
     agents: dict[str, ExtensionAgent],
     engine: "CallEngine | None",
@@ -389,6 +408,7 @@ async def _shutdown(
 ) -> None:
     """
     Graceful shutdown sequence:
+      0. UAC: signal UAS to stop via peer_stop_url (on every shutdown: success, failure, Ctrl+C)
       1. Stop call engine (no new INVITEs)
       2. Drain active calls (BYE, 5s timeout)
       3. Stop UAS auto-answer loops
@@ -397,6 +417,13 @@ async def _shutdown(
       6. Flush final metrics snapshot
       7. Cancel metrics server
     """
+    # 0. UAC: signal UAS to stop (ensures UAS unregisters on pre-phase failure, Ctrl+C, or normal completion)
+    # Try configured port + fallbacks (8082, 8083) — UAS may have bound to a different port if 8081 was in use
+    if config.is_uac:
+        peer_url = getattr(config, "peer_stop_url", "") or ""
+        if peer_url and _REQUESTS_AVAILABLE:
+            await asyncio.to_thread(_post_peer_stop, peer_url)
+
     # 1. Stop new calls
     if engine:
         engine.stop()
@@ -435,11 +462,16 @@ async def _shutdown(
     ]
     await asyncio.gather(*close_tasks, return_exceptions=True)
 
-    # 6. Final metrics flush
+    # 6. Final metrics flush + traffic summary
     collector.set_phase("DONE")
     async with collector._lock:
         snap = collector._build_snapshot()
     log.info("Final metrics: %s", snap.to_dict())
+
+    write_traffic_summary(
+        collector, config, log_dir="logs",
+        engine=engine, uas_engine=uas_engine, agents=agents,
+    )
 
     # 7. Cancel metrics server
     if server_task and not server_task.done():

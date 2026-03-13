@@ -19,11 +19,19 @@ asyncio, so it shares the same event loop — no subprocess needed.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, TYPE_CHECKING
+
+ConcurrentProvider = Callable[[], int]
+
+if TYPE_CHECKING:
+    from .config import VMConfig
+    from .extension_agent import ExtensionAgent
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +129,12 @@ class MetricsCollector:
         self._running = False
 
         self._subscribers: list[asyncio.Queue] = []  # WebSocket push queues
+        self._call_results: list = []  # raw CallResult for summary
+        self._concurrent_provider: Optional[ConcurrentProvider] = None
+
+    def set_concurrent_provider(self, provider: Optional[ConcurrentProvider]) -> None:
+        """Set callable that returns current active call count (UAC only). Used for real-time /metrics."""
+        self._concurrent_provider = provider
 
     # ------------------------------------------------------------------
     # State setters (called by main.py as phases progress)
@@ -156,6 +170,7 @@ class MetricsCollector:
         `result` has: success, pdd_ms, hold_ms, total_ms attributes.
         """
         async with self._lock:
+            self._call_results.append(result)
             self._calls_attempted += 1
             self._window_calls += 1
             if result.success:
@@ -192,12 +207,18 @@ class MetricsCollector:
         def _avg(lst):
             return sum(lst) / len(lst) if lst else 0.0
 
+        # Real-time concurrent from engine (UAC) when provider is set
+        concurrent = (
+            self._concurrent_provider()
+            if self._concurrent_provider else self._concurrent_calls
+        )
+
         snap = TrafficMetrics(
             timestamp=time.time(),
             vm_id=self._vm_id,
             phase=self._phase,
             cps_actual=round(cps_actual, 3),
-            concurrent_calls=self._concurrent_calls,
+            concurrent_calls=concurrent,
             calls_attempted=self._calls_attempted,
             calls_completed=self._calls_completed,
             calls_failed=self._calls_failed,
@@ -331,6 +352,8 @@ def build_app(
     # ── POST /api/test/stop ──────────────────────────────────────────────
     @app.post("/api/test/stop")
     async def test_stop():
+        if config.is_uas:
+            log.info("Received API signal to stop from UAC — initiating graceful shutdown")
         if stop_callback:
             asyncio.create_task(stop_callback())
             return {"status": "stopping"}
@@ -403,7 +426,9 @@ async def start_server(
                 break          # port is free
             except OSError:
                 log.warning(
-                    "Metrics port %d is in use, trying %d", port, port + 1
+                    "Metrics port %d is in use (leftover process?), trying %d — "
+                    "kill any stale traffic process to free the port",
+                    port, port + 1,
                 )
                 port += 1
     else:
@@ -443,3 +468,129 @@ async def start_server(
     )
 
     return server_task
+
+
+# ---------------------------------------------------------------------------
+# Traffic run summary (written to logs/ after run completes)
+# ---------------------------------------------------------------------------
+
+def write_traffic_summary(
+    collector: MetricsCollector,
+    config: "VMConfig",
+    log_dir: str = "logs",
+    engine=None,
+    uas_engine=None,
+    agents: Optional[dict[str, "ExtensionAgent"]] = None,
+) -> str:
+    """
+    Write a summary of the traffic run to logs/traffic_summary_<vm_id>_<ts>.log.
+    Returns the path of the written file.
+    """
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    vm_id = config.vm_id
+    path = os.path.join(log_dir, f"traffic_summary_{vm_id}_{ts}.log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    results = getattr(collector, "_call_results", [])
+    snap = collector.latest
+
+    # SIP ephemeral ports (one per extension)
+    sip_ports_used: list[int] = []
+    sip_ports_by_ext: dict[str, int] = {}
+    if agents:
+        for ext, agent in agents.items():
+            tp = getattr(agent, "_transport", None)
+            port = tp.local_port if tp else getattr(agent, "_local_port", 0)
+            if port:
+                sip_ports_used.append(port)
+                sip_ports_by_ext[ext] = port
+
+    # RTP UDP ports (per call, created and closed)
+    rtp_ports_used: list[int] = []
+    rtp_ports_by_call: list[tuple[str, str, int]] = []  # (caller, callee, port)
+    for r in results:
+        port = getattr(r, "rtp_local_port", 0)
+        if port and port != 9:
+            rtp_ports_used.append(port)
+            rtp_ports_by_call.append((getattr(r, "caller", "?"), getattr(r, "callee", "?"), port))
+
+    # RTP media verification
+    successful = [r for r in results if r.success]
+    media_verified = sum(1 for r in successful if getattr(r, "media_verified", False))
+    media_failed = sum(1 for r in successful if not getattr(r, "media_verified", False))
+    media_total = len(successful)
+
+    # Peak concurrent (UAC only)
+    peak_concurrent = 0
+    if engine and hasattr(engine, "_peak_active_calls"):
+        peak_concurrent = engine._peak_active_calls
+
+    # UAC-to-UAS pairings per pool wrap
+    pairings_by_wrap: dict[int, list[tuple[str, str]]] = {}
+    for r in results:
+        wrap = getattr(r, "pool_wrap_index", 0)
+        caller = getattr(r, "caller", "?")
+        callee = getattr(r, "callee", "?")
+        if caller != "remote":  # UAC-initiated
+            pairings_by_wrap.setdefault(wrap, []).append((caller, callee))
+
+    lines: list[str] = []
+    lines.append("=" * 70)
+    lines.append(f"TRAFFIC RUN SUMMARY — {vm_id} — {config.vm_role}")
+    lines.append(f"Timestamp: {datetime.datetime.now().isoformat()}")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append("--- Overall metrics ---")
+    lines.append(f"  calls_attempted:  {snap.calls_attempted}")
+    lines.append(f"  calls_completed:  {snap.calls_completed}")
+    lines.append(f"  calls_failed:     {snap.calls_failed}")
+    lines.append(f"  ASR:              {snap.asr:.1f}%")
+    lines.append(f"  avg_pdd_ms:       {snap.avg_pdd_ms:.2f}")
+    lines.append(f"  avg_hold_ms:      {snap.avg_hold_ms:.2f}")
+    lines.append(f"  avg_total_ms:     {snap.avg_total_ms:.2f}")
+    if peak_concurrent > 0:
+        lines.append(f"  peak_concurrent:  {peak_concurrent}")
+    lines.append("")
+    lines.append("--- RTP media verification ---")
+    lines.append(f"  MEDIA_VERIFIED:   {media_verified} / {media_total} successful calls")
+    if media_failed > 0:
+        lines.append(f"  MEDIA_FAILED:     {media_failed}")
+    lines.append("")
+    lines.append("--- Ephemeral SIP ports (used and closed by extensions) ---")
+    if sip_ports_by_ext:
+        for ext, port in sorted(sip_ports_by_ext.items(), key=lambda x: int(x[0])):
+            lines.append(f"  ext {ext}: port {port}")
+    else:
+        lines.append("  (none recorded)")
+    lines.append("")
+    lines.append("--- UDP RTP ports (created and closed per call) ---")
+    if rtp_ports_by_call:
+        for caller, callee, port in rtp_ports_by_call[:50]:  # limit for readability
+            lines.append(f"  {caller} -> {callee}: port {port}")
+        if len(rtp_ports_by_call) > 50:
+            lines.append(f"  ... and {len(rtp_ports_by_call) - 50} more")
+    else:
+        lines.append("  (none recorded)")
+    lines.append("")
+    if pairings_by_wrap:
+        lines.append("--- UAC-to-UAS call pairings by pool wrap ---")
+        for wrap in sorted(pairings_by_wrap.keys()):
+            lines.append(f"  Wrap {wrap + 1}:")
+            for caller, callee in pairings_by_wrap[wrap]:
+                lines.append(f"    {caller} -> {callee}")
+    lines.append("")
+    lines.append("--- Config ---")
+    lines.append(f"  cps: {config.cps}  hold_time_seconds: {config.hold_time_seconds}")
+    lines.append(f"  uac_ext: {config.uac_ext_start}-{config.uac_ext_end}")
+    lines.append(f"  uas_ext: {config.uas_ext_start}-{config.uas_ext_end}")
+    lines.append("=" * 70)
+
+    content = "\n".join(lines)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info("Traffic summary written to %s", path)
+    except OSError as exc:
+        log.warning("Could not write traffic summary: %s", exc)
+
+    return path
