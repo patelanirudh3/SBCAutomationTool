@@ -79,7 +79,7 @@ python -m callflow_tool.traffic.main --config uac.yaml --log-level INFO
 - ✅ All 3 lines found → move to Step 3 immediately, do not wait further
 - ❌ If not found within 60s after process start → abort and report
 
-> ⚠️ Do NOT use a fixed sleep like `sleep 20` or `sleep 120` for UAC.
+> ⚠️ Do NOT use a fixed sleep like `sleep 20` or `sleep 60` for UAC.
 > The 10s is only an initial buffer before log tailing begins.
 > Always transition to log-line detection — never wait blindly.
 

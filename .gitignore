@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Node / JS artifacts
+node_modules/
+*.png
+nul
