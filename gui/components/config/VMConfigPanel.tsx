@@ -39,9 +39,6 @@ export type RawVMFormValues = {
   traffic_mode: TrafficMode
   call_count: string
   duration_hours: string
-  register_rate: string
-  register_timeout: string
-  register_retry: string
 }
 
 export interface VMConfigPanelProps {
@@ -400,11 +397,11 @@ export function VMConfigPanel({
         </div>
       </div>
 
-      {/* ── UAC-only: Run Control + Peer Stop URL ─────────────── */}
+      {/* ── UAC-only: Traffic Mode + Peer Stop URL ────────────── */}
       {isUAC && (
         <>
           <div className="space-y-3">
-            <SectionHeader>Run Control</SectionHeader>
+            <SectionHeader>Traffic Mode</SectionHeader>
             <TrafficModeSelector
               value={raw.traffic_mode as TrafficMode}
               onChange={(m) => onChange('traffic_mode', m)}
@@ -447,45 +444,6 @@ export function VMConfigPanel({
         </>
       )}
 
-      {/* ── Registration ──────────────────────────────────────── */}
-      <div className="space-y-3">
-        <SectionHeader>Registration</SectionHeader>
-        <div className="grid grid-cols-3 gap-2">
-          <FormField label="Rate (reg/s)" error={e('register_rate')}>
-            <Input
-              type="number"
-              min={1}
-              value={raw.register_rate}
-              onChange={(ev) => onChange('register_rate', ev.target.value)}
-              onBlur={() => onBlur('register_rate')}
-              className="font-mono"
-              aria-invalid={t('register_rate') && !!errors.register_rate ? true : undefined}
-            />
-          </FormField>
-          <FormField label="Timeout (s)" error={e('register_timeout')}>
-            <Input
-              type="number"
-              min={1}
-              value={raw.register_timeout}
-              onChange={(ev) => onChange('register_timeout', ev.target.value)}
-              onBlur={() => onBlur('register_timeout')}
-              className="font-mono"
-              aria-invalid={t('register_timeout') && !!errors.register_timeout ? true : undefined}
-            />
-          </FormField>
-          <FormField label="Retry" error={e('register_retry')}>
-            <Input
-              type="number"
-              min={0}
-              value={raw.register_retry}
-              onChange={(ev) => onChange('register_retry', ev.target.value)}
-              onBlur={() => onBlur('register_retry')}
-              className="font-mono"
-              aria-invalid={t('register_retry') && !!errors.register_retry ? true : undefined}
-            />
-          </FormField>
-        </div>
-      </div>
     </div>
   )
 }

@@ -27,22 +27,22 @@ export function Navbar() {
   const wsStatus = useTrafficStore((s) => s.wsStatus)
 
   return (
-    <header className="sticky top-0 z-50 flex h-12 items-center gap-4 border-b border-border bg-card px-4">
+    <header className="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-border bg-card px-5">
       {/* Logo */}
-      <div className="flex items-center gap-2">
-        <Activity className="size-4 text-emerald-400" strokeWidth={2.5} />
-        <span className="font-semibold tracking-tight text-sm text-foreground">
+      <div className="flex items-center gap-2.5">
+        <Activity className="size-5 text-emerald-400" strokeWidth={2.5} />
+        <span className="font-bold tracking-tight text-base text-foreground">
           CCI Traffic
         </span>
       </div>
 
       {/* Divider */}
-      <div className="h-4 w-px bg-border" />
+      <div className="h-5 w-px bg-border" />
 
       {/* Phase badge */}
-      <div className="flex items-center gap-1.5">
-        <span className="text-xs text-muted-foreground">Phase</span>
-        <span className={cn('text-xs font-medium font-mono', PHASE_COLOR[phase])}>
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-foreground/70">Phase</span>
+        <span className={cn('text-sm font-semibold font-mono', PHASE_COLOR[phase])}>
           {PHASE_LABEL[phase]}
         </span>
       </div>
@@ -55,11 +55,20 @@ export function Navbar() {
         <TooltipTrigger asChild>
           <button
             type="button"
-            className="flex items-center gap-1.5 rounded-md px-2 py-1 hover:bg-secondary transition-colors"
+            className="flex items-center gap-2 rounded-md px-2.5 py-1.5 hover:bg-secondary transition-colors"
             aria-label={`WebSocket: ${wsStatus}`}
           >
             <WsDot status={wsStatus} />
-            <span className="text-xs text-muted-foreground hidden sm:inline">
+            <span
+              className={cn(
+                'text-sm font-medium',
+                wsStatus === 'connected'
+                  ? 'text-emerald-400'
+                  : wsStatus === 'reconnecting'
+                    ? 'text-amber-400'
+                    : 'text-rose-500'
+              )}
+            >
               {wsStatus === 'connected'
                 ? 'Live'
                 : wsStatus === 'reconnecting'
@@ -79,14 +88,14 @@ export function Navbar() {
 function WsDot({ status }: { status: 'connected' | 'reconnecting' | 'disconnected' }) {
   if (status === 'connected') {
     return (
-      <span className="relative flex size-2">
+      <span className="relative flex size-2.5">
         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />
-        <span className="relative inline-flex rounded-full size-2 bg-emerald-400" />
+        <span className="relative inline-flex rounded-full size-2.5 bg-emerald-400" />
       </span>
     )
   }
   if (status === 'reconnecting') {
-    return <span className="size-2 rounded-full bg-amber-400 animate-pulse" />
+    return <span className="size-2.5 rounded-full bg-amber-400 animate-pulse" />
   }
-  return <span className="size-2 rounded-full bg-rose-500" />
+  return <span className="size-2.5 rounded-full bg-rose-500" />
 }

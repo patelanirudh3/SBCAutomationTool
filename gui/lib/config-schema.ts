@@ -41,11 +41,6 @@ export const VMConfigSchema = z
     traffic_mode: TrafficModeSchema.optional(),
     call_count: z.number().int().nonnegative().optional(),
     duration_hours: z.number().positive().optional(),
-
-    // Registration
-    register_rate: z.number().positive('Register rate must be positive'),
-    register_timeout: z.number().positive('Register timeout must be positive'),
-    register_retry: z.number().int().nonnegative('Register retry must be ≥ 0'),
   })
   .superRefine((data, ctx) => {
     if (data.uac_ext_start >= data.uac_ext_end) {

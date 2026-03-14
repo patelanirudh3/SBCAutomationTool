@@ -4,6 +4,26 @@ export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type RunPhase = 'IDLE' | 'PRE_PHASE' | 'TRAFFIC' | 'COMPLETE' | 'FAILED'
 export type RunMode = 'local' | 'multi-vm'
 
+export interface AdvancedSettings {
+  register_rate: number           // default: 10
+  register_timeout: number        // default: 8
+  register_retry: number          // default: 3
+  rtp_burst_seconds: number       // default: 2
+  rtp_burst_pps: number           // default: 50
+  rtp_keepalive_interval: number  // default: 3
+  pool_wrap_delay_seconds: number // default: 32
+}
+
+export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
+  register_rate: 10,
+  register_timeout: 8,
+  register_retry: 3,
+  rtp_burst_seconds: 2,
+  rtp_burst_pps: 50,
+  rtp_keepalive_interval: 3,
+  pool_wrap_delay_seconds: 32,
+}
+
 export interface VMConfig {
   // Identity
   vm_role: VMRole
@@ -37,11 +57,6 @@ export interface VMConfig {
   traffic_mode?: TrafficMode
   call_count?: number
   duration_hours?: number
-
-  // Registration
-  register_rate: number
-  register_timeout: number
-  register_retry: number
 }
 
 export interface VMPair {
@@ -49,6 +64,7 @@ export interface VMPair {
   pair_label: string          // e.g. 'Pair 1'
   uac: VMConfig
   uas: VMConfig
+  advancedSettings: AdvancedSettings
   validated: boolean
   saved: boolean
   save_error?: string

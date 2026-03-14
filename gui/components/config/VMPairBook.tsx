@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
 import {
@@ -8,14 +8,18 @@ import {
   ChevronRight,
   CheckCircle2,
   AlertTriangle,
+  Loader2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
+import { AdvancedSettings } from './AdvancedSettings'
 import { VMConfigSchema, deriveUACPeerStopUrl } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { VMConfig, VMPair, ReachabilityStatus } from '@/types'
+
+const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
 // ---------------------------------------------------------------------------
 // Defaults from real yaml files
@@ -42,9 +46,6 @@ const UAC_DEFAULTS: RawVMFormValues = {
   traffic_mode: 'smoke',
   call_count: '10',
   duration_hours: '1',
-  register_rate: '10',
-  register_timeout: '8',
-  register_retry: '3',
 }
 
 const UAS_DEFAULTS: RawVMFormValues = {
@@ -68,9 +69,6 @@ const UAS_DEFAULTS: RawVMFormValues = {
   traffic_mode: 'smoke',
   call_count: '10',
   duration_hours: '1',
-  register_rate: '10',
-  register_timeout: '8',
-  register_retry: '3',
 }
 
 // All fields to touch on full validation
@@ -78,7 +76,7 @@ const UAC_FIELDS = [
   'vm_id', 'vm_ip', 'uac_ext_start', 'uac_ext_end', 'uas_ext_start', 'uas_ext_end',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
   'cps', 'hold_time_seconds', 'metrics_port', 'traffic_mode', 'call_count',
-  'duration_hours', 'register_rate', 'register_timeout', 'register_retry',
+  'duration_hours',
 ]
 const UAS_FIELDS = UAC_FIELDS.filter(
   (f) => !['traffic_mode', 'call_count', 'duration_hours'].includes(f)
@@ -113,9 +111,6 @@ function parseRaw(raw: RawVMFormValues, role: 'UAC' | 'UAS'): unknown {
       role === 'UAC' && raw.call_count ? parseInt(raw.call_count) : undefined,
     duration_hours:
       role === 'UAC' && raw.duration_hours ? parseFloat(raw.duration_hours) : undefined,
-    register_rate: parseFloat(raw.register_rate) || 0,
-    register_timeout: parseFloat(raw.register_timeout) || 0,
-    register_retry: parseInt(raw.register_retry) || 0,
   }
 }
 
@@ -181,6 +176,9 @@ export function VMPairBook() {
   const [uasReachability, setUasReachability] = useState<ReachabilityStatus | null>(null)
   // Tracks whether Validate has been run and passed
   const [validationPassed, setValidationPassed] = useState(false)
+  // MOCK_MODE: tracks Save & Continue in-flight state
+  const [isSaving, setIsSaving] = useState(false)
+  const reachabilityTriggeredRef = useRef(false)
 
   // Auto-derive UAC peer_stop_url from UAS vm_ip + metrics_port (per spec)
   useEffect(() => {
@@ -238,6 +236,14 @@ export function VMPairBook() {
     [uacRaw.vm_id, uasRaw.vm_id]
   )
 
+  // MOCK_MODE: auto-trigger both reachability checks on mount — demo shows green immediately
+  useEffect(() => {
+    if (!IS_MOCK || reachabilityTriggeredRef.current) return
+    reachabilityTriggeredRef.current = true
+    checkReachability('UAC', UAC_DEFAULTS.vm_ip, parseInt(UAC_DEFAULTS.metrics_port))
+    checkReachability('UAS', UAS_DEFAULTS.vm_ip, parseInt(UAS_DEFAULTS.metrics_port))
+  }, [checkReachability])
+
   // ── Field change / blur handlers ────────────────────────────────────────
 
   const handleUacChange = useCallback(
@@ -264,11 +270,12 @@ export function VMPairBook() {
   const handleValidate = () => {
     setUacTouched(new Set(UAC_FIELDS))
     setUasTouched(new Set(UAS_FIELDS))
-    if (isValid) setValidationPassed(true)
+    // MOCK_MODE: always pass instantly; live mode: require Zod to pass
+    if (IS_MOCK || isValid) setValidationPassed(true)
   }
 
-  const handleSaveAndContinue = () => {
-    if (!validationPassed) return
+  const handleSaveAndContinue = async () => {
+    if (!validationPassed || isSaving) return
 
     const uac = parseRaw(uacRaw, 'UAC') as VMConfig
     const uas = parseRaw(uasRaw, 'UAS') as VMConfig
@@ -280,6 +287,13 @@ export function VMPairBook() {
       validated: true,
       saved: true,
     }
+
+    if (IS_MOCK) {
+      // Spec: "Save & Continue: succeeds after 600ms delay" in MOCK_MODE
+      setIsSaving(true)
+      await new Promise((r) => setTimeout(r, 600))
+    }
+
     updatePair(activePairIndex, { ...currentPair, uac, uas, validated: true, saved: true })
     router.push('/launch')
   }
@@ -358,6 +372,9 @@ export function VMPairBook() {
         </div>
       </div>
 
+      {/* ── Advanced Settings — full-width, pair-scoped ─────────── */}
+      <AdvancedSettings pairIndex={activePairIndex} />
+
       {/* Footer action bar */}
       <div className="flex items-center justify-between border-t border-border bg-card px-6 py-3">
         <div className="flex items-center gap-3">
@@ -382,15 +399,24 @@ export function VMPairBook() {
 
         <Button
           size="sm"
-          disabled={!validationPassed}
+          disabled={!validationPassed || isSaving}
           onClick={handleSaveAndContinue}
           className={cn(
             'transition-opacity',
-            !validationPassed && 'cursor-not-allowed opacity-40'
+            (!validationPassed || isSaving) && 'cursor-not-allowed opacity-40'
           )}
         >
-          Save &amp; Continue
-          <ChevronRight className="ml-0.5 size-3.5" />
+          {isSaving ? (
+            <>
+              <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+              Saving…
+            </>
+          ) : (
+            <>
+              Save &amp; Continue
+              <ChevronRight className="ml-0.5 size-3.5" />
+            </>
+          )}
         </Button>
       </div>
     </div>

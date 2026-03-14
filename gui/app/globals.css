@@ -166,3 +166,31 @@
 .dark *::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* ── Recharts dark theme overrides (used by Tremor AreaChart) ──────────────
+   Default recharts uses dark fill (#666) for axis tick text which is
+   invisible on our slate-950 background. Override to match our muted token.
+──────────────────────────────────────────────────────────────────────────── */
+
+.dark .recharts-cartesian-axis-tick-value {
+  fill: oklch(0.78 0.02 250) !important;
+  font-size: 11px;
+}
+
+.dark .recharts-cartesian-grid-line {
+  stroke: oklch(0.30 0.02 250) !important;
+}
+
+.dark .recharts-layer.recharts-cartesian-axis-line line,
+.dark .recharts-layer.recharts-cartesian-axis-tick line {
+  stroke: oklch(0.30 0.02 250) !important;
+}
+
+.dark .recharts-tooltip-wrapper .recharts-default-tooltip {
+  background-color: oklch(0.17 0.02 250) !important;
+  border-color: oklch(0.30 0.02 250) !important;
+}
+
+.dark .recharts-legend-item-text {
+  color: oklch(0.78 0.02 250) !important;
+}

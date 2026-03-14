@@ -8,7 +8,9 @@ import type {
   CallEvent,
   AggregateMetrics,
   ReachabilityStatus,
+  AdvancedSettings,
 } from '@/types'
+import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 interface MetricsHistoryPoint {
   t: number
@@ -41,9 +43,6 @@ function makePair(index: number): VMPair {
       peer_stop_url: 'http://127.0.0.1:8081/api/test/stop',
       traffic_mode: 'smoke',
       call_count: 10,
-      register_rate: 10,
-      register_timeout: 8,
-      register_retry: 3,
     },
     uas: {
       vm_role: 'UAS',
@@ -61,10 +60,8 @@ function makePair(index: number): VMPair {
       cps: 1,
       hold_time_seconds: 5,
       metrics_port: 8081,
-      register_rate: 10,
-      register_timeout: 8,
-      register_retry: 3,
     },
+    advancedSettings: { ...DEFAULT_ADVANCED_SETTINGS },
     validated: false,
     saved: false,
   }
@@ -80,6 +77,7 @@ interface TrafficStore {
   activePairIndex: number
   addPair: () => void
   updatePair: (index: number, pair: VMPair) => void
+  updateAdvancedSettings: (pairIndex: number, settings: AdvancedSettings) => void
   setActivePair: (index: number) => void
 
   // Reachability
@@ -146,6 +144,15 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     set((state) => {
       const pairs = [...state.pairs]
       pairs[index] = pair
+      return { pairs }
+    }),
+
+  updateAdvancedSettings: (pairIndex, settings) =>
+    set((state) => {
+      const pairs = [...state.pairs]
+      if (pairs[pairIndex]) {
+        pairs[pairIndex] = { ...pairs[pairIndex], advancedSettings: settings }
+      }
       return { pairs }
     }),
 

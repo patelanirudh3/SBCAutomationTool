@@ -29,9 +29,6 @@ export const MOCK_UAC_CONFIG: VMConfig = {
   peer_stop_url: 'http://127.0.0.1:8081/api/test/stop',
   traffic_mode: 'smoke',
   call_count: 20,
-  register_rate: 10,
-  register_timeout: 8,
-  register_retry: 3,
 }
 
 export const MOCK_UAS_CONFIG: VMConfig = {
@@ -50,9 +47,6 @@ export const MOCK_UAS_CONFIG: VMConfig = {
   cps: 2,
   hold_time_seconds: 10,
   metrics_port: 8081,
-  register_rate: 10,
-  register_timeout: 8,
-  register_retry: 3,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +196,7 @@ export const MOCK_METRICS_HISTORY = Array.from({ length: 30 }, (_, i) => ({
   t: Date.now() - (30 - i) * 2000,
   asr: 85 + Math.min(i * 0.5, 10) + Math.sin(i) * 2,
   completed: i * 2,
+  failed: i >= 8 ? (i >= 10 ? 2 : 1) : 0,
 }))
 
 // ---------------------------------------------------------------------------

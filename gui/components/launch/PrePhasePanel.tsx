@@ -8,7 +8,6 @@ import { Button } from '@/components/ui/button'
 import { ChecklistItem, type ChecklistState } from './ChecklistItem'
 import { LaunchCountdown } from './LaunchCountdown'
 import { useTrafficStore } from '@/store/traffic'
-import { simulatePrePhase } from '@/lib/mock-data'
 import { cn } from '@/lib/utils'
 import type { PrePhaseStatus, VMRole } from '@/types'
 
