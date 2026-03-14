@@ -7,8 +7,8 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-dm-sans);
+  --font-mono: var(--font-space-mono);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -83,37 +83,37 @@
 }
 
 .dark {
-  --background: oklch(0.129 0.042 264.695);
-  --foreground: oklch(0.984 0.003 247.858);
-  --card: oklch(0.129 0.042 264.695);
-  --card-foreground: oklch(0.984 0.003 247.858);
-  --popover: oklch(0.208 0.042 265.755);
-  --popover-foreground: oklch(0.984 0.003 247.858);
-  --primary: oklch(0.984 0.003 247.858);
-  --primary-foreground: oklch(0.208 0.042 265.755);
-  --secondary: oklch(0.279 0.041 260.031);
-  --secondary-foreground: oklch(0.984 0.003 247.858);
-  --muted: oklch(0.279 0.041 260.031);
-  --muted-foreground: oklch(0.704 0.04 256.788);
-  --accent: oklch(0.279 0.041 260.031);
-  --accent-foreground: oklch(0.984 0.003 247.858);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(0.279 0.041 260.031);
-  --input: oklch(0.279 0.041 260.031);
-  --ring: oklch(0.869 0.022 252.894);
-  --chart-1: oklch(0.809 0.105 251.813);
-  --chart-2: oklch(0.623 0.214 259.815);
-  --chart-3: oklch(0.546 0.245 262.881);
-  --chart-4: oklch(0.488 0.243 264.376);
-  --chart-5: oklch(0.424 0.199 265.638);
-  --sidebar: oklch(0.208 0.042 265.755);
-  --sidebar-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-accent: oklch(0.279 0.041 260.031);
-  --sidebar-accent-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-border: oklch(0.279 0.041 260.031);
-  --sidebar-ring: oklch(0.704 0.04 256.788);
+  --background: oklch(0.13 0.02 250);
+  --foreground: oklch(0.95 0.01 250);
+  --card: oklch(0.17 0.02 250);
+  --card-foreground: oklch(0.95 0.01 250);
+  --popover: oklch(0.17 0.02 250);
+  --popover-foreground: oklch(0.95 0.01 250);
+  --primary: oklch(0.95 0.01 250);
+  --primary-foreground: oklch(0.17 0.02 250);
+  --secondary: oklch(0.22 0.02 250);
+  --secondary-foreground: oklch(0.95 0.01 250);
+  --muted: oklch(0.22 0.02 250);
+  --muted-foreground: oklch(0.78 0.02 250);
+  --accent: oklch(0.22 0.02 250);
+  --accent-foreground: oklch(0.95 0.01 250);
+  --destructive: oklch(0.65 0.22 25);
+  --border: oklch(0.30 0.02 250);
+  --input: oklch(0.22 0.02 250);
+  --ring: oklch(0.50 0.04 250);
+  --chart-1: oklch(0.72 0.18 200);
+  --chart-2: oklch(0.65 0.15 150);
+  --chart-3: oklch(0.60 0.18 280);
+  --chart-4: oklch(0.70 0.16 60);
+  --chart-5: oklch(0.65 0.20 25);
+  --sidebar: oklch(0.17 0.02 250);
+  --sidebar-foreground: oklch(0.95 0.01 250);
+  --sidebar-primary: oklch(0.60 0.15 250);
+  --sidebar-primary-foreground: oklch(0.95 0.01 250);
+  --sidebar-accent: oklch(0.22 0.02 250);
+  --sidebar-accent-foreground: oklch(0.95 0.01 250);
+  --sidebar-border: oklch(0.30 0.02 250);
+  --sidebar-ring: oklch(0.50 0.04 250);
 }
 
 @layer base {
@@ -126,4 +126,43 @@
   html {
     @apply font-sans;
   }
+}
+
+/* ── Custom scrollbars — dark theme (emerald accent) ──────────────────────
+   Firefox: scrollbar-width + scrollbar-color
+   Chrome / Edge / Safari: webkit pseudo-elements
+   Resting:  emerald at 30% opacity  — subtle, not distracting
+   Hover:    emerald at 65% opacity  — clearly visible, inviting
+   Active:   full bright emerald     — confirms interaction
+──────────────────────────────────────────────────────────────────────── */
+
+.dark * {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(0.52 0.17 160 / 0.30) transparent;
+}
+
+.dark *::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.dark *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dark *::-webkit-scrollbar-thumb {
+  background: oklch(0.52 0.17 160 / 0.30);
+  border-radius: 9999px;
+}
+
+.dark *::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.60 0.19 160 / 0.65);
+}
+
+.dark *::-webkit-scrollbar-thumb:active {
+  background: oklch(0.68 0.20 160);
+}
+
+.dark *::-webkit-scrollbar-corner {
+  background: transparent;
 }
