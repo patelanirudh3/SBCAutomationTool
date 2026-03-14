@@ -10,7 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { FieldError, FieldHint } from './ConfigValidator'
+import { FieldError, FieldHint, FieldWarning } from './ConfigValidator'
 import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { cn } from '@/lib/utils'
@@ -376,9 +376,7 @@ export function VMConfigPanel({
           </FormField>
         </div>
         <div className="space-y-1">
-          <FormField label="Metrics Port" error={e('metrics_port')}
-            hint={`FastAPI server port on this VM — health check: http://${raw.vm_ip || '<ip>'}:<port>/api/ping`}
-          >
+          <FormField label="Metrics Port" error={e('metrics_port')}>
             <Input
               type="number"
               value={raw.metrics_port}
@@ -389,6 +387,17 @@ export function VMConfigPanel({
               aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
             />
           </FormField>
+          <FieldHint>
+            {`Health check: http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
+          </FieldHint>
+          <FieldWarning>
+            The FastAPI backend must already be running on this port before the
+            GUI can connect. Start it first:
+            {' '}
+            <span className="font-mono">
+              python -m callflow_tool.traffic.main --config {isUAC ? 'uac' : 'uas'}.yaml --api-only
+            </span>
+          </FieldWarning>
           {reachability && (
             <div className="pt-0.5">
               <ReachabilityIndicator status={reachability} />

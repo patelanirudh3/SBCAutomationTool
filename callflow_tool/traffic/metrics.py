@@ -331,6 +331,20 @@ def build_app(
         finally:
             collector.unsubscribe_ws(q)
 
+    # ── GET /api/ping ─────────────────────────────────────────────────────
+    @app.get("/api/ping")
+    async def ping():
+        """
+        Lightweight health check used by the GUI reachability indicator.
+        Returns immediately — no SIP or metrics state required.
+        """
+        return {
+            "reachable": True,
+            "vm_id": config.vm_id,
+            "role": config.vm_role,
+            "phase": collector.latest.phase,
+        }
+
     # ── GET /api/test/status ─────────────────────────────────────────────
     @app.get("/api/test/status")
     async def test_status():

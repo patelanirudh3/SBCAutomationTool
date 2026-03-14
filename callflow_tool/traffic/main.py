@@ -187,6 +187,17 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("NO_UNREGISTER", "").lower() in ("1", "true", "yes"),
         help="Skip REGISTER(Expires:0) unregistration on shutdown (leave extensions registered)",
     )
+    p.add_argument(
+        "--api-only",
+        action="store_true",
+        default=os.environ.get("API_ONLY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Start the FastAPI metrics server only — no SIP agents, no REGISTER, no traffic. "
+            "Useful to verify GUI connectivity before the main run, or to keep the health-check "
+            "endpoint alive while UAC/UAS processes are not yet started. "
+            "GET /api/ping will return reachable:true immediately."
+        ),
+    )
     return p.parse_args()
 
 
@@ -233,9 +244,15 @@ async def run(
     max_calls: int = 0,
     pre_phase_only: bool = False,
     no_unregister: bool = False,
+    api_only: bool = False,
 ) -> int:
     """
     Full lifecycle coroutine. Returns exit code (0 = success).
+
+    When api_only=True the FastAPI server is started and the process waits
+    for SIGTERM/SIGINT.  No SIP sockets, REGISTER, or traffic are created.
+    This lets the GUI health-check (GET /api/ping) confirm the backend is
+    reachable before the operator starts the real traffic run.
     """
     overall_start = time.monotonic()
     stop_event = asyncio.Event()
@@ -265,6 +282,28 @@ async def run(
     server_task = await start_server(
         collector, config, stop_callback=_stop_callback
     )
+
+    # ── API-ONLY mode: server is up, skip all SIP work ────────────────────
+    if api_only:
+        role = "UAC" if config.is_uac else "UAS"
+        log.info("=" * 60)
+        log.info(
+            "API-ONLY mode (%s) — FastAPI server running on :%d",
+            role, config.metrics_port,
+        )
+        log.info("GET /api/ping  → { reachable: true }")
+        log.info("No SIP agents, REGISTER, or traffic will be started.")
+        log.info("Press Ctrl+C or POST /api/test/stop to exit.")
+        log.info("=" * 60)
+        await stop_event.wait()
+        if server_task and not server_task.done():
+            server_task.cancel()
+            try:
+                await asyncio.wait_for(server_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        log.info("API-ONLY shutdown complete")
+        return 0
 
     # ── Create agents ─────────────────────────────────────────────────────
     agents = _create_agents(config)
@@ -556,6 +595,7 @@ def main() -> None:
             max_calls=max_calls,
             pre_phase_only=args.pre_phase_only,
             no_unregister=args.no_unregister,
+            api_only=args.api_only,
         ))
     except KeyboardInterrupt:
         log.info("Interrupted by user")
