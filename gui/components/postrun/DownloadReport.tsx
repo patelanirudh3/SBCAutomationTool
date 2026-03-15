@@ -1,6 +1,7 @@
 'use client'
 
-import { Download } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { Download, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useTrafficStore } from '@/store/traffic'
 import { cn } from '@/lib/utils'
@@ -41,8 +42,25 @@ export function DownloadReport({ className }: DownloadReportProps) {
     URL.revokeObjectURL(url)
   }
 
+  const router = useRouter()
+  const reset = useTrafficStore((s) => s.reset)
+
+  function handleNewRun() {
+    reset()
+    router.push('/config')
+  }
+
   return (
-    <div className={cn('flex justify-end', className)}>
+    <div className={cn('flex items-center justify-between', className)}>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={handleNewRun}
+        className="gap-2 border-border text-foreground hover:bg-secondary"
+      >
+        <RotateCcw className="size-3.5" />
+        New Run
+      </Button>
       <Button
         variant="outline"
         size="sm"

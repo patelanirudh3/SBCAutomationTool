@@ -1,7 +1,8 @@
 'use client'
 
-import type { ReactNode } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -58,10 +59,10 @@ export interface VMConfigPanelProps {
 
 function SectionHeader({ children }: { children: ReactNode }) {
   return (
-    <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
-      <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-emerald-500/70" />
+    <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-foreground">
+      <span className="h-4 w-0.5 shrink-0 rounded-full bg-emerald-500" />
       {children}
-      <span className="h-px flex-1 bg-border/60" />
+      <span className="h-px flex-1 bg-border" />
     </h3>
   )
 }
@@ -84,6 +85,73 @@ function FormField({
       {error && <FieldError error={error} />}
       {!error && hint && <FieldHint>{hint}</FieldHint>}
     </div>
+  )
+}
+
+function TestReachabilityButton({
+  vmIp,
+  metricsPort,
+  reachability,
+  onTest,
+}: {
+  vmIp: string
+  metricsPort: string
+  reachability: ReachabilityStatus | null
+  onTest: () => void
+}) {
+  const [showSuccess, setShowSuccess] = useState(false)
+  const port = parseInt(metricsPort, 10)
+  const canTest = !!vmIp && !Number.isNaN(port) && port > 0
+
+  useEffect(() => {
+    if (reachability?.reachable && !reachability.checking) {
+      setShowSuccess(true)
+      const t = setTimeout(() => setShowSuccess(false), 3000)
+      return () => clearTimeout(t)
+    }
+  }, [reachability?.reachable, reachability?.checking])
+
+  if (!canTest) return null
+
+  if (reachability?.checking) {
+    return (
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled
+        className="shrink-0 gap-1.5 font-mono text-xs"
+      >
+        <Loader2 className="size-3 animate-spin" />
+        Checking…
+      </Button>
+    )
+  }
+
+  if (showSuccess && reachability?.reachable) {
+    return (
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="shrink-0 gap-1.5 border-emerald-500/50 bg-emerald-500/10 font-mono text-xs text-emerald-400"
+      >
+        <CheckCircle className="size-3" />
+        Reachable
+      </Button>
+    )
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      onClick={onTest}
+      className="shrink-0 font-mono text-xs"
+    >
+      Test
+    </Button>
   )
 }
 
@@ -377,15 +445,23 @@ export function VMConfigPanel({
         </div>
         <div className="space-y-1">
           <FormField label="Metrics Port" error={e('metrics_port')}>
-            <Input
-              type="number"
-              value={raw.metrics_port}
-              onChange={(ev) => onChange('metrics_port', ev.target.value)}
-              onBlur={handleMetricsPortBlur}
-              placeholder={isUAC ? '8082' : '8081'}
-              className="font-mono"
-              aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
-            />
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                value={raw.metrics_port}
+                onChange={(ev) => onChange('metrics_port', ev.target.value)}
+                onBlur={handleMetricsPortBlur}
+                placeholder={isUAC ? '8082' : '8081'}
+                className="font-mono flex-1"
+                aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
+              />
+              <TestReachabilityButton
+                vmIp={raw.vm_ip}
+                metricsPort={raw.metrics_port}
+                reachability={reachability}
+                onTest={() => onCheckReachability()}
+              />
+            </div>
           </FormField>
           <FieldHint>
             {`Health check: http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
@@ -406,11 +482,11 @@ export function VMConfigPanel({
         </div>
       </div>
 
-      {/* ── UAC-only: Traffic Mode + Peer Stop URL ────────────── */}
+      {/* ── UAC-only: Run Control + Peer Stop URL ────────────── */}
       {isUAC && (
         <>
           <div className="space-y-3">
-            <SectionHeader>Traffic Mode</SectionHeader>
+            <SectionHeader>Run Control</SectionHeader>
             <TrafficModeSelector
               value={raw.traffic_mode as TrafficMode}
               onChange={(m) => onChange('traffic_mode', m)}

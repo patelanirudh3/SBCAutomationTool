@@ -1,10 +1,5 @@
 import type { TrafficMetrics } from '@/types'
 
-const BASE_URL =
-  process.env.NEXT_PUBLIC_COORDINATOR_URL ?? 'http://localhost:8082'
-
-const WS_URL = BASE_URL.replace(/^http/, 'ws') + '/api/metrics/stream'
-
 const BACKOFF_STEPS_MS = [1000, 2000, 4000, 8000, 16000, 30000]
 
 export type WSStatus = 'connected' | 'reconnecting' | 'disconnected'
@@ -21,11 +16,14 @@ export class MetricsStream {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private closed = false
 
-  constructor(private handlers: MetricsStreamHandlers) {}
+  constructor(
+    private url: string,
+    private handlers: MetricsStreamHandlers
+  ) {}
 
   connect(): void {
     if (this.closed) return
-    this.ws = new WebSocket(WS_URL)
+    this.ws = new WebSocket(this.url)
 
     this.ws.onopen = () => {
       this.reconnectAttempt = 0
@@ -90,6 +88,7 @@ export class MetricsStream {
 import { useEffect, useRef } from 'react'
 
 export function useMetricsStream(
+  url: string,
   handlers: MetricsStreamHandlers,
   enabled = true
 ): void {
@@ -99,7 +98,7 @@ export function useMetricsStream(
   useEffect(() => {
     if (!enabled) return
 
-    const stream = new MetricsStream({
+    const stream = new MetricsStream(url, {
       onMetrics: (m) => handlersRef.current.onMetrics(m),
       onStatusChange: (s) => handlersRef.current.onStatusChange(s),
       onError: (e) => handlersRef.current.onError?.(e),
@@ -107,5 +106,8 @@ export function useMetricsStream(
 
     stream.connect()
     return () => stream.disconnect()
+  // url is intentionally not in deps — reconnect logic handles URL changes would need
+  // a full teardown which isn't needed here; url is stable per hook call site
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled])
 }

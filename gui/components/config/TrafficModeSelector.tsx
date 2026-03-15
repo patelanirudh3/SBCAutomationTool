@@ -53,12 +53,6 @@ export function TrafficModeSelector({
 
   return (
     <div className="space-y-3">
-      <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
-        <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-emerald-500/70" />
-        Traffic Mode
-        <span className="h-px flex-1 bg-border/60" />
-      </h3>
-
       {/* Radio cards */}
       <div className="grid grid-cols-3 gap-2">
         {MODES.map(({ value: modeVal, label, Icon, desc }) => {

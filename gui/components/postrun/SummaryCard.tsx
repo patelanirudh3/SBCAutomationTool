@@ -56,7 +56,11 @@ export function SummaryCard({ className }: SummaryCardProps) {
   const uacVmId = pair?.uac.vm_id ?? 'uac-local'
   const uasVmId = pair?.uas.vm_id ?? 'uas-local'
 
-  const runTimestamp = aggregate.run_id.replace('run-', '').replace(/-/g, '')
+  const started = new Date(aggregate.started_at)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const runTimestamp =
+    `${started.getFullYear()}${pad(started.getMonth() + 1)}${pad(started.getDate())}_` +
+    `${pad(started.getHours())}${pad(started.getMinutes())}${pad(started.getSeconds())}`
 
   return (
     <div

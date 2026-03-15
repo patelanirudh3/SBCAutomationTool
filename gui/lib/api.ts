@@ -14,8 +14,13 @@ export class APIError extends Error {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  // Only set Content-Type when sending a body — GET requests must not send it
+  // because that triggers a CORS preflight OPTIONS the backend doesn't handle
+  const headers: Record<string, string> = options?.body != null
+    ? { 'Content-Type': 'application/json' }
+    : {}
   const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...options,
   })
   if (!res.ok) {
@@ -67,6 +72,17 @@ export async function putConfig(config: VMConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Simple boolean ping — 3s timeout, used by "Start Monitoring" button
+// ---------------------------------------------------------------------------
+
+export async function pingVM(ip: string, port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/ping`, { signal: AbortSignal.timeout(3000) })
+    return res.ok
+  } catch { return false }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP health check — hits the VM's FastAPI process at http://{vmIp}:{metricsPort}/api/ping
 // ---------------------------------------------------------------------------
 
@@ -91,7 +107,7 @@ export async function checkHealth(
 // ---------------------------------------------------------------------------
 
 export async function getMetrics(): Promise<TrafficMetrics[]> {
-  return request<TrafficMetrics[]>('/api/metrics')
+  return request<TrafficMetrics[]>('/metrics')
 }
 
 // ---------------------------------------------------------------------------
@@ -109,4 +125,87 @@ export interface VMSummary {
 
 export async function getVMs(): Promise<VMSummary[]> {
   return request<VMSummary[]>('/api/vms')
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM status + metrics — bypass BASE_URL, go directly to ip:port
+// No custom headers → no CORS preflight
+// ---------------------------------------------------------------------------
+
+export interface VMStatusResponse {
+  phase: string
+  running: boolean
+  elapsed_seconds: number
+  vm_id: string
+}
+
+export async function getStatusFor(
+  ip: string,
+  port: number
+): Promise<VMStatusResponse> {
+  const res = await fetch(`http://${ip}:${port}/api/test/status`)
+  return res.json() as Promise<VMStatusResponse>
+}
+
+export async function getMetricsFor(
+  ip: string,
+  port: number
+): Promise<TrafficMetrics> {
+  const res = await fetch(`http://${ip}:${port}/metrics`)
+  return res.json() as Promise<TrafficMetrics>
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM call events — GET /api/calls on a specific VM
+// Returns [] on any error so callers never need try/catch
+// ---------------------------------------------------------------------------
+
+export async function getCallsFor(
+  ip: string,
+  port: number
+): Promise<import('@/types').CallEvent[]> {
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/calls`)
+    if (!res.ok) return []
+    return (await res.json()) as import('@/types').CallEvent[]
+  } catch { return [] }
+}
+
+// ---------------------------------------------------------------------------
+// Build AggregateMetrics from fetched call events
+// UAC is source of truth for attempts (UAC drives all calls)
+// ---------------------------------------------------------------------------
+
+export function buildAggregate(
+  uacEvents: import('@/types').CallEvent[],
+  uasEvents: import('@/types').CallEvent[],
+  runId: string,
+  startedAt: string
+): import('@/types').AggregateMetrics {
+  const allEvents = uacEvents.length > 0 ? uacEvents : uasEvents
+  const attempted = allEvents.length
+  const completed = allEvents.filter((e) => e.result === 'COMPLETED').length
+  const failed = attempted - completed
+  return {
+    run_id: runId,
+    started_at: startedAt,
+    ended_at: new Date().toISOString(),
+    total_attempted: attempted,
+    total_completed: completed,
+    total_failed: failed,
+    aggregate_asr: attempted > 0 ? Math.round((completed / attempted) * 1000) / 10 : 0,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// URL builders — used by WS hooks and any per-VM REST calls
+// ---------------------------------------------------------------------------
+
+export function vmUrl(ip: string, port: number): string {
+  return `http://${ip}:${port}`
+}
+
+export function vmWsUrl(ip: string, port: number): string {
+  // Server mounts WS at /metrics/stream (no /api prefix) — see metrics.py line 319
+  return `ws://${ip}:${port}/metrics/stream`
 }

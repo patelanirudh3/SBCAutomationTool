@@ -98,11 +98,12 @@ interface TrafficStore {
   uacMetrics: TrafficMetrics | null
   uasMetrics: TrafficMetrics | null
   metricsHistory: MetricsHistoryPoint[]
-  updateMetrics: (uac: TrafficMetrics, uas: TrafficMetrics) => void
+  updateUACMetrics: (m: TrafficMetrics) => void
+  updateUASMetrics: (m: TrafficMetrics) => void
 
-  // WebSocket connection status
-  wsStatus: 'connected' | 'reconnecting' | 'disconnected'
-  setWsStatus: (s: 'connected' | 'reconnecting' | 'disconnected') => void
+  // WebSocket connection status — one entry per VM role
+  wsStatus: { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' }
+  setWsStatus: (role: 'uac' | 'uas', s: 'connected' | 'reconnecting' | 'disconnected') => void
 
   // Post-run
   callEvents: CallEvent[]
@@ -125,7 +126,7 @@ const initialState = {
   uacMetrics: null,
   uasMetrics: null,
   metricsHistory: [] as MetricsHistoryPoint[],
-  wsStatus: 'disconnected' as const,
+  wsStatus: { uac: 'disconnected', uas: 'disconnected' } as { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' },
   callEvents: [] as CallEvent[],
   aggregate: null,
 }
@@ -168,25 +169,32 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
   setUASPrePhase: (s) => set({ uasPrePhase: s }),
   setUACPrePhase: (s) => set({ uacPrePhase: s }),
 
-  updateMetrics: (uac, uas) =>
+  updateUACMetrics: (m) =>
     set((state) => ({
-      uacMetrics: uac,
-      uasMetrics: uas,
+      uacMetrics: m,
       metricsHistory: [
         ...state.metricsHistory.slice(-59),
         {
           t: Date.now(),
-          asr: uac.asr,
-          completed: uac.calls_completed,
-          failed: uac.calls_failed,
+          asr: m.asr,
+          completed: m.calls_completed,
+          failed: m.calls_failed,
         },
       ],
     })),
 
-  setWsStatus: (s) => set({ wsStatus: s }),
+  updateUASMetrics: (m) => set({ uasMetrics: m }),
+
+  setWsStatus: (role, s) =>
+    set((state) => ({
+      wsStatus: { ...state.wsStatus, [role]: s },
+    })),
 
   setCallEvents: (events) => set({ callEvents: events }),
   setAggregate: (a) => set({ aggregate: a }),
 
-  reset: () => set({ ...initialState, pairs: [makePair(0)] }),
+  reset: () => {
+    const { runMode, pairs } = get()
+    set({ ...initialState, runMode, pairs })
+  },
 }))

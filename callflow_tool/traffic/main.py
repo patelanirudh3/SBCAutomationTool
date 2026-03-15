@@ -198,6 +198,17 @@ def _parse_args() -> argparse.Namespace:
             "GET /api/ping will return reachable:true immediately."
         ),
     )
+    p.add_argument(
+        "--gui-drain-seconds",
+        type=int,
+        default=int(os.environ.get("GUI_DRAIN_SECONDS", "15")),
+        metavar="N",
+        help=(
+            "After SIP cleanup, keep the metrics HTTP server alive for N seconds "
+            "so the GUI can fetch final metrics and call events. "
+            "Set to 0 for headless/CI runs where no GUI is attached. (default: 15)"
+        ),
+    )
     return p.parse_args()
 
 
@@ -245,6 +256,7 @@ async def run(
     pre_phase_only: bool = False,
     no_unregister: bool = False,
     api_only: bool = False,
+    gui_drain_seconds: int = 15,
 ) -> int:
     """
     Full lifecycle coroutine. Returns exit code (0 = success).
@@ -253,6 +265,10 @@ async def run(
     for SIGTERM/SIGINT.  No SIP sockets, REGISTER, or traffic are created.
     This lets the GUI health-check (GET /api/ping) confirm the backend is
     reachable before the operator starts the real traffic run.
+
+    gui_drain_seconds:  After SIP cleanup completes, keep the metrics HTTP
+        server alive for this many seconds so the GUI can fetch final
+        metrics, call events, and status.  Set to 0 for headless/CI runs.
     """
     overall_start = time.monotonic()
     stop_event = asyncio.Event()
@@ -326,6 +342,7 @@ async def run(
     except RuntimeError as exc:
         log.critical("Pre-phase failed: %s", exc)
         await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
+        await _cancel_server(server_task)
         return 1
 
     collector.update_counts(
@@ -347,6 +364,7 @@ async def run(
         collector.set_phase("READY_PRE_PHASE_ONLY")
         await stop_event.wait()
         await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
+        await _cancel_server(server_task)
         return 0
 
     # ── TRAFFIC PHASE ─────────────────────────────────────────────────────
@@ -405,6 +423,31 @@ async def run(
         elapsed, snap.calls_attempted, snap.calls_completed, snap.calls_failed, snap.asr,
     )
 
+    # ── GUI DRAIN DELAY ──────────────────────────────────────────────────
+    # Keep the metrics HTTP server alive so the GUI can fetch final data:
+    #   GET /metrics       → final snapshot (10/10 calls, ASR, etc.)
+    #   GET /api/calls     → all call event detail rows
+    #   GET /api/test/status → phase=DONE
+    # Second Ctrl+C during the delay → immediate exit.
+    if gui_drain_seconds > 0 and server_task and not server_task.done():
+        log.info(
+            "GUI drain: keeping metrics server alive for %ds "
+            "(phase=DONE, all endpoints serving final data)…",
+            gui_drain_seconds,
+        )
+        try:
+            await asyncio.sleep(gui_drain_seconds)
+        except asyncio.CancelledError:
+            log.info("GUI drain interrupted — exiting immediately")
+
+    # ── Cancel metrics server ─────────────────────────────────────────────
+    if server_task and not server_task.done():
+        server_task.cancel()
+        try:
+            await asyncio.wait_for(server_task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
     return 0
 
 
@@ -434,6 +477,16 @@ def _post_peer_stop(peer_url: str, fallback_ports: tuple[int, ...] = (8081, 8082
         except Exception as exc:
             log.debug("POST %s failed: %s", url, exc)
     log.warning("POST to peer_stop_url failed on all ports %s (UAS may need manual stop)", ports_to_try)
+
+
+async def _cancel_server(server_task) -> None:
+    """Cancel the metrics HTTP server task (used for early-exit paths)."""
+    if server_task and not server_task.done():
+        server_task.cancel()
+        try:
+            await asyncio.wait_for(server_task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
 
 async def _shutdown(
@@ -512,15 +565,11 @@ async def _shutdown(
         engine=engine, uas_engine=uas_engine, agents=agents,
     )
 
-    # 7. Cancel metrics server
-    if server_task and not server_task.done():
-        server_task.cancel()
-        try:
-            await asyncio.wait_for(server_task, timeout=3.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    # 7. Metrics server is intentionally NOT cancelled here.
+    #    The caller holds the server open for gui_drain_seconds so the GUI
+    #    can fetch final metrics, call events, and phase=DONE before exit.
 
-    log.info("Shutdown complete")
+    log.info("SIP cleanup complete — metrics server still serving")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +645,7 @@ def main() -> None:
             pre_phase_only=args.pre_phase_only,
             no_unregister=args.no_unregister,
             api_only=args.api_only,
+            gui_drain_seconds=args.gui_drain_seconds,
         ))
     except KeyboardInterrupt:
         log.info("Interrupted by user")

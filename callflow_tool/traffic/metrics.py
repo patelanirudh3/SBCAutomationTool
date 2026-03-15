@@ -308,6 +308,17 @@ def build_app(
         version="1.0.0",
     )
 
+    # CORS — allow the Next.js GUI (localhost:3000) to fetch from this server.
+    # allow_origins="*" is safe here: this is a local dev/lab tool, not a public API.
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
     # ── GET /metrics ─────────────────────────────────────────────────────
     @app.get("/metrics")
     async def get_metrics():
@@ -372,6 +383,47 @@ def build_app(
             asyncio.create_task(stop_callback())
             return {"status": "stopping"}
         return {"status": "no_stop_callback_registered"}
+
+    # ── GET /api/calls ────────────────────────────────────────────────────
+    @app.get("/api/calls")
+    async def get_calls():
+        """Return call results collected so far as a JSON array matching the
+        GUI CallEvent type.  Available from the moment the first call completes
+        and keeps growing until the process exits."""
+        import datetime as _dt
+
+        results = getattr(collector, "_call_results", getattr(collector, "call_results", []))
+        out = []
+        for i, r in enumerate(results):
+            media = "NO_MEDIA"
+            if getattr(r, "media_verified", False):
+                media = "MEDIA_VERIFIED"
+            elif getattr(r, "rtp_tx_pkts", 0) > 0 or getattr(r, "rtp_rx_pkts", 0) > 0:
+                media = "MEDIA_PARTIAL"
+
+            # Prefer timestamp from the result object if available
+            ts_raw = getattr(r, "timestamp", getattr(r, "end_time", None))
+            if hasattr(ts_raw, "isoformat"):
+                ts = ts_raw.isoformat()
+            elif ts_raw:
+                ts = str(ts_raw)
+            else:
+                ts = _dt.datetime.now().isoformat()
+
+            out.append({
+                "call_id": getattr(r, "call_id", f"call-{i:04d}"),
+                "uac_ext": str(getattr(r, "caller", getattr(r, "uac_ext", ""))),
+                "uas_ext": str(getattr(r, "callee", getattr(r, "uas_ext", ""))),
+                "result": "COMPLETED" if getattr(r, "success", False) else "FAILED",
+                "failure_reason": getattr(r, "failure_reason", None) or None,
+                "pdd_ms": float(getattr(r, "pdd_ms", 0) or 0),
+                "hold_ms": float(getattr(r, "hold_ms", 0) or 0),
+                "media_status": media,
+                "rtp_tx_pkts": getattr(r, "rtp_tx_pkts", None),
+                "rtp_rx_pkts": getattr(r, "rtp_rx_pkts", None),
+                "timestamp": ts,
+            })
+        return out
 
     # ── GET /api/vms ─────────────────────────────────────────────────────
     @app.get("/api/vms")
@@ -477,7 +529,7 @@ async def start_server(
 
     log.info(
         "Metrics server starting on http://0.0.0.0:%d "
-        "| WS /metrics/stream | GET /metrics",
+        "| GET /metrics | GET /api/ping | WS /metrics/stream",
         port,
     )
 

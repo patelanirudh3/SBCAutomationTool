@@ -22,9 +22,18 @@ const PHASE_COLOR: Record<RunPhase, string> = {
   FAILED: 'text-rose-500',
 }
 
+type WsDisplayStatus = 'connected' | 'reconnecting' | 'disconnected'
+
+function deriveWsStatus(ws: { uac: WsDisplayStatus; uas: WsDisplayStatus }): WsDisplayStatus {
+  if (ws.uac === 'disconnected' || ws.uas === 'disconnected') return 'disconnected'
+  if (ws.uac === 'reconnecting' || ws.uas === 'reconnecting') return 'reconnecting'
+  return 'connected'
+}
+
 export function Navbar() {
   const phase = useTrafficStore((s) => s.phase)
-  const wsStatus = useTrafficStore((s) => s.wsStatus)
+  const wsStatusRaw = useTrafficStore((s) => s.wsStatus)
+  const wsStatus = deriveWsStatus(wsStatusRaw)
 
   return (
     <header className="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-border bg-card px-5">
@@ -78,7 +87,7 @@ export function Navbar() {
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          WebSocket stream: {wsStatus}
+          UAC: {wsStatusRaw.uac} · UAS: {wsStatusRaw.uas}
         </TooltipContent>
       </Tooltip>
     </header>

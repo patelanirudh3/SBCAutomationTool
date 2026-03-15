@@ -1,8 +1,9 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff } from 'lucide-react'
+import { WifiOff, Square, Loader2 } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 
 import { Navbar } from '@/components/layout/Navbar'
 import { StepIndicator } from '@/components/layout/StepIndicator'
@@ -19,6 +20,7 @@ import { DownloadReport } from '@/components/postrun/DownloadReport'
 
 import { useTrafficStore } from '@/store/traffic'
 import { useMetricsStream } from '@/lib/ws'
+import { vmWsUrl, getMetricsFor, getCallsFor, buildAggregate } from '@/lib/api'
 import {
   MOCK_UAC_METRICS,
   MOCK_UAS_METRICS,
@@ -26,15 +28,45 @@ import {
   MOCK_AGGREGATE,
   simulateMetricsTick,
 } from '@/lib/mock-data'
-import type { TrafficMetrics } from '@/types'
+import type { TrafficMetrics, RunPhase } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
+
+// ---------------------------------------------------------------------------
+// Backend-phase → UI RunPhase combinator
+// Both VM statuses are consulted; UAC drives the primary state
+// ---------------------------------------------------------------------------
+
+function mapBackendPhase(uacPhase: string, uasPhase: string): RunPhase {
+  const phases = [uacPhase, uasPhase].map((p) => (p ?? '').toUpperCase())
+  if (phases.some((p) => p === 'FAILED')) return 'FAILED'
+  if (phases.some((p) => p === 'TRAFFIC')) return 'TRAFFIC'
+  if (
+    phases.some(
+      (p) => p === 'PRE_PHASE' || p === 'PRE_REGISTER' || p === 'PRE_SUBSCRIBE'
+    )
+  )
+    return 'PRE_PHASE'
+  if (
+    phases.some((p) => p === 'DONE' || p === 'STOPPING') &&
+    phases.every((p) => p === 'DONE' || p === 'STOPPING' || p === 'IDLE')
+  )
+    return 'COMPLETE'
+  return 'IDLE'
+}
 
 // ---------------------------------------------------------------------------
 // Live Dashboard — Screen 3
 // ---------------------------------------------------------------------------
 
-function LiveDashboard() {
+function LiveDashboard({
+  stopping,
+  onStop,
+}: {
+  stopping: boolean
+  onStop: () => void
+}) {
+  const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const uasMetrics = useTrafficStore((s) => s.uasMetrics)
   const pairs = useTrafficStore((s) => s.pairs)
@@ -43,7 +75,6 @@ function LiveDashboard() {
   const pair = pairs[activePairIndex]
   const configuredCps = pair?.uac.cps ?? 2
 
-  // Ceiling = registered extensions count (or configured ext range)
   const extensionCeiling =
     pair
       ? (pair.uac.uac_ext_end - pair.uac.uac_ext_start + 1) +
@@ -60,12 +91,35 @@ function LiveDashboard() {
     )
   }
 
+  const showStopBtn = phase === 'TRAFFIC'
+
   return (
     <div className="flex flex-col gap-4 p-4 max-w-6xl mx-auto w-full">
-      {/* Row 1 — Hero: ASR + RunTimer */}
+      {/* Row 1 — Hero: ASR + RunTimer + Stop */}
       <div className="rounded-lg border border-border bg-card p-5 flex items-center gap-6">
         <ASRGauge asr={uacMetrics.asr} className="flex-1 min-w-0" />
         <RunTimer elapsed={uacMetrics.run_elapsed_seconds} />
+        {showStopBtn && (
+          <Button
+            onClick={onStop}
+            disabled={stopping}
+            variant="outline"
+            size="sm"
+            className="gap-2 border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-50"
+          >
+            {stopping ? (
+              <>
+                <Loader2 className="size-3.5 animate-spin" />
+                Stopping…
+              </>
+            ) : (
+              <>
+                <Square className="size-3.5" />
+                Stop Traffic
+              </>
+            )}
+          </Button>
+        )}
       </div>
 
       {/* Aggregate totals bar */}
@@ -148,14 +202,75 @@ function ReconnectBanner({ visible }: { visible: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Build aggregate metrics from last known UAC + UAS metrics snapshots
+// ---------------------------------------------------------------------------
+
+function buildAggregateFromStore(): void {
+  const { uacMetrics, setAggregate, pairs, activePairIndex } =
+    useTrafficStore.getState()
+
+  if (!uacMetrics) return
+
+  const pair = pairs[activePairIndex]
+
+  setAggregate({
+    total_attempted: uacMetrics.calls_attempted,
+    total_completed: uacMetrics.calls_completed,
+    total_failed: uacMetrics.calls_failed,
+    aggregate_asr: uacMetrics.asr,
+    run_id: `run-${pair?.uac.vm_id ?? 'local'}-${Date.now()}`,
+    started_at: new Date(
+      Date.now() - (uacMetrics.run_elapsed_seconds ?? 0) * 1000
+    ).toISOString(),
+    ended_at: new Date().toISOString(),
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Fetch call events from both VMs, merge, store in Zustand.
+// When isFinal=true, also builds aggregate from the call events (more
+// accurate than the metrics snapshot which may be stale).
+// ---------------------------------------------------------------------------
+
+async function fetchAndStoreCallEvents(
+  livePair: { uac: { vm_ip: string; metrics_port: number; vm_id?: string }; uas: { vm_ip: string; metrics_port: number } },
+  isFinal = false
+): Promise<boolean> {
+  const [uacCalls, uasCalls] = await Promise.all([
+    getCallsFor(livePair.uac.vm_ip, livePair.uac.metrics_port),
+    getCallsFor(livePair.uas.vm_ip, livePair.uas.metrics_port),
+  ])
+
+  const allEvents = uacCalls.length > 0 ? uacCalls : uasCalls
+  if (allEvents.length === 0) return false
+
+  const { setCallEvents, setAggregate, uacMetrics } = useTrafficStore.getState()
+  setCallEvents(allEvents)
+
+  if (isFinal) {
+    const runId = `run-${livePair.uac.vm_id ?? 'local'}-${Date.now()}`
+    const startedAt = uacMetrics?.run_elapsed_seconds
+      ? new Date(Date.now() - uacMetrics.run_elapsed_seconds * 1000).toISOString()
+      : new Date().toISOString()
+
+    setAggregate(buildAggregate(uacCalls, uasCalls, runId, startedAt))
+  }
+
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // Root page — orchestrator
 // ---------------------------------------------------------------------------
 
 export default function RunPage() {
   const phase = useTrafficStore((s) => s.phase)
   const wsStatus = useTrafficStore((s) => s.wsStatus)
-  const { setPhase, updateMetrics, setWsStatus, setCallEvents, setAggregate } =
+  const pair = useTrafficStore((s) => s.pairs[s.activePairIndex])
+  const { setPhase, updateUACMetrics, updateUASMetrics, setWsStatus, setCallEvents, setAggregate } =
     useTrafficStore()
+
+  const [stopping, setStopping] = useState(false)
 
   const mockTickRef = useRef(0)
   const mockUacRef = useRef<TrafficMetrics>(MOCK_UAC_METRICS)
@@ -167,15 +282,15 @@ export default function RunPage() {
   useEffect(() => {
     if (!IS_MOCK) return
 
-    // If arriving here with IDLE phase, assume we came straight from launch
     if (phase === 'IDLE' || phase === 'PRE_PHASE') {
       setPhase('TRAFFIC')
     }
 
-    setWsStatus('connected')
+    setWsStatus('uac', 'connected')
+    setWsStatus('uas', 'connected')
 
-    // Seed initial metrics immediately
-    updateMetrics(mockUacRef.current, mockUasRef.current)
+    updateUACMetrics(mockUacRef.current)
+    updateUASMetrics(mockUasRef.current)
 
     const interval = setInterval(() => {
       mockTickRef.current += 1
@@ -197,9 +312,9 @@ export default function RunPage() {
         0
       )
 
-      updateMetrics(mockUacRef.current, mockUasRef.current)
+      updateUACMetrics(mockUacRef.current)
+      updateUASMetrics(mockUasRef.current)
 
-      // Auto-complete after ~20 updates
       if (tick >= 20) {
         clearInterval(interval)
         setCallEvents(MOCK_CALL_EVENTS)
@@ -225,17 +340,175 @@ export default function RunPage() {
   }, [])
 
   // ------------------------------------------------------------------
-  // Live mode: connect WebSocket
+  // Stop Traffic handler
   // ------------------------------------------------------------------
+  const handleStop = async () => {
+    setStopping(true)
+
+    if (IS_MOCK) {
+      setCallEvents(MOCK_CALL_EVENTS)
+      setAggregate({
+        ...MOCK_AGGREGATE,
+        ended_at: new Date().toISOString(),
+      })
+      setPhase('COMPLETE')
+      return
+    }
+
+    try {
+      await fetch(
+        `http://${pair?.uac.vm_ip ?? '127.0.0.1'}:${pair?.uac.metrics_port ?? 8082}/api/test/stop`,
+        { method: 'POST' }
+      )
+    } catch {
+      setStopping(false)
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Live mode: unified poll — fetches metrics (supplements WS)
+  // AND detects phase changes including backend exit.
+  //
+  // Why REST alongside WS?
+  //   WS push interval is 10s (metrics_interval default).  For a 10-call
+  //   smoke test completing in ~50s, we can miss the final 2 calls if the
+  //   backend exits before the next push.  Polling /metrics every 5s
+  //   catches the latest snapshot regardless.
+  //
+  // Phase detection:
+  //   - Each /metrics response includes `phase`.  If both show DONE/
+  //     STOPPING, we build aggregate and transition to COMPLETE.
+  //   - If both backends are unreachable (processes exited) AND we were
+  //     already in TRAFFIC, we use last-known metrics to build aggregate
+  //     and transition to COMPLETE after 2 consecutive failures (~10s).
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (IS_MOCK) return
+
+    const { pairs, activePairIndex } = useTrafficStore.getState()
+    const livePair = pairs[activePairIndex]
+
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    let consecutiveFailures = 0
+    let completed = false
+    let callsFetched = false
+
+    const finish = async (targetPhase: RunPhase) => {
+      if (completed) return
+      completed = true
+      if (intervalId !== null) clearInterval(intervalId)
+
+      // Fetch call events one last time (isFinal=true builds aggregate from events)
+      const gotEvents = await fetchAndStoreCallEvents(livePair, true)
+
+      // Fallback: if we couldn't reach backends for call events, build
+      // aggregate from the last-known metrics snapshot
+      if (!gotEvents) {
+        buildAggregateFromStore()
+      }
+
+      setPhase(targetPhase)
+    }
+
+    const poll = async () => {
+      if (completed) return
+
+      let uacReachable = false
+      let uasReachable = false
+      let uacPhase = ''
+      let uasPhase = ''
+
+      const [uacResult, uasResult] = await Promise.all([
+        getMetricsFor(livePair.uac.vm_ip, livePair.uac.metrics_port).catch(() => null),
+        getMetricsFor(livePair.uas.vm_ip, livePair.uas.metrics_port).catch(() => null),
+      ])
+
+      if (uacResult) {
+        uacReachable = true
+        updateUACMetrics(uacResult)
+        uacPhase = (uacResult as unknown as { phase: string }).phase ?? ''
+      }
+      if (uasResult) {
+        uasReachable = true
+        updateUASMetrics(uasResult)
+        uasPhase = (uasResult as unknown as { phase: string }).phase ?? ''
+      }
+
+      // At least one backend is alive — attempt phase detection + call fetch
+      if (uacReachable || uasReachable) {
+        consecutiveFailures = 0
+
+        // Continuously fetch call events while backends are alive so we
+        // always have the latest snapshot — the backends may exit before
+        // we get another chance.
+        const currentPhase = useTrafficStore.getState().phase
+        if (
+          !callsFetched &&
+          (currentPhase === 'TRAFFIC' || uacPhase === 'TRAFFIC' || uacPhase === 'STOPPING' || uacPhase === 'DONE')
+        ) {
+          callsFetched = await fetchAndStoreCallEvents(livePair)
+        }
+
+        if (uacPhase || uasPhase) {
+          const livePhase = mapBackendPhase(
+            uacPhase || 'IDLE',
+            uasPhase || 'IDLE'
+          )
+
+          if (livePhase === 'COMPLETE' || livePhase === 'FAILED') {
+            // Backends reporting DONE — finish will handle final call fetch
+            await finish(livePhase)
+            return
+          }
+
+          setPhase(livePhase)
+        }
+        return
+      }
+
+      // Both unreachable — backends likely exited
+      consecutiveFailures++
+      const storePhase = useTrafficStore.getState().phase
+      if (
+        consecutiveFailures >= 3 &&
+        (storePhase === 'TRAFFIC' || storePhase === 'PRE_PHASE')
+      ) {
+        await finish('COMPLETE')
+      }
+    }
+
+    poll()
+    intervalId = setInterval(poll, 5000)
+    return () => {
+      if (intervalId !== null) clearInterval(intervalId)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ------------------------------------------------------------------
+  // Live mode: two independent WebSocket connections
+  // ------------------------------------------------------------------
+
   useMetricsStream(
+    vmWsUrl(pair?.uac.vm_ip ?? '127.0.0.1', pair?.uac.metrics_port ?? 8082),
     {
       onMetrics: (metrics) => {
-        const uac = metrics.find((m) => m.vm_id.startsWith('uac'))
-        const uas = metrics.find((m) => m.vm_id.startsWith('uas'))
-        if (uac && uas) updateMetrics(uac, uas)
-        else if (uac) updateMetrics(uac, uac)
+        const m = metrics.find((m) => m.vm_id === pair?.uac.vm_id) ?? metrics[0]
+        if (m) updateUACMetrics(m)
       },
-      onStatusChange: (s) => setWsStatus(s),
+      onStatusChange: (status) => setWsStatus('uac', status),
+    },
+    !IS_MOCK
+  )
+
+  useMetricsStream(
+    vmWsUrl(pair?.uas.vm_ip ?? '127.0.0.1', pair?.uas.metrics_port ?? 8081),
+    {
+      onMetrics: (metrics) => {
+        const m = metrics.find((m) => m.vm_id === pair?.uas.vm_id) ?? metrics[0]
+        if (m) updateUASMetrics(m)
+      },
+      onStatusChange: (status) => setWsStatus('uas', status),
     },
     !IS_MOCK
   )
@@ -243,7 +516,9 @@ export default function RunPage() {
   const isTraffic = phase === 'TRAFFIC'
   const isPostRun = phase === 'COMPLETE' || phase === 'FAILED'
   const showReconnectBanner =
-    !IS_MOCK && isTraffic && (wsStatus === 'reconnecting' || wsStatus === 'disconnected')
+    !IS_MOCK &&
+    isTraffic &&
+    (wsStatus.uac !== 'connected' || wsStatus.uas !== 'connected')
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -263,7 +538,7 @@ export default function RunPage() {
               transition={{ duration: 0.3 }}
               className="flex flex-col items-center"
             >
-              <LiveDashboard />
+              <LiveDashboard stopping={stopping} onStop={handleStop} />
             </motion.div>
           )}
           {isPostRun && (
