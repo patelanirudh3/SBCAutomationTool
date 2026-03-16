@@ -198,6 +198,58 @@ export function buildAggregate(
 }
 
 // ---------------------------------------------------------------------------
+// Per-VM config push — PUT /api/config on a specific VM backend
+// ---------------------------------------------------------------------------
+
+export async function putConfigFor(
+  ip: string,
+  port: number,
+  config: Record<string, unknown>
+): Promise<{ status: string; vm_id?: string; error?: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string; vm_id?: string }
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM traffic start — POST /api/test/start on a specific VM backend
+// ---------------------------------------------------------------------------
+
+export async function startTestFor(
+  ip: string,
+  port: number
+): Promise<{ status: string; vm_id?: string; error?: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/test/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string; vm_id?: string }
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM stop — POST /api/test/stop on a specific VM backend
+// ---------------------------------------------------------------------------
+
+export async function stopTestFor(
+  ip: string,
+  port: number
+): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/test/stop`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  return res.json() as Promise<{ status: string }>
+}
+
+// ---------------------------------------------------------------------------
 // URL builders — used by WS hooks and any per-VM REST calls
 // ---------------------------------------------------------------------------
 

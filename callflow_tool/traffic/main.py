@@ -114,7 +114,10 @@ from .config import load_config, VMConfig
 from .extension_agent import ExtensionAgent
 from .pre_phase import run_pre_phase
 from .call_engine import CallEngine, UasAutoAnswer
-from .metrics import MetricsCollector, start_server, write_traffic_summary
+from .metrics import (
+    MetricsCollector, start_server, start_api_only_server,
+    write_traffic_summary, ProcessContext,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +196,19 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("API_ONLY", "").lower() in ("1", "true", "yes"),
         help=(
             "Start the FastAPI metrics server only — no SIP agents, no REGISTER, no traffic. "
-            "Useful to verify GUI connectivity before the main run, or to keep the health-check "
-            "endpoint alive while UAC/UAS processes are not yet started. "
-            "GET /api/ping will return reachable:true immediately."
+            "When used without --config, the server waits for config via PUT /api/config "
+            "and traffic start via POST /api/test/start (GUI-driven mode). "
+            "When used with --config, starts the server for health-check only."
+        ),
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("API_PORT", "0")),
+        metavar="PORT",
+        help=(
+            "Port for the FastAPI server when running --api-only without --config. "
+            "E.g. --api-only --port 8081 for UAS, --api-only --port 8082 for UAC."
         ),
     )
     p.add_argument(
@@ -573,6 +586,213 @@ async def _shutdown(
 
 
 # ---------------------------------------------------------------------------
+# GUI-driven lifecycle (triggered by POST /api/test/start)
+# ---------------------------------------------------------------------------
+
+async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
+    """
+    Run the full traffic lifecycle (agents → pre-phase → traffic → shutdown)
+    as a background task inside the --api-only process.
+
+    This executes the same code path as the CLI ``run()`` function but is
+    triggered by the GUI via POST /api/test/start instead of process startup.
+    """
+    config: VMConfig = ctx.config
+    collector = ctx.collector
+    stop_event = ctx.stop_event
+
+    # Setup file logging now that we have a vm_id
+    log_file = _auto_log_file(config.vm_id)
+    _setup_logging(ctx.log_level, log_file=log_file)
+
+    # Derive max_calls the same way the CLI does
+    max_calls = 0
+    if config.is_uac:
+        if config.traffic_mode == "smoke":
+            max_calls = config.call_count
+        elif config.traffic_mode == "timed":
+            max_calls = int(config.cps * config.duration_hours * 3600)
+
+    if max_calls > 0 and config.pool_wrap_count > 0:
+        pool_wraps = math.ceil(max_calls / config.pool_wrap_count)
+        log.info(
+            "traffic_mode=%s max_calls=%d | LCM(%d,%d)=%d -> pool_wraps=%d (internal)",
+            config.traffic_mode, max_calls,
+            config.uac_ext_count, config.uas_ext_count,
+            config.pool_wrap_count, pool_wraps,
+        )
+    elif max_calls == 0:
+        log.info("traffic_mode=%s -> unlimited (run until stopped)", config.traffic_mode)
+
+    engine = None
+    uas_engine = None
+    agents: dict[str, ExtensionAgent] = {}
+
+    try:
+        # ── Create agents ─────────────────────────────────────────────
+        agents = _create_agents(config)
+        log.info("Starting %d extension agent transports…", len(agents))
+        await asyncio.gather(*[a.start() for a in agents.values()])
+        collector.update_counts(sockets=len(agents))
+        log.info("All transports connected")
+
+        # ── PRE-PHASE: REGISTER + SUBSCRIBE ───────────────────────────
+        collector.set_phase("PRE_REGISTER")
+
+        try:
+            pre_result = await run_pre_phase(list(agents.values()), config)
+        except RuntimeError as exc:
+            log.critical("Pre-phase failed: %s", exc)
+            collector.set_phase("FAILED")
+            ctx.state = "FAILED"
+            await _shutdown(agents, None, None, collector, None, config)
+            return
+
+        collector.update_counts(
+            sockets=len(agents),
+            registered=pre_result.registered,
+            subscribed=pre_result.subscribed,
+        )
+
+        # ── TRAFFIC PHASE ─────────────────────────────────────────────
+        collector.set_phase("TRAFFIC")
+        collector.set_running(True)
+
+        if config.is_uac:
+            engine = CallEngine(
+                agents, config,
+                on_call_complete=collector.record_call,
+                max_calls=max_calls,
+            )
+            collector.set_concurrent_provider(lambda: engine.active_call_count)
+            log.info(
+                "UAC mode | %d CPS | %ds hold | ~%d concurrent | ramp=%ds",
+                config.cps, config.hold_time_seconds,
+                config.effective_max_concurrent, config.ramp_up_seconds,
+            )
+
+            engine_task = asyncio.create_task(engine.run(), name="call-engine")
+            stop_waiter = asyncio.create_task(stop_event.wait(), name="stop-waiter")
+
+            done, pending = await asyncio.wait(
+                [engine_task, stop_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            uas_engine = UasAutoAnswer(
+                agents, config, on_call_complete=collector.record_call,
+            )
+            await uas_engine.start()
+            log.info("UAS auto-answer mode active on %d extensions", len(agents))
+            await stop_event.wait()
+
+        # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────
+        collector.set_phase("STOPPING")
+        collector.set_running(False)
+        log.info("Initiating graceful shutdown…")
+
+        await _shutdown(agents, engine, uas_engine, collector, None, config)
+
+        snap = collector.latest
+        log.info(
+            "=" * 60 + "\nRUN COMPLETE | attempted=%d completed=%d failed=%d ASR=%.1f%%\n" + "=" * 60,
+            snap.calls_attempted, snap.calls_completed, snap.calls_failed, snap.asr,
+        )
+        ctx.state = "COMPLETE"
+
+    except Exception:
+        log.exception("Traffic lifecycle failed unexpectedly")
+        collector.set_phase("FAILED")
+        ctx.state = "FAILED"
+        if agents:
+            await _shutdown(agents, engine, uas_engine, collector, None, config)
+
+
+# ---------------------------------------------------------------------------
+# API-only mode — bare FastAPI server waiting for GUI commands
+# ---------------------------------------------------------------------------
+
+async def run_api_only(port: int, log_level: str = "INFO", gui_drain_seconds: int = 15) -> int:
+    """
+    Start a bare FastAPI server that waits for:
+      1. PUT /api/config  → receive and write VM config
+      2. POST /api/test/start → trigger the full traffic lifecycle
+
+    This is the GUI-driven entry point.  No config file is needed at startup.
+    """
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+
+    def _handle_signal(sig):
+        log.info("Received signal %s, initiating shutdown…", sig.name)
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+        except NotImplementedError:
+            signal.signal(sig, lambda s, f: stop_event.set())
+
+    collector = MetricsCollector("unconfigured", metrics_interval=10)
+    collector.set_phase("IDLE")
+
+    ctx = ProcessContext(collector=collector, stop_event=stop_event, port=port)
+    ctx.log_level = log_level
+
+    async def _do_start():
+        ctx._lifecycle_task = asyncio.create_task(
+            _run_traffic_lifecycle(ctx),
+            name="traffic-lifecycle",
+        )
+    ctx._start_func = _do_start
+
+    async def _stop_callback():
+        stop_event.set()
+
+    server_task = await start_api_only_server(ctx, stop_callback=_stop_callback)
+
+    log.info("=" * 60)
+    log.info("GUI-DRIVEN mode — FastAPI server on :%d", ctx.port)
+    log.info("  1. GUI pushes config:  PUT  /api/config")
+    log.info("  2. GUI triggers start: POST /api/test/start")
+    log.info("  3. GUI monitors:       GET  /api/test/status  |  WS /metrics/stream")
+    log.info("Press Ctrl+C to exit.")
+    log.info("=" * 60)
+
+    # Wait for process exit signal (Ctrl+C, SIGTERM, or POST /api/test/stop)
+    await stop_event.wait()
+
+    # If lifecycle is still running, give it time to do graceful shutdown
+    if ctx._lifecycle_task and not ctx._lifecycle_task.done():
+        log.info("Waiting for traffic lifecycle to complete shutdown…")
+        try:
+            await asyncio.wait_for(ctx._lifecycle_task, timeout=60.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.warning("Lifecycle task did not finish in time")
+
+    # Keep server alive for GUI to fetch final data
+    if gui_drain_seconds > 0 and server_task and not server_task.done():
+        log.info("GUI drain: keeping server alive for %ds…", gui_drain_seconds)
+        try:
+            await asyncio.sleep(gui_drain_seconds)
+        except asyncio.CancelledError:
+            pass
+
+    if server_task and not server_task.done():
+        server_task.cancel()
+        try:
+            await asyncio.wait_for(server_task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    log.info("API-only shutdown complete")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -584,6 +804,23 @@ def main() -> None:
     log.info("SBC Traffic Engine — Phase 1")
     log.info("=" * 60)
 
+    # ── GUI-driven mode: --api-only without --config ─────────────────────
+    if args.api_only and not args.config:
+        if not args.port:
+            log.critical("--api-only without --config requires --port (e.g. --port 8081)")
+            sys.exit(1)
+        try:
+            exit_code = asyncio.run(
+                run_api_only(args.port, args.log_level, args.gui_drain_seconds)
+            )
+        except KeyboardInterrupt:
+            log.info("Interrupted by user")
+            exit_code = 0
+        log.info("Process PID %d exiting (code %d)", os.getpid(), exit_code)
+        os._exit(exit_code)
+        return
+
+    # ── CLI mode: load config from yaml/env (existing path) ──────────────
     # Load config
     try:
         config = load_config(yaml_path=args.config or None)

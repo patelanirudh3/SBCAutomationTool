@@ -15,9 +15,10 @@ import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
 import { VMConfigSchema, deriveUACPeerStopUrl, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
-import { checkHealth } from '@/lib/api'
+import { checkHealth, putConfigFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { VMConfig, VMPair, ReachabilityStatus } from '@/types'
+import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
@@ -174,10 +175,9 @@ export function VMPairBook() {
   const [uasTouched, setUasTouched] = useState<Set<string>>(new Set())
   const [uacReachability, setUacReachability] = useState<ReachabilityStatus | null>(null)
   const [uasReachability, setUasReachability] = useState<ReachabilityStatus | null>(null)
-  // Tracks whether Validate has been run and passed
   const [validationPassed, setValidationPassed] = useState(false)
-  // MOCK_MODE: tracks Save & Continue in-flight state
   const [isSaving, setIsSaving] = useState(false)
+  const [configPushError, setConfigPushError] = useState<string | null>(null)
   const reachabilityTriggeredRef = useRef(false)
 
   // Auto-derive UAC peer_stop_url from UAS vm_ip + metrics_port (per spec)
@@ -293,24 +293,44 @@ export function VMPairBook() {
   const handleSaveAndContinue = async () => {
     if (!validationPassed || isSaving) return
 
+    setIsSaving(true)
+    setConfigPushError(null)
+
     const uac = parseRaw(uacRaw, 'UAC') as VMConfig
     const uas = parseRaw(uasRaw, 'UAS') as VMConfig
+
+    // Merge advanced settings into config payloads for the backend
+    const adv = pairs[activePairIndex]?.advancedSettings ?? DEFAULT_ADVANCED_SETTINGS
+    const uacPayload = { ...uac, ...adv }
+    const uasPayload = { ...uas, ...adv }
+
     const currentPair: VMPair = pairs[activePairIndex] ?? {
       pair_id: 'pair-1',
       pair_label: 'Pair 1',
       uac,
       uas,
+      advancedSettings: adv,
       validated: true,
       saved: true,
     }
 
     if (IS_MOCK) {
-      // Spec: "Save & Continue: succeeds after 600ms delay" in MOCK_MODE
-      setIsSaving(true)
       await new Promise((r) => setTimeout(r, 600))
+    } else {
+      // Push config to both backends via PUT /api/config
+      try {
+        await putConfigFor(uas.vm_ip, uas.metrics_port, uasPayload)
+        await putConfigFor(uac.vm_ip, uac.metrics_port, uacPayload)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to push config'
+        setConfigPushError(msg)
+        setIsSaving(false)
+        return
+      }
     }
 
-    updatePair(activePairIndex, { ...currentPair, uac, uas, validated: true, saved: true })
+    updatePair(activePairIndex, { ...currentPair, uac, uas, advancedSettings: adv, validated: true, saved: true })
+    setIsSaving(false)
     router.push('/launch')
   }
 
@@ -417,6 +437,13 @@ export function VMPairBook() {
               <span className="flex items-center gap-1.5 text-xs text-emerald-400">
                 <CheckCircle2 className="size-3.5" />
                 All valid
+              </span>
+            )}
+
+            {configPushError && (
+              <span className="flex items-center gap-1.5 text-xs text-rose-400">
+                <AlertTriangle className="size-3.5" />
+                {configPushError}
               </span>
             )}
           </div>
