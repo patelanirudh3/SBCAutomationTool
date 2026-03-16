@@ -72,14 +72,15 @@ export function ModeSelector() {
           </div>
 
           <p className="mb-4 text-sm text-muted-foreground">
-            UAC + UAS on the same box. One coordinator per process.
+            Co-located UAC &amp; UAS with a single coordinator. No external dependencies.
           </p>
 
           <ul className="mb-6 space-y-1.5 text-sm">
             {[
               'Dev & smoke tests',
-              'Single VM demos',
-              'Monday demos ✓',
+              'Single VM deployment',
+              'Configurable call rates',
+              'Real-time call metrics',
             ].map((item) => (
               <li key={item} className="flex items-center gap-2 text-muted-foreground">
                 <CheckCircle className="size-3.5 shrink-0 text-emerald-400" />

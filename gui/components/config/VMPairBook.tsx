@@ -13,7 +13,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
-import { VMConfigSchema, deriveUACPeerStopUrl } from '@/lib/config-schema'
+import { VMConfigSchema, deriveUACPeerStopUrl, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -206,6 +206,22 @@ export function VMPairBook() {
   const uacErrors = useMemo(() => getErrors(uacRaw, 'UAC'), [uacRaw])
   const uasErrors = useMemo(() => getErrors(uasRaw, 'UAS'), [uasRaw])
 
+  const uacWarnings = useMemo(() => {
+    const w = getFieldWarnings(uacRaw)
+    if (uacRaw.metrics_port && uasRaw.metrics_port && uacRaw.metrics_port === uasRaw.metrics_port) {
+      w.metrics_port = 'Same port as UAS — must be different for co-located VMs'
+    }
+    return w
+  }, [uacRaw, uasRaw])
+
+  const uasWarnings = useMemo(() => {
+    const w = getFieldWarnings(uasRaw)
+    if (uacRaw.metrics_port && uasRaw.metrics_port && uacRaw.metrics_port === uasRaw.metrics_port) {
+      w.metrics_port = 'Same port as UAC — must be different for co-located VMs'
+    }
+    return w
+  }, [uacRaw, uasRaw])
+
   const isValid =
     Object.keys(uacErrors).length === 0 && Object.keys(uasErrors).length === 0
 
@@ -306,118 +322,127 @@ export function VMPairBook() {
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
 
-      {/* ── Shared header row — single border guarantees alignment ── */}
-      <div className="flex items-center border-b border-border bg-card/80 py-2.5">
-        <PanelHeaderContent role="UAC" label={uacRaw.vm_id || 'UAC'} errorCount={uacErrorCount} />
+      {/* ── Scrollable content area ──────────────────────────── */}
+      <div className="flex-1 overflow-y-auto bg-background">
+        <div className="mx-auto w-full max-w-7xl space-y-5 px-6 py-5">
 
-        {/* Swap button */}
-        <div className="flex w-10 shrink-0 items-center justify-center">
-          <motion.button
-            onClick={handleSwap}
-            whileHover={{ scale: 1.12 }}
-            whileTap={{ rotate: 180, scale: 0.88 }}
-            transition={{ duration: 0.2 }}
-            title="Swap UAC ↔ UAS configs"
+          {/* ── Card row: UAC | swap | UAS ────────────────────── */}
+          <div className="flex items-start gap-4">
+
+            {/* UAC card */}
+            <div className="flex flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
+              <div className="flex items-center border-b border-border px-4 py-2.5">
+                <PanelHeaderContent role="UAC" label={uacRaw.vm_id || 'UAC'} errorCount={uacErrorCount} />
+              </div>
+              <VMConfigPanel
+                role="UAC"
+                raw={uacRaw}
+                onChange={handleUacChange}
+                touched={uacTouched}
+                onBlur={handleUacBlur}
+                errors={uacErrors}
+                warnings={uacWarnings}
+                reachability={uacReachability}
+                onCheckReachability={() =>
+                  checkReachability('UAC', uacRaw.vm_ip, parseInt(uacRaw.metrics_port) || 0)
+                }
+              />
+            </div>
+
+            {/* Swap button — aligned with card headers */}
+            <div className="flex h-[41px] shrink-0 items-center">
+              <motion.button
+                onClick={handleSwap}
+                whileHover={{ scale: 1.12 }}
+                whileTap={{ rotate: 180, scale: 0.88 }}
+                transition={{ duration: 0.2 }}
+                title="Swap UAC ↔ UAS configs"
+                className={cn(
+                  'flex cursor-pointer items-center justify-center rounded-full p-1.5',
+                  'border border-emerald-500/40 bg-card text-emerald-400',
+                  'transition-colors duration-200',
+                  'hover:border-emerald-400 hover:bg-emerald-500/15',
+                  'hover:shadow-[0_0_14px_oklch(0.52_0.17_160/0.45)]',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50'
+                )}
+              >
+                <ArrowLeftRight className="size-3.5" />
+              </motion.button>
+            </div>
+
+            {/* UAS card */}
+            <div className="flex flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
+              <div className="flex items-center border-b border-border px-4 py-2.5">
+                <PanelHeaderContent role="UAS" label={uasRaw.vm_id || 'UAS'} errorCount={uasErrorCount} />
+              </div>
+              <VMConfigPanel
+                role="UAS"
+                raw={uasRaw}
+                onChange={handleUasChange}
+                touched={uasTouched}
+                onBlur={handleUasBlur}
+                errors={uasErrors}
+                warnings={uasWarnings}
+                reachability={uasReachability}
+                onCheckReachability={() =>
+                  checkReachability('UAS', uasRaw.vm_ip, parseInt(uasRaw.metrics_port) || 0)
+                }
+              />
+            </div>
+          </div>
+
+          {/* ── Advanced Settings card ────────────────────────── */}
+          <div className="overflow-hidden rounded-xl border border-border bg-card">
+            <AdvancedSettings pairIndex={activePairIndex} />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Footer action bar — pinned at bottom ─────────────── */}
+      <div className="border-t border-border bg-card">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-3">
+          <div className="flex items-center gap-3">
+            <Button variant="outline" size="sm" onClick={handleValidate}>
+              Validate
+            </Button>
+
+            {hasValidated && totalErrors > 0 && (
+              <span className="flex items-center gap-1.5 text-xs text-rose-400">
+                <AlertTriangle className="size-3.5" />
+                {totalErrors} error{totalErrors !== 1 ? 's' : ''}
+              </span>
+            )}
+
+            {validationPassed && (
+              <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+                <CheckCircle2 className="size-3.5" />
+                All valid
+              </span>
+            )}
+          </div>
+
+          <Button
+            size="sm"
+            disabled={!validationPassed || isSaving}
+            onClick={handleSaveAndContinue}
             className={cn(
-              'flex cursor-pointer items-center justify-center rounded-full p-1.5',
-              'border border-emerald-500/40 bg-card text-emerald-400',
-              'transition-colors duration-200',
-              'hover:border-emerald-400 hover:bg-emerald-500/15',
-              'hover:shadow-[0_0_14px_oklch(0.52_0.17_160/0.45)]',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50'
+              'transition-opacity',
+              (!validationPassed || isSaving) && 'cursor-not-allowed opacity-40'
             )}
           >
-            <ArrowLeftRight className="size-3.5" />
-          </motion.button>
-        </div>
-
-        <PanelHeaderContent role="UAS" label={uasRaw.vm_id || 'UAS'} errorCount={uasErrorCount} />
-      </div>
-
-      {/* ── Content columns ────────────────────────────────────── */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* UAC panel */}
-        <div className="flex-1 overflow-y-auto">
-          <VMConfigPanel
-            role="UAC"
-            raw={uacRaw}
-            onChange={handleUacChange}
-            touched={uacTouched}
-            onBlur={handleUacBlur}
-            errors={uacErrors}
-            reachability={uacReachability}
-            onCheckReachability={() =>
-              checkReachability('UAC', uacRaw.vm_ip, parseInt(uacRaw.metrics_port) || 0)
-            }
-          />
-        </div>
-
-        {/* Thin divider line between scroll areas */}
-        <div className="w-px shrink-0 bg-border/30" />
-
-        {/* UAS panel */}
-        <div className="flex-1 overflow-y-auto">
-          <VMConfigPanel
-            role="UAS"
-            raw={uasRaw}
-            onChange={handleUasChange}
-            touched={uasTouched}
-            onBlur={handleUasBlur}
-            errors={uasErrors}
-            reachability={uasReachability}
-            onCheckReachability={() =>
-              checkReachability('UAS', uasRaw.vm_ip, parseInt(uasRaw.metrics_port) || 0)
-            }
-          />
-        </div>
-      </div>
-
-      {/* ── Advanced Settings — full-width, pair-scoped ─────────── */}
-      <AdvancedSettings pairIndex={activePairIndex} />
-
-      {/* Footer action bar */}
-      <div className="flex items-center justify-between border-t border-border bg-card px-6 py-3">
-        <div className="flex items-center gap-3">
-          <Button variant="outline" size="sm" onClick={handleValidate}>
-            Validate
+            {isSaving ? (
+              <>
+                <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                Saving…
+              </>
+            ) : (
+              <>
+                Save &amp; Continue
+                <ChevronRight className="ml-0.5 size-3.5" />
+              </>
+            )}
           </Button>
-
-          {hasValidated && totalErrors > 0 && (
-            <span className="flex items-center gap-1.5 text-xs text-rose-400">
-              <AlertTriangle className="size-3.5" />
-              {totalErrors} error{totalErrors !== 1 ? 's' : ''}
-            </span>
-          )}
-
-          {validationPassed && (
-            <span className="flex items-center gap-1.5 text-xs text-emerald-400">
-              <CheckCircle2 className="size-3.5" />
-              All valid
-            </span>
-          )}
         </div>
-
-        <Button
-          size="sm"
-          disabled={!validationPassed || isSaving}
-          onClick={handleSaveAndContinue}
-          className={cn(
-            'transition-opacity',
-            (!validationPassed || isSaving) && 'cursor-not-allowed opacity-40'
-          )}
-        >
-          {isSaving ? (
-            <>
-              <Loader2 className="mr-1.5 size-3.5 animate-spin" />
-              Saving…
-            </>
-          ) : (
-            <>
-              Save &amp; Continue
-              <ChevronRight className="ml-0.5 size-3.5" />
-            </>
-          )}
-        </Button>
       </div>
     </div>
   )

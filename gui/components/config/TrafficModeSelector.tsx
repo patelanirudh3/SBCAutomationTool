@@ -3,7 +3,7 @@
 import { Zap, Clock, Infinity as InfinityIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { FieldError } from './ConfigValidator'
+import { FieldError, FieldSoftWarning } from './ConfigValidator'
 import { deriveMaxCalls } from '@/lib/config-schema'
 import { cn } from '@/lib/utils'
 import type { TrafficMode } from '@/types'
@@ -17,6 +17,7 @@ interface TrafficModeSelectorProps {
   onDurationHoursChange: (v: string) => void
   cps: string
   errors: { call_count?: string; duration_hours?: string }
+  warnings: { call_count?: string; duration_hours?: string }
   touched: { call_count?: boolean; duration_hours?: boolean }
   onBlur: (field: 'call_count' | 'duration_hours') => void
 }
@@ -43,6 +44,7 @@ export function TrafficModeSelector({
   onDurationHoursChange,
   cps,
   errors,
+  warnings,
   touched,
   onBlur,
 }: TrafficModeSelectorProps) {
@@ -92,6 +94,7 @@ export function TrafficModeSelector({
             aria-invalid={touched.call_count && !!errors.call_count ? true : undefined}
           />
           {touched.call_count && <FieldError error={errors.call_count} />}
+          {touched.call_count && !errors.call_count && <FieldSoftWarning warning={warnings.call_count} />}
         </div>
       )}
 
@@ -128,6 +131,7 @@ export function TrafficModeSelector({
             aria-invalid={touched.duration_hours && !!errors.duration_hours ? true : undefined}
           />
           {touched.duration_hours && <FieldError error={errors.duration_hours} />}
+          {touched.duration_hours && !errors.duration_hours && <FieldSoftWarning warning={warnings.duration_hours} />}
           {maxCalls !== null && maxCalls > 0 && (
             <p className="text-xs text-muted-foreground">
               ≈ {maxCalls.toLocaleString()} max calls at {cps} CPS

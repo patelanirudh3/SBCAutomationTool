@@ -11,11 +11,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { FieldError, FieldHint, FieldWarning } from './ConfigValidator'
+import { FieldError, FieldHint, FieldWarning, FieldSoftWarning } from './ConfigValidator'
 import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { cn } from '@/lib/utils'
-import { Link2, Hash, Loader2, CheckCircle, XCircle } from 'lucide-react'
+import { Link2, Hash, Loader2, CheckCircle, XCircle, Signal } from 'lucide-react'
 import type { VMRole, TrafficMode, SipTransport, ReachabilityStatus } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -49,6 +49,7 @@ export interface VMConfigPanelProps {
   touched: Set<string>
   onBlur: (field: string) => void
   errors: Record<string, string>
+  warnings: Record<string, string>
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
 }
@@ -70,11 +71,13 @@ function SectionHeader({ children }: { children: ReactNode }) {
 function FormField({
   label,
   error,
+  warning,
   hint,
   children,
 }: {
   label: string
   error?: string
+  warning?: string
   hint?: string
   children: ReactNode
 }) {
@@ -83,7 +86,8 @@ function FormField({
       <Label className="text-xs font-medium text-foreground/80">{label}</Label>
       {children}
       {error && <FieldError error={error} />}
-      {!error && hint && <FieldHint>{hint}</FieldHint>}
+      {!error && warning && <FieldSoftWarning warning={warning} />}
+      {!error && !warning && hint && <FieldHint>{hint}</FieldHint>}
     </div>
   )
 }
@@ -145,11 +149,11 @@ function TestReachabilityButton({
   return (
     <Button
       type="button"
-      variant="outline"
       size="sm"
       onClick={onTest}
-      className="shrink-0 font-mono text-xs"
+      className="shrink-0 gap-1.5 border border-emerald-500/50 bg-emerald-500/10 font-mono text-xs text-emerald-400 hover:border-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-300"
     >
+      <Signal className="size-3" />
       Test
     </Button>
   )
@@ -195,12 +199,14 @@ export function VMConfigPanel({
   touched,
   onBlur,
   errors,
+  warnings,
   reachability,
   onCheckReachability,
 }: VMConfigPanelProps) {
   const isUAC = role === 'UAC'
 
   const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
+  const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
   const t = (field: string) => touched.has(field)
 
   const uacExtCount = deriveExtCount(parseInt(raw.uac_ext_start), parseInt(raw.uac_ext_end))
@@ -283,7 +289,7 @@ export function VMConfigPanel({
               aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
             />
           </FormField>
-          <FormField label="SBC Port" error={e('sbc_port')}>
+          <FormField label="SBC Port" error={e('sbc_port')} warning={w('sbc_port')}>
             <Input
               type="number"
               value={raw.sbc_port}
@@ -419,7 +425,7 @@ export function VMConfigPanel({
       <div className="space-y-3">
         <SectionHeader>Traffic</SectionHeader>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="CPS" error={e('cps')} hint="Calls per second">
+          <FormField label="CPS" error={e('cps')} warning={w('cps')} hint="Calls per second">
             <Input
               type="number"
               min={0.1}
@@ -431,7 +437,7 @@ export function VMConfigPanel({
               aria-invalid={t('cps') && !!errors.cps ? true : undefined}
             />
           </FormField>
-          <FormField label="Hold Time (s)" error={e('hold_time_seconds')}>
+          <FormField label="Hold Time (s)" error={e('hold_time_seconds')} warning={w('hold_time_seconds')}>
             <Input
               type="number"
               min={0}
@@ -444,7 +450,7 @@ export function VMConfigPanel({
           </FormField>
         </div>
         <div className="space-y-1">
-          <FormField label="Metrics Port" error={e('metrics_port')}>
+          <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
             <div className="flex gap-2">
               <Input
                 type="number"
@@ -498,6 +504,10 @@ export function VMConfigPanel({
               errors={{
                 call_count: t('call_count') ? errors.call_count : undefined,
                 duration_hours: t('duration_hours') ? errors.duration_hours : undefined,
+              }}
+              warnings={{
+                call_count: t('call_count') ? warnings.call_count : undefined,
+                duration_hours: t('duration_hours') ? warnings.duration_hours : undefined,
               }}
               touched={{
                 call_count: t('call_count'),

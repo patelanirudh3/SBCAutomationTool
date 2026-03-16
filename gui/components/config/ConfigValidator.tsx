@@ -35,6 +35,24 @@ export function FieldHint({
   )
 }
 
+export function FieldSoftWarning({
+  warning,
+  className,
+}: {
+  warning?: string
+  className?: string
+}) {
+  if (!warning) return null
+  return (
+    <p
+      className={cn('mt-0.5 flex items-center gap-1 text-xs text-amber-400', className)}
+    >
+      <AlertTriangle className="size-3 shrink-0" />
+      {warning}
+    </p>
+  )
+}
+
 export function FieldWarning({
   children,
   className,
