@@ -42,6 +42,7 @@ const UAC_DEFAULTS: RawVMFormValues = {
   sip_password: '123456',
   cps: '1',
   hold_time_seconds: '5',
+  ramp_up_seconds: '5',
   metrics_port: '8082',
   peer_stop_url: 'http://127.0.0.1:8081/api/test/stop',
   traffic_mode: 'smoke',
@@ -65,6 +66,7 @@ const UAS_DEFAULTS: RawVMFormValues = {
   sip_password: '123456',
   cps: '1',
   hold_time_seconds: '5',
+  ramp_up_seconds: '0',
   metrics_port: '8081',
   peer_stop_url: '',
   traffic_mode: 'smoke',
@@ -76,7 +78,7 @@ const UAS_DEFAULTS: RawVMFormValues = {
 const UAC_FIELDS = [
   'vm_id', 'vm_ip', 'uac_ext_start', 'uac_ext_end', 'uas_ext_start', 'uas_ext_end',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
-  'cps', 'hold_time_seconds', 'metrics_port', 'traffic_mode', 'call_count',
+  'cps', 'hold_time_seconds', 'ramp_up_seconds', 'metrics_port', 'traffic_mode', 'call_count',
   'duration_hours',
 ]
 const UAS_FIELDS = UAC_FIELDS.filter(
@@ -105,6 +107,7 @@ function parseRaw(raw: RawVMFormValues, role: 'UAC' | 'UAS'): unknown {
     sip_password: raw.sip_password,
     cps: parseFloat(raw.cps) || 0,
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
+    ramp_up_seconds: role === 'UAC' && raw.ramp_up_seconds !== '' ? parseFloat(raw.ramp_up_seconds) : undefined,
     metrics_port: parseInt(raw.metrics_port) || 0,
     peer_stop_url: raw.peer_stop_url || undefined,
     traffic_mode: role === 'UAC' ? raw.traffic_mode || undefined : undefined,

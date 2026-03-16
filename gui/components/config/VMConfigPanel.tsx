@@ -35,6 +35,7 @@ export type RawVMFormValues = {
   sip_password: string
   cps: string
   hold_time_seconds: string
+  ramp_up_seconds: string
   metrics_port: string
   peer_stop_url: string
   traffic_mode: TrafficMode
@@ -449,6 +450,24 @@ export function VMConfigPanel({
             />
           </FormField>
         </div>
+        {isUAC && (
+          <FormField
+            label="Ramp Up (s)"
+            error={e('ramp_up_seconds')}
+            hint="Seconds to linearly ramp from 0 to full CPS at run start"
+          >
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              value={raw.ramp_up_seconds}
+              onChange={(ev) => onChange('ramp_up_seconds', ev.target.value)}
+              onBlur={() => onBlur('ramp_up_seconds')}
+              className="font-mono"
+              aria-invalid={t('ramp_up_seconds') && !!errors.ramp_up_seconds ? true : undefined}
+            />
+          </FormField>
+        )}
         <div className="space-y-1">
           <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
             <div className="flex gap-2">

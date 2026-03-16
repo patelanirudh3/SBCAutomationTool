@@ -50,6 +50,7 @@ export interface VMConfig {
   // Traffic
   cps: number
   hold_time_seconds: number
+  ramp_up_seconds?: number    // UAC only — default: 5
   metrics_port: number
   peer_stop_url?: string      // UAC only — auto-derived from UAS vm_ip + metrics_port
 

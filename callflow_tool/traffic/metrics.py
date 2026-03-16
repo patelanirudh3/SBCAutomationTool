@@ -654,6 +654,11 @@ async def start_server(
         loop="none",   # use the existing asyncio event loop
     )
     server = uvicorn.Server(server_config)
+    # Prevent uvicorn from overriding the asyncio signal handlers registered in
+    # main.py (_handle_signal / stop_event).  Without this, uvicorn's SIGINT
+    # handler fires first, shuts down the server task, and server_task.done() is
+    # True before the GUI-drain window can start.
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
 
     server_task = asyncio.create_task(
         _serve_nofail(server),
@@ -716,6 +721,9 @@ async def start_api_only_server(
         log_level="warning", loop="none",
     )
     server = uvicorn.Server(server_config)
+    # Same rationale as start_server: prevent uvicorn from overriding our asyncio
+    # signal handlers so the GUI-drain window runs reliably after Ctrl+C.
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
     server_task = asyncio.create_task(_serve_nofail(server), name="metrics-http-server")
 
     log.info(
