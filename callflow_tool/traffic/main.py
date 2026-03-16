@@ -297,8 +297,10 @@ async def run(
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
         except NotImplementedError:
-            # Windows doesn't support add_signal_handler for all signals
-            signal.signal(sig, lambda s, f: stop_event.set())
+            # Windows: loop.add_signal_handler is not available; use signal.signal
+            # with call_soon_threadsafe so _handle_signal is invoked safely inside
+            # the running event loop (enabling the log message and reliable wakeup).
+            signal.signal(sig, lambda s, f, _sig=sig: loop.call_soon_threadsafe(_handle_signal, _sig))
 
     # ── Metrics collector ─────────────────────────────────────────────────
     collector = MetricsCollector(config.vm_id, config.metrics_interval)
@@ -734,7 +736,10 @@ async def run_api_only(port: int, log_level: str = "INFO", gui_drain_seconds: in
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
         except NotImplementedError:
-            signal.signal(sig, lambda s, f: stop_event.set())
+            # Windows: loop.add_signal_handler is not available; use signal.signal
+            # with call_soon_threadsafe so _handle_signal is invoked safely inside
+            # the running event loop (enabling the log message and reliable wakeup).
+            signal.signal(sig, lambda s, f, _sig=sig: loop.call_soon_threadsafe(_handle_signal, _sig))
 
     collector = MetricsCollector("unconfigured", metrics_interval=10)
     collector.set_phase("IDLE")

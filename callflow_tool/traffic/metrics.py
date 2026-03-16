@@ -654,11 +654,16 @@ async def start_server(
         loop="none",   # use the existing asyncio event loop
     )
     server = uvicorn.Server(server_config)
-    # Prevent uvicorn from overriding the asyncio signal handlers registered in
-    # main.py (_handle_signal / stop_event).  Without this, uvicorn's SIGINT
-    # handler fires first, shuts down the server task, and server_task.done() is
-    # True before the GUI-drain window can start.
-    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    # uvicorn 0.30+ installs its own SIGINT/SIGTERM handlers inside serve() via
+    # a capture_signals() context manager.  On Windows this overrides our lambda
+    # (set in main.py) so uvicorn's handle_exit fires on Ctrl+C instead of ours,
+    # shuts the server down, and server_task.done() is True by the time the
+    # GUI-drain window check runs — skipping the drain entirely.
+    # Replacing capture_signals with contextlib.nullcontext keeps our asyncio
+    # signal handlers in full control; we cancel server_task explicitly after
+    # the drain window instead.
+    import contextlib as _contextlib
+    server.capture_signals = _contextlib.nullcontext  # type: ignore[method-assign]
 
     server_task = asyncio.create_task(
         _serve_nofail(server),
@@ -721,9 +726,11 @@ async def start_api_only_server(
         log_level="warning", loop="none",
     )
     server = uvicorn.Server(server_config)
-    # Same rationale as start_server: prevent uvicorn from overriding our asyncio
-    # signal handlers so the GUI-drain window runs reliably after Ctrl+C.
-    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    # Same rationale as start_server: replace uvicorn's capture_signals() with a
+    # no-op so our asyncio signal handlers stay in control and the GUI-drain
+    # window runs reliably after Ctrl+C on both Linux and Windows.
+    import contextlib as _contextlib
+    server.capture_signals = _contextlib.nullcontext  # type: ignore[method-assign]
     server_task = asyncio.create_task(_serve_nofail(server), name="metrics-http-server")
 
     log.info(
