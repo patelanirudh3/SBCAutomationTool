@@ -711,6 +711,12 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
         ctx.state = "FAILED"
         if agents:
             await _shutdown(agents, engine, uas_engine, collector, None, config)
+    finally:
+        # Revert to console-only logging so the RotatingFileHandler releases
+        # the log file.  The process survives in COMPLETE state — without this
+        # the file stays locked until Ctrl+C / shutdown.
+        _setup_logging(ctx.log_level)
+        log.info("Log file released — process ready for new run or shutdown")
 
 
 # ---------------------------------------------------------------------------
@@ -720,31 +726,35 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
 async def run_api_only(port: int, log_level: str = "INFO", gui_drain_seconds: int = 15) -> int:
     """
     Start a bare FastAPI server that waits for:
-      1. PUT /api/config  → receive and write VM config
+      1. PUT /api/config      → receive and write VM config
       2. POST /api/test/start → trigger the full traffic lifecycle
+      3. POST /api/test/reset → reset state for a new run
+      4. POST /api/shutdown   → exit the process
 
-    This is the GUI-driven entry point.  No config file is needed at startup.
+    Traffic stop (/api/test/stop) only stops the SIP lifecycle — the process
+    stays alive so the GUI can fetch final data and start new runs.
+    Only Ctrl+C, SIGTERM, or POST /api/shutdown exits the process.
     """
-    stop_event = asyncio.Event()
+    stop_event = asyncio.Event()          # stops traffic lifecycle
+    process_exit_event = asyncio.Event()  # exits the entire process
     loop = asyncio.get_event_loop()
 
     def _handle_signal(sig):
         log.info("Received signal %s, initiating shutdown…", sig.name)
         stop_event.set()
+        process_exit_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
         except NotImplementedError:
-            # Windows: loop.add_signal_handler is not available; use signal.signal
-            # with call_soon_threadsafe so _handle_signal is invoked safely inside
-            # the running event loop (enabling the log message and reliable wakeup).
             signal.signal(sig, lambda s, f, _sig=sig: loop.call_soon_threadsafe(_handle_signal, _sig))
 
     collector = MetricsCollector("unconfigured", metrics_interval=10)
     collector.set_phase("IDLE")
 
     ctx = ProcessContext(collector=collector, stop_event=stop_event, port=port)
+    ctx.process_exit_event = process_exit_event
     ctx.log_level = log_level
 
     async def _do_start():
@@ -764,21 +774,26 @@ async def run_api_only(port: int, log_level: str = "INFO", gui_drain_seconds: in
     log.info("  1. GUI pushes config:  PUT  /api/config")
     log.info("  2. GUI triggers start: POST /api/test/start")
     log.info("  3. GUI monitors:       GET  /api/test/status  |  WS /metrics/stream")
-    log.info("Press Ctrl+C to exit.")
+    log.info("  4. New run:            POST /api/test/reset")
+    log.info("  5. Exit process:       POST /api/shutdown  |  Ctrl+C")
     log.info("=" * 60)
 
-    # Wait for process exit signal (Ctrl+C, SIGTERM, or POST /api/test/stop)
-    await stop_event.wait()
+    # Wait for explicit process exit (Ctrl+C, SIGTERM, or POST /api/shutdown).
+    # Traffic stop (/api/test/stop) does NOT set this event — the process
+    # stays alive in COMPLETE state so the GUI can fetch final data and
+    # the operator can start new runs without restarting processes.
+    await process_exit_event.wait()
 
-    # If lifecycle is still running, give it time to do graceful shutdown
+    # If lifecycle is still running, ensure it gets the stop signal and wait
     if ctx._lifecycle_task and not ctx._lifecycle_task.done():
         log.info("Waiting for traffic lifecycle to complete shutdown…")
+        stop_event.set()
         try:
             await asyncio.wait_for(ctx._lifecycle_task, timeout=60.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             log.warning("Lifecycle task did not finish in time")
 
-    # Keep server alive for GUI to fetch final data
+    # Brief drain so GUI can fetch last data before process dies
     if gui_drain_seconds > 0 and server_task and not server_task.done():
         log.info("GUI drain: keeping server alive for %ds…", gui_drain_seconds)
         try:

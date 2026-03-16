@@ -51,7 +51,8 @@ class ProcessContext:
         port: int,
     ) -> None:
         self.collector = collector
-        self.stop_event = stop_event
+        self.stop_event = stop_event              # signals traffic lifecycle to stop
+        self.process_exit_event = asyncio.Event() # signals process to exit (Ctrl+C, /api/shutdown)
         self.port = port
         self.config: Optional[Any] = None        # set by PUT /api/config
         self.state: str = "IDLE"                  # IDLE → CONFIGURED → RUNNING → COMPLETE / FAILED
@@ -308,6 +309,29 @@ class MetricsCollector:
         if q in self._subscribers:
             self._subscribers.remove(q)
 
+    async def reset(self) -> None:
+        """Clear all accumulated metrics state so a new run starts from zero."""
+        async with self._lock:
+            self._calls_attempted = 0
+            self._calls_completed = 0
+            self._calls_failed = 0
+            self._pdd_samples.clear()
+            self._hold_samples.clear()
+            self._total_samples.clear()
+            self._window_start = time.monotonic()
+            self._window_calls = 0
+            self._concurrent_calls = 0
+            self._socket_count = 0
+            self._registered_count = 0
+            self._subscribed_count = 0
+            self._phase = "IDLE"
+            self._run_start = 0.0
+            self._running = False
+            self._call_results.clear()
+            self._concurrent_provider = None
+            self._vm_id = "unconfigured"
+            self._latest = TrafficMetrics(vm_id="unconfigured")
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app factory
@@ -507,13 +531,79 @@ def build_app(
     # ── POST /api/test/stop ──────────────────────────────────────────────
     @app.post("/api/test/stop")
     async def test_stop():
-        cfg = _effective_config()
-        if cfg and cfg.is_uas:
-            log.info("Received API signal to stop from UAC — initiating graceful shutdown")
+        """
+        Stop the traffic lifecycle (SIP cleanup) but keep the process alive.
+        The metrics server continues serving so the GUI can fetch final data
+        and a new run can be started via /api/test/reset + /api/test/start.
+        """
+        if process_ctx:
+            cfg = _effective_config()
+            if cfg and cfg.is_uas:
+                log.info("Received API signal to stop from UAC — stopping traffic lifecycle")
+            process_ctx.stop_event.set()
+            return {"status": "stopping", "state": process_ctx.state}
+
+        # CLI mode — stop_callback triggers full shutdown (original behavior)
         if stop_callback:
             asyncio.create_task(stop_callback())
             return {"status": "stopping"}
         return {"status": "no_stop_callback_registered"}
+
+    # ── POST /api/test/reset ────────────────────────────────────────────
+    @app.post("/api/test/reset")
+    async def test_reset():
+        """
+        Reset state from COMPLETE/FAILED → IDLE so a new run can begin.
+        Clears metrics, config, and the stop event.  The process stays alive.
+        """
+        if not process_ctx:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Reset not supported in CLI mode"},
+            )
+        if process_ctx.state == "RUNNING":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Cannot reset while traffic is running — stop first"},
+            )
+        if process_ctx.state not in ("COMPLETE", "FAILED", "CONFIGURED"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Nothing to reset: state is '{process_ctx.state}'"},
+            )
+
+        process_ctx.state = "IDLE"
+        process_ctx.config = None
+        process_ctx.yaml_path = None
+        process_ctx._lifecycle_task = None
+        process_ctx.stop_event.clear()
+
+        await collector.reset()
+
+        log.info("State reset to IDLE — ready for new config push")
+        return {"status": "reset", "state": "IDLE"}
+
+    # ── POST /api/shutdown ────────────────────────────────────────────
+    @app.post("/api/shutdown")
+    async def shutdown():
+        """
+        Gracefully shut down the entire process: stop traffic (if running),
+        drain, then exit.  Use Ctrl+C for the same effect from the terminal.
+        """
+        if process_ctx:
+            log.info("Shutdown requested via API — stopping traffic and exiting process")
+            process_ctx.stop_event.set()
+            process_ctx.process_exit_event.set()
+            return JSONResponse(
+                status_code=202,
+                content={"status": "shutting_down", "state": process_ctx.state},
+            )
+
+        # CLI mode
+        if stop_callback:
+            asyncio.create_task(stop_callback())
+            return JSONResponse(status_code=202, content={"status": "shutting_down"})
+        return JSONResponse(status_code=400, content={"error": "Shutdown not supported"})
 
     # ── GET /api/calls ────────────────────────────────────────────────────
     @app.get("/api/calls")

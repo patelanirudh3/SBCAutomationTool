@@ -250,6 +250,40 @@ export async function stopTestFor(
 }
 
 // ---------------------------------------------------------------------------
+// Per-VM reset — POST /api/test/reset on a specific VM backend
+// ---------------------------------------------------------------------------
+
+export async function resetTestFor(
+  ip: string,
+  port: number
+): Promise<{ status: string; state?: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/test/reset`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string; state?: string }
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM shutdown — POST /api/shutdown on a specific VM backend
+// ---------------------------------------------------------------------------
+
+export async function shutdownFor(
+  ip: string,
+  port: number
+): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/shutdown`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+// ---------------------------------------------------------------------------
 // URL builders — used by WS hooks and any per-VM REST calls
 // ---------------------------------------------------------------------------
 

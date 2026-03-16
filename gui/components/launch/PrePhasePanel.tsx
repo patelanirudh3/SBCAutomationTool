@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { ChecklistItem, type ChecklistState } from './ChecklistItem'
 import { LaunchCountdown } from './LaunchCountdown'
 import { useTrafficStore } from '@/store/traffic'
-import { pingVM, getMetricsFor, startTestFor } from '@/lib/api'
+import { getMetricsFor, startTestFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { VMRole } from '@/types'
 
@@ -428,20 +428,13 @@ export function PrePhasePanel() {
     if (!pair) return
     setUasPingError(null)
 
-    // Verify backend is reachable, then trigger the traffic lifecycle
-    const ok = await pingVM(pair.uas.vm_ip, pair.uas.metrics_port)
-    if (!ok) {
-      setUasPingError(
-        `Could not reach UAS at http://${pair.uas.vm_ip}:${pair.uas.metrics_port} — ensure the --api-only process is running`
-      )
-      return
-    }
-
     try {
       await startTestFor(pair.uas.vm_ip, pair.uas.metrics_port)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start UAS'
-      setUasPingError(`Start UAS failed: ${msg}`)
+      setUasPingError(
+        `Could not start UAS at http://${pair.uas.vm_ip}:${pair.uas.metrics_port} — ${msg}`
+      )
       return
     }
 
@@ -453,19 +446,13 @@ export function PrePhasePanel() {
     if (!pair) return
     setUacPingError(null)
 
-    const ok = await pingVM(pair.uac.vm_ip, pair.uac.metrics_port)
-    if (!ok) {
-      setUacPingError(
-        `Could not reach UAC at http://${pair.uac.vm_ip}:${pair.uac.metrics_port} — ensure the --api-only process is running`
-      )
-      return
-    }
-
     try {
       await startTestFor(pair.uac.vm_ip, pair.uac.metrics_port)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start UAC'
-      setUacPingError(`Start UAC failed: ${msg}`)
+      setUacPingError(
+        `Could not start UAC at http://${pair.uac.vm_ip}:${pair.uac.metrics_port} — ${msg}`
+      )
       return
     }
 
