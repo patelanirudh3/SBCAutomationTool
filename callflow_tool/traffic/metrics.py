@@ -33,6 +33,34 @@ if TYPE_CHECKING:
     from .config import VMConfig
     from .extension_agent import ExtensionAgent
 
+
+# ---------------------------------------------------------------------------
+# ProcessContext — shared mutable state for GUI-driven (--api-only) mode
+# ---------------------------------------------------------------------------
+
+class ProcessContext:
+    """
+    Holds mutable state shared between the FastAPI endpoints and the
+    traffic lifecycle when running in GUI-driven (--api-only) mode.
+    """
+
+    def __init__(
+        self,
+        collector: "MetricsCollector",
+        stop_event: "asyncio.Event",
+        port: int,
+    ) -> None:
+        self.collector = collector
+        self.stop_event = stop_event              # signals traffic lifecycle to stop
+        self.process_exit_event = asyncio.Event() # signals process to exit (Ctrl+C, /api/shutdown)
+        self.port = port
+        self.config: Optional[Any] = None        # set by PUT /api/config
+        self.state: str = "IDLE"                  # IDLE → CONFIGURED → RUNNING → COMPLETE / FAILED
+        self.yaml_path: Optional[str] = None      # path to generated yaml
+        self.log_level: str = "INFO"
+        self._lifecycle_task: Optional[asyncio.Task] = None
+        self._start_func: Optional[Callable] = None   # injected by main.py
+
 log = logging.getLogger(__name__)
 
 # FastAPI / uvicorn are optional at import time so that the engine can
@@ -281,6 +309,29 @@ class MetricsCollector:
         if q in self._subscribers:
             self._subscribers.remove(q)
 
+    async def reset(self) -> None:
+        """Clear all accumulated metrics state so a new run starts from zero."""
+        async with self._lock:
+            self._calls_attempted = 0
+            self._calls_completed = 0
+            self._calls_failed = 0
+            self._pdd_samples.clear()
+            self._hold_samples.clear()
+            self._total_samples.clear()
+            self._window_start = time.monotonic()
+            self._window_calls = 0
+            self._concurrent_calls = 0
+            self._socket_count = 0
+            self._registered_count = 0
+            self._subscribed_count = 0
+            self._phase = "IDLE"
+            self._run_start = 0.0
+            self._running = False
+            self._call_results.clear()
+            self._concurrent_provider = None
+            self._vm_id = "unconfigured"
+            self._latest = TrafficMetrics(vm_id="unconfigured")
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app factory
@@ -288,8 +339,9 @@ class MetricsCollector:
 
 def build_app(
     collector: MetricsCollector,
-    config,                    # VMConfig
+    config,                    # VMConfig — may be None in api-only mode
     stop_callback: Optional[Callable] = None,
+    process_ctx: Optional["ProcessContext"] = None,
 ) -> Any:
     """
     Build and return the FastAPI application.
@@ -297,7 +349,10 @@ def build_app(
     Args:
         collector:      MetricsCollector instance.
         config:         VMConfig (for vm_id, role, ext ranges, etc.).
+                        May be None when started in --api-only mode (GUI-driven).
         stop_callback:  Async callable() to trigger graceful shutdown.
+        process_ctx:    ProcessContext for GUI-driven mode (--api-only).
+                        When set, PUT /api/config and POST /api/test/start are live.
     """
     if not _FASTAPI_AVAILABLE:
         raise ImportError("fastapi and uvicorn must be installed")
@@ -308,16 +363,20 @@ def build_app(
         version="1.0.0",
     )
 
-    # CORS — allow the Next.js GUI (localhost:3000) to fetch from this server.
-    # allow_origins="*" is safe here: this is a local dev/lab tool, not a public API.
     from fastapi.middleware.cors import CORSMiddleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    def _effective_config():
+        """Return the current config — from process_ctx (GUI-driven) or startup config (CLI)."""
+        if process_ctx and process_ctx.config:
+            return process_ctx.config
+        return config
 
     # ── GET /metrics ─────────────────────────────────────────────────────
     @app.get("/metrics")
@@ -347,42 +406,204 @@ def build_app(
     async def ping():
         """
         Lightweight health check used by the GUI reachability indicator.
-        Returns immediately — no SIP or metrics state required.
+        Returns role:'unconfigured' when started with --api-only and no config pushed yet.
         """
+        cfg = _effective_config()
+        if cfg:
+            return {
+                "reachable": True,
+                "vm_id": cfg.vm_id,
+                "role": cfg.vm_role,
+                "phase": collector.latest.phase,
+                "state": process_ctx.state if process_ctx else "CLI",
+            }
         return {
             "reachable": True,
-            "vm_id": config.vm_id,
-            "role": config.vm_role,
+            "vm_id": "unconfigured",
+            "role": "unconfigured",
             "phase": collector.latest.phase,
+            "state": process_ctx.state if process_ctx else "IDLE",
         }
 
     # ── GET /api/test/status ─────────────────────────────────────────────
     @app.get("/api/test/status")
     async def test_status():
         snap = collector.latest
+        cfg = _effective_config()
         return {
             "phase": snap.phase,
             "running": snap.running,
             "elapsed_seconds": snap.run_elapsed_seconds,
-            "vm_id": snap.vm_id,
+            "vm_id": cfg.vm_id if cfg else "unconfigured",
+            "state": process_ctx.state if process_ctx else "CLI",
+        }
+
+    # ── PUT /api/config ──────────────────────────────────────────────────
+    @app.put("/api/config")
+    async def put_config(body: dict):
+        """
+        Receive VM config from the GUI, validate it, write a YAML file,
+        and store it on the ProcessContext.  Does NOT create agents or
+        start transports — that happens on POST /api/test/start.
+        """
+        if not process_ctx:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Config push not supported in CLI mode — use YAML files"},
+            )
+
+        if process_ctx.state == "RUNNING":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Cannot push config while traffic is running"},
+            )
+
+        from .config import config_from_dict, write_config_yaml
+
+        try:
+            cfg = config_from_dict(body)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse(status_code=422, content={"error": str(exc)})
+
+        yaml_filename = f"{cfg.vm_role.lower()}.yaml"
+        try:
+            yaml_path = write_config_yaml(cfg, yaml_filename)
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"error": f"Failed to write YAML: {exc}"})
+
+        process_ctx.config = cfg
+        process_ctx.yaml_path = yaml_path
+        process_ctx.state = "CONFIGURED"
+
+        collector._vm_id = cfg.vm_id
+        collector._latest = collector._build_snapshot()
+
+        log.info(
+            "Config received from GUI: role=%s vm_id=%s ext=%d-%d → %s",
+            cfg.vm_role, cfg.vm_id,
+            cfg.uac_ext_start if cfg.is_uac else cfg.uas_ext_start,
+            cfg.uac_ext_end if cfg.is_uac else cfg.uas_ext_end,
+            yaml_path,
+        )
+
+        return {
+            "status": "configured",
+            "vm_id": cfg.vm_id,
+            "role": cfg.vm_role,
+            "yaml_path": yaml_path,
         }
 
     # ── POST /api/test/start ─────────────────────────────────────────────
     @app.post("/api/test/start")
-    async def test_start(body: dict):
-        # Config is read at startup from env/yaml. This endpoint is for
-        # the GUI coordinator to push config overrides in future phases.
+    async def test_start():
+        """
+        Trigger the full traffic lifecycle (agents → pre-phase → traffic)
+        as a background asyncio task.  Returns 202 immediately.
+        """
+        if process_ctx:
+            if process_ctx.state == "RUNNING":
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "Traffic is already running"},
+                )
+            if process_ctx.state != "CONFIGURED":
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Cannot start: state is '{process_ctx.state}', expected 'CONFIGURED'. Push config first via PUT /api/config."},
+                )
+            if not process_ctx._start_func:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Lifecycle starter not registered — internal error"},
+                )
+
+            process_ctx.state = "RUNNING"
+            await process_ctx._start_func()
+            log.info("Traffic lifecycle started via API for %s", process_ctx.config.vm_id)
+            return JSONResponse(
+                status_code=202,
+                content={"status": "started", "vm_id": process_ctx.config.vm_id},
+            )
+
+        # CLI mode fallback (existing behavior)
         return {"status": "accepted", "message": "Traffic engine controlled via CLI/env vars"}
 
     # ── POST /api/test/stop ──────────────────────────────────────────────
     @app.post("/api/test/stop")
     async def test_stop():
-        if config.is_uas:
-            log.info("Received API signal to stop from UAC — initiating graceful shutdown")
+        """
+        Stop the traffic lifecycle (SIP cleanup) but keep the process alive.
+        The metrics server continues serving so the GUI can fetch final data
+        and a new run can be started via /api/test/reset + /api/test/start.
+        """
+        if process_ctx:
+            cfg = _effective_config()
+            if cfg and cfg.is_uas:
+                log.info("Received API signal to stop from UAC — stopping traffic lifecycle")
+            process_ctx.stop_event.set()
+            return {"status": "stopping", "state": process_ctx.state}
+
+        # CLI mode — stop_callback triggers full shutdown (original behavior)
         if stop_callback:
             asyncio.create_task(stop_callback())
             return {"status": "stopping"}
         return {"status": "no_stop_callback_registered"}
+
+    # ── POST /api/test/reset ────────────────────────────────────────────
+    @app.post("/api/test/reset")
+    async def test_reset():
+        """
+        Reset state from COMPLETE/FAILED → IDLE so a new run can begin.
+        Clears metrics, config, and the stop event.  The process stays alive.
+        """
+        if not process_ctx:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Reset not supported in CLI mode"},
+            )
+        if process_ctx.state == "RUNNING":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Cannot reset while traffic is running — stop first"},
+            )
+        if process_ctx.state not in ("COMPLETE", "FAILED", "CONFIGURED"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Nothing to reset: state is '{process_ctx.state}'"},
+            )
+
+        process_ctx.state = "IDLE"
+        process_ctx.config = None
+        process_ctx.yaml_path = None
+        process_ctx._lifecycle_task = None
+        process_ctx.stop_event.clear()
+
+        await collector.reset()
+
+        log.info("State reset to IDLE — ready for new config push")
+        return {"status": "reset", "state": "IDLE"}
+
+    # ── POST /api/shutdown ────────────────────────────────────────────
+    @app.post("/api/shutdown")
+    async def shutdown():
+        """
+        Gracefully shut down the entire process: stop traffic (if running),
+        drain, then exit.  Use Ctrl+C for the same effect from the terminal.
+        """
+        if process_ctx:
+            log.info("Shutdown requested via API — stopping traffic and exiting process")
+            process_ctx.stop_event.set()
+            process_ctx.process_exit_event.set()
+            return JSONResponse(
+                status_code=202,
+                content={"status": "shutting_down", "state": process_ctx.state},
+            )
+
+        # CLI mode
+        if stop_callback:
+            asyncio.create_task(stop_callback())
+            return JSONResponse(status_code=202, content={"status": "shutting_down"})
+        return JSONResponse(status_code=400, content={"error": "Shutdown not supported"})
 
     # ── GET /api/calls ────────────────────────────────────────────────────
     @app.get("/api/calls")
@@ -401,7 +622,6 @@ def build_app(
             elif getattr(r, "rtp_tx_pkts", 0) > 0 or getattr(r, "rtp_rx_pkts", 0) > 0:
                 media = "MEDIA_PARTIAL"
 
-            # Prefer timestamp from the result object if available
             ts_raw = getattr(r, "timestamp", getattr(r, "end_time", None))
             if hasattr(ts_raw, "isoformat"):
                 ts = ts_raw.isoformat()
@@ -429,14 +649,17 @@ def build_app(
     @app.get("/api/vms")
     async def list_vms():
         snap = collector.latest
+        cfg = _effective_config()
+        if not cfg:
+            return [{"vm_id": "unconfigured", "role": "unconfigured", "status": snap.phase}]
         return [
             {
-                "vm_id": config.vm_id,
-                "role": config.vm_role,
+                "vm_id": cfg.vm_id,
+                "role": cfg.vm_role,
                 "ext_range": (
-                    f"{config.uac_ext_start}-{config.uac_ext_end}"
-                    if config.is_uac
-                    else f"{config.uas_ext_start}-{config.uas_ext_end}"
+                    f"{cfg.uac_ext_start}-{cfg.uac_ext_end}"
+                    if cfg.is_uac
+                    else f"{cfg.uas_ext_start}-{cfg.uas_ext_end}"
                 ),
                 "status": snap.phase,
                 "cps": snap.cps_actual,
@@ -521,6 +744,16 @@ async def start_server(
         loop="none",   # use the existing asyncio event loop
     )
     server = uvicorn.Server(server_config)
+    # uvicorn 0.30+ installs its own SIGINT/SIGTERM handlers inside serve() via
+    # a capture_signals() context manager.  On Windows this overrides our lambda
+    # (set in main.py) so uvicorn's handle_exit fires on Ctrl+C instead of ours,
+    # shuts the server down, and server_task.done() is True by the time the
+    # GUI-drain window check runs — skipping the drain entirely.
+    # Replacing capture_signals with contextlib.nullcontext keeps our asyncio
+    # signal handlers in full control; we cancel server_task explicitly after
+    # the drain window instead.
+    import contextlib as _contextlib
+    server.capture_signals = _contextlib.nullcontext  # type: ignore[method-assign]
 
     server_task = asyncio.create_task(
         _serve_nofail(server),
@@ -533,6 +766,68 @@ async def start_server(
         port,
     )
 
+    return server_task
+
+
+# ---------------------------------------------------------------------------
+# API-only server startup (GUI-driven mode — no VMConfig at startup)
+# ---------------------------------------------------------------------------
+
+async def start_api_only_server(
+    ctx: "ProcessContext",
+    stop_callback: Optional[Callable] = None,
+) -> "asyncio.Task | None":
+    """
+    Start FastAPI server for --api-only mode.  No VMConfig is needed at
+    startup — config arrives later via PUT /api/config.
+    """
+    if not _FASTAPI_AVAILABLE:
+        log.warning("Metrics server not started: fastapi/uvicorn not installed")
+        return None
+
+    import socket as _socket
+
+    port = ctx.port
+    for _ in range(10):
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                _s.bind(("0.0.0.0", port))
+                break
+            except OSError:
+                log.warning("Port %d in use, trying %d", port, port + 1)
+                port += 1
+    else:
+        log.warning("Could not find a free port near %d", ctx.port)
+        return None
+
+    ctx.port = port
+
+    app = build_app(
+        ctx.collector, config=None,
+        stop_callback=stop_callback,
+        process_ctx=ctx,
+    )
+
+    asyncio.create_task(ctx.collector.run_push_loop(), name="metrics-push-loop")
+
+    server_config = uvicorn.Config(
+        app=app, host="0.0.0.0", port=port,
+        log_level="warning", loop="none",
+    )
+    server = uvicorn.Server(server_config)
+    # Same rationale as start_server: replace uvicorn's capture_signals() with a
+    # no-op so our asyncio signal handlers stay in control and the GUI-drain
+    # window runs reliably after Ctrl+C on both Linux and Windows.
+    import contextlib as _contextlib
+    server.capture_signals = _contextlib.nullcontext  # type: ignore[method-assign]
+    server_task = asyncio.create_task(_serve_nofail(server), name="metrics-http-server")
+
+    log.info(
+        "API-only server on http://0.0.0.0:%d "
+        "| PUT /api/config | POST /api/test/start | GET /api/ping",
+        port,
+    )
     return server_task
 
 

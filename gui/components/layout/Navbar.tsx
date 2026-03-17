@@ -3,6 +3,7 @@
 import { Activity } from 'lucide-react'
 import { useTrafficStore } from '@/store/traffic'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { SessionMenu } from './SessionMenu'
 import type { RunPhase } from '@/types'
 import { cn } from '@/lib/utils'
 
@@ -41,7 +42,7 @@ export function Navbar() {
       <div className="flex items-center gap-2.5">
         <Activity className="size-5 text-emerald-400" strokeWidth={2.5} />
         <span className="font-bold tracking-tight text-base text-foreground">
-          CCI Traffic
+          CCI Studio
         </span>
       </div>
 
@@ -50,7 +51,7 @@ export function Navbar() {
 
       {/* Phase badge */}
       <div className="flex items-center gap-2">
-        <span className="text-sm font-medium text-foreground/70">Phase</span>
+        <span className="text-sm font-semibold text-cyan-400">Phase</span>
         <span className={cn('text-sm font-semibold font-mono', PHASE_COLOR[phase])}>
           {PHASE_LABEL[phase]}
         </span>
@@ -58,6 +59,12 @@ export function Navbar() {
 
       {/* Spacer */}
       <div className="flex-1" />
+
+      {/* Session management dropdown */}
+      <SessionMenu />
+
+      {/* Divider */}
+      <div className="h-5 w-px bg-border/50" />
 
       {/* WS status dot */}
       <Tooltip>
