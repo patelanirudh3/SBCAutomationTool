@@ -2,10 +2,11 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Settings2, Pencil, Check, ChevronDown } from 'lucide-react'
+import { Settings2, Pencil, Check, ChevronDown, Info } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTrafficStore } from '@/store/traffic'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 import type { AdvancedSettings as AdvancedSettingsType } from '@/types'
@@ -24,6 +25,7 @@ function AdvancedField({
   step,
   error,
   hint,
+  tooltip,
   onChange,
 }: {
   label: string
@@ -33,11 +35,26 @@ function AdvancedField({
   step?: number
   error?: string
   hint?: string
+  tooltip?: string
   onChange: (v: number) => void
 }) {
   return (
     <div className="space-y-1">
-      <Label className="text-xs font-medium text-foreground/80">{label}</Label>
+      <div className="flex items-center gap-1.5">
+        <Label className="text-xs font-semibold text-slate-200/90">{label}</Label>
+        {tooltip && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+                <Info className="size-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+              {tooltip}
+            </TooltipContent>
+          </Tooltip>
+        )}
+      </div>
       <Input
         type="number"
         min={min ?? 1}
@@ -46,8 +63,9 @@ function AdvancedField({
         disabled={disabled}
         onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
         className={cn(
-          'font-mono',
-          disabled && 'cursor-default opacity-60'
+          'font-mono border-zinc-600/60 bg-zinc-800/70 text-slate-100',
+          'focus-visible:border-violet-500/60 focus-visible:ring-1 focus-visible:ring-violet-500/30',
+          disabled && 'cursor-default opacity-55'
         )}
       />
       {error && <FieldError error={error} />}
@@ -74,9 +92,9 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       {tokens.map((tok, i) => (
         <span key={i} className="flex items-center gap-2">
-          <span className="font-mono text-[11px] text-foreground/70">{tok}</span>
+          <span className="font-mono text-[11px] font-medium text-cyan-300/80">{tok}</span>
           {i < tokens.length - 1 && (
-            <span className="text-muted-foreground/40">·</span>
+            <span className="text-violet-400/40">·</span>
           )}
         </span>
       ))}
@@ -166,7 +184,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
   return (
     <div
       ref={panelRef}
-      className="border-t-2 border-violet-500/40 bg-card/90 shadow-[0_-1px_0_oklch(0.30_0.02_250)]"
+      className={cn(
+        'border-t-2 border-violet-500/50 bg-violet-950/20',
+        'shadow-[0_-1px_12px_oklch(0.35_0.10_290/0.25)]',
+        'ring-1 ring-violet-500/15',
+      )}
     >
       {/* ── Header row ──────────────────────────────────────────── */}
       <div className="flex items-center justify-between px-5 py-2.5">
@@ -247,10 +269,10 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
               <div className="grid grid-cols-2 gap-x-8 gap-y-3">
                 {/* Left column — Registration */}
                 <div className="space-y-3">
-                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-foreground/80">
-                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400/80" />
+                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-blue-300">
+                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
                     Registration
-                    <span className="h-px flex-1 bg-border/60" />
+                    <span className="h-px flex-1 bg-blue-500/20" />
                   </h3>
                   <AdvancedField
                     label="Register Rate (reg/s)"
@@ -278,16 +300,17 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
                 {/* Right column — RTP */}
                 <div className="space-y-3">
-                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-foreground/80">
-                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-violet-400/80" />
+                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-violet-300">
+                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-violet-400" />
                     RTP
-                    <span className="h-px flex-1 bg-border/60" />
+                    <span className="h-px flex-1 bg-violet-500/20" />
                   </h3>
                   <AdvancedField
                     label="RTP Burst Duration (s)"
                     value={draft.rtp_burst_seconds}
                     disabled={disabled}
                     error={errors.rtp_burst_seconds}
+                    tooltip="Duration of the high-rate RTP burst at the start and end of each call. Example: for a 180s hold, a burst of 2s means RTP fires at 50 pps during 0–2s and 178–180s. The middle period (2–178s) uses RTP Keepalive Interval for low-rate heartbeat packets."
                     onChange={set('rtp_burst_seconds')}
                   />
                   <AdvancedField
@@ -302,6 +325,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                     value={draft.rtp_keepalive_interval}
                     disabled={disabled}
                     error={errors.rtp_keepalive_interval}
+                    tooltip="Interval between low-rate RTP heartbeat packets during the middle of a call (between the start and end bursts). Example: 3s interval during the 2–178s mid-period of a 180s call."
                     onChange={set('rtp_keepalive_interval')}
                   />
                 </div>

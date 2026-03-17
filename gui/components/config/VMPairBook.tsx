@@ -189,6 +189,30 @@ export function VMPairBook() {
     setUacRaw((prev) => ({ ...prev, peer_stop_url: url }))
   }, [uasRaw.vm_ip, uasRaw.metrics_port])
 
+  // Keep the store's pair connection info (ip, port, vm_id) in sync with the
+  // live form values so SessionMenu always shows the current typed-in values —
+  // not just the last Save & Continue snapshot.
+  useEffect(() => {
+    const pair = pairs[activePairIndex]
+    if (!pair) return
+    const uacPort = parseInt(uacRaw.metrics_port) || pair.uac.metrics_port
+    const uasPort = parseInt(uasRaw.metrics_port) || pair.uas.metrics_port
+    if (
+      pair.uac.vm_ip === uacRaw.vm_ip &&
+      pair.uac.metrics_port === uacPort &&
+      pair.uac.vm_id === uacRaw.vm_id &&
+      pair.uas.vm_ip === uasRaw.vm_ip &&
+      pair.uas.metrics_port === uasPort &&
+      pair.uas.vm_id === uasRaw.vm_id
+    ) return
+    updatePair(activePairIndex, {
+      ...pair,
+      uac: { ...pair.uac, vm_ip: uacRaw.vm_ip, metrics_port: uacPort, vm_id: uacRaw.vm_id },
+      uas: { ...pair.uas, vm_ip: uasRaw.vm_ip, metrics_port: uasPort, vm_id: uasRaw.vm_id },
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uacRaw.vm_ip, uacRaw.metrics_port, uacRaw.vm_id, uasRaw.vm_ip, uasRaw.metrics_port, uasRaw.vm_id])
+
   // Re-validate on every raw change (clear passed status if data changes post-validation)
   useEffect(() => {
     setValidationPassed(false)

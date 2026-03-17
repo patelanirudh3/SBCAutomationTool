@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Square, Loader2 } from 'lucide-react'
+import { WifiOff, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 import { Navbar } from '@/components/layout/Navbar'
 import { StepIndicator } from '@/components/layout/StepIndicator'
@@ -100,25 +101,36 @@ function LiveDashboard({
         <ASRGauge asr={uacMetrics.asr} className="flex-1 min-w-0" />
         <RunTimer elapsed={uacMetrics.run_elapsed_seconds} />
         {showStopBtn && (
-          <Button
+          <button
             onClick={onStop}
             disabled={stopping}
-            variant="outline"
-            size="sm"
-            className="gap-2 border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-50"
+            className={cn(
+              'group relative flex size-20 shrink-0 flex-col items-center justify-center rounded-full',
+              'bg-rose-600 text-white shadow-[0_0_24px_oklch(0.50_0.22_15/0.55)]',
+              'border-4 border-rose-400/40',
+              'transition-all duration-150',
+              'hover:bg-rose-500 hover:shadow-[0_0_32px_oklch(0.55_0.24_15/0.70)] hover:scale-105',
+              'active:scale-95 active:shadow-[0_0_14px_oklch(0.45_0.20_15/0.45)]',
+              'disabled:cursor-not-allowed disabled:opacity-60 disabled:shadow-none disabled:scale-100',
+            )}
           >
             {stopping ? (
               <>
-                <Loader2 className="size-3.5 animate-spin" />
-                Stopping…
+                <Loader2 className="size-5 animate-spin mb-0.5" />
+                <span className="text-[9px] font-bold uppercase tracking-widest leading-none">
+                  Stopping
+                </span>
               </>
             ) : (
               <>
-                <Square className="size-3.5" />
-                Stop Traffic
+                {/* Outer ring pulse */}
+                <span className="absolute inset-0 rounded-full bg-rose-500/30 animate-ping group-hover:hidden" />
+                <span className="relative text-[11px] font-black uppercase tracking-wider leading-tight text-center px-1">
+                  Stop<br />Traffic
+                </span>
               </>
             )}
-          </Button>
+          </button>
         )}
       </div>
 

@@ -245,16 +245,57 @@ export function VMConfigPanel({
       <div className="space-y-3">
         <SectionHeader>VM Connection</SectionHeader>
 
-        <FormField label="IP Address" error={e('vm_ip')}>
-          <Input
-            value={raw.vm_ip}
-            onChange={(ev) => onChange('vm_ip', ev.target.value)}
-            onBlur={handleIpBlur}
-            placeholder="127.0.0.1"
-            className="font-mono"
-            aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
-          />
-        </FormField>
+        {/* IP + Metrics Port side-by-side — they belong together */}
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label="IP Address" error={e('vm_ip')}>
+            <Input
+              value={raw.vm_ip}
+              onChange={(ev) => onChange('vm_ip', ev.target.value)}
+              onBlur={handleIpBlur}
+              placeholder="127.0.0.1"
+              className="font-mono"
+              aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
+            />
+          </FormField>
+          <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                value={raw.metrics_port}
+                onChange={(ev) => onChange('metrics_port', ev.target.value)}
+                onBlur={handleMetricsPortBlur}
+                placeholder={isUAC ? '8082' : '8081'}
+                className="font-mono"
+                aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
+              />
+              <TestReachabilityButton
+                vmIp={raw.vm_ip}
+                metricsPort={raw.metrics_port}
+                reachability={reachability}
+                onTest={() => onCheckReachability()}
+              />
+            </div>
+          </FormField>
+        </div>
+
+        {/* Health check URL + reachability status */}
+        <div className="space-y-1">
+          <FieldHint>
+            {`Health check: http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
+          </FieldHint>
+          <FieldWarning>
+            The FastAPI backend must already be running on this port before the
+            GUI can connect. Start it first:{' '}
+            <span className="font-mono">
+              python -m callflow_tool.traffic.main --api-only --port {isUAC ? '8082' : '8081'}
+            </span>
+          </FieldWarning>
+          {reachability && (
+            <div className="pt-0.5">
+              <ReachabilityIndicator status={reachability} />
+            </div>
+          )}
+        </div>
 
         <FormField label="SSH User (optional)" error={e('ssh_user')}>
           <Input
@@ -468,43 +509,6 @@ export function VMConfigPanel({
             />
           </FormField>
         )}
-        <div className="space-y-1">
-          <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
-            <div className="flex gap-2">
-              <Input
-                type="number"
-                value={raw.metrics_port}
-                onChange={(ev) => onChange('metrics_port', ev.target.value)}
-                onBlur={handleMetricsPortBlur}
-                placeholder={isUAC ? '8082' : '8081'}
-                className="font-mono flex-1"
-                aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
-              />
-              <TestReachabilityButton
-                vmIp={raw.vm_ip}
-                metricsPort={raw.metrics_port}
-                reachability={reachability}
-                onTest={() => onCheckReachability()}
-              />
-            </div>
-          </FormField>
-          <FieldHint>
-            {`Health check: http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
-          </FieldHint>
-          <FieldWarning>
-            The FastAPI backend must already be running on this port before the
-            GUI can connect. Start it first:
-            {' '}
-            <span className="font-mono">
-              python -m callflow_tool.traffic.main --config {isUAC ? 'uac' : 'uas'}.yaml --api-only
-            </span>
-          </FieldWarning>
-          {reachability && (
-            <div className="pt-0.5">
-              <ReachabilityIndicator status={reachability} />
-            </div>
-          )}
-        </div>
       </div>
 
       {/* ── UAC-only: Run Control + Peer Stop URL ────────────── */}

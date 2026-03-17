@@ -73,8 +73,8 @@ export function StepIndicator() {
               </div>
               <span
                 className={cn(
-                  'text-[10px] font-medium hidden sm:block transition-colors duration-300',
-                  isActive ? 'text-emerald-400' : isCompleted ? 'text-emerald-400/70' : 'text-muted-foreground'
+                  'text-xs font-semibold hidden sm:block transition-colors duration-300',
+                  isActive ? 'text-emerald-400' : isCompleted ? 'text-emerald-300/80' : 'text-slate-400'
                 )}
               >
                 {step.label}
