@@ -96,10 +96,9 @@ def _setup_logging(level: str = "INFO", log_file: str = "") -> None:
         )
 
 
-def _auto_log_file(vm_id: str, log_dir: str = "logs") -> str:
-    """Generate a timestamped log file path: logs/traffic_<vm_id>_YYYYMMDD_HHMMSS.log"""
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(log_dir, f"traffic_{vm_id}_{ts}.log")
+def _auto_log_file(run_id: str, pair_id: str, vm_id: str, log_dir: str = "logs") -> str:
+    """Generate log file path: logs/traffic_{run_id}_{pair_id}_{vm_id}.log"""
+    return os.path.join(log_dir, f"traffic_{run_id}_{pair_id}_{vm_id}.log")
 
 
 # Bootstrap console-only logging until config (and vm_id) are available.
@@ -270,6 +269,8 @@ async def run(
     no_unregister: bool = False,
     api_only: bool = False,
     gui_drain_seconds: int = 15,
+    run_id: str = "",
+    pair_id: str = "pair-1",
 ) -> int:
     """
     Full lifecycle coroutine. Returns exit code (0 = success).
@@ -336,6 +337,11 @@ async def run(
         log.info("API-ONLY shutdown complete")
         return 0
 
+    # CLI mode: use provided run_id or generate default
+    if not run_id:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"run-cli-{ts}"
+
     # ── Create agents ─────────────────────────────────────────────────────
     agents = _create_agents(config)
     log.info("Starting %d extension agent transports…", len(agents))
@@ -356,7 +362,7 @@ async def run(
         )
     except RuntimeError as exc:
         log.critical("Pre-phase failed: %s", exc)
-        await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
+        await _shutdown(agents, None, None, collector, server_task, config, run_id, pair_id, no_unregister=no_unregister)
         await _cancel_server(server_task)
         return 1
 
@@ -378,7 +384,7 @@ async def run(
         log.info("=" * 60)
         collector.set_phase("READY_PRE_PHASE_ONLY")
         await stop_event.wait()
-        await _shutdown(agents, None, None, collector, server_task, config, no_unregister=no_unregister)
+        await _shutdown(agents, None, None, collector, server_task, config, run_id, pair_id, no_unregister=no_unregister)
         await _cancel_server(server_task)
         return 0
 
@@ -392,6 +398,7 @@ async def run(
         engine = CallEngine(
             agents, config,
             on_call_complete=collector.record_call,
+            on_call_attempt=collector.record_attempt,
             max_calls=max_calls,
         )
         collector.set_concurrent_provider(lambda: engine.active_call_count)
@@ -429,7 +436,7 @@ async def run(
     collector.set_running(False)
     log.info("Initiating graceful shutdown…")
 
-    await _shutdown(agents, engine, uas_engine, collector, server_task, config, no_unregister=no_unregister)
+    await _shutdown(agents, engine, uas_engine, collector, server_task, config, run_id, pair_id, no_unregister=no_unregister)
 
     elapsed = time.monotonic() - overall_start
     snap = collector.latest
@@ -511,6 +518,8 @@ async def _shutdown(
     collector: MetricsCollector,
     server_task,
     config: VMConfig,
+    run_id: str,
+    pair_id: str,
     no_unregister: bool = False,
 ) -> None:
     """
@@ -577,6 +586,7 @@ async def _shutdown(
 
     write_traffic_summary(
         collector, config, log_dir="logs",
+        run_id=run_id, pair_id=pair_id,
         engine=engine, uas_engine=uas_engine, agents=agents,
     )
 
@@ -603,8 +613,8 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
     collector = ctx.collector
     stop_event = ctx.stop_event
 
-    # Setup file logging now that we have a vm_id
-    log_file = _auto_log_file(config.vm_id)
+    # Setup file logging now that we have run_id, pair_id, vm_id
+    log_file = _auto_log_file(ctx.run_id, ctx.pair_id, config.vm_id)
     _setup_logging(ctx.log_level, log_file=log_file)
 
     # Derive max_calls the same way the CLI does
@@ -647,7 +657,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
             log.critical("Pre-phase failed: %s", exc)
             collector.set_phase("FAILED")
             ctx.state = "FAILED"
-            await _shutdown(agents, None, None, collector, None, config)
+            await _shutdown(agents, None, None, collector, None, config, ctx.run_id, ctx.pair_id)
             return
 
         collector.update_counts(
@@ -664,6 +674,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
             engine = CallEngine(
                 agents, config,
                 on_call_complete=collector.record_call,
+                on_call_attempt=collector.record_attempt,
                 max_calls=max_calls,
             )
             collector.set_concurrent_provider(lambda: engine.active_call_count)
@@ -696,7 +707,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
         collector.set_running(False)
         log.info("Initiating graceful shutdown…")
 
-        await _shutdown(agents, engine, uas_engine, collector, None, config)
+        await _shutdown(agents, engine, uas_engine, collector, None, config, ctx.run_id, ctx.pair_id)
 
         snap = collector.latest
         log.info(
@@ -710,7 +721,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
         collector.set_phase("FAILED")
         ctx.state = "FAILED"
         if agents:
-            await _shutdown(agents, engine, uas_engine, collector, None, config)
+            await _shutdown(agents, engine, uas_engine, collector, None, config, ctx.run_id, ctx.pair_id)
     finally:
         # Revert to console-only logging so the RotatingFileHandler releases
         # the log file.  The process survives in COMPLETE state — without this
@@ -750,7 +761,7 @@ async def run_api_only(port: int, log_level: str = "INFO", gui_drain_seconds: in
         except NotImplementedError:
             signal.signal(sig, lambda s, f, _sig=sig: loop.call_soon_threadsafe(_handle_signal, _sig))
 
-    collector = MetricsCollector("unconfigured", metrics_interval=10)
+    collector = MetricsCollector("unconfigured", metrics_interval=3)
     collector.set_phase("IDLE")
 
     ctx = ProcessContext(collector=collector, stop_event=stop_event, port=port)
@@ -849,7 +860,10 @@ def main() -> None:
         sys.exit(1)
 
     # Re-configure logging now that vm_id is known — add file handler
-    log_file = args.log_file or _auto_log_file(config.vm_id, args.log_dir)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _run_id = f"run-cli-{ts}"
+    _pair_id = "pair-1"
+    log_file = args.log_file or _auto_log_file(_run_id, _pair_id, config.vm_id, args.log_dir)
     _setup_logging(args.log_level, log_file=log_file)
 
     # Dry run: validate and exit
@@ -903,6 +917,8 @@ def main() -> None:
             no_unregister=args.no_unregister,
             api_only=args.api_only,
             gui_drain_seconds=args.gui_drain_seconds,
+            run_id=_run_id,
+            pair_id=_pair_id,
         ))
     except KeyboardInterrupt:
         log.info("Interrupted by user")

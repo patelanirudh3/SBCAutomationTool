@@ -223,10 +223,14 @@ export async function putConfigFor(
 
 export async function startTestFor(
   ip: string,
-  port: number
+  port: number,
+  runId: string,
+  pairId: string
 ): Promise<{ status: string; vm_id?: string; error?: string }> {
   const res = await fetch(`http://${ip}:${port}/api/test/start`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ run_id: runId, pair_id: pairId }),
     signal: AbortSignal.timeout(10_000),
   })
   const data = await res.json()

@@ -58,6 +58,8 @@ class ProcessContext:
         self.state: str = "IDLE"                  # IDLE → CONFIGURED → RUNNING → COMPLETE / FAILED
         self.yaml_path: Optional[str] = None      # path to generated yaml
         self.log_level: str = "INFO"
+        self.run_id: str = ""                     # set by POST /api/test/start body
+        self.pair_id: str = ""                    # set by POST /api/test/start body
         self._lifecycle_task: Optional[asyncio.Task] = None
         self._start_func: Optional[Callable] = None   # injected by main.py
 
@@ -90,8 +92,8 @@ class TrafficMetrics:
     phase: str                = "IDLE"         # PRE_REGISTER | PRE_SUBSCRIBE | TRAFFIC | STOPPING | DONE
 
     # Rate / volume
-    cps_actual: float         = 0.0            # calls fired in last interval / interval
-    concurrent_calls: int     = 0
+    cps_actual: float         = 0.0            # calls launched in last interval / interval (true throughput rate)
+    concurrent_calls: int     = 0              # active calls in-flight (GUI label: "Active Calls")
     calls_attempted: int      = 0
     calls_completed: int      = 0
     calls_failed: int         = 0
@@ -140,9 +142,9 @@ class MetricsCollector:
         self._hold_samples: list[float] = []
         self._total_samples: list[float] = []
 
-        # Windowed (last interval) for CPS calculation
+        # Windowed (last interval) for CPS calculation — counts launches, not completions
         self._window_start = time.monotonic()
-        self._window_calls = 0
+        self._window_attempts = 0
 
         # Latest snapshot (updated every interval)
         self._latest = TrafficMetrics(vm_id=vm_id)
@@ -192,6 +194,10 @@ class MetricsCollector:
     # Call result ingestion
     # ------------------------------------------------------------------
 
+    def record_attempt(self) -> None:
+        """Called at the moment a call is launched (before it completes). Used for CPS display."""
+        self._window_attempts += 1
+
     async def record_call(self, result) -> None:
         """
         Accept a CallResult from call_engine and update metrics.
@@ -200,7 +206,6 @@ class MetricsCollector:
         async with self._lock:
             self._call_results.append(result)
             self._calls_attempted += 1
-            self._window_calls += 1
             if result.success:
                 self._calls_completed += 1
                 if result.pdd_ms:
@@ -220,12 +225,12 @@ class MetricsCollector:
         now = time.monotonic()
         window_elapsed = now - self._window_start
 
-        # CPS: calls fired in last window / window duration
-        cps_actual = self._window_calls / window_elapsed if window_elapsed > 0 else 0.0
+        # CPS: calls launched (attempted) in last window / window duration
+        cps_actual = self._window_attempts / window_elapsed if window_elapsed > 0 else 0.0
 
         # Reset window
         self._window_start = now
-        self._window_calls = 0
+        self._window_attempts = 0
 
         # ASR
         asr = 0.0
@@ -319,7 +324,7 @@ class MetricsCollector:
             self._hold_samples.clear()
             self._total_samples.clear()
             self._window_start = time.monotonic()
-            self._window_calls = 0
+            self._window_attempts = 0
             self._concurrent_calls = 0
             self._socket_count = 0
             self._registered_count = 0
@@ -476,6 +481,9 @@ def build_app(
         process_ctx.state = "CONFIGURED"
 
         collector._vm_id = cfg.vm_id
+        # Apply the configured push cadence immediately — run_push_loop re-reads
+        # self._interval on each iteration, so this takes effect on the next tick.
+        collector._interval = cfg.metrics_interval
         collector._latest = collector._build_snapshot()
 
         log.info(
@@ -495,12 +503,24 @@ def build_app(
 
     # ── POST /api/test/start ─────────────────────────────────────────────
     @app.post("/api/test/start")
-    async def test_start():
+    async def test_start(body: dict | None = None):
         """
         Trigger the full traffic lifecycle (agents → pre-phase → traffic)
         as a background asyncio task.  Returns 202 immediately.
+        Body must include run_id and pair_id (required for log file naming).
         """
         if process_ctx:
+            payload = body or {}
+            run_id = payload.get("run_id")
+            pair_id = payload.get("pair_id")
+            if not run_id or not pair_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "run_id and pair_id are required in request body",
+                        "example": {"run_id": "run-20260318_113204", "pair_id": "pair-1"},
+                    },
+                )
             if process_ctx.state == "RUNNING":
                 return JSONResponse(
                     status_code=409,
@@ -517,9 +537,11 @@ def build_app(
                     content={"error": "Lifecycle starter not registered — internal error"},
                 )
 
+            process_ctx.run_id = run_id
+            process_ctx.pair_id = pair_id
             process_ctx.state = "RUNNING"
             await process_ctx._start_func()
-            log.info("Traffic lifecycle started via API for %s", process_ctx.config.vm_id)
+            log.info("Traffic lifecycle started via API for %s (run_id=%s)", process_ctx.config.vm_id, run_id)
             return JSONResponse(
                 status_code=202,
                 content={"status": "started", "vm_id": process_ctx.config.vm_id},
@@ -839,17 +861,18 @@ def write_traffic_summary(
     collector: MetricsCollector,
     config: "VMConfig",
     log_dir: str = "logs",
+    run_id: str = "",
+    pair_id: str = "",
     engine=None,
     uas_engine=None,
     agents: Optional[dict[str, "ExtensionAgent"]] = None,
 ) -> str:
     """
-    Write a summary of the traffic run to logs/traffic_summary_<vm_id>_<ts>.log.
+    Write a summary of the traffic run to logs/traffic_summary_<run_id>_<pair_id>_<vm_id>.log.
     Returns the path of the written file.
     """
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     vm_id = config.vm_id
-    path = os.path.join(log_dir, f"traffic_summary_{vm_id}_{ts}.log")
+    path = os.path.join(log_dir, f"traffic_summary_{run_id}_{pair_id}_{vm_id}.log")
     os.makedirs(log_dir, exist_ok=True)
 
     results = getattr(collector, "_call_results", [])

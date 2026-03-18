@@ -15,7 +15,7 @@ import { FieldError, FieldHint, FieldWarning, FieldSoftWarning } from './ConfigV
 import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { cn } from '@/lib/utils'
-import { Link2, Hash, Loader2, CheckCircle, XCircle, Signal } from 'lucide-react'
+import { Link2, Hash, Loader2, CheckCircle, XCircle, Signal, ArrowDownToLine } from 'lucide-react'
 import type { VMRole, TrafficMode, SipTransport, ReachabilityStatus } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -466,31 +466,54 @@ export function VMConfigPanel({
       {/* ── Traffic ───────────────────────────────────────────── */}
       <div className="space-y-3">
         <SectionHeader>Traffic</SectionHeader>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="CPS" error={e('cps')} warning={w('cps')} hint="Calls per second">
+
+        {isUAC ? (
+          /* UAC: CPS + Hold Time side-by-side (both editable) */
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="CPS" error={e('cps')} warning={w('cps')} hint="Calls per second">
+              <Input
+                type="number"
+                min={0.1}
+                step={0.1}
+                value={raw.cps}
+                onChange={(ev) => onChange('cps', ev.target.value)}
+                onBlur={() => onBlur('cps')}
+                className="font-mono"
+                aria-invalid={t('cps') && !!errors.cps ? true : undefined}
+              />
+            </FormField>
+            <FormField label="Hold Time (s)" error={e('hold_time_seconds')} warning={w('hold_time_seconds')}>
+              <Input
+                type="number"
+                min={0}
+                value={raw.hold_time_seconds}
+                onChange={(ev) => onChange('hold_time_seconds', ev.target.value)}
+                onBlur={() => onBlur('hold_time_seconds')}
+                className="font-mono"
+                aria-invalid={t('hold_time_seconds') && !!errors.hold_time_seconds ? true : undefined}
+              />
+            </FormField>
+          </div>
+        ) : (
+          /* UAS: Hold Time only, read-only — auto-mirrored from UAC */
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5">
+              <Label className="text-xs font-medium text-foreground/80">Hold Time (s)</Label>
+              <ArrowDownToLine className="size-3 text-muted-foreground/50" />
+            </div>
             <Input
-              type="number"
-              min={0.1}
-              step={0.1}
-              value={raw.cps}
-              onChange={(ev) => onChange('cps', ev.target.value)}
-              onBlur={() => onBlur('cps')}
-              className="font-mono"
-              aria-invalid={t('cps') && !!errors.cps ? true : undefined}
-            />
-          </FormField>
-          <FormField label="Hold Time (s)" error={e('hold_time_seconds')} warning={w('hold_time_seconds')}>
-            <Input
-              type="number"
-              min={0}
+              readOnly
+              tabIndex={-1}
               value={raw.hold_time_seconds}
-              onChange={(ev) => onChange('hold_time_seconds', ev.target.value)}
-              onBlur={() => onBlur('hold_time_seconds')}
-              className="font-mono"
-              aria-invalid={t('hold_time_seconds') && !!errors.hold_time_seconds ? true : undefined}
+              className={cn(
+                'cursor-default font-mono text-muted-foreground',
+                'bg-secondary/30 focus-visible:ring-0 focus-visible:border-input'
+              )}
             />
-          </FormField>
-        </div>
+            <FieldHint>Auto-mirrored from UAC hold time (UAS uses this as BYE-wait timeout)</FieldHint>
+          </div>
+        )}
+
         {isUAC && (
           <FormField
             label="Ramp Up (s)"

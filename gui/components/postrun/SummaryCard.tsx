@@ -55,12 +55,8 @@ export function SummaryCard({ className }: SummaryCardProps) {
 
   const uacVmId = pair?.uac.vm_id ?? 'uac-local'
   const uasVmId = pair?.uas.vm_id ?? 'uas-local'
-
-  const started = new Date(aggregate.started_at)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const runTimestamp =
-    `${started.getFullYear()}${pad(started.getMonth() + 1)}${pad(started.getDate())}_` +
-    `${pad(started.getHours())}${pad(started.getMinutes())}${pad(started.getSeconds())}`
+  const pairId = pair?.pair_id ?? 'pair-1'
+  const runId = aggregate.run_id
 
   return (
     <div
@@ -135,10 +131,10 @@ export function SummaryCard({ className }: SummaryCardProps) {
           Log Files
         </span>
         {[
-          `traffic_${uacVmId}_${runTimestamp}.log`,
-          `traffic_summary_${uacVmId}_${runTimestamp}.log`,
-          `traffic_${uasVmId}_${runTimestamp}.log`,
-          `traffic_summary_${uasVmId}_${runTimestamp}.log`,
+          `traffic_${runId}_${pairId}_${uacVmId}.log`,
+          `traffic_summary_${runId}_${pairId}_${uacVmId}.log`,
+          `traffic_${runId}_${pairId}_${uasVmId}.log`,
+          `traffic_summary_${runId}_${pairId}_${uasVmId}.log`,
         ].map((f) => (
           <div key={f} className="flex items-center gap-2">
             <FileText className="size-3 text-foreground/50 shrink-0" />

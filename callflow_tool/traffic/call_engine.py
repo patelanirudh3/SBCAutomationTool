@@ -126,6 +126,7 @@ class CallEngine:
         uac_agents: dict[str, ExtensionAgent],
         config: VMConfig,
         on_call_complete=None,
+        on_call_attempt=None,
         max_calls: int = 0,
     ) -> None:
         """
@@ -133,11 +134,13 @@ class CallEngine:
             uac_agents:         ext_str → ExtensionAgent for UAC extensions.
             config:             VMConfig.
             on_call_complete:   Optional async callable(CallResult) for metrics.
+            on_call_attempt:    Optional sync callable() invoked at each call launch (for CPS).
             max_calls:          Stop after this many calls attempted (0 = unlimited).
         """
         self._agents = uac_agents
         self._config = config
         self._on_complete = on_call_complete
+        self._on_attempt = on_call_attempt
         self._max_calls = max_calls
         self._index = 0
         self.stop_event = asyncio.Event()
@@ -242,6 +245,8 @@ class CallEngine:
             if self._calls_attempted == 0:
                 self._first_call_launch_time = time.monotonic()
             self._calls_attempted += 1
+            if self._on_attempt:
+                self._on_attempt()
             pool_count = cfg.pool_wrap_count
             wrap_idx = (self._calls_attempted - 1) // pool_count if pool_count else 0
             task = asyncio.create_task(
@@ -771,7 +776,7 @@ class UasAutoAnswer:
             # ── Wait for BYE ──────────────────────────────────────────
             bye_q = agent._wait_for_event("BYE")
             try:
-                hold_timeout = float(cfg.hold_time_seconds + 30)
+                hold_timeout = float(cfg.hold_time_seconds + 60)
                 raw_bye = await asyncio.wait_for(bye_q.get(), timeout=hold_timeout)
                 await agent.handle_bye(raw_bye, dialog)
                 _log_call_event(call_id, agent.ext, "UAS_BYE_RCVD")

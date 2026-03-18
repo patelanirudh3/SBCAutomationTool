@@ -86,6 +86,7 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     `rtp_burst: ${s.rtp_burst_seconds}s / ${s.rtp_burst_pps}pps`,
     `keepalive: ${s.rtp_keepalive_interval}s`,
     `pool_wrap_delay: ${s.pool_wrap_delay_seconds}s`,
+    `metrics: ${s.metrics_interval}s`,
   ]
 
   return (
@@ -224,12 +225,12 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
               type="button"
               onClick={handleEdit}
               className={cn(
-                'flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium',
-                'border border-border/60 text-muted-foreground',
-                'transition-colors hover:border-emerald-500/50 hover:text-emerald-400'
+                'flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-semibold',
+                'border border-violet-500/40 text-violet-300',
+                'transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/10 hover:text-emerald-400'
               )}
             >
-              <Pencil className="size-2.5" />
+              <Pencil className="size-3.5" />
               Edit
             </button>
           ) : (
@@ -340,6 +341,20 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   error={errors.pool_wrap_delay_seconds}
                   hint="Delay between extension pool wraps during traffic phase"
                   onChange={set('pool_wrap_delay_seconds')}
+                />
+              </div>
+
+              {/* Full-width — Metrics Interval */}
+              <div className="border-t border-border/30 pt-3">
+                <AdvancedField
+                  label="Metrics Interval (s)"
+                  value={draft.metrics_interval}
+                  disabled={disabled}
+                  min={1}
+                  error={errors.metrics_interval}
+                  hint="How often the backend pushes a fresh metrics snapshot over WebSocket to the Live Dashboard"
+                  tooltip="Controls the WS /metrics/stream push cadence. Lower = more responsive Live Dashboard; higher = less CPU. Default 3s gives smooth updates without noticeable overhead."
+                  onChange={set('metrics_interval')}
                 />
               </div>
 

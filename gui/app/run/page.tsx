@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2 } from 'lucide-react'
+import { WifiOff, Loader2, Home } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
@@ -218,19 +219,20 @@ function ReconnectBanner({ visible }: { visible: boolean }) {
 // ---------------------------------------------------------------------------
 
 function buildAggregateFromStore(): void {
-  const { uacMetrics, setAggregate, pairs, activePairIndex } =
+  const { uacMetrics, setAggregate, pairs, activePairIndex, currentRunId } =
     useTrafficStore.getState()
 
   if (!uacMetrics) return
 
   const pair = pairs[activePairIndex]
+  const runId = currentRunId || `run-${pair?.uac.vm_id ?? 'local'}-${Date.now()}`
 
   setAggregate({
     total_attempted: uacMetrics.calls_attempted,
     total_completed: uacMetrics.calls_completed,
     total_failed: uacMetrics.calls_failed,
     aggregate_asr: uacMetrics.asr,
-    run_id: `run-${pair?.uac.vm_id ?? 'local'}-${Date.now()}`,
+    run_id: runId,
     started_at: new Date(
       Date.now() - (uacMetrics.run_elapsed_seconds ?? 0) * 1000
     ).toISOString(),
@@ -260,7 +262,8 @@ async function fetchAndStoreCallEvents(
   setCallEvents(allEvents)
 
   if (isFinal) {
-    const runId = `run-${livePair.uac.vm_id ?? 'local'}-${Date.now()}`
+    const { currentRunId } = useTrafficStore.getState()
+    const runId = currentRunId || `run-${livePair.uac.vm_id ?? 'local'}-${Date.now()}`
     const startedAt = uacMetrics?.run_elapsed_seconds
       ? new Date(Date.now() - uacMetrics.run_elapsed_seconds * 1000).toISOString()
       : new Date().toISOString()
@@ -330,8 +333,10 @@ export default function RunPage() {
       if (tick >= 20) {
         clearInterval(interval)
         setCallEvents(MOCK_CALL_EVENTS)
+        const runId = useTrafficStore.getState().currentRunId || MOCK_AGGREGATE.run_id
         setAggregate({
           ...MOCK_AGGREGATE,
+          run_id: runId,
           total_attempted: totalAttempted,
           total_completed: totalCompleted,
           total_failed: totalFailed,
@@ -536,7 +541,22 @@ export default function RunPage() {
     <div className="min-h-screen flex flex-col">
       <Navbar />
       <ReconnectBanner visible={showReconnectBanner} />
-      <div className="flex justify-center py-4 border-b border-border">
+      <div className="relative flex items-center justify-center border-b border-border px-6 py-4">
+        <div className="absolute left-6">
+          <Link
+            href="/config"
+            className={[
+              'flex items-center gap-2 rounded-md border px-3 py-1.5',
+              'border-sky-500/50 text-sky-400',
+              'text-sm font-semibold tracking-wide',
+              'hover:border-sky-400 hover:bg-sky-500/15 hover:text-sky-300',
+              'transition-all duration-200',
+            ].join(' ')}
+          >
+            <Home className="size-4" strokeWidth={2.5} />
+            <span>Home</span>
+          </Link>
+        </div>
         <StepIndicator />
       </div>
       <main className="flex-1 overflow-y-auto py-2">

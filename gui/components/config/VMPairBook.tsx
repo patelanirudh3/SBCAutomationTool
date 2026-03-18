@@ -189,6 +189,26 @@ export function VMPairBook() {
     setUacRaw((prev) => ({ ...prev, peer_stop_url: url }))
   }, [uasRaw.vm_ip, uasRaw.metrics_port])
 
+  // Mirror UAC hold_time_seconds to UAS so the UAS BYE-wait timeout stays in
+  // sync. UAS uses hold_time_seconds + 60s as a safety timeout — it must be at
+  // least as large as the UAC value to avoid false timeouts on the UAS side.
+  useEffect(() => {
+    setUasRaw((prev) => ({ ...prev, hold_time_seconds: uacRaw.hold_time_seconds }))
+  }, [uacRaw.hold_time_seconds])
+
+  // Pre-populate UAS extension ranges from UAC when the UAC values change.
+  // The UAS panel remains fully editable — this is just a convenience default
+  // so users only have to fill in extension ranges once (on the UAC side).
+  useEffect(() => {
+    setUasRaw((prev) => ({
+      ...prev,
+      uac_ext_start: uacRaw.uac_ext_start,
+      uac_ext_end:   uacRaw.uac_ext_end,
+      uas_ext_start: uacRaw.uas_ext_start,
+      uas_ext_end:   uacRaw.uas_ext_end,
+    }))
+  }, [uacRaw.uac_ext_start, uacRaw.uac_ext_end, uacRaw.uas_ext_start, uacRaw.uas_ext_end])
+
   // Keep the store's pair connection info (ip, port, vm_id) in sync with the
   // live form values so SessionMenu always shows the current typed-in values —
   // not just the last Save & Continue snapshot.

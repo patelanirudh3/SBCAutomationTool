@@ -12,6 +12,7 @@ export interface AdvancedSettings {
   rtp_burst_pps: number           // default: 50
   rtp_keepalive_interval: number  // default: 3
   pool_wrap_delay_seconds: number // default: 32
+  metrics_interval: number        // default: 3  — WS push cadence (seconds)
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -22,6 +23,7 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_burst_pps: 50,
   rtp_keepalive_interval: 3,
   pool_wrap_delay_seconds: 32,
+  metrics_interval: 3,
 }
 
 export interface VMConfig {

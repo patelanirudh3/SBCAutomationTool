@@ -111,6 +111,10 @@ interface TrafficStore {
   setCallEvents: (events: CallEvent[]) => void
   setAggregate: (a: AggregateMetrics) => void
 
+  // Run-level ID (one per traffic run, shared by all pairs)
+  currentRunId: string
+  setCurrentRunId: (id: string) => void
+
   // Reset
   reset: () => void
 }
@@ -129,6 +133,7 @@ const initialState = {
   wsStatus: { uac: 'disconnected', uas: 'disconnected' } as { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' },
   callEvents: [] as CallEvent[],
   aggregate: null,
+  currentRunId: '',
 }
 
 export const useTrafficStore = create<TrafficStore>((set, get) => ({
@@ -192,6 +197,8 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
 
   setCallEvents: (events) => set({ callEvents: events }),
   setAggregate: (a) => set({ aggregate: a }),
+
+  setCurrentRunId: (id) => set({ currentRunId: id }),
 
   reset: () => {
     const { runMode, pairs } = get()

@@ -21,7 +21,7 @@ export function ConcurrentCallsBar({
     <div className={cn('flex flex-col gap-2', className)}>
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold uppercase tracking-widest text-foreground/75">
-          Concurrent Calls
+          Active Calls
         </span>
         <span className="font-mono text-sm tabular-nums text-foreground">
           <span className={cn('font-bold', isAlarm ? 'text-rose-500' : 'text-foreground')}>

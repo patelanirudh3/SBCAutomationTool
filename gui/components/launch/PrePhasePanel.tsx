@@ -13,6 +13,13 @@ import { cn } from '@/lib/utils'
 import type { VMRole } from '@/types'
 
 // ---------------------------------------------------------------------------
+// Transition timing — tuned for demo: snappy but readable
+// ---------------------------------------------------------------------------
+const STEP_CHECKING_MS = 400   // spinner before showing ok
+const STEP_AFTER_OK_MS = 300   // pause after each item before next
+const STEP_BETWEEN_MS = 350    // between items (mock mode)
+
+// ---------------------------------------------------------------------------
 // Per-side checklist model
 // ---------------------------------------------------------------------------
 
@@ -155,7 +162,7 @@ function SidePanel({
 
 export function PrePhasePanel() {
   const router = useRouter()
-  const { pairs, activePairIndex, setPhase, setUASPrePhase, setUACPrePhase } = useTrafficStore()
+  const { pairs, activePairIndex, setPhase, setUASPrePhase, setUACPrePhase, setCurrentRunId } = useTrafficStore()
   const pair = pairs[activePairIndex]
   const extCount = pair ? pair.uas.uas_ext_end - pair.uas.uas_ext_start + 1 : 10
 
@@ -211,7 +218,7 @@ export function PrePhasePanel() {
       label: string
     ) => {
       advanceItem(setter, key, 'checking')
-      await new Promise((r) => setTimeout(r, 800))
+      await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
       advanceItem(setter, key, finalState, label)
     },
     [advanceItem]
@@ -237,17 +244,23 @@ export function PrePhasePanel() {
 
     setPhase('PRE_PHASE')
 
+    // Generate run-level run_id for this traffic run
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const now = new Date()
+    const runId = `run-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+    setCurrentRunId(runId)
+
     const run = async () => {
       const n = extCount
 
       await transitionItem(setUasItems, 'register',   'ok', `REGISTER complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUasItems, 'subscribe',  'ok', `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUasItems, 'extensions', 'ok', `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUasItems, 'auto_start', 'ok', `UAS auto-answer started for ${n} extensions`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUasItems, 'auto_active','ok', `UAS auto-answer mode active on ${n} extensions`)
 
       setUasComplete(true)
@@ -269,7 +282,7 @@ export function PrePhasePanel() {
     }
 
     run()
-  }, [isMock, extCount, pair, setPhase, setUASPrePhase, transitionItem])
+  }, [isMock, extCount, pair, setPhase, setUASPrePhase, setCurrentRunId, transitionItem])
 
   // ---------------------------------------------------------------------------
   // Live mode: UAS polling — started by "Start UAS" button
@@ -310,9 +323,9 @@ export function PrePhasePanel() {
           ]
           for (const [key, label] of steps) {
             advanceItem(setUasItems, key, 'checking')
-            await new Promise((r) => setTimeout(r, 800))
+            await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
             advanceItem(setUasItems, key, 'ok', label)
-            await new Promise((r) => setTimeout(r, 600))
+            await new Promise((r) => setTimeout(r, STEP_AFTER_OK_MS))
           }
 
           setUasComplete(true)
@@ -383,9 +396,9 @@ export function PrePhasePanel() {
           ]
           for (const [key, label] of steps) {
             advanceItem(setUacItems, key, 'checking')
-            await new Promise((r) => setTimeout(r, 800))
+            await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
             advanceItem(setUacItems, key, 'ok', label)
-            await new Promise((r) => setTimeout(r, 600))
+            await new Promise((r) => setTimeout(r, STEP_AFTER_OK_MS))
           }
 
           setUacComplete(true)
@@ -428,8 +441,14 @@ export function PrePhasePanel() {
     if (!pair) return
     setUasPingError(null)
 
+    // Generate run-level run_id (one per traffic run, shared by all pairs)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const now = new Date()
+    const runId = `run-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+    setCurrentRunId(runId)
+
     try {
-      await startTestFor(pair.uas.vm_ip, pair.uas.metrics_port)
+      await startTestFor(pair.uas.vm_ip, pair.uas.metrics_port, runId, pair.pair_id)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start UAS'
       setUasPingError(
@@ -440,14 +459,20 @@ export function PrePhasePanel() {
 
     setUasMonitoringStarted(true)
     startUASPolling()
-  }, [pair, startUASPolling])
+  }, [pair, startUASPolling, setCurrentRunId])
 
   const handleStartUAC = useCallback(async () => {
     if (!pair) return
     setUacPingError(null)
 
+    const runId = useTrafficStore.getState().currentRunId
+    if (!runId) {
+      setUacPingError('Start UAS first to establish run_id')
+      return
+    }
+
     try {
-      await startTestFor(pair.uac.vm_ip, pair.uac.metrics_port)
+      await startTestFor(pair.uac.vm_ip, pair.uac.metrics_port, runId, pair.pair_id)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start UAC'
       setUacPingError(
@@ -467,11 +492,11 @@ export function PrePhasePanel() {
 
     if (isMock) {
       const n = extCount
-      await new Promise((r) => setTimeout(r, 500))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUacItems, 'register',   'ok', `REGISTER complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUacItems, 'subscribe',  'ok', `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, 1000))
+      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
       await transitionItem(setUacItems, 'extensions', 'ok', `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`)
 
       setUacComplete(true)
