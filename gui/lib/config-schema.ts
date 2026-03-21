@@ -66,6 +66,7 @@ export const VMConfigSchema = z
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
     ramp_up_seconds: z.number().nonnegative('Ramp-up must be ≥ 0').max(300, 'Cannot exceed 300s').optional(),
+    media_enabled: z.boolean().optional(),
     metrics_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
     peer_stop_url: z
       .string()

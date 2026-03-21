@@ -146,7 +146,8 @@ class CallEngine:
         self.stop_event = asyncio.Event()
         self._active_calls: set[str] = set()   # call_ids currently in-flight
         self._calls_attempted = 0
-        self._first_call_launch_time: float = 0.0  # for pool wrap delay
+        self._first_call_launch_time: float = 0.0  # legacy: kept for metrics/logging
+        self._current_wrap_start_time: float = 0.0  # pool wrap delay: start of current wrap
         self._peak_active_calls = 0
         self._calls_completed = 0
         self._calls_failed = 0
@@ -212,20 +213,56 @@ class CallEngine:
                 await asyncio.sleep(0.05)
                 continue
 
-            # Pool wrap delay: before starting a new wrap, wait so extensions from
-            # the first call of the previous wrap are free (hold_time + 2s gap)
+            # WRAP DELAY FORMULA
+            #
+            # At each wrap boundary ext #1 from the current wrap may still
+            # be on a call.  We must not reuse it until:
+            #   hold_time + SIP_BYE_BUFFER  seconds have elapsed since this
+            #   wrap started (_current_wrap_start_time).
+            #
+            # sleep_for = max(0, hold_time + SIP_BYE_BUFFER + extra_margin - elapsed)
+            #
+            # Always computed — handles all cases in one formula:
+            #   wrap_time >> hold_time → elapsed >> target → sleep_for ≤ 0 (natural)
+            #   wrap_time == hold_time → sleep_for ≈ SIP_BYE_BUFFER (boundary safe)
+            #   wrap_time <  hold_time → sleep_for > 0 (computed delay)
+            #   ramp_up slowed wrap   → elapsed is large → sleep_for ≤ 0 (natural)
+            #
+            # SIP_BYE_BUFFER = 2.0s — BYE RTT + SBC dialog cleanup.
+            #   Internal constant, never user-configurable.
+            # pool_wrap_delay_seconds = optional extra safety margin.
+            #   Default 0. Only needed if SBC is slow to release dialogs.
+            SIP_BYE_BUFFER = 2.0
+
             pool_count = cfg.pool_wrap_count
             if pool_count > 0 and self._calls_attempted > 0 and self._calls_attempted % pool_count == 0:
-                delay_sec = cfg.hold_time_seconds + getattr(cfg, "pool_wrap_delay_seconds", 2)
-                elapsed = time.monotonic() - self._first_call_launch_time
-                sleep_for = max(0.0, delay_sec - elapsed)
+                wrap_time    = pool_count / max(cfg.cps, 0.001)
+                hold_time    = cfg.hold_time_seconds
+                extra_margin = getattr(cfg, 'pool_wrap_delay_seconds', 0) or 0
+                natural      = wrap_time >= hold_time + SIP_BYE_BUFFER
+
+                elapsed   = time.monotonic() - self._current_wrap_start_time
+                sleep_for = max(0.0, hold_time + SIP_BYE_BUFFER + extra_margin - elapsed)
+
                 if sleep_for > 0:
                     log.info(
-                        "Pool wrap delay: sleeping %.1fs before wrap %d (hold=%ds + %ds gap)",
-                        sleep_for, (self._calls_attempted // pool_count) + 1,
-                        cfg.hold_time_seconds, getattr(cfg, "pool_wrap_delay_seconds", 2),
+                        "Pool wrap delay: sleeping %.1fs before wrap %d "
+                        "(wrap_time=%.1fs, hold=%ds, natural=%s)",
+                        sleep_for,
+                        (self._calls_attempted // pool_count) + 1,
+                        wrap_time, hold_time,
+                        'yes' if natural else 'no',
                     )
                     await asyncio.sleep(sleep_for)
+                elif not natural:
+                    log.debug(
+                        "Pool wrap boundary %d: no sleep needed "
+                        "(elapsed=%.1fs already covers hold=%ds+%.1fs buffer)",
+                        (self._calls_attempted // pool_count) + 1,
+                        elapsed, hold_time, SIP_BYE_BUFFER,
+                    )
+
+                self._current_wrap_start_time = time.monotonic()
 
             # Linear ramp-up: interval decreases from full_interval×10 → full_interval
             if step < ramp_steps:
@@ -244,6 +281,7 @@ class CallEngine:
 
             if self._calls_attempted == 0:
                 self._first_call_launch_time = time.monotonic()
+                self._current_wrap_start_time = time.monotonic()
             self._calls_attempted += 1
             if self._on_attempt:
                 self._on_attempt()
@@ -311,13 +349,14 @@ class CallEngine:
 
         try:
             # ── Allocate RTP endpoint (port goes into SDP offer) ──────
-            try:
-                rtp_ep = await RtpEndpoint.create(agent._local_host)
-            except Exception as exc:
-                log.warning(
-                    "ext=%s RTP socket alloc failed (%s) — using port 9 (no media)",
-                    agent.ext, exc,
-                )
+            if self._config.media_enabled:
+                try:
+                    rtp_ep = await RtpEndpoint.create(agent._local_host)
+                except Exception as exc:
+                    log.warning(
+                        "ext=%s RTP socket alloc failed (%s) — using port 9 (no media)",
+                        agent.ext, exc,
+                    )
             rtp_port = rtp_ep.local_port if rtp_ep else 9
 
             # ── INVITE ────────────────────────────────────────────────
@@ -441,6 +480,9 @@ class CallEngine:
                     call_id, agent.ext, media_event,
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uac",
                 )
+
+            if not cfg.media_enabled:
+                _log_call_event(call_id, agent.ext, "MEDIA_DISABLED", direction="uac")
 
             # ── Call complete ─────────────────────────────────────────
             total_ms = (time.monotonic() - call_start) * 1000
@@ -723,13 +765,14 @@ class UasAutoAnswer:
 
         try:
             # ── Allocate RTP endpoint before 200 OK (port goes in SDP) ──
-            try:
-                rtp_ep = await RtpEndpoint.create(agent._local_host)
-            except Exception as exc:
-                log.warning(
-                    "ext=%s RTP endpoint alloc failed (%s) — using port 9 (no media)",
-                    agent.ext, exc,
-                )
+            if self._config.media_enabled:
+                try:
+                    rtp_ep = await RtpEndpoint.create(agent._local_host)
+                except Exception as exc:
+                    log.warning(
+                        "ext=%s RTP endpoint alloc failed (%s) — using port 9 (no media)",
+                        agent.ext, exc,
+                    )
             rtp_port = rtp_ep.local_port if rtp_ep else 9
 
             # ── Handle INVITE: sends 100 + 180 ───────────────────────
@@ -800,6 +843,9 @@ class UasAutoAnswer:
                     call_id, agent.ext, media_event,
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uas",
                 )
+
+            if not cfg.media_enabled:
+                _log_call_event(call_id, agent.ext, "MEDIA_DISABLED", direction="uas")
 
             total_ms = (time.monotonic() - call_start) * 1000
             result = CallResult(

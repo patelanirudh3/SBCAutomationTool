@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Settings2, Pencil, Check, ChevronDown, Info } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -75,10 +75,59 @@ function AdvancedField({
 }
 
 // ---------------------------------------------------------------------------
+// Wrap analysis helpers (derived, read-only)
+// ---------------------------------------------------------------------------
+
+const SIP_BYE_BUFFER = 2
+
+function gcd(a: number, b: number): number { return b === 0 ? a : gcd(b, a % b) }
+function lcm(a: number, b: number): number { return (a * b) / gcd(a, b) }
+
+export interface WrapAnalysis {
+  poolCount: number
+  wrapTime: number
+  holdTime: number
+  naturalSpacing: boolean
+  autoDelay: number
+  userMargin: number
+  effectiveDelay: number
+  minPoolForNatural: number
+}
+
+function useWrapAnalysis(pairIndex: number, advSettings: AdvancedSettingsType): WrapAnalysis {
+  const pair = useTrafficStore((s) => s.pairs[pairIndex])
+  return useMemo(() => {
+    if (!pair) {
+      return { poolCount: 0, wrapTime: 0, holdTime: 0, naturalSpacing: true, autoDelay: 0, userMargin: 0, effectiveDelay: 0, minPoolForNatural: 0 }
+    }
+    const uacCount = pair.uac.uac_ext_end - pair.uac.uac_ext_start + 1
+    const uasCount = pair.uas.uas_ext_end - pair.uas.uas_ext_start + 1
+    const poolCount = lcm(Math.max(uacCount, 1), Math.max(uasCount, 1))
+    const cps = Math.max(pair.uac.cps, 0.001)
+    const wrapTime = poolCount / cps
+    const holdTime = pair.uac.hold_time_seconds
+    const naturalSpacing = wrapTime >= holdTime + SIP_BYE_BUFFER
+
+    const worstCaseElapsed = wrapTime
+    const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - worstCaseElapsed)
+
+    const userMargin = advSettings.pool_wrap_delay_seconds ?? 0
+    const effectiveDelay = autoDelay + Math.max(0, userMargin)
+    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER))
+
+    return { poolCount, wrapTime, holdTime, naturalSpacing, autoDelay, userMargin, effectiveDelay, minPoolForNatural }
+  }, [pair, advSettings.pool_wrap_delay_seconds])
+}
+
+// ---------------------------------------------------------------------------
 // Token row (collapsed read-only display)
 // ---------------------------------------------------------------------------
 
-function TokenRow({ s }: { s: AdvancedSettingsType }) {
+function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnalysis }) {
+  const wrapLabel = analysis.naturalSpacing
+    ? 'natural'
+    : `auto ${analysis.autoDelay.toFixed(0)}s + ${Math.max(0, analysis.userMargin)}s`
+
   const tokens = [
     `reg_rate: ${s.register_rate}`,
     `timeout: ${s.register_timeout}s`,
@@ -87,13 +136,21 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     `keepalive: ${s.rtp_keepalive_interval}s`,
     `pool_wrap_delay: ${s.pool_wrap_delay_seconds}s`,
     `metrics: ${s.metrics_interval}s`,
+    `wrap: ${wrapLabel}`,
   ]
 
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       {tokens.map((tok, i) => (
         <span key={i} className="flex items-center gap-2">
-          <span className="font-mono text-[11px] font-medium text-cyan-300/80">{tok}</span>
+          <span className={cn(
+            'font-mono text-[11px] font-medium',
+            tok.startsWith('wrap:')
+              ? analysis.naturalSpacing ? 'text-emerald-400' : 'text-amber-400'
+              : 'text-cyan-300/80'
+          )}>
+            {tok}
+          </span>
           {i < tokens.length - 1 && (
             <span className="text-violet-400/40">·</span>
           )}
@@ -107,10 +164,13 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
 // Main component
 // ---------------------------------------------------------------------------
 
-export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
+export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: number; liveAnalysis?: WrapAnalysis }) {
   const { pairs, updateAdvancedSettings } = useTrafficStore()
   const saved: AdvancedSettingsType =
     pairs[pairIndex]?.advancedSettings ?? { ...DEFAULT_ADVANCED_SETTINGS }
+
+  const storeAnalysis = useWrapAnalysis(pairIndex, saved)
+  const analysis = liveAnalysis ?? storeAnalysis
 
   const [isOpen, setIsOpen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -161,10 +221,15 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
   }
 
   const handleSave = () => {
+    const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
-      if (!Number.isFinite(val as number) || (val as number) <= 0) {
-        newErrors[key as keyof AdvancedSettingsType] = 'Must be a positive number'
+      const v = val as number
+      if (!Number.isFinite(v)) {
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be a number'
+      } else if (ALLOW_ZERO.has(key) ? v < 0 : v <= 0) {
+        newErrors[key as keyof AdvancedSettingsType] =
+          ALLOW_ZERO.has(key) ? 'Must be ≥ 0' : 'Must be a positive number'
       }
     }
     if (Object.keys(newErrors).length > 0) {
@@ -249,7 +314,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
       {/* ── Token row (collapsed, always visible below header) ─── */}
       {!isOpen && (
         <div className="border-t border-border/30 px-5 py-2">
-          <TokenRow s={saved} />
+          <TokenRow s={saved} analysis={analysis} />
         </div>
       )}
 
@@ -335,11 +400,13 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
               {/* Full-width — Pool Wrap Delay */}
               <div className="border-t border-border/30 pt-3">
                 <AdvancedField
-                  label="Pool Wrap Delay (s)"
+                  label="Pool Wrap Delay — Extra Margin (s)"
                   value={draft.pool_wrap_delay_seconds}
                   disabled={disabled}
+                  min={0}
                   error={errors.pool_wrap_delay_seconds}
-                  hint="Delay between extension pool wraps during traffic phase"
+                  hint="Extra safety margin beyond the auto-computed delay. Default 0. Only needed if SBC is slow to release dialogs (e.g. 503s at wrap boundaries)."
+                  tooltip="The engine auto-computes a wrap delay from hold_time + SIP_BYE_BUFFER (2s). This field adds extra seconds on top of that. Set to 0 unless your SBC needs more time to clean up dialogs."
                   onChange={set('pool_wrap_delay_seconds')}
                 />
               </div>
@@ -361,7 +428,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
               {/* Current token row (read-only summary while expanded) */}
               {!isEditing && (
                 <div className="border-t border-border/30 pt-2">
-                  <TokenRow s={saved} />
+                  <TokenRow s={saved} analysis={analysis} />
                 </div>
               )}
             </div>

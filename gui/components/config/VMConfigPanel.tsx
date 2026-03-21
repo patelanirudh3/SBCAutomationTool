@@ -14,8 +14,9 @@ import {
 import { FieldError, FieldHint, FieldWarning, FieldSoftWarning } from './ConfigValidator'
 import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { Link2, Hash, Loader2, CheckCircle, XCircle, Signal, ArrowDownToLine } from 'lucide-react'
+import { Link2, Loader2, CheckCircle, XCircle, Signal, ArrowDownToLine, Lock } from 'lucide-react'
 import type { VMRole, TrafficMode, SipTransport, ReachabilityStatus } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -26,8 +27,11 @@ export type RawVMFormValues = {
   ssh_key_path: string
   uac_ext_start: string
   uac_ext_end: string
+  uac_ext_count: string
   uas_ext_start: string
   uas_ext_end: string
+  uas_ext_count: string
+  uas_override: boolean
   sbc_host: string
   sbc_port: string
   sip_transport: SipTransport
@@ -36,6 +40,7 @@ export type RawVMFormValues = {
   cps: string
   hold_time_seconds: string
   ramp_up_seconds: string
+  media_enabled: boolean
   metrics_port: string
   peer_stop_url: string
   traffic_mode: TrafficMode
@@ -46,7 +51,7 @@ export type RawVMFormValues = {
 export interface VMConfigPanelProps {
   role: VMRole
   raw: RawVMFormValues
-  onChange: (field: keyof RawVMFormValues, value: string) => void
+  onChange: (field: keyof RawVMFormValues, value: string | boolean) => void
   touched: Set<string>
   onBlur: (field: string) => void
   errors: Record<string, string>
@@ -319,7 +324,7 @@ export function VMConfigPanel({
 
       {/* ── SIP Connection ────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>SIP Connection</SectionHeader>
+        <SectionHeader>SIP Server</SectionHeader>
 
         <div className="grid grid-cols-2 gap-3">
           <FormField label="SBC Host" error={e('sbc_host')}>
@@ -390,77 +395,82 @@ export function VMConfigPanel({
       <div className="space-y-3">
         <SectionHeader>Extensions</SectionHeader>
 
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-foreground/80">UAC range</span>
-            {uacExtCount > 0 && (
-              <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400">
-                <Hash className="size-2.5" />
-                {uacExtCount} ext
-              </span>
-            )}
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <FormField label="Start" error={e('uac_ext_start')}>
-              <Input
-                type="number"
-                value={raw.uac_ext_start}
-                onChange={(ev) => onChange('uac_ext_start', ev.target.value)}
-                onBlur={() => onBlur('uac_ext_start')}
-                placeholder="4001000"
-                className="font-mono text-xs"
-                aria-invalid={t('uac_ext_start') && !!errors.uac_ext_start ? true : undefined}
-              />
-            </FormField>
-            <FormField label="End" error={e('uac_ext_end')}>
-              <Input
-                type="number"
-                value={raw.uac_ext_end}
-                onChange={(ev) => onChange('uac_ext_end', ev.target.value)}
-                onBlur={() => onBlur('uac_ext_end')}
-                placeholder="4001004"
-                className="font-mono text-xs"
-                aria-invalid={t('uac_ext_end') && !!errors.uac_ext_end ? true : undefined}
-              />
-            </FormField>
-          </div>
-        </div>
+        {isUAC ? (
+          <>
+            {/* UAC Range — Start + Count → derived End */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-foreground/70">UAC Range</span>
+                {uacExtCount > 0 && (
+                  <span className="flex items-center gap-1 rounded bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-cyan-300/80">
+                    → {raw.uac_ext_end} · {uacExtCount} ext
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
+                <FormField label="Start" error={e('uac_ext_start')}>
+                  <Input
+                    type="number"
+                    value={raw.uac_ext_start}
+                    onChange={(ev) => onChange('uac_ext_start', ev.target.value)}
+                    onBlur={() => onBlur('uac_ext_start')}
+                    placeholder="4001000"
+                    className="font-mono text-xs"
+                    aria-invalid={t('uac_ext_start') && !!errors.uac_ext_start ? true : undefined}
+                  />
+                </FormField>
+                <span className="pb-2 text-base font-bold text-cyan-400/50">+</span>
+                <FormField label="Count">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={raw.uac_ext_count ?? ''}
+                    onChange={(ev) => onChange('uac_ext_count', ev.target.value)}
+                    onBlur={() => onBlur('uac_ext_count')}
+                    placeholder="5"
+                    className="font-mono text-xs"
+                  />
+                </FormField>
+              </div>
+            </div>
 
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-foreground/80">UAS range</span>
-            {uasExtCount > 0 && (
-              <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400">
-                <Hash className="size-2.5" />
-                {uasExtCount} ext
-              </span>
-            )}
+            {/* UAS Range — auto-derived from UAC */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-semibold text-foreground/70">UAS Range</span>
+                  <ArrowDownToLine className="size-2.5 text-muted-foreground/40" />
+                </div>
+                {uasExtCount > 0 && (
+                  <span className="flex items-center gap-1 rounded bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-cyan-300/80">
+                    {raw.uas_ext_start} → {raw.uas_ext_end} · {uasExtCount} ext
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] leading-relaxed text-muted-foreground/60">
+                UAS Start = UAC End + 1, same count
+              </p>
+            </div>
+          </>
+        ) : (
+          /* UAS card: read-only, auto-synced from UAC */
+          <div className="rounded-md border border-border/40 bg-secondary/20 px-3 py-2.5 space-y-2">
+            <div className="flex items-center gap-1.5">
+              <Lock className="size-3 text-muted-foreground/40" />
+              <span className="text-[10px] font-semibold tracking-wide text-muted-foreground/60">Auto-synced from UAC</span>
+            </div>
+            <div className="font-mono text-[11px] leading-relaxed text-slate-300/70 space-y-0.5">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400/70">UAC</span>
+                <span className="text-cyan-300/70">{raw.uac_ext_start} → {raw.uac_ext_end} ({uacExtCount} ext)</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400/70">UAS</span>
+                <span className="text-cyan-300/70">{raw.uas_ext_start} → {raw.uas_ext_end} ({uasExtCount} ext)</span>
+              </div>
+            </div>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            <FormField label="Start" error={e('uas_ext_start')}>
-              <Input
-                type="number"
-                value={raw.uas_ext_start}
-                onChange={(ev) => onChange('uas_ext_start', ev.target.value)}
-                onBlur={() => onBlur('uas_ext_start')}
-                placeholder="4001005"
-                className="font-mono text-xs"
-                aria-invalid={t('uas_ext_start') && !!errors.uas_ext_start ? true : undefined}
-              />
-            </FormField>
-            <FormField label="End" error={e('uas_ext_end')}>
-              <Input
-                type="number"
-                value={raw.uas_ext_end}
-                onChange={(ev) => onChange('uas_ext_end', ev.target.value)}
-                onBlur={() => onBlur('uas_ext_end')}
-                placeholder="4001009"
-                className="font-mono text-xs"
-                aria-invalid={t('uas_ext_end') && !!errors.uas_ext_end ? true : undefined}
-              />
-            </FormField>
-          </div>
-        </div>
+        )}
       </div>
 
       {/* ── Traffic ───────────────────────────────────────────── */}
@@ -531,6 +541,23 @@ export function VMConfigPanel({
               aria-invalid={t('ramp_up_seconds') && !!errors.ramp_up_seconds ? true : undefined}
             />
           </FormField>
+        )}
+
+        {isUAC && (
+          <div className="flex items-center justify-between rounded-md border border-border/40 bg-secondary/20 px-3 py-2.5">
+            <div className="space-y-0.5">
+              <Label className="text-[11px] font-semibold text-foreground/70">Media (RTP)</Label>
+              <p className="text-[10px] leading-relaxed text-muted-foreground/60">
+                {raw.media_enabled
+                  ? 'RTP packets will be sent during calls'
+                  : 'Signaling-only — no RTP packets (MEDIA_DISABLED)'}
+              </p>
+            </div>
+            <Switch
+              checked={raw.media_enabled}
+              onCheckedChange={(checked) => onChange('media_enabled', checked)}
+            />
+          </div>
         )}
       </div>
 

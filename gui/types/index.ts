@@ -11,7 +11,7 @@ export interface AdvancedSettings {
   rtp_burst_seconds: number       // default: 2
   rtp_burst_pps: number           // default: 50
   rtp_keepalive_interval: number  // default: 3
-  pool_wrap_delay_seconds: number // default: 32
+  pool_wrap_delay_seconds: number // default: 0 — extra margin beyond auto-computed delay
   metrics_interval: number        // default: 3  — WS push cadence (seconds)
 }
 
@@ -22,7 +22,7 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_burst_seconds: 2,
   rtp_burst_pps: 50,
   rtp_keepalive_interval: 3,
-  pool_wrap_delay_seconds: 32,
+  pool_wrap_delay_seconds: 0,
   metrics_interval: 3,
 }
 
@@ -53,6 +53,7 @@ export interface VMConfig {
   cps: number
   hold_time_seconds: number
   ramp_up_seconds?: number    // UAC only — default: 5
+  media_enabled?: boolean     // UAC only — default: true; false = signaling-only
   metrics_port: number
   peer_stop_url?: string      // UAC only — auto-derived from UAS vm_ip + metrics_port
 

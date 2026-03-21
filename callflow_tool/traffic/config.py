@@ -51,7 +51,8 @@ _DEFAULTS: dict[str, Any] = {
     "rtp_burst_seconds": 2,       # duration of start/end burst phases
     "rtp_burst_pps": 50,          # packet rate during bursts (= 1000 / ptime_ms)
     "rtp_keepalive_interval": 5,  # seconds between keepalive packets (must be < SBC inactivity timer)
-    "pool_wrap_delay_seconds": 2,  # delay before starting next pool wrap (extensions free from BYE)
+    "pool_wrap_delay_seconds": 0,  # extra margin beyond auto-computed delay (0 = rely on SIP_BYE_BUFFER)
+    "media_enabled": True,           # True = send RTP; False = signaling-only (no RTP)
     # ── Traffic run control ──────────────────────────────────────────────────
     # The GUI (or YAML) sets exactly ONE of the three modes below.
     # CLI --max-calls overrides all three at launch time.
@@ -91,6 +92,7 @@ _ENV_MAP: dict[str, str] = {
     "rtp_burst_pps":      "RTP_BURST_PPS",
     "rtp_keepalive_interval": "RTP_KEEPALIVE_INTERVAL",
     "pool_wrap_delay_seconds": "POOL_WRAP_DELAY_SECONDS",
+    "media_enabled":      "MEDIA_ENABLED",
     "traffic_mode":       "TRAFFIC_MODE",
     "call_count":         "CALL_COUNT",
     "duration_hours":     "DURATION_HOURS",
@@ -108,6 +110,8 @@ _INT_FIELDS = {
 
 # Fields that should be coerced to float
 _FLOAT_FIELDS = {"duration_hours"}
+
+_BOOL_FIELDS = {"media_enabled"}
 
 
 @dataclass
@@ -142,7 +146,8 @@ class VMConfig:
     rtp_burst_seconds: int  = field(default=2)        # burst phase duration (seconds)
     rtp_burst_pps: int      = field(default=50)       # burst packet rate (= 1000/ptime)
     rtp_keepalive_interval: int = field(default=5)    # seconds between keepalive packets
-    pool_wrap_delay_seconds: int = field(default=2)  # delay before next pool wrap (extensions free)
+    media_enabled: bool     = field(default=True)   # False = signaling-only (no RTP)
+    pool_wrap_delay_seconds: int = field(default=0)  # extra margin beyond auto-computed delay (0 = SIP_BYE_BUFFER only)
     # Traffic run control — GUI or YAML sets one mode; CLI --max-calls overrides all
     traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"
     call_count: int         = field(default=0)            # smoke: exact call total (> 0)
@@ -280,6 +285,10 @@ def load_config(yaml_path: str | None = None) -> VMConfig:
     for key in _FLOAT_FIELDS:
         if key in values and values[key] is not None:
             values[key] = float(values[key])
+    for key in _BOOL_FIELDS:
+        if key in values and values[key] is not None:
+            if isinstance(values[key], str):
+                values[key] = values[key].lower() in ("true", "1", "yes")
 
     # Build dataclass (only pass known fields)
     known = {f.name for f in fields(VMConfig)}
@@ -360,6 +369,10 @@ def config_from_dict(data: dict[str, Any]) -> VMConfig:
                 values[key] = float(values[key])
             except (ValueError, TypeError):
                 pass
+    for key in _BOOL_FIELDS:
+        if key in values and values[key] is not None:
+            if isinstance(values[key], str):
+                values[key] = values[key].lower() in ("true", "1", "yes")
 
     known = {f.name for f in fields(VMConfig)}
     cfg = VMConfig(**{k: v for k, v in values.items() if k in known})
