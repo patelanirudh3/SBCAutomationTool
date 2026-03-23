@@ -17,7 +17,7 @@
   - Success accent: use Tailwind `emerald-400` class
   - Warning accent: use Tailwind `amber-400` class
   - Error accent:   use Tailwind `rose-500` class
-- Reference @PHASE1_5CALL_DESIGN.md, @RTP_FLOW_REFERENCE.md and @README.md for all domain logic
+- Reference @docs/PHASE1_5CALL_DESIGN.md, @docs/RTP_FLOW_REFERENCE.md and @docs/README.md for all domain logic
 
 ---
 
