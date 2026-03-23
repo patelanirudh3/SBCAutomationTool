@@ -160,6 +160,7 @@ class MetricsCollector:
 
         self._subscribers: list[asyncio.Queue] = []  # WebSocket push queues
         self._call_results: list = []  # raw CallResult for summary
+        self._raw_events: list = []
         self._concurrent_provider: Optional[ConcurrentProvider] = None
 
     def set_concurrent_provider(self, provider: Optional[ConcurrentProvider]) -> None:
@@ -216,6 +217,12 @@ class MetricsCollector:
                     self._total_samples.append(result.total_ms)
             else:
                 self._calls_failed += 1
+
+    def record_raw_event(self, event: dict) -> None:
+        """Store raw call event for live streaming and GET /api/calls response."""
+        self._raw_events.append(event)
+        if len(self._raw_events) > 10000:
+            self._raw_events = self._raw_events[-10000:]
 
     # ------------------------------------------------------------------
     # Snapshot builder
@@ -333,6 +340,7 @@ class MetricsCollector:
             self._run_start = 0.0
             self._running = False
             self._call_results.clear()
+            self._raw_events.clear()
             self._concurrent_provider = None
             self._vm_id = "unconfigured"
             self._latest = TrafficMetrics(vm_id="unconfigured")

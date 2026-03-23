@@ -37,6 +37,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 from .extension_agent import ExtensionAgent, DialogState
@@ -88,6 +89,39 @@ def _classify_media(stats: RtpStats, hold_seconds: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SIP milestone timestamps (ms offsets from call start, monotonic clock)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SipMilestones:
+    # UAC side
+    invite_sent_ms: float = 0.0
+    trying_100_ms: float = 0.0
+    ringing_180_ms: float = 0.0
+    prack_sent_ms: float = 0.0
+    prack_200_ms: float = 0.0
+    ok_200_ms: float = 0.0
+    ack_sent_ms: float = 0.0
+    rtp_start_ms: float = 0.0
+    rtp_end_ms: float = 0.0
+    bye_sent_ms: float = 0.0
+    bye_200_ms: float = 0.0
+    media_verified_ms: float = 0.0
+    invite_ts_utc: str = ""
+    # UAS side
+    invite_received_ms: float = 0.0
+    trying_100_sent_ms: float = 0.0
+    ringing_180_sent_ms: float = 0.0
+    prack_received_ms: float = 0.0
+    prack_200_sent_ms: float = 0.0
+    ok_200_sent_ms: float = 0.0
+    ack_received_ms: float = 0.0
+    bye_received_ms: float = 0.0
+    bye_200_sent_ms: float = 0.0
+    uas_invite_ts_utc: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Call result (fed into metrics)
 # ---------------------------------------------------------------------------
 
@@ -106,6 +140,18 @@ class CallResult:
     media_verified: bool = False
     rtp_local_port: int = 0    # UDP port used for RTP (0 if none)
     pool_wrap_index: int = 0   # which pool wrap (0-based)
+    # Phase 2 enrichment
+    peer_ext: str = ""
+    ts_utc: str = ""
+    direction: str = "uac"
+    sbc_rtp_relay_ip: str = ""
+    sbc_rtp_relay_port: int = 0
+    sip_milestones: SipMilestones = field(default_factory=SipMilestones)
+    rtp_rx_from_sbc_pkts: int = 0
+    rtp_rx_other_pkts: int = 0
+    rtp_asymmetry_flag: str = ""
+    scenario: str = "basic_call"
+    scenario_assertions: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +174,7 @@ class CallEngine:
         on_call_complete=None,
         on_call_attempt=None,
         max_calls: int = 0,
+        metrics=None,
     ) -> None:
         """
         Args:
@@ -136,12 +183,14 @@ class CallEngine:
             on_call_complete:   Optional async callable(CallResult) for metrics.
             on_call_attempt:    Optional sync callable() invoked at each call launch (for CPS).
             max_calls:          Stop after this many calls attempted (0 = unlimited).
+            metrics:            Optional MetricsCollector for raw event recording.
         """
         self._agents = uac_agents
         self._config = config
         self._on_complete = on_call_complete
         self._on_attempt = on_call_attempt
         self._max_calls = max_calls
+        self._metrics = metrics
         self._index = 0
         self.stop_event = asyncio.Event()
         self._active_calls: set[str] = set()   # call_ids currently in-flight
@@ -304,6 +353,29 @@ class CallEngine:
         """Signal the run loop to stop firing new calls."""
         self.stop_event.set()
 
+    def _emit_call_event(self, call_id: str, ext: str, event: str,
+                         direction: str = "uac", peer_ext: str = "",
+                         sip_code: int = 0, milestone_ms: float = 0.0,
+                         **extra) -> None:
+        ts_utc = datetime.now(timezone.utc).isoformat()
+        ts_mono = time.monotonic() * 1000
+        payload = {
+            "call_id": call_id,
+            "ext": ext,
+            "peer_ext": peer_ext,
+            "event": event,
+            "direction": direction,
+            "ts_utc": ts_utc,
+            "ts_mono_ms": round(ts_mono, 3),
+            "milestone_ms": round(milestone_ms, 3),
+        }
+        if sip_code:
+            payload["sip_code"] = sip_code
+        payload.update(extra)
+        log.info("CALL_EVENT %s", json.dumps(payload))
+        if self._metrics:
+            self._metrics.record_raw_event(payload)
+
     # ------------------------------------------------------------------
     # Extension pairing
     # ------------------------------------------------------------------
@@ -346,6 +418,8 @@ class CallEngine:
         dialog: Optional[DialogState] = None
         call_id = "pending"
         rtp_ep: Optional[RtpEndpoint] = None
+        milestones = SipMilestones()
+        invite_ts_utc = ""
 
         try:
             # ── Allocate RTP endpoint (port goes into SDP offer) ──────
@@ -365,7 +439,11 @@ class CallEngine:
             self._active_calls.add(call_id)
             if len(self._active_calls) > self._peak_active_calls:
                 self._peak_active_calls = len(self._active_calls)
-            _log_call_event(call_id, agent.ext, "INVITE_SENT", callee=callee)
+            invite_ts_utc = datetime.now(timezone.utc).isoformat()
+            milestones.invite_sent_ms = 0.0
+            milestones.invite_ts_utc = invite_ts_utc
+            self._emit_call_event(call_id, agent.ext, "INVITE_SENT",
+                                  peer_ext=callee, milestone_ms=0.0, callee=callee)
 
             timeout = float(self._config.register_timeout * 2)
 
@@ -386,19 +464,26 @@ class CallEngine:
                     event_code, _ = classify_message(raw)
 
                     if event_code == "100":
-                        _log_call_event(call_id, agent.ext, "100_TRYING", sip_code="100")
+                        milestones.trying_100_ms = (time.monotonic() - call_start) * 1000
+                        self._emit_call_event(call_id, agent.ext, "TRYING_100",
+                                              peer_ext=callee, sip_code=100,
+                                              milestone_ms=milestones.trying_100_ms)
 
                     elif event_code in ("180", "183"):
                         agent.parse_prov_response(raw, dialog)
                         pdd = dialog.ringing_recv_ms - dialog.invite_sent_ms
-                        _log_call_event(
-                            call_id, agent.ext, "RINGING", sip_code=event_code,
+                        milestones.ringing_180_ms = (time.monotonic() - call_start) * 1000
+                        self._emit_call_event(
+                            call_id, agent.ext, "RINGING_180", peer_ext=callee,
+                            sip_code=int(event_code),
+                            milestone_ms=milestones.ringing_180_ms,
                             pdd_ms=round(pdd, 2),
                         )
                         got_180 = True
 
                     elif event_code == "407":
-                        _log_call_event(call_id, agent.ext, "AUTH_407", sip_code="407")
+                        self._emit_call_event(call_id, agent.ext, "AUTH_407",
+                                              peer_ext=callee, sip_code=407)
                         await self._handle_407_invite(agent, dialog, raw)
 
                     elif event_code in _FINAL_FAIL or (
@@ -406,9 +491,10 @@ class CallEngine:
                         and event_code[0] in ("4", "5", "6")
                     ):
                         await agent.send_ack_for_failure(dialog, raw)
-                        _log_call_event(
-                            call_id, agent.ext, "CALL_FAILED",
-                            sip_code=event_code, reason="final failure",
+                        self._emit_call_event(
+                            call_id, agent.ext, "CALL_FAILED", peer_ext=callee,
+                            sip_code=int(event_code) if event_code.isdigit() else 0,
+                            reason="final failure",
                         )
                         raise _CallFailed(f"Rejected with {event_code}")
 
@@ -418,12 +504,18 @@ class CallEngine:
             # ── PRACK (if 100rel) ─────────────────────────────────────
             if dialog.is_reliable and dialog.rseq:
                 await agent.send_prack(dialog)
-                _log_call_event(call_id, agent.ext, "PRACK_SENT")
+                milestones.prack_sent_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "PRACK_SENT",
+                                      peer_ext=callee,
+                                      milestone_ms=milestones.prack_sent_ms)
 
                 prack_200_q = agent._wait_for_event("200_PRACK")
                 try:
                     await asyncio.wait_for(prack_200_q.get(), timeout=timeout)
-                    _log_call_event(call_id, agent.ext, "200_PRACK", sip_code="200")
+                    milestones.prack_200_ms = (time.monotonic() - call_start) * 1000
+                    self._emit_call_event(call_id, agent.ext, "PRACK_200",
+                                          peer_ext=callee, sip_code=200,
+                                          milestone_ms=milestones.prack_200_ms)
                 finally:
                     agent._deregister_event_queue(prack_200_q, "200_PRACK")
 
@@ -432,17 +524,27 @@ class CallEngine:
             try:
                 raw_200 = await asyncio.wait_for(inv_200_q.get(), timeout=timeout)
                 agent.parse_200_invite(raw_200, dialog)
-                _log_call_event(call_id, agent.ext, "200_INVITE", sip_code="200")
+                milestones.ok_200_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "OK_200_INVITE",
+                                      peer_ext=callee, sip_code=200,
+                                      milestone_ms=milestones.ok_200_ms)
             finally:
                 agent._deregister_event_queue(inv_200_q, "200_INVITE")
 
             # ── ACK ───────────────────────────────────────────────────
             await agent.send_ack(dialog)
-            _log_call_event(call_id, agent.ext, "ACK_SENT")
+            milestones.ack_sent_ms = (time.monotonic() - call_start) * 1000
+            self._emit_call_event(call_id, agent.ext, "ACK_SENT",
+                                  peer_ext=callee,
+                                  milestone_ms=milestones.ack_sent_ms)
 
             # ── RTP 3-phase (BURST → KEEPALIVE → BURST) ──────────────
             cfg = self._config
             if rtp_ep:
+                milestones.rtp_start_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "RTP_BURST_START",
+                                      peer_ext=callee,
+                                      milestone_ms=milestones.rtp_start_ms)
                 await rtp_ep.run(
                     dialog.rtp_remote_ip,
                     dialog.rtp_remote_port,
@@ -451,18 +553,28 @@ class CallEngine:
                     burst_pps=cfg.rtp_burst_pps,
                     keepalive_interval=float(cfg.rtp_keepalive_interval),
                 )
+                milestones.rtp_end_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "RTP_BURST_END",
+                                      peer_ext=callee,
+                                      milestone_ms=milestones.rtp_end_ms)
             else:
                 await asyncio.sleep(cfg.hold_time_seconds)
             hold_ms = (time.monotonic() * 1000) - dialog.ack_sent_ms
 
             # ── BYE ───────────────────────────────────────────────────
             await agent.send_bye(dialog)
-            _log_call_event(call_id, agent.ext, "BYE_SENT")
+            milestones.bye_sent_ms = (time.monotonic() - call_start) * 1000
+            self._emit_call_event(call_id, agent.ext, "BYE_SENT",
+                                  peer_ext=callee,
+                                  milestone_ms=milestones.bye_sent_ms)
 
             bye_200_q = agent._wait_for_event("200")
             try:
                 await asyncio.wait_for(bye_200_q.get(), timeout=timeout)
-                _log_call_event(call_id, agent.ext, "200_BYE", sip_code="200")
+                milestones.bye_200_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "BYE_200",
+                                      peer_ext=callee, sip_code=200,
+                                      milestone_ms=milestones.bye_200_ms)
             finally:
                 agent._deregister_event_queue(bye_200_q, "200")
 
@@ -476,13 +588,16 @@ class CallEngine:
                 rtp_rx = st.rx_pkts
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
-                _log_call_event(
-                    call_id, agent.ext, media_event,
+                milestones.media_verified_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(
+                    call_id, agent.ext, media_event, peer_ext=callee,
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uac",
+                    milestone_ms=milestones.media_verified_ms,
                 )
 
             if not cfg.media_enabled:
-                _log_call_event(call_id, agent.ext, "MEDIA_DISABLED", direction="uac")
+                self._emit_call_event(call_id, agent.ext, "MEDIA_DISABLED",
+                                      direction="uac", peer_ext=callee)
 
             # ── Call complete ─────────────────────────────────────────
             total_ms = (time.monotonic() - call_start) * 1000
@@ -500,10 +615,16 @@ class CallEngine:
                 media_verified=media_ok,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
                 pool_wrap_index=pool_wrap_index,
+                peer_ext=callee,
+                ts_utc=invite_ts_utc,
+                direction="uac",
+                sbc_rtp_relay_ip=dialog.rtp_remote_ip if dialog else "",
+                sbc_rtp_relay_port=dialog.rtp_remote_port if dialog else 0,
+                sip_milestones=milestones,
             )
             self._calls_completed += 1
-            _log_call_event(
-                call_id, agent.ext, "CALL_COMPLETE",
+            self._emit_call_event(
+                call_id, agent.ext, "CALL_COMPLETE", peer_ext=callee,
                 pdd_ms=round(pdd_ms, 2),
                 hold_ms=round(hold_ms, 2),
                 total_ms=round(total_ms, 2),
@@ -516,9 +637,12 @@ class CallEngine:
                 total_ms=(time.monotonic() - call_start) * 1000,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
                 pool_wrap_index=pool_wrap_index,
+                peer_ext=callee, ts_utc=invite_ts_utc, direction="uac",
+                sip_milestones=milestones,
             )
             self._calls_failed += 1
-            _log_call_event(call_id, agent.ext, "CALL_FAILED", reason=str(exc))
+            self._emit_call_event(call_id, agent.ext, "CALL_FAILED",
+                                  peer_ext=callee, reason=str(exc))
 
         except asyncio.TimeoutError:
             result = CallResult(
@@ -527,9 +651,12 @@ class CallEngine:
                 total_ms=(time.monotonic() - call_start) * 1000,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
                 pool_wrap_index=pool_wrap_index,
+                peer_ext=callee, ts_utc=invite_ts_utc, direction="uac",
+                sip_milestones=milestones,
             )
             self._calls_failed += 1
-            _log_call_event(call_id, agent.ext if agent else "?", "CALL_TIMEOUT")
+            self._emit_call_event(call_id, agent.ext if agent else "?",
+                                  "CALL_TIMEOUT", peer_ext=callee)
 
         except asyncio.CancelledError:
             if dialog and dialog.state == "ESTABLISHED":
@@ -548,6 +675,8 @@ class CallEngine:
                 total_ms=(time.monotonic() - call_start) * 1000,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
                 pool_wrap_index=pool_wrap_index,
+                peer_ext=callee, ts_utc=invite_ts_utc, direction="uac",
+                sip_milestones=milestones,
             )
             self._calls_failed += 1
 
@@ -654,7 +783,8 @@ class CallEngine:
             sdp = agent._build_sdp()
             raw = buildMessage(dialog.invite_msg, sdp)
             await agent._transport.send(raw)
-            _log_call_event(dialog.call_id, agent.ext, "INVITE_AUTH_RESENT")
+            self._emit_call_event(dialog.call_id, agent.ext, "INVITE_AUTH_RESENT",
+                                  peer_ext=dialog.remote_ext)
 
     # ------------------------------------------------------------------
     # Graceful shutdown: send BYE to all active calls
@@ -700,10 +830,12 @@ class UasAutoAnswer:
         uas_agents: dict[str, ExtensionAgent],
         config: VMConfig,
         on_call_complete=None,
+        metrics=None,
     ) -> None:
         self._agents = uas_agents
         self._config = config
         self._on_complete = on_call_complete
+        self._metrics = metrics
         self._tasks: list[asyncio.Task] = []
         self.stop_event = asyncio.Event()
 
@@ -724,6 +856,29 @@ class UasAutoAnswer:
             if not t.done():
                 t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def _emit_call_event(self, call_id: str, ext: str, event: str,
+                         direction: str = "uas", peer_ext: str = "",
+                         sip_code: int = 0, milestone_ms: float = 0.0,
+                         **extra) -> None:
+        ts_utc = datetime.now(timezone.utc).isoformat()
+        ts_mono = time.monotonic() * 1000
+        payload = {
+            "call_id": call_id,
+            "ext": ext,
+            "peer_ext": peer_ext,
+            "event": event,
+            "direction": direction,
+            "ts_utc": ts_utc,
+            "ts_mono_ms": round(ts_mono, 3),
+            "milestone_ms": round(milestone_ms, 3),
+        }
+        if sip_code:
+            payload["sip_code"] = sip_code
+        payload.update(extra)
+        log.info("CALL_EVENT %s", json.dumps(payload))
+        if self._metrics:
+            self._metrics.record_raw_event(payload)
 
     async def _uas_loop(self, agent: ExtensionAgent) -> None:
         """
@@ -762,6 +917,9 @@ class UasAutoAnswer:
         rtp_ep: Optional[RtpEndpoint] = None
         rtp_task: Optional[asyncio.Task] = None
         result: Optional[CallResult] = None
+        milestones = SipMilestones()
+        uas_invite_ts_utc = ""
+        caller_ext = ""
 
         try:
             # ── Allocate RTP endpoint before 200 OK (port goes in SDP) ──
@@ -778,27 +936,57 @@ class UasAutoAnswer:
             # ── Handle INVITE: sends 100 + 180 ───────────────────────
             dialog = await agent.handle_incoming_invite(raw_invite)
             call_id = dialog.call_id
-            _log_call_event(call_id, agent.ext, "UAS_INVITE_RCVD")
+            for _line in raw_invite.split("\r\n"):
+                if _line.lower().startswith("from:") and "sip:" in _line:
+                    caller_ext = _line[_line.index("sip:") + 4:].split("@")[0]
+                    break
+            uas_invite_ts_utc = datetime.now(timezone.utc).isoformat()
+            milestones.invite_received_ms = 0.0
+            milestones.uas_invite_ts_utc = uas_invite_ts_utc
+            _offset = (time.monotonic() - call_start) * 1000
+            milestones.trying_100_sent_ms = _offset
+            milestones.ringing_180_sent_ms = _offset
+            self._emit_call_event(call_id, agent.ext, "UAS_INVITE_RECEIVED",
+                                  peer_ext=caller_ext, milestone_ms=0.0)
+            self._emit_call_event(call_id, agent.ext, "UAS_TRYING_100_SENT",
+                                  peer_ext=caller_ext, sip_code=100,
+                                  milestone_ms=milestones.trying_100_sent_ms)
+            self._emit_call_event(call_id, agent.ext, "UAS_RINGING_180_SENT",
+                                  peer_ext=caller_ext, sip_code=180,
+                                  milestone_ms=milestones.ringing_180_sent_ms)
 
             # ── Wait for PRACK ────────────────────────────────────────
             prack_q = agent._wait_for_event("PRACK")
             try:
                 raw_prack = await asyncio.wait_for(prack_q.get(), timeout=timeout)
+                milestones.prack_received_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "UAS_PRACK_RECEIVED",
+                                      peer_ext=caller_ext,
+                                      milestone_ms=milestones.prack_received_ms)
                 await agent.handle_prack(raw_prack, dialog)
-                _log_call_event(call_id, agent.ext, "UAS_PRACK_RCVD")
+                milestones.prack_200_sent_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "UAS_200_PRACK_SENT",
+                                      peer_ext=caller_ext, sip_code=200,
+                                      milestone_ms=milestones.prack_200_sent_ms)
             finally:
                 agent._deregister_event_queue(prack_q, "PRACK")
 
             # ── Send 200 OK to INVITE (with real RTP port in SDP) ─────
             await agent.send_200_invite(dialog, rtp_port=rtp_port)
-            _log_call_event(call_id, agent.ext, "UAS_200_SENT")
+            milestones.ok_200_sent_ms = (time.monotonic() - call_start) * 1000
+            self._emit_call_event(call_id, agent.ext, "UAS_200_OK_SENT",
+                                  peer_ext=caller_ext, sip_code=200,
+                                  milestone_ms=milestones.ok_200_sent_ms)
 
             # ── Wait for ACK ──────────────────────────────────────────
             ack_q = agent._wait_for_event("ACK")
             try:
                 await asyncio.wait_for(ack_q.get(), timeout=timeout)
                 dialog.state = "ESTABLISHED"
-                _log_call_event(call_id, agent.ext, "UAS_ACK_RCVD")
+                milestones.ack_received_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "UAS_ACK_RECEIVED",
+                                      peer_ext=caller_ext,
+                                      milestone_ms=milestones.ack_received_ms)
             finally:
                 agent._deregister_event_queue(ack_q, "ACK")
 
@@ -821,8 +1009,15 @@ class UasAutoAnswer:
             try:
                 hold_timeout = float(cfg.hold_time_seconds + 60)
                 raw_bye = await asyncio.wait_for(bye_q.get(), timeout=hold_timeout)
+                milestones.bye_received_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "UAS_BYE_RECEIVED",
+                                      peer_ext=caller_ext,
+                                      milestone_ms=milestones.bye_received_ms)
                 await agent.handle_bye(raw_bye, dialog)
-                _log_call_event(call_id, agent.ext, "UAS_BYE_RCVD")
+                milestones.bye_200_sent_ms = (time.monotonic() - call_start) * 1000
+                self._emit_call_event(call_id, agent.ext, "UAS_200_BYE_SENT",
+                                      peer_ext=caller_ext, sip_code=200,
+                                      milestone_ms=milestones.bye_200_sent_ms)
             finally:
                 agent._deregister_event_queue(bye_q, "BYE")
 
@@ -839,33 +1034,45 @@ class UasAutoAnswer:
                 rtp_rx = st.rx_pkts
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
-                _log_call_event(
-                    call_id, agent.ext, media_event,
+                self._emit_call_event(
+                    call_id, agent.ext, media_event, peer_ext=caller_ext,
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uas",
                 )
 
             if not cfg.media_enabled:
-                _log_call_event(call_id, agent.ext, "MEDIA_DISABLED", direction="uas")
+                self._emit_call_event(call_id, agent.ext, "MEDIA_DISABLED",
+                                      direction="uas", peer_ext=caller_ext)
 
             total_ms = (time.monotonic() - call_start) * 1000
             result = CallResult(
-                call_id=call_id, caller="remote", callee=agent.ext,
+                call_id=call_id, caller=caller_ext or "remote", callee=agent.ext,
                 success=True, total_ms=total_ms,
                 rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
                 media_verified=media_ok,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                peer_ext=caller_ext,
+                ts_utc=uas_invite_ts_utc,
+                direction="uas",
+                sbc_rtp_relay_ip=dialog.rtp_remote_ip if dialog else "",
+                sbc_rtp_relay_port=dialog.rtp_remote_port if dialog else 0,
+                sip_milestones=milestones,
             )
-            _log_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE", total_ms=round(total_ms, 2))
+            self._emit_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE",
+                                  peer_ext=caller_ext,
+                                  total_ms=round(total_ms, 2))
 
         except asyncio.TimeoutError:
-            _log_call_event(call_id, agent.ext, "UAS_CALL_TIMEOUT")
+            self._emit_call_event(call_id, agent.ext, "UAS_CALL_TIMEOUT",
+                                  peer_ext=caller_ext)
             if dialog and dialog.call_id in agent.active_dialogs:
                 agent.active_dialogs.pop(dialog.call_id, None)
             result = CallResult(
-                call_id=call_id, caller="remote", callee=agent.ext,
+                call_id=call_id, caller=caller_ext or "remote", callee=agent.ext,
                 success=False, failure_reason="timeout",
                 total_ms=(time.monotonic() - call_start) * 1000,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                peer_ext=caller_ext, ts_utc=uas_invite_ts_utc, direction="uas",
+                sip_milestones=milestones,
             )
 
         except asyncio.CancelledError:
@@ -876,10 +1083,12 @@ class UasAutoAnswer:
             if dialog and dialog.call_id in agent.active_dialogs:
                 agent.active_dialogs.pop(dialog.call_id, None)
             result = CallResult(
-                call_id=call_id, caller="remote", callee=agent.ext,
+                call_id=call_id, caller=caller_ext or "remote", callee=agent.ext,
                 success=False, failure_reason=str(exc),
                 total_ms=(time.monotonic() - call_start) * 1000,
                 rtp_local_port=rtp_ep.local_port if rtp_ep else 0,
+                peer_ext=caller_ext, ts_utc=uas_invite_ts_utc, direction="uas",
+                sip_milestones=milestones,
             )
 
         finally:

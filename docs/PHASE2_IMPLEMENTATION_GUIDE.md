@@ -1806,5 +1806,44 @@ After Python implementation is complete and verified, a separate `PHASE3_GO_MIGR
 
 ---
 
-*PHASE2_IMPLEMENTATION_GUIDE.md — last updated: 2026-03-22*
-*Status: Design-complete. Implementation target: 4 weeks.*
+---
+
+## AMENDMENTS — Supersede sections where noted
+
+### AMD-1: RTP Section 6 — Replace strict filter with dual counting
+Section 6 is SUPERSEDED. Use three counters:
+- `rtp_rx_pkts`: all valid RTP (version=2, len>=12), any source — primary, unchanged semantics
+- `rtp_rx_from_sbc_pkts`: valid RTP from expected SBC relay addr only — NEW
+- `rtp_rx_other_pkts`: valid RTP from any other source — NEW diagnostic
+MEDIA_VERIFIED logic unchanged (still uses `rtp_rx_pkts > 0`).
+Asymmetry cross-check uses `rtp_rx_from_sbc_pkts`.
+set_expected_src() populates after 200 OK SDP parse (UAC) or INVITE SDP parse (UAS).
+
+### AMD-2: Section 9 (Kamailio Parser) — Placeholder only
+Create file `callflow_tool/mcp_server/kamailio_parser.py` with module docstring and
+`parse_siptrace_file()` stub that raises NotImplementedError("Phase 3"). Do not implement.
+
+### AMD-3: Section 10 (Hold/Unhold backend) — Placeholder only
+Add `scenario: str = "basic_call"` field to VMConfig. In `_execute_call()`, after ACK,
+add: `if config.scenario != "basic_call": raise NotImplementedError(f"Scenario {config.scenario} not yet implemented")`.
+Add `GET /api/scenarios` endpoint returning the registry with `hold_unhold` marked `status: "coming_soon"`.
+
+### AMD-4: Section 11 (MCP Server) — Placeholder only
+Create `callflow_tool/mcp_server/` directory with `__init__.py` and `main.py` that prints
+"MCP Server — Phase 3" and exits 0. No tool implementations yet.
+
+### AMD-5: Section 12 (Database) — Placeholder only
+Create `callflow_tool/mcp_server/database.py` with `init_db_pool()` stub that logs
+"Database: Phase 3 — not yet implemented" and returns None. Non-blocking.
+
+### AMD-6: Timeline — Compress to 5 days
+Day 1: Clock + CallResult/CallEvent enrichment + peer_ext (Section 2, 7)
+Day 2: RTP dual-count fix + SBC relay addr extraction (Section 6 AMD-1)
+Day 3: Call Spine correlation + UAS collection + run JSON restructure (Section 4)
+Day 4: Aggregator improvements + all new API endpoints (Section 8)
+Day 5: GUI SIP Ladder + CallSpineCard + Feature Scenario scaffolding (Sections 3, 5)
+
+---
+
+*PHASE2_IMPLEMENTATION_GUIDE.md — last updated: 2026-03-23*
+*Status: Design-complete. Implementation target: 5 days (AMD-6).*
