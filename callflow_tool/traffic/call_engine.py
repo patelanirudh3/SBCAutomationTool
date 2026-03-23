@@ -79,9 +79,10 @@ def _classify_media(stats: RtpStats, hold_seconds: float) -> str:
       MEDIA_PARTIAL  — rx > 0 but duration < 50% of hold_time
       MEDIA_FAILED   — rx == 0
     """
-    if stats.rx_pkts == 0:
+    if stats.rtp_rx_pkts == 0:
         return "MEDIA_FAILED"
-    if stats.last_rx_ms > 0 and stats.first_rx_ms > 0:
+    if (stats.last_rx_ms is not None and stats.first_rx_ms is not None
+            and stats.last_rx_ms > 0 and stats.first_rx_ms > 0):
         rx_duration_s = (stats.last_rx_ms - stats.first_rx_ms) / 1000.0
         if rx_duration_s < hold_seconds * 0.5:
             return "MEDIA_PARTIAL"
@@ -376,6 +377,25 @@ class CallEngine:
         if self._metrics:
             self._metrics.record_raw_event(payload)
 
+    def _compute_rtp_asymmetry_flag(self, tx_pkts: int, rx_from_sbc: int,
+                                     rx_total: int) -> str:
+        """
+        Compute asymmetry using filtered (SBC-only) rx count.
+        Falls back to all-rx if expected_src was never set (rx_from_sbc == 0 but rx > 0).
+        """
+        if tx_pkts == 0:
+            return "OK"
+        if rx_from_sbc == 0 and rx_total > 0:
+            effective_rx = rx_total
+        else:
+            effective_rx = rx_from_sbc
+        delta_pct = abs(tx_pkts - effective_rx) / tx_pkts * 100
+        if delta_pct <= 5:
+            return "OK"
+        if delta_pct <= 15:
+            return "WARNING"
+        return "CRITICAL"
+
     # ------------------------------------------------------------------
     # Extension pairing
     # ------------------------------------------------------------------
@@ -531,6 +551,9 @@ class CallEngine:
             finally:
                 agent._deregister_event_queue(inv_200_q, "200_INVITE")
 
+            if rtp_ep and dialog.rtp_remote_ip:
+                rtp_ep.set_remote_rtp_addr(dialog.rtp_remote_ip, dialog.rtp_remote_port)
+
             # ── ACK ───────────────────────────────────────────────────
             await agent.send_ack(dialog)
             milestones.ack_sent_ms = (time.monotonic() - call_start) * 1000
@@ -581,17 +604,24 @@ class CallEngine:
             # ── Talk-path verification ────────────────────────────────
             rtp_tx = 0
             rtp_rx = 0
+            rtp_rx_from_sbc = 0
+            rtp_rx_other = 0
             media_ok = False
             if rtp_ep:
                 st = rtp_ep.stats
-                rtp_tx = st.tx_pkts
-                rtp_rx = st.rx_pkts
+                rtp_tx = rtp_ep.tx_pkts
+                rtp_rx = st.rtp_rx_pkts
+                rtp_rx_from_sbc = st.rtp_rx_from_sbc
+                rtp_rx_other = st.rtp_rx_other
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
                 milestones.media_verified_ms = (time.monotonic() - call_start) * 1000
                 self._emit_call_event(
                     call_id, agent.ext, media_event, peer_ext=callee,
-                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uac",
+                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
+                    rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
+                    rtp_rx_other_pkts=rtp_rx_other,
+                    direction="uac",
                     milestone_ms=milestones.media_verified_ms,
                 )
 
@@ -621,6 +651,9 @@ class CallEngine:
                 sbc_rtp_relay_ip=dialog.rtp_remote_ip if dialog else "",
                 sbc_rtp_relay_port=dialog.rtp_remote_port if dialog else 0,
                 sip_milestones=milestones,
+                rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
+                rtp_rx_other_pkts=rtp_rx_other,
+                rtp_asymmetry_flag=self._compute_rtp_asymmetry_flag(rtp_tx, rtp_rx_from_sbc, rtp_rx),
             )
             self._calls_completed += 1
             self._emit_call_event(
@@ -880,6 +913,21 @@ class UasAutoAnswer:
         if self._metrics:
             self._metrics.record_raw_event(payload)
 
+    def _compute_rtp_asymmetry_flag(self, tx_pkts: int, rx_from_sbc: int,
+                                     rx_total: int) -> str:
+        if tx_pkts == 0:
+            return "OK"
+        if rx_from_sbc == 0 and rx_total > 0:
+            effective_rx = rx_total
+        else:
+            effective_rx = rx_from_sbc
+        delta_pct = abs(tx_pkts - effective_rx) / tx_pkts * 100
+        if delta_pct <= 5:
+            return "OK"
+        if delta_pct <= 15:
+            return "WARNING"
+        return "CRITICAL"
+
     async def _uas_loop(self, agent: ExtensionAgent) -> None:
         """
         Infinite loop for one UAS extension.
@@ -955,6 +1003,9 @@ class UasAutoAnswer:
                                   peer_ext=caller_ext, sip_code=180,
                                   milestone_ms=milestones.ringing_180_sent_ms)
 
+            if rtp_ep and dialog.rtp_remote_ip:
+                rtp_ep.set_remote_rtp_addr(dialog.rtp_remote_ip, dialog.rtp_remote_port)
+
             # ── Wait for PRACK ────────────────────────────────────────
             prack_q = agent._wait_for_event("PRACK")
             try:
@@ -1024,19 +1075,26 @@ class UasAutoAnswer:
             # ── Cancel RTP task and collect stats ─────────────────────
             rtp_tx = 0
             rtp_rx = 0
+            rtp_rx_from_sbc = 0
+            rtp_rx_other = 0
             media_ok = False
             if rtp_task and not rtp_task.done():
                 rtp_task.cancel()
                 await asyncio.gather(rtp_task, return_exceptions=True)
             if rtp_ep:
                 st = rtp_ep.stats
-                rtp_tx = st.tx_pkts
-                rtp_rx = st.rx_pkts
+                rtp_tx = rtp_ep.tx_pkts
+                rtp_rx = st.rtp_rx_pkts
+                rtp_rx_from_sbc = st.rtp_rx_from_sbc
+                rtp_rx_other = st.rtp_rx_other
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
                 self._emit_call_event(
                     call_id, agent.ext, media_event, peer_ext=caller_ext,
-                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx, direction="uas",
+                    rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
+                    rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
+                    rtp_rx_other_pkts=rtp_rx_other,
+                    direction="uas",
                 )
 
             if not cfg.media_enabled:
@@ -1056,6 +1114,9 @@ class UasAutoAnswer:
                 sbc_rtp_relay_ip=dialog.rtp_remote_ip if dialog else "",
                 sbc_rtp_relay_port=dialog.rtp_remote_port if dialog else 0,
                 sip_milestones=milestones,
+                rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
+                rtp_rx_other_pkts=rtp_rx_other,
+                rtp_asymmetry_flag=self._compute_rtp_asymmetry_flag(rtp_tx, rtp_rx_from_sbc, rtp_rx),
             )
             self._emit_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE",
                                   peer_ext=caller_ext,

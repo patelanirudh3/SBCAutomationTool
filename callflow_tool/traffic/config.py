@@ -59,6 +59,10 @@ _DEFAULTS: dict[str, Any] = {
     "traffic_mode": "unlimited",  # "smoke" | "timed" | "unlimited"
     "call_count": 0,              # smoke: exact number of calls to attempt (> 0)
     "duration_hours": 0.0,        # timed: run duration in hours (decimals ok: 0.25 = 15 min)
+    "scenario": "basic_call",     # "basic_call" | "hold_unhold" — future scenarios added here
+    "scenario_hold_duration_seconds": 5.0,
+    "scenario_pre_hold_rtp_seconds": 3.0,
+    "scenario_post_hold_rtp_seconds": 3.0,
 }
 
 # ENV VAR name mapping: field_name -> ENV_VAR_NAME
@@ -96,6 +100,10 @@ _ENV_MAP: dict[str, str] = {
     "traffic_mode":       "TRAFFIC_MODE",
     "call_count":         "CALL_COUNT",
     "duration_hours":     "DURATION_HOURS",
+    "scenario":           "SCENARIO",
+    "scenario_hold_duration_seconds": "SCENARIO_HOLD_DURATION_SECONDS",
+    "scenario_pre_hold_rtp_seconds":  "SCENARIO_PRE_HOLD_RTP_SECONDS",
+    "scenario_post_hold_rtp_seconds": "SCENARIO_POST_HOLD_RTP_SECONDS",
 }
 
 # Fields that should be coerced to int
@@ -109,7 +117,7 @@ _INT_FIELDS = {
 }
 
 # Fields that should be coerced to float
-_FLOAT_FIELDS = {"duration_hours"}
+_FLOAT_FIELDS = {"duration_hours", "scenario_hold_duration_seconds", "scenario_pre_hold_rtp_seconds", "scenario_post_hold_rtp_seconds"}
 
 _BOOL_FIELDS = {"media_enabled"}
 
@@ -152,6 +160,11 @@ class VMConfig:
     traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"
     call_count: int         = field(default=0)            # smoke: exact call total (> 0)
     duration_hours: float   = field(default=0.0)          # timed: hours (0.25 = 15 min)
+    # Scenario support (Phase 2 placeholder)
+    scenario: str                       = field(default="basic_call")  # "basic_call" | "hold_unhold"
+    scenario_hold_duration_seconds: float = field(default=5.0)
+    scenario_pre_hold_rtp_seconds: float  = field(default=3.0)
+    scenario_post_hold_rtp_seconds: float = field(default=3.0)
 
     # ------------------------------------------------------------------
     # Derived helpers (not serialised as config)

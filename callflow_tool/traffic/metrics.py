@@ -68,7 +68,7 @@ log = logging.getLogger(__name__)
 # FastAPI / uvicorn are optional at import time so that the engine can
 # start even if the web server fails. They're imported lazily in start_server().
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
     from fastapi.responses import JSONResponse
     import uvicorn
     _FASTAPI_AVAILABLE = True
@@ -161,7 +161,13 @@ class MetricsCollector:
         self._subscribers: list[asyncio.Queue] = []  # WebSocket push queues
         self._call_results: list = []  # raw CallResult for summary
         self._raw_events: list = []
+        self._call_spines: list = []
         self._concurrent_provider: Optional[ConcurrentProvider] = None
+
+        # Phase 2 — aggregator improvements
+        self._pdd_breakdown_samples: list = []   # list of {invite_to_100, 100_to_180, 180_to_200}
+        self._rtp_health_counts: dict = {"OK": 0, "WARNING": 0, "CRITICAL": 0}
+        self._scenario_assertion_results: list = []
 
     def set_concurrent_provider(self, provider: Optional[ConcurrentProvider]) -> None:
         """Set callable that returns current active call count (UAC only). Used for real-time /metrics."""
@@ -218,11 +224,82 @@ class MetricsCollector:
             else:
                 self._calls_failed += 1
 
+            # PDD breakdown: only if milestones are populated
+            m = getattr(result, 'sip_milestones', None)
+            if m and m.ringing_180_ms > 0 and m.trying_100_ms > 0:
+                self._pdd_breakdown_samples.append({
+                    "invite_to_100_ms":  round(m.trying_100_ms - m.invite_sent_ms, 2),
+                    "100_to_180_ms":     round(m.ringing_180_ms - m.trying_100_ms, 2),
+                    "180_to_200_ms":     round(m.ok_200_ms - m.ringing_180_ms, 2) if m.ok_200_ms > 0 else 0.0,
+                })
+
+            # RTP health
+            flag = getattr(result, 'rtp_asymmetry_flag', '')
+            if flag in self._rtp_health_counts:
+                self._rtp_health_counts[flag] += 1
+
+            # Scenario assertions
+            if getattr(result, 'scenario_assertions', None):
+                self._scenario_assertion_results.append({
+                    "call_id": result.call_id,
+                    "scenario": result.scenario,
+                    "assertions": result.scenario_assertions,
+                })
+
     def record_raw_event(self, event: dict) -> None:
         """Store raw call event for live streaming and GET /api/calls response."""
         self._raw_events.append(event)
         if len(self._raw_events) > 10000:
             self._raw_events = self._raw_events[-10000:]
+
+    def get_all_events(self) -> list[dict]:
+        """Return all raw call events (for per-call-id lookup)."""
+        return list(self._raw_events)
+
+    def get_call_results_as_dicts(self) -> list[dict]:
+        """Convert stored CallResult objects to dicts for spine builder."""
+        from dataclasses import asdict
+        out = []
+        for r in self._call_results:
+            try:
+                out.append(asdict(r))
+            except Exception:
+                pass
+        return out
+
+    def store_call_spines(self, spines: list) -> None:
+        """Store correlated call spines built by _build_call_spines."""
+        self._call_spines = list(spines)
+
+    def get_rtp_health_snapshot(self) -> dict:
+        return dict(self._rtp_health_counts)
+
+    def get_final_summary(self) -> dict:
+        """Return aggregate summary dict with Phase 2 enrichment fields."""
+        summary: dict = {}
+
+        if self._pdd_breakdown_samples:
+            from statistics import mean
+            summary["avg_pdd_breakdown"] = {
+                "invite_to_100_ms": round(mean(s["invite_to_100_ms"] for s in self._pdd_breakdown_samples), 2),
+                "100_to_180_ms":    round(mean(s["100_to_180_ms"]    for s in self._pdd_breakdown_samples), 2),
+                "180_to_200_ms":    round(mean(s["180_to_200_ms"]    for s in self._pdd_breakdown_samples), 2),
+            }
+
+        summary["rtp_health"] = dict(self._rtp_health_counts)
+
+        if self._scenario_assertion_results:
+            all_pass = all(
+                all(v.get("pass", False) for v in a["assertions"].values())
+                for a in self._scenario_assertion_results
+            )
+            summary["scenario_result"] = {
+                "scenario": self._scenario_assertion_results[0]["scenario"] if self._scenario_assertion_results else "basic_call",
+                "all_assertions_pass": all_pass,
+                "details": self._scenario_assertion_results,
+            }
+
+        return summary
 
     # ------------------------------------------------------------------
     # Snapshot builder
@@ -295,7 +372,9 @@ class MetricsCollector:
             async with self._lock:
                 snap = self._build_snapshot()
 
-            payload = json.dumps(snap.to_dict())
+            data = snap.to_dict()
+            data["rtp_health"] = self.get_rtp_health_snapshot()
+            payload = json.dumps(data)
             dead = []
             for q in self._subscribers:
                 try:
@@ -341,7 +420,11 @@ class MetricsCollector:
             self._running = False
             self._call_results.clear()
             self._raw_events.clear()
+            self._call_spines.clear()
             self._concurrent_provider = None
+            self._pdd_breakdown_samples.clear()
+            self._rtp_health_counts = {"OK": 0, "WARNING": 0, "CRITICAL": 0}
+            self._scenario_assertion_results.clear()
             self._vm_id = "unconfigured"
             self._latest = TrafficMetrics(vm_id="unconfigured")
 
@@ -396,7 +479,9 @@ def build_app(
     async def get_metrics():
         async with collector._lock:
             snap = collector._build_snapshot()
-        return JSONResponse(content=snap.to_dict())
+        data = snap.to_dict()
+        data["rtp_health"] = collector.get_rtp_health_snapshot()
+        return JSONResponse(content=data)
 
     # ── WS /metrics/stream ───────────────────────────────────────────────
     @app.websocket("/metrics/stream")
@@ -652,18 +737,23 @@ def build_app(
             elif getattr(r, "rtp_tx_pkts", 0) > 0 or getattr(r, "rtp_rx_pkts", 0) > 0:
                 media = "MEDIA_PARTIAL"
 
-            ts_raw = getattr(r, "timestamp", getattr(r, "end_time", None))
-            if hasattr(ts_raw, "isoformat"):
-                ts = ts_raw.isoformat()
-            elif ts_raw:
-                ts = str(ts_raw)
+            ts_utc = getattr(r, "ts_utc", "")
+            if ts_utc:
+                ts = ts_utc
             else:
-                ts = _dt.datetime.now().isoformat()
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+            direction = getattr(r, "direction", "uac")
+            caller_str = str(getattr(r, "caller", getattr(r, "uac_ext", "")))
+            callee_str = str(getattr(r, "callee", getattr(r, "uas_ext", "")))
 
             out.append({
                 "call_id": getattr(r, "call_id", f"call-{i:04d}"),
-                "uac_ext": str(getattr(r, "caller", getattr(r, "uac_ext", ""))),
-                "uas_ext": str(getattr(r, "callee", getattr(r, "uas_ext", ""))),
+                "uac_ext": caller_str,
+                "uas_ext": callee_str,
+                "ext": callee_str if direction == "uas" else caller_str,
+                "peer_ext": str(getattr(r, "peer_ext", "")),
+                "direction": direction,
                 "result": "COMPLETED" if getattr(r, "success", False) else "FAILED",
                 "failure_reason": getattr(r, "failure_reason", None) or None,
                 "pdd_ms": float(getattr(r, "pdd_ms", 0) or 0),
@@ -671,9 +761,56 @@ def build_app(
                 "media_status": media,
                 "rtp_tx_pkts": getattr(r, "rtp_tx_pkts", None),
                 "rtp_rx_pkts": getattr(r, "rtp_rx_pkts", None),
+                "rtp_rx_from_sbc_pkts": getattr(r, "rtp_rx_from_sbc_pkts", 0),
+                "rtp_rx_other_pkts": getattr(r, "rtp_rx_other_pkts", 0),
+                "rtp_asymmetry_flag": getattr(r, "rtp_asymmetry_flag", ""),
+                "sbc_rtp_relay_ip": getattr(r, "sbc_rtp_relay_ip", ""),
+                "sbc_rtp_relay_port": getattr(r, "sbc_rtp_relay_port", 0),
+                "ts_utc": ts,
                 "timestamp": ts,
             })
         return out
+
+    # ── GET /api/calls/{call_id} ──────────────────────────────────────────
+    @app.get("/api/calls/{call_id}")
+    async def get_call_by_id(call_id: str):
+        """Return the full call event record for a specific Call-ID."""
+        for event in reversed(collector.get_all_events()):
+            if event.get("call_id") == call_id:
+                return event
+        raise HTTPException(status_code=404, detail=f"Call-ID {call_id} not found")
+
+    # ── GET /api/call-spines ──────────────────────────────────────────────
+    @app.get("/api/call-spines")
+    async def get_call_spines():
+        """Return the correlated call spines array (UAC + UAS legs)."""
+        return getattr(collector, "_call_spines", [])
+
+    # ── GET /api/scenarios ────────────────────────────────────────────────
+    @app.get("/api/scenarios")
+    async def get_scenarios():
+        return {
+            "scenarios": [
+                {
+                    "id": "basic_call",
+                    "name": "Basic Call",
+                    "description": "Standard INVITE → RTP → BYE call flow",
+                    "status": "available",
+                    "assertions": [],
+                },
+                {
+                    "id": "hold_unhold",
+                    "name": "Hold / Unhold",
+                    "description": "Call with re-INVITE hold and resume (a=inactive / a=sendrecv)",
+                    "status": "coming_soon",
+                    "assertions": [
+                        {"key": "re_invite_count", "expected": 2},
+                        {"key": "media_state_sequence", "expected": ["ACTIVE", "HELD", "ACTIVE"]},
+                        {"key": "asr", "expected": 100},
+                    ],
+                },
+            ]
+        }
 
     # ── GET /api/vms ─────────────────────────────────────────────────────
     @app.get("/api/vms")

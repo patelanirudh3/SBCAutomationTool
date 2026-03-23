@@ -400,6 +400,7 @@ async def run(
             on_call_complete=collector.record_call,
             on_call_attempt=collector.record_attempt,
             max_calls=max_calls,
+            metrics=collector,
         )
         collector.set_concurrent_provider(lambda: engine.active_call_count)
         log.info(
@@ -423,13 +424,40 @@ async def run(
     else:
         # UAS mode: start auto-answer on all agents
         uas_engine = UasAutoAnswer(
-            agents, config, on_call_complete=collector.record_call
+            agents, config, on_call_complete=collector.record_call,
+            metrics=collector,
         )
         await uas_engine.start()
         log.info("UAS auto-answer mode active on %d extensions", len(agents))
 
         # Wait for stop signal
         await stop_event.wait()
+
+    # ── CALL SPINE CORRELATION (UAC only) ─────────────────────────────────
+    # Runs BEFORE _shutdown() which sends the UAS stop signal.
+    # UAS process is alive and serving — GET /api/calls is safe here.
+    if config.is_uac:
+        peer_url = getattr(config, "peer_stop_url", "") or ""
+        if peer_url:
+            _parsed = urlparse(peer_url)
+            uas_base_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port}"
+        else:
+            uas_base_url = ""
+
+        if uas_base_url:
+            uas_calls = await _collect_uas_events(uas_base_url, timeout_seconds=8.0)
+        else:
+            uas_calls = []
+            log.warning("No peer_stop_url — skipping UAS event collection for spine correlation")
+
+        uac_calls = collector.get_call_results_as_dicts()
+        call_spines = _build_call_spines(uac_calls, uas_calls)
+        collector.store_call_spines(call_spines)
+        log.info(
+            "Built %d call spines (%d with UAS correlation)",
+            len(call_spines),
+            sum(1 for s in call_spines if s.get("correlation_method") == "ext_time_window"),
+        )
 
     # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
     collector.set_phase("STOPPING")
@@ -509,6 +537,141 @@ async def _cancel_server(server_task) -> None:
             await asyncio.wait_for(server_task, timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Call Spine — UAS event collection + UAC↔UAS correlation
+# ---------------------------------------------------------------------------
+
+async def _collect_uas_events(uas_base_url: str, timeout_seconds: float = 8.0) -> list:
+    """
+    Fetch call events from the UAS process via GET /api/calls.
+    Called immediately after UAC final metrics are flushed, before writing run JSON.
+    UAS process is guaranteed alive at this point — it stays running between runs.
+    Returns empty list on any failure — never raises, never blocks the run export.
+    """
+    import aiohttp
+    url = f"{uas_base_url}/api/calls"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    log.info("Collected %d UAS call events from %s", len(data), url)
+                    return data
+                else:
+                    log.warning("UAS /api/calls returned %d — spine will be UAC-only", r.status)
+                    return []
+    except Exception as e:
+        log.warning("Could not collect UAS events from %s: %s — spine will be UAC-only", url, e)
+        return []
+
+
+def _build_call_spines(uac_calls: list, uas_calls: list) -> list:
+    """
+    Correlate UAC and UAS call events by (uac_ext, uas_ext, time_window=3s).
+
+    Avaya CM is a B2BUA: Leg A (UAC→CM) has one Call-ID, Leg B (CM→UAS) has
+    a different Call-ID.  ASBC passes Leg A Call-ID through unchanged.
+    The only cross-VM linking key available without SBC/Kamailio logs is:
+    extension pairing + time.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    def parse_ts(ts_str: str) -> float:
+        if not ts_str:
+            return 0.0
+        try:
+            return _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def pct_delta(a: int, b: int) -> float:
+        if a == 0 and b == 0:
+            return 0.0
+        if a == 0:
+            return 100.0
+        return abs(a - b) / a * 100
+
+    def rtp_flag(pct: float) -> str:
+        if pct <= 5:
+            return "OK"
+        if pct <= 15:
+            return "WARNING"
+        return "CRITICAL"
+
+    # Build UAS index: (uas_own_ext, uac_peer_ext) → sorted list of events
+    uas_index: dict[tuple, list] = {}
+    for ue in uas_calls:
+        uas_own = ue.get("ext", ue.get("uas_ext", ue.get("callee", "")))
+        uac_peer = ue.get("peer_ext", ue.get("uac_ext", ue.get("caller", "")))
+        key = (str(uas_own), str(uac_peer))
+        uas_index.setdefault(key, []).append(ue)
+    for bucket in uas_index.values():
+        bucket.sort(key=lambda e: parse_ts(e.get("ts_utc", e.get("timestamp", ""))))
+
+    spines = []
+    for uac_call in uac_calls:
+        uac_ext = str(uac_call.get("ext", uac_call.get("caller", uac_call.get("uac_ext", ""))))
+        uas_ext = str(uac_call.get("peer_ext", uac_call.get("callee", uac_call.get("uas_ext", ""))))
+        uac_ts = parse_ts(uac_call.get("ts_utc", uac_call.get("timestamp", "")))
+
+        # Find matching UAS event within ±3 seconds
+        uas_match = None
+        for candidate in uas_index.get((uas_ext, uac_ext), []):
+            uas_ts = parse_ts(candidate.get("ts_utc", candidate.get("timestamp", "")))
+            if uas_ts and abs(uas_ts - uac_ts) < 3.0:
+                uas_match = candidate
+                break
+
+        # RTP cross-check
+        uac_tx = uac_call.get("rtp_tx_pkts", 0) or 0
+        uas_rx_sbc = (uas_match or {}).get(
+            "rtp_rx_from_sbc_pkts",
+            (uas_match or {}).get("rtp_rx_pkts", 0),
+        ) or 0
+        uas_tx = (uas_match or {}).get("rtp_tx_pkts", 0) or 0
+        uac_rx_sbc = uac_call.get(
+            "rtp_rx_from_sbc_pkts",
+            uac_call.get("rtp_rx_pkts", 0),
+        ) or 0
+
+        a_to_b_pct = pct_delta(uac_tx, uas_rx_sbc)
+        b_to_a_pct = pct_delta(uas_tx, uac_rx_sbc)
+        overall = "OK" if rtp_flag(a_to_b_pct) == "OK" and rtp_flag(b_to_a_pct) == "OK" else "DEGRADED"
+
+        spine = {
+            "spine_id": f"{uac_ext}->{uas_ext}@{uac_call.get('ts_utc', uac_call.get('timestamp', ''))}",
+            "correlation_method": "ext_time_window" if uas_match else "uac_only",
+            "call_ids": {
+                "leg_a": uac_call.get("call_id", ""),
+                "leg_b": (uas_match or {}).get("call_id", None),
+                "b2bua_boundary": "avaya_cm",
+            },
+            "uac_leg": uac_call,
+            "uas_leg": uas_match,
+            "media_cross_check": {
+                "uac_tx_vs_uas_rx": {
+                    "uac_tx": uac_tx,
+                    "uas_rx": uas_rx_sbc,
+                    "uas_rx_total": (uas_match or {}).get("rtp_rx_pkts", 0) or 0,
+                    "delta_pct": round(a_to_b_pct, 1),
+                    "flag": rtp_flag(a_to_b_pct),
+                },
+                "uas_tx_vs_uac_rx": {
+                    "uas_tx": uas_tx,
+                    "uac_rx": uac_rx_sbc,
+                    "uac_rx_total": uac_call.get("rtp_rx_pkts", 0) or 0,
+                    "delta_pct": round(b_to_a_pct, 1),
+                    "flag": rtp_flag(b_to_a_pct),
+                },
+                "overall_status": overall,
+            },
+            "kam_trace": None,
+        }
+        spines.append(spine)
+
+    return spines
 
 
 async def _shutdown(
@@ -676,6 +839,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
                 on_call_complete=collector.record_call,
                 on_call_attempt=collector.record_attempt,
                 max_calls=max_calls,
+                metrics=collector,
             )
             collector.set_concurrent_provider(lambda: engine.active_call_count)
             log.info(
@@ -697,10 +861,37 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
         else:
             uas_engine = UasAutoAnswer(
                 agents, config, on_call_complete=collector.record_call,
+                metrics=collector,
             )
             await uas_engine.start()
             log.info("UAS auto-answer mode active on %d extensions", len(agents))
             await stop_event.wait()
+
+        # ── CALL SPINE CORRELATION (UAC only) ─────────────────────────
+        # Runs BEFORE _shutdown() which sends the UAS stop signal.
+        # UAS process is alive and serving — GET /api/calls is safe here.
+        if config.is_uac:
+            peer_url = getattr(config, "peer_stop_url", "") or ""
+            if peer_url:
+                _parsed = urlparse(peer_url)
+                uas_base_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port}"
+            else:
+                uas_base_url = ""
+
+            if uas_base_url:
+                uas_calls = await _collect_uas_events(uas_base_url, timeout_seconds=8.0)
+            else:
+                uas_calls = []
+                log.warning("No peer_stop_url — skipping UAS event collection for spine correlation")
+
+            uac_calls = collector.get_call_results_as_dicts()
+            call_spines = _build_call_spines(uac_calls, uas_calls)
+            collector.store_call_spines(call_spines)
+            log.info(
+                "Built %d call spines (%d with UAS correlation)",
+                len(call_spines),
+                sum(1 for s in call_spines if s.get("correlation_method") == "ext_time_window"),
+            )
 
         # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────
         collector.set_phase("STOPPING")

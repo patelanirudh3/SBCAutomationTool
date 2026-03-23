@@ -77,40 +77,71 @@ def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
 
 @dataclass(frozen=True)
 class RtpStats:
-    """Immutable snapshot of an RtpEndpoint's send/receive counters."""
-    tx_pkts: int
-    rx_pkts: int
-    first_rx_ms: float
-    last_rx_ms: float
+    """Immutable snapshot of an RtpEndpoint's receive counters (three-tier classification)."""
+    rtp_rx_pkts: int            # all valid RTP received (primary, unchanged semantics)
+    rtp_rx_from_sbc: int        # valid RTP from expected SBC relay address
+    rtp_rx_other: int           # valid RTP from other sources (probes, etc.)
+    first_rx_ms: float | None
+    last_rx_ms: float | None
 
 
 # ---------------------------------------------------------------------------
-# Counting DatagramProtocol — lightweight receive counter
+# Counting DatagramProtocol — three-tier RTP receive counter
 # ---------------------------------------------------------------------------
 
 class _CountingProtocol(asyncio.DatagramProtocol):
     """
-    Counts incoming datagrams and records first/last receive timestamps.
-    No payload inspection, no allocation per packet — effectively zero overhead.
+    Counts incoming UDP datagrams with three-tier classification:
+    - packets_received: ALL valid RTP (version=2, len>=12) — primary counter, unchanged semantics
+    - pkts_from_expected_src: valid RTP from the known SBC relay address only
+    - pkts_from_other_src: valid RTP from any other source (SBC probes, RTCP-over-RTP, etc.)
+
+    Non-RTP packets (version != 2 or len < 12) are silently ignored and not counted in any bucket.
+    This prevents SBC keep-alive probes and RTCP packets from appearing as RTP traffic.
     """
-    __slots__ = ("packets_received", "first_recv_ts", "last_recv_ts")
-
-    def __init__(self) -> None:
+    def __init__(self):
         self.packets_received: int = 0
-        self.first_recv_ts: float = 0.0
-        self.last_recv_ts: float = 0.0
+        self.pkts_from_expected_src: int = 0
+        self.pkts_from_other_src: int = 0
+        self.first_recv_ts: float | None = None
+        self.last_recv_ts: float | None = None
+        self._expected_src: tuple[str, int] | None = None
+        self._transport = None
 
-    def datagram_received(self, data: bytes, addr: Tuple) -> None:
-        now = time.monotonic()
-        if self.packets_received == 0:
+    def connection_made(self, transport) -> None:
+        self._transport = transport
+
+    def set_expected_src(self, ip: str, port: int) -> None:
+        """
+        Register the SBC RTP relay address after SDP negotiation.
+        Until called, all valid RTP is counted in packets_received but
+        pkts_from_expected_src remains 0 (pre-answer phase packets are
+        attributed to pkts_from_other_src).
+        """
+        self._expected_src = (ip, port)
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < 12:
+            return
+
+        if (data[0] >> 6) != 2:
+            return
+
+        now = time.monotonic() * 1000
+        if self.first_recv_ts is None:
             self.first_recv_ts = now
         self.last_recv_ts = now
         self.packets_received += 1
 
-    def error_received(self, exc: Exception) -> None:
-        pass
+        if self._expected_src is not None and addr == self._expected_src:
+            self.pkts_from_expected_src += 1
+        else:
+            self.pkts_from_other_src += 1
 
-    def connection_lost(self, exc: Optional[Exception]) -> None:
+    def error_received(self, exc: Exception) -> None:
+        log.debug("RTP socket error: %s", exc)
+
+    def connection_lost(self, exc) -> None:
         pass
 
 
@@ -133,7 +164,8 @@ class RtpEndpoint:
         await ep.close()
     """
 
-    __slots__ = ("_transport", "_protocol", "_local_port", "_closed", "_tx_pkts")
+    __slots__ = ("_transport", "_protocol", "_local_port", "_closed", "_tx_pkts",
+                 "_remote_ip", "_remote_port")
 
     def __init__(
         self,
@@ -146,6 +178,8 @@ class RtpEndpoint:
         self._local_port = local_port
         self._closed    = False
         self._tx_pkts   = 0
+        self._remote_ip: str = ""
+        self._remote_port: int = 0
 
     # ------------------------------------------------------------------
 
@@ -172,13 +206,33 @@ class RtpEndpoint:
         return self._local_port
 
     @property
+    def tx_pkts(self) -> int:
+        """Total RTP packets sent by this endpoint."""
+        return self._tx_pkts
+
+    def set_remote_rtp_addr(self, ip: str, port: int) -> None:
+        """
+        Called by CallEngine after parsing 200 OK SDP answer (UAC) or INVITE SDP (UAS).
+        Registers the SBC relay address with the counting protocol so it can
+        distinguish SBC media traffic from SBC probes/RTCP.
+        Safe to call before or after run() — protocol is updated immediately if running.
+        """
+        self._remote_ip = ip
+        self._remote_port = port
+        if self._protocol is not None:
+            self._protocol.set_expected_src(ip, port)
+
+    @property
     def stats(self) -> RtpStats:
-        """Snapshot of send/receive counters.  Safe to read after run() completes."""
+        """Snapshot of receive counters (three-tier).  Safe to read after run() completes."""
+        if self._protocol is None:
+            return RtpStats(0, 0, 0, None, None)
         return RtpStats(
-            tx_pkts=self._tx_pkts,
-            rx_pkts=self._protocol.packets_received,
-            first_rx_ms=self._protocol.first_recv_ts * 1000 if self._protocol.first_recv_ts else 0.0,
-            last_rx_ms=self._protocol.last_recv_ts * 1000 if self._protocol.last_recv_ts else 0.0,
+            rtp_rx_pkts=self._protocol.packets_received,
+            rtp_rx_from_sbc=self._protocol.pkts_from_expected_src,
+            rtp_rx_other=self._protocol.pkts_from_other_src,
+            first_rx_ms=self._protocol.first_recv_ts,
+            last_rx_ms=self._protocol.last_recv_ts,
         )
 
     # ------------------------------------------------------------------
