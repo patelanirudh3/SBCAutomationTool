@@ -107,8 +107,10 @@ interface TrafficStore {
 
   // Post-run
   callEvents: CallEvent[]
+  callSpines: Record<string, unknown>[]
   aggregate: AggregateMetrics | null
   setCallEvents: (events: CallEvent[]) => void
+  setCallSpines: (spines: Record<string, unknown>[]) => void
   setAggregate: (a: AggregateMetrics) => void
 
   // Run-level ID (one per traffic run, shared by all pairs)
@@ -132,6 +134,7 @@ const initialState = {
   metricsHistory: [] as MetricsHistoryPoint[],
   wsStatus: { uac: 'disconnected', uas: 'disconnected' } as { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' },
   callEvents: [] as CallEvent[],
+  callSpines: [] as Record<string, unknown>[],
   aggregate: null,
   currentRunId: '',
 }
@@ -196,6 +199,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     })),
 
   setCallEvents: (events) => set({ callEvents: events }),
+  setCallSpines: (spines) => set({ callSpines: spines }),
   setAggregate: (a) => set({ aggregate: a }),
 
   setCurrentRunId: (id) => set({ currentRunId: id }),

@@ -172,19 +172,34 @@ export async function getCallsFor(
 }
 
 // ---------------------------------------------------------------------------
+// Per-VM call spines — GET /api/call-spines on a specific VM (UAC)
+// Returns [] on any error so callers never need try/catch
+// ---------------------------------------------------------------------------
+
+export async function getCallSpinesFor(
+  ip: string,
+  port: number
+): Promise<Record<string, unknown>[]> {
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/call-spines`)
+    if (!res.ok) return []
+    return (await res.json()) as Record<string, unknown>[]
+  } catch { return [] }
+}
+
+// ---------------------------------------------------------------------------
 // Build AggregateMetrics from fetched call events
 // UAC is source of truth for attempts (UAC drives all calls)
 // ---------------------------------------------------------------------------
 
 export function buildAggregate(
   uacEvents: import('@/types').CallEvent[],
-  uasEvents: import('@/types').CallEvent[],
+  _uasEvents: import('@/types').CallEvent[],
   runId: string,
   startedAt: string
 ): import('@/types').AggregateMetrics {
-  const allEvents = uacEvents.length > 0 ? uacEvents : uasEvents
-  const attempted = allEvents.length
-  const completed = allEvents.filter((e) => e.result === 'COMPLETED').length
+  const attempted = uacEvents.length
+  const completed = uacEvents.filter((e) => e.result === 'COMPLETED').length
   const failed = attempted - completed
   return {
     run_id: runId,

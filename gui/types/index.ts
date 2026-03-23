@@ -111,6 +111,9 @@ export interface CallEvent {
   call_id: string
   uac_ext: string
   uas_ext: string
+  ext?: string
+  peer_ext?: string
+  direction?: 'uac' | 'uas'
   result: 'COMPLETED' | 'FAILED'
   failure_reason?: string
   pdd_ms: number
@@ -118,6 +121,12 @@ export interface CallEvent {
   media_status: 'MEDIA_VERIFIED' | 'MEDIA_PARTIAL' | 'MEDIA_FAILED' | 'NO_MEDIA'
   rtp_tx_pkts?: number
   rtp_rx_pkts?: number
+  rtp_rx_from_sbc_pkts?: number
+  rtp_rx_other_pkts?: number
+  rtp_asymmetry_flag?: string
+  sbc_rtp_relay_ip?: string
+  sbc_rtp_relay_port?: number
+  ts_utc?: string
   timestamp: string
 }
 

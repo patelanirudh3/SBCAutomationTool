@@ -1838,12 +1838,132 @@ Create `callflow_tool/mcp_server/database.py` with `init_db_pool()` stub that lo
 
 ### AMD-6: Timeline — Compress to 5 days
 Day 1: Clock + CallResult/CallEvent enrichment + peer_ext (Section 2, 7)
-Day 2: RTP dual-count fix + SBC relay addr extraction (Section 6 AMD-1)
-Day 3: Call Spine correlation + UAS collection + run JSON restructure (Section 4)
-Day 4: Aggregator improvements + all new API endpoints (Section 8)
+Day 2: RTP dual-count fix + SBC relay addr extraction (Section 6 AMD-1) — **DONE**
+Day 3: Call Spine correlation + UAS collection + run JSON restructure (Section 4) — **DONE** (AMD-7)
+Day 4: Aggregator improvements + all new API endpoints (Section 8) — **DONE** (AMD-8)
 Day 5: GUI SIP Ladder + CallSpineCard + Feature Scenario scaffolding (Sections 3, 5)
+
+### AMD-7: Section 4 (Call Spine) — IMPLEMENTED with strategy pattern
+Section 4 code samples are **superseded** by the implementation below. The design intent
+(UAS collection, ext+time correlation, call_spines in run JSON) is preserved. Changes:
+
+**Backend — `callflow_tool/traffic/main.py`:**
+- `_build_call_spines()` replaced with a `CorrelationStrategy` chain pattern.
+- `CorrelationStrategy` dataclass: `name`, `priority`, `matcher: Callable[[dict, dict], bool]`.
+- Two built-in strategies in `CORRELATION_STRATEGIES` list (sorted by priority):
+  1. `_strategy_gsid` (priority 1) — exact match on `gsid` / `x_gsid` field. Ready for future use
+     when Avaya GSID header becomes available. Currently no-ops (field not populated).
+  2. `_strategy_ext_time` (priority 2) — match by `(uac_ext → uas_ext)` pairing within ±3s window.
+     Active now. This is the same logic as Section 4 but wrapped in the strategy interface.
+- `_find_uas_match(uac_event, uas_candidates)` tries each strategy in priority order.
+  Returns `(matched_event, strategy_name)` or `(None, "unmatched")`.
+- `used_uas_indices: set[int]` prevents double-matching (one UAS event per spine).
+- `correlation_method` values: `"gsid"` | `"ext_time"` | `"unmatched"`
+  (supersedes Section 4's `"ext_time_window"` | `"uac_only"`).
+- `call_ids` now includes a `note` field:
+  `"CM generates a new Call-ID for Leg B. Legs correlated by: ext_time"`.
+- New strategies are added by appending to `CORRELATION_STRATEGIES` list — no changes
+  to `_build_call_spines()` or `_find_uas_match()` needed.
+
+**GUI — event merge fix (supersedes Section 4 Step 3 JSON example):**
+- `gui/app/run/page.tsx` — `fetchAndStoreCallEvents()`:
+  `const allEvents = [...uacCalls, ...uasCalls]` (was: `uacCalls.length > 0 ? uacCalls : uasCalls`).
+  Sorted by `ts_utc` ascending. Both sides always included.
+- `gui/lib/api.ts` — new `getCallSpinesFor(ip, port)` fetches `GET /api/call-spines` from UAC backend.
+  `buildAggregate()` uses `uacEvents` directly (UAC is source of truth for call attempts).
+- `gui/store/traffic.ts` — new `callSpines: Record<string, unknown>[]` + `setCallSpines()`.
+  Populated on `isFinal` alongside call events.
+- `gui/components/postrun/DownloadReport.tsx` — report JSON includes `call_spines` as top-level field.
+- `gui/types/index.ts` — `CallEvent` extended with: `ext`, `peer_ext`, `direction`, `ts_utc`,
+  `rtp_rx_from_sbc_pkts`, `rtp_rx_other_pkts`, `rtp_asymmetry_flag`,
+  `sbc_rtp_relay_ip`, `sbc_rtp_relay_port` (all optional).
+
+**Updated run JSON structure (exported by GUI DownloadReport):**
+```json
+{
+  "generated_at": "...",
+  "run_id": "...",
+  "aggregate": { ... },
+  "final_uac_metrics": { ... },
+  "final_uas_metrics": { ... },
+  "config": { ... },
+  "call_events": [ "...merged UAC+UAS, each with direction field, sorted by ts_utc..." ],
+  "call_spines": [
+    {
+      "spine_id": "4001000->4001005@2026-03-23T12:12:40.587419+00:00",
+      "correlation_method": "ext_time",
+      "call_ids": {
+        "leg_a": "3413966",
+        "leg_b": "96ed22226b141f1b745050569b2422",
+        "b2bua_boundary": "avaya_cm",
+        "note": "CM generates a new Call-ID for Leg B. Legs correlated by: ext_time"
+      },
+      "uac_leg": { "...full UAC CallResult with direction: uac..." },
+      "uas_leg": { "...full UAS CallResult with direction: uas..." },
+      "media_cross_check": { "...uac_tx_vs_uas_rx, uas_tx_vs_uac_rx, overall_status..." },
+      "kam_trace": null
+    }
+  ]
+}
+```
+
+### AMD-8: Section 8 (Aggregator Improvements) — IMPLEMENTED
+Section 8 aggregator additions are **implemented**. Do not re-implement. Actual code
+uses slightly different method names than the Section 8 pseudocode — defer to source.
+
+**`MetricsCollector` (callflow_tool/traffic/metrics.py) new fields in `__init__`:**
+- `_pdd_breakdown_samples: list` — list of `{invite_to_100_ms, 100_to_180_ms, 180_to_200_ms}`
+- `_rtp_health_counts: dict` — `{"OK": 0, "WARNING": 0, "CRITICAL": 0}`
+- `_scenario_assertion_results: list` — per-call scenario assertion records
+
+**Accumulation in `record_call()`:**
+- PDD breakdown: computes deltas from `sip_milestones` when 180 + 100 are populated.
+- RTP health: increments `_rtp_health_counts[flag]` from `rtp_asymmetry_flag`.
+- Scenario assertions: appends `{call_id, scenario, assertions}` when present.
+- `reset()` clears all three new fields.
+
+**New methods:**
+- `get_final_summary()` → returns `{avg_pdd_breakdown, rtp_health, scenario_result}`.
+- `get_rtp_health_snapshot()` → returns `dict(self._rtp_health_counts)`.
+
+**Wiring:**
+- `GET /metrics` response includes `"rtp_health"` key.
+- WebSocket push payload in `run_push_loop` includes `"rtp_health"` key.
+- `GET /api/scenarios` returns `basic_call` (available) and `hold_unhold` (coming_soon).
+
+**VMConfig additions (callflow_tool/traffic/config.py):**
+- `scenario: str = "basic_call"`
+- `scenario_hold_duration_seconds: float = 5.0`
+- `scenario_pre_hold_rtp_seconds: float = 3.0`
+- `scenario_post_hold_rtp_seconds: float = 3.0`
+
+### AMD-9: AMD-1 addendum — per-endpoint asymmetry flag false positives
+The dual-counting approach in AMD-1 is correct. However, testing revealed that the
+**per-endpoint** asymmetry formula (`abs(tx - rx_from_sbc) / tx`) still produces
+false positives (CRITICAL) in the confirmed B2BUA topology. Root causes:
+
+1. **CM is an independent media source.** CM's media server (10.133.87.152) sends its own
+   RTP through the SBC. Both UAC and UAS receive packets originating from CM, not just
+   from each other. This inflates `rtp_rx_from_sbc_pkts` beyond `rtp_tx_pkts` on each side.
+2. **Early media from 180 Ringing.** The 180 contains SDP with CM's media address.
+   CM starts sending RTP before ACK, inflating UAC rx count by ~40 pkts at 50 pps.
+3. **UAS sends fewer packets by design.** `run_until_cancelled()` produces ~101 pkts
+   vs UAC's `run()` producing ~201 pkts. This alone creates a 50% delta.
+
+Observed values (single basic call): UAC tx=201 rx=241 (CRITICAL 19.9%),
+UAS tx=101 rx=301 (CRITICAL 198%). Both are false positives.
+
+**The spine-level `media_cross_check`** (UAC-tx vs UAS-rx and vice versa) is the
+more meaningful metric, but is also affected by CM injection. A correct formula
+for per-endpoint health should check `rx >= expected_minimum` rather than `tx ≈ rx`.
+
+**TODO (not yet implemented):**
+- Replace per-endpoint asymmetry formula with threshold-based check:
+  `flag = "OK" if rx >= (hold_time * pps * 0.3) else "WARNING" if rx > 0 else "CRITICAL"`.
+- Add `rtp_health_note` string to aggregate explaining B2BUA topology effects.
+- Consider adding `rtp_rx_from_cm_pkts` counter if CM's media server IP is known.
 
 ---
 
 *PHASE2_IMPLEMENTATION_GUIDE.md — last updated: 2026-03-23*
-*Status: Design-complete. Implementation target: 5 days (AMD-6).*
+*Status: Days 2-4 complete. Day 1 (clock + event enrichment) and Day 5 (GUI ladder + scenarios) remain.*

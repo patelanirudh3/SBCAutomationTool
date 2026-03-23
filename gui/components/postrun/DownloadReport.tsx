@@ -13,6 +13,7 @@ interface DownloadReportProps {
 export function DownloadReport({ className }: DownloadReportProps) {
   const aggregate = useTrafficStore((s) => s.aggregate)
   const callEvents = useTrafficStore((s) => s.callEvents)
+  const callSpines = useTrafficStore((s) => s.callSpines)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const uasMetrics = useTrafficStore((s) => s.uasMetrics)
   const pairs = useTrafficStore((s) => s.pairs)
@@ -27,6 +28,7 @@ export function DownloadReport({ className }: DownloadReportProps) {
       final_uas_metrics: uasMetrics,
       config: pairs[activePairIndex],
       call_events: callEvents,
+      call_spines: callSpines,
     }
 
     const blob = new Blob([JSON.stringify(report, null, 2)], {

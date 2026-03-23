@@ -456,7 +456,7 @@ async def run(
         log.info(
             "Built %d call spines (%d with UAS correlation)",
             len(call_spines),
-            sum(1 for s in call_spines if s.get("correlation_method") == "ext_time_window"),
+            sum(1 for s in call_spines if s.get("correlation_method") != "unmatched"),
         )
 
     # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
@@ -567,105 +567,148 @@ async def _collect_uas_events(uas_base_url: str, timeout_seconds: float = 8.0) -
         return []
 
 
+# ---------------------------------------------------------------------------
+# Correlation Strategy pattern — extensible for future keys (GSID, etc.)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+def _parse_ts(ts_str: str) -> float:
+    """Parse an ISO-8601 timestamp string to a POSIX float. Returns 0.0 on failure."""
+    if not ts_str:
+        return 0.0
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+@dataclass
+class CorrelationStrategy:
+    """
+    A named strategy for matching a UAC call event to a UAS call event.
+    matcher: returns True if uas_event is the correct match for uac_event.
+    priority: lower number = tried first.
+    """
+    name: str
+    priority: int
+    matcher: Callable[[dict, dict], bool]
+
+
+def _strategy_gsid(uac: dict, uas: dict) -> bool:
+    """Exact match on Avaya Global Session ID (GSID). Use when available."""
+    g1 = uac.get("gsid") or uac.get("x_gsid")
+    g2 = uas.get("gsid") or uas.get("x_gsid")
+    return bool(g1 and g2 and g1 == g2)
+
+
+def _strategy_ext_time(uac: dict, uas: dict) -> bool:
+    """Match by (uac_ext→uas_ext) pairing within a ±3s time window."""
+    uac_ext = uac.get("ext") or uac.get("caller", "")
+    uas_ext = uac.get("peer_ext") or uac.get("callee", "")
+    uas_own_ext = uas.get("ext", "")
+    uas_peer_ext = uas.get("peer_ext", "")
+    if str(uac_ext) != str(uas_peer_ext) or str(uas_ext) != str(uas_own_ext):
+        return False
+    uac_ts = _parse_ts(uac.get("ts_utc", ""))
+    uas_ts = _parse_ts(uas.get("ts_utc", ""))
+    return bool(uac_ts and uas_ts and abs(uac_ts - uas_ts) < 3.0)
+
+
+CORRELATION_STRATEGIES: list[CorrelationStrategy] = [
+    CorrelationStrategy("gsid",     priority=1, matcher=_strategy_gsid),
+    CorrelationStrategy("ext_time", priority=2, matcher=_strategy_ext_time),
+]
+CORRELATION_STRATEGIES.sort(key=lambda s: s.priority)
+
+
+def _find_uas_match(uac_event: dict, uas_candidates: list[dict]) -> tuple[dict | None, str]:
+    """
+    Try each strategy in priority order. Returns (matched_event, strategy_name_used)
+    or (None, "unmatched").
+    """
+    for strategy in CORRELATION_STRATEGIES:
+        for candidate in uas_candidates:
+            if strategy.matcher(uac_event, candidate):
+                return candidate, strategy.name
+    return None, "unmatched"
+
+
 def _build_call_spines(uac_calls: list, uas_calls: list) -> list:
     """
-    Correlate UAC and UAS call events by (uac_ext, uas_ext, time_window=3s).
+    Correlate UAC and UAS call events using the strategy chain.
+    Records which strategy was used so debuggers know how the match was made.
 
     Avaya CM is a B2BUA: Leg A (UAC→CM) has one Call-ID, Leg B (CM→UAS) has
     a different Call-ID.  ASBC passes Leg A Call-ID through unchanged.
-    The only cross-VM linking key available without SBC/Kamailio logs is:
-    extension pairing + time.
     """
-    from datetime import datetime as _dt, timezone as _tz
-
-    def parse_ts(ts_str: str) -> float:
-        if not ts_str:
-            return 0.0
-        try:
-            return _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return 0.0
-
-    def pct_delta(a: int, b: int) -> float:
+    def _pct(a: int, b: int) -> float:
         if a == 0 and b == 0:
             return 0.0
         if a == 0:
             return 100.0
-        return abs(a - b) / a * 100
+        return round(abs(a - b) / a * 100, 1)
 
-    def rtp_flag(pct: float) -> str:
-        if pct <= 5:
+    def _flag(p: float) -> str:
+        if p <= 5:
             return "OK"
-        if pct <= 15:
+        if p <= 15:
             return "WARNING"
         return "CRITICAL"
 
-    # Build UAS index: (uas_own_ext, uac_peer_ext) → sorted list of events
-    uas_index: dict[tuple, list] = {}
-    for ue in uas_calls:
-        uas_own = ue.get("ext", ue.get("uas_ext", ue.get("callee", "")))
-        uac_peer = ue.get("peer_ext", ue.get("uac_ext", ue.get("caller", "")))
-        key = (str(uas_own), str(uac_peer))
-        uas_index.setdefault(key, []).append(ue)
-    for bucket in uas_index.values():
-        bucket.sort(key=lambda e: parse_ts(e.get("ts_utc", e.get("timestamp", ""))))
-
     spines = []
+    used_uas_indices: set[int] = set()
+
     for uac_call in uac_calls:
-        uac_ext = str(uac_call.get("ext", uac_call.get("caller", uac_call.get("uac_ext", ""))))
-        uas_ext = str(uac_call.get("peer_ext", uac_call.get("callee", uac_call.get("uas_ext", ""))))
-        uac_ts = parse_ts(uac_call.get("ts_utc", uac_call.get("timestamp", "")))
+        available = [c for i, c in enumerate(uas_calls) if i not in used_uas_indices]
+        uas_match, strategy_used = _find_uas_match(uac_call, available)
 
-        # Find matching UAS event within ±3 seconds
-        uas_match = None
-        for candidate in uas_index.get((uas_ext, uac_ext), []):
-            uas_ts = parse_ts(candidate.get("ts_utc", candidate.get("timestamp", "")))
-            if uas_ts and abs(uas_ts - uac_ts) < 3.0:
-                uas_match = candidate
-                break
+        if uas_match:
+            used_uas_indices.add(uas_calls.index(uas_match))
 
-        # RTP cross-check
-        uac_tx = uac_call.get("rtp_tx_pkts", 0) or 0
-        uas_rx_sbc = (uas_match or {}).get(
-            "rtp_rx_from_sbc_pkts",
-            (uas_match or {}).get("rtp_rx_pkts", 0),
-        ) or 0
-        uas_tx = (uas_match or {}).get("rtp_tx_pkts", 0) or 0
-        uac_rx_sbc = uac_call.get(
-            "rtp_rx_from_sbc_pkts",
-            uac_call.get("rtp_rx_pkts", 0),
-        ) or 0
+        uac_tx    = uac_call.get("rtp_tx_pkts", 0) or 0
+        uas_rx    = (uas_match or {}).get("rtp_rx_from_sbc_pkts") \
+                    or (uas_match or {}).get("rtp_rx_pkts", 0) or 0
+        uas_tx    = (uas_match or {}).get("rtp_tx_pkts", 0) or 0
+        uac_rx    = uac_call.get("rtp_rx_from_sbc_pkts") \
+                    or uac_call.get("rtp_rx_pkts", 0) or 0
 
-        a_to_b_pct = pct_delta(uac_tx, uas_rx_sbc)
-        b_to_a_pct = pct_delta(uas_tx, uac_rx_sbc)
-        overall = "OK" if rtp_flag(a_to_b_pct) == "OK" and rtp_flag(b_to_a_pct) == "OK" else "DEGRADED"
+        a_pct = _pct(uac_tx, uas_rx)
+        b_pct = _pct(uas_tx, uac_rx)
 
         spine = {
-            "spine_id": f"{uac_ext}->{uas_ext}@{uac_call.get('ts_utc', uac_call.get('timestamp', ''))}",
-            "correlation_method": "ext_time_window" if uas_match else "uac_only",
+            "spine_id": (
+                f"{uac_call.get('ext', '')}->{uac_call.get('peer_ext', '')}"
+                f"@{uac_call.get('ts_utc', '')}"
+            ),
+            "correlation_method": strategy_used,
             "call_ids": {
                 "leg_a": uac_call.get("call_id", ""),
                 "leg_b": (uas_match or {}).get("call_id", None),
                 "b2bua_boundary": "avaya_cm",
+                "note": "CM generates a new Call-ID for Leg B. Legs correlated by: " + strategy_used,
             },
             "uac_leg": uac_call,
             "uas_leg": uas_match,
             "media_cross_check": {
                 "uac_tx_vs_uas_rx": {
                     "uac_tx": uac_tx,
-                    "uas_rx": uas_rx_sbc,
+                    "uas_rx": uas_rx,
                     "uas_rx_total": (uas_match or {}).get("rtp_rx_pkts", 0) or 0,
-                    "delta_pct": round(a_to_b_pct, 1),
-                    "flag": rtp_flag(a_to_b_pct),
+                    "delta_pct": a_pct,
+                    "flag": _flag(a_pct),
                 },
                 "uas_tx_vs_uac_rx": {
                     "uas_tx": uas_tx,
-                    "uac_rx": uac_rx_sbc,
+                    "uac_rx": uac_rx,
                     "uac_rx_total": uac_call.get("rtp_rx_pkts", 0) or 0,
-                    "delta_pct": round(b_to_a_pct, 1),
-                    "flag": rtp_flag(b_to_a_pct),
+                    "delta_pct": b_pct,
+                    "flag": _flag(b_pct),
                 },
-                "overall_status": overall,
+                "overall_status": "OK" if _flag(a_pct) == "OK" and _flag(b_pct) == "OK" else "DEGRADED",
             },
             "kam_trace": None,
         }
@@ -890,7 +933,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
             log.info(
                 "Built %d call spines (%d with UAS correlation)",
                 len(call_spines),
-                sum(1 for s in call_spines if s.get("correlation_method") == "ext_time_window"),
+                sum(1 for s in call_spines if s.get("correlation_method") != "unmatched"),
             )
 
         # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────

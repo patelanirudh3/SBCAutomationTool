@@ -22,7 +22,7 @@ import { DownloadReport } from '@/components/postrun/DownloadReport'
 
 import { useTrafficStore } from '@/store/traffic'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, buildAggregate } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate } from '@/lib/api'
 import {
   MOCK_UAC_METRICS,
   MOCK_UAS_METRICS,
@@ -255,20 +255,28 @@ async function fetchAndStoreCallEvents(
     getCallsFor(livePair.uas.vm_ip, livePair.uas.metrics_port),
   ])
 
-  const allEvents = uacCalls.length > 0 ? uacCalls : uasCalls
+  const allEvents = [...uacCalls, ...uasCalls]
+  allEvents.sort((a, b) =>
+    new Date(a.ts_utc ?? a.timestamp ?? 0).getTime() -
+    new Date(b.ts_utc ?? b.timestamp ?? 0).getTime()
+  )
   if (allEvents.length === 0) return false
 
   const { setCallEvents, setAggregate, uacMetrics } = useTrafficStore.getState()
   setCallEvents(allEvents)
 
   if (isFinal) {
-    const { currentRunId } = useTrafficStore.getState()
+    const { currentRunId, setCallSpines } = useTrafficStore.getState()
     const runId = currentRunId || `run-${livePair.uac.vm_id ?? 'local'}-${Date.now()}`
     const startedAt = uacMetrics?.run_elapsed_seconds
       ? new Date(Date.now() - uacMetrics.run_elapsed_seconds * 1000).toISOString()
       : new Date().toISOString()
 
     setAggregate(buildAggregate(uacCalls, uasCalls, runId, startedAt))
+
+    // Fetch correlated call spines from UAC backend
+    const spines = await getCallSpinesFor(livePair.uac.vm_ip, livePair.uac.metrics_port)
+    setCallSpines(spines)
   }
 
   return true
