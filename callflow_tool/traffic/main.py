@@ -606,11 +606,12 @@ def _strategy_gsid(uac: dict, uas: dict) -> bool:
 
 
 def _strategy_ext_time(uac: dict, uas: dict) -> bool:
-    """Match by (uac_ext→uas_ext) pairing within a ±3s time window."""
+    """Match by (uac_ext→uas_ext) pairing within a ±3s time window.
+    Handles both /api/calls shape (ext/peer_ext) and asdict(CallResult) shape (caller/callee)."""
     uac_ext = uac.get("ext") or uac.get("caller", "")
     uas_ext = uac.get("peer_ext") or uac.get("callee", "")
-    uas_own_ext = uas.get("ext", "")
-    uas_peer_ext = uas.get("peer_ext", "")
+    uas_own_ext = uas.get("ext") or uas.get("callee", "")
+    uas_peer_ext = uas.get("peer_ext") or uas.get("caller", "")
     if str(uac_ext) != str(uas_peer_ext) or str(uas_ext) != str(uas_own_ext):
         return False
     uac_ts = _parse_ts(uac.get("ts_utc", ""))
