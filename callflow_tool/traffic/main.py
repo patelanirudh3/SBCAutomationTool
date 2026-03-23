@@ -435,7 +435,7 @@ async def run(
 
     # ── CALL SPINE CORRELATION (UAC only) ─────────────────────────────────
     # Runs BEFORE _shutdown() which sends the UAS stop signal.
-    # UAS process is alive and serving — GET /api/calls is safe here.
+    # UAS process is alive and serving — GET /api/call-results is safe here.
     if config.is_uac:
         peer_url = getattr(config, "peer_stop_url", "") or ""
         if peer_url:
@@ -445,7 +445,7 @@ async def run(
             uas_base_url = ""
 
         if uas_base_url:
-            uas_calls = await _collect_uas_events(uas_base_url, timeout_seconds=8.0)
+            uas_calls = await _collect_uas_call_results(uas_base_url, timeout_seconds=8.0)
         else:
             uas_calls = []
             log.warning("No peer_stop_url — skipping UAS event collection for spine correlation")
@@ -543,27 +543,27 @@ async def _cancel_server(server_task) -> None:
 # Call Spine — UAS event collection + UAC↔UAS correlation
 # ---------------------------------------------------------------------------
 
-async def _collect_uas_events(uas_base_url: str, timeout_seconds: float = 8.0) -> list:
+async def _collect_uas_call_results(uas_base_url: str, timeout_seconds: float = 8.0) -> list:
     """
-    Fetch call events from the UAS process via GET /api/calls.
-    Called immediately after UAC final metrics are flushed, before writing run JSON.
-    UAS process is guaranteed alive at this point — it stays running between runs.
+    Fetch full CallResult dicts from the UAS process via GET /api/call-results.
+    Returns the same asdict(CallResult) shape the UAC side produces locally,
+    ensuring both legs have identical structure in call spines.
     Returns empty list on any failure — never raises, never blocks the run export.
     """
     import aiohttp
-    url = f"{uas_base_url}/api/calls"
+    url = f"{uas_base_url}/api/call-results"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    log.info("Collected %d UAS call events from %s", len(data), url)
+                    log.info("Collected %d UAS CallResults from %s", len(data), url)
                     return data
                 else:
-                    log.warning("UAS /api/calls returned %d — spine will be UAC-only", r.status)
+                    log.warning("UAS /api/call-results returned %d — spine will be UAC-only", r.status)
                     return []
     except Exception as e:
-        log.warning("Could not collect UAS events from %s: %s — spine will be UAC-only", url, e)
+        log.warning("Could not collect UAS CallResults from %s: %s — spine will be UAC-only", url, e)
         return []
 
 
@@ -679,11 +679,11 @@ def _build_call_spines(uac_calls: list, uas_calls: list) -> list:
         a_pct = _pct(uac_tx, uas_rx)
         b_pct = _pct(uas_tx, uac_rx)
 
+        uac_ext = uac_call.get("ext") or uac_call.get("caller", "")
+        uas_ext = uac_call.get("peer_ext") or uac_call.get("callee", "")
+
         spine = {
-            "spine_id": (
-                f"{uac_call.get('ext', '')}->{uac_call.get('peer_ext', '')}"
-                f"@{uac_call.get('ts_utc', '')}"
-            ),
+            "spine_id": f"{uac_ext}->{uas_ext}@{uac_call.get('ts_utc', '')}",
             "correlation_method": strategy_used,
             "call_ids": {
                 "leg_a": uac_call.get("call_id", ""),
@@ -912,7 +912,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
 
         # ── CALL SPINE CORRELATION (UAC only) ─────────────────────────
         # Runs BEFORE _shutdown() which sends the UAS stop signal.
-        # UAS process is alive and serving — GET /api/calls is safe here.
+        # UAS process is alive and serving — GET /api/call-results is safe here.
         if config.is_uac:
             peer_url = getattr(config, "peer_stop_url", "") or ""
             if peer_url:
@@ -922,7 +922,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
                 uas_base_url = ""
 
             if uas_base_url:
-                uas_calls = await _collect_uas_events(uas_base_url, timeout_seconds=8.0)
+                uas_calls = await _collect_uas_call_results(uas_base_url, timeout_seconds=8.0)
             else:
                 uas_calls = []
                 log.warning("No peer_stop_url — skipping UAS event collection for spine correlation")

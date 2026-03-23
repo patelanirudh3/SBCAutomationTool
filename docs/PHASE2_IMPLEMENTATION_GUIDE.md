@@ -1757,7 +1757,7 @@ async def _ensure_schema() -> None:
 | 4 | `_build_call_spines()` + UAS event collection in orchestrator | `main.py` |
 | 4 | Updated `run-*.json` structure with `call_spines` array | `main.py` |
 | 5 | `MetricsCollector` PDD breakdown + RTP health aggregation | `metrics.py` |
-| 5 | `GET /api/calls/{call_id}` endpoint, updated `GET /api/calls` | `metrics.py` |
+| 5 | `GET /api/calls/{call_id}`, `GET /api/call-results` (full CallResult shape) | `metrics.py` |
 
 **Week 2 — Feature Scenarios Backend**
 
@@ -1788,7 +1788,7 @@ async def _ensure_schema() -> None:
 |-----|------|--------|
 | 15-16 | `SipLadderLive` — real-time SVG ladder component | `gui/components/scenarios/` |
 | 15-16 | `ScenarioResultPanel` — assertions + full ladder + AI analysis | `gui/components/scenarios/` |
-| 17 | `CallSpineCard` — replaces CallTable with correlated spine view | `gui/components/postrun/` |
+| 17 | `CallSpineCard` — expanded spine detail view (milestones, RTP breakdown) | `gui/components/postrun/` |
 | 17 | PDD breakdown donut chart in Summary | `gui/components/dashboard/` |
 | 18-19 | VP demo rehearsal run — smoke test full flow end-to-end | All |
 | 20 | Buffer / bug fix day | — |
@@ -1864,6 +1864,16 @@ Section 4 code samples are **superseded** by the implementation below. The desig
   `"CM generates a new Call-ID for Leg B. Legs correlated by: ext_time"`.
 - New strategies are added by appending to `CORRELATION_STRATEGIES` list — no changes
   to `_build_call_spines()` or `_find_uas_match()` needed.
+- `spine_id` construction uses `caller`/`callee` fallback when `ext`/`peer_ext` are absent:
+  `uac_ext = uac_call.get("ext") or uac_call.get("caller", "")`.
+
+**Backend — `callflow_tool/traffic/metrics.py` — new `GET /api/call-results`:**
+- Returns `collector.get_call_results_as_dicts()` — `dataclasses.asdict(CallResult)`.
+- Provides **identical shape** for both UAC and UAS legs (full `CallResult` including
+  `sip_milestones`, `total_ms`, `scenario`, `media_verified`, `scenario_assertions`).
+- `_collect_uas_call_results()` (renamed from `_collect_uas_events()`) now fetches from
+  `/api/call-results` instead of `/api/calls`. Both spine legs have symmetric structure.
+- `GET /api/calls` is **unchanged** — remains the lightweight GUI-friendly format.
 
 **GUI — event merge fix (supersedes Section 4 Step 3 JSON example):**
 - `gui/app/run/page.tsx` — `fetchAndStoreCallEvents()`:
@@ -1877,6 +1887,16 @@ Section 4 code samples are **superseded** by the implementation below. The desig
 - `gui/types/index.ts` — `CallEvent` extended with: `ext`, `peer_ext`, `direction`, `ts_utc`,
   `rtp_rx_from_sbc_pkts`, `rtp_rx_other_pkts`, `rtp_asymmetry_flag`,
   `sbc_rtp_relay_ip`, `sbc_rtp_relay_port` (all optional).
+
+**GUI — CallTable restructured (supersedes Week 4 Day 17 `CallSpineCard` task):**
+- `gui/components/postrun/CallTable.tsx` now reads from `callSpines` (Zustand store)
+  instead of `callEvents`. One row per correlated call, not per raw event.
+- Fallback: when spines are empty (mid-run), filters `callEvents` to `direction === 'uac'` only.
+- Columns: `#`, `UAC Ext`, `UAS Ext`, `Result`, `PDD ms`, `Hold ms`, `UAC Media`, `UAS Media`,
+  `Correlated` (strategy badge), `Leg A / Leg B` (truncated Call-IDs with hover), `Reason`.
+- Eliminates the duplicate-row problem (UAC+UAS shown as two rows for the same call).
+- A future `CallSpineCard` component can provide expanded detail (milestones, RTP breakdown)
+  but the table itself is now spine-aware and functionally correct.
 
 **Updated run JSON structure (exported by GUI DownloadReport):**
 ```json
@@ -1898,8 +1918,8 @@ Section 4 code samples are **superseded** by the implementation below. The desig
         "b2bua_boundary": "avaya_cm",
         "note": "CM generates a new Call-ID for Leg B. Legs correlated by: ext_time"
       },
-      "uac_leg": { "...full UAC CallResult with direction: uac..." },
-      "uas_leg": { "...full UAS CallResult with direction: uas..." },
+      "uac_leg": { "...full CallResult (asdict) with sip_milestones, direction: uac..." },
+      "uas_leg": { "...full CallResult (asdict) with sip_milestones, direction: uas..." },
       "media_cross_check": { "...uac_tx_vs_uas_rx, uas_tx_vs_uac_rx, overall_status..." },
       "kam_trace": null
     }
@@ -1966,4 +1986,4 @@ for per-endpoint health should check `rx >= expected_minimum` rather than `tx �
 ---
 
 *PHASE2_IMPLEMENTATION_GUIDE.md — last updated: 2026-03-23*
-*Status: Days 2-4 complete. Day 1 (clock + event enrichment) and Day 5 (GUI ladder + scenarios) remain.*
+*Status: Days 2-4 complete. CallTable spine-aware (Day 17 partial). Day 1 (clock + event enrichment) and Day 5 (GUI ladder + scenarios) remain.*

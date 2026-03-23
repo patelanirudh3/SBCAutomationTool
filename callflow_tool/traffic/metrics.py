@@ -780,6 +780,13 @@ def build_app(
                 return event
         raise HTTPException(status_code=404, detail=f"Call-ID {call_id} not found")
 
+    # ── GET /api/call-results ─────────────────────────────────────────────
+    @app.get("/api/call-results")
+    async def get_call_results():
+        """Return raw CallResult dicts (dataclasses.asdict) with full symmetry.
+        Used by UAC→UAS spine correlation so both legs have identical shape."""
+        return collector.get_call_results_as_dicts()
+
     # ── GET /api/call-spines ──────────────────────────────────────────────
     @app.get("/api/call-spines")
     async def get_call_spines():

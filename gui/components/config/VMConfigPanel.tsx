@@ -544,10 +544,10 @@ export function VMConfigPanel({
         )}
 
         {isUAC && (
-          <div className="flex items-center justify-between rounded-md border border-border/40 bg-secondary/20 px-3 py-2.5">
+          <div className="inline-flex items-center gap-3 rounded-md border border-border/40 bg-secondary/20 px-3 py-2">
             <div className="space-y-0.5">
-              <Label className="text-[11px] font-semibold text-foreground/70">Media (RTP)</Label>
-              <p className="text-[10px] leading-relaxed text-muted-foreground/60">
+              <Label className="text-xs font-bold tracking-wide text-foreground">Media (RTP)</Label>
+              <p className="text-[10px] leading-relaxed text-foreground/60">
                 {raw.media_enabled
                   ? 'RTP packets will be sent during calls'
                   : 'Signaling-only — no RTP packets (MEDIA_DISABLED)'}
