@@ -62,10 +62,16 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
   const uacInviteUtc = (uacM.invite_ts_utc ?? '') as string
   const uasInviteUtc = (uasM.uas_invite_ts_utc ?? uasM.invite_ts_utc ?? '') as string
 
-  const offset =
+  const rawOffset =
     uacInviteUtc && uasInviteUtc
       ? Date.parse(uasInviteUtc) - Date.parse(uacInviteUtc)
       : 0
+
+  // A negative offset means UAS reports an earlier wall-clock than UAC's INVITE —
+  // physically impossible, so it signals NTP drift. Clamp to 0 and fall back to
+  // structural ordering (Leg A first, then Leg B placed after the B2BUA divider).
+  const clockDriftDetected = rawOffset < 0
+  const offset = clockDriftDetected ? 0 : rawOffset
 
   // --- Leg A (UAC ↔ SBC+Kam Left) ---
 
@@ -149,8 +155,16 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
   })
 
   // --- Leg B (CM ↔ SBC+Kam Right ↔ UAS) ---
-  if (uasM.invite_received_ms != null && offset !== 0) {
-    const cmInviteMs = (uasM.invite_received_ms ?? 0) + offset - ESTIMATED_TRANSIT_MS
+  // When clock drift is detected, place Leg B events sequentially after the
+  // B2BUA divider using a synthetic base timestamp.
+  const dividerT = (uacM.ack_sent_ms ?? uacM.ok_200_ms ?? 0) + 0.5
+  const legBBase = clockDriftDetected ? dividerT + 1 : 0
+  let legBStep = 0
+
+  if (uasM.invite_received_ms != null && (offset !== 0 || clockDriftDetected)) {
+    const cmInviteMs = clockDriftDetected
+      ? legBBase + (++legBStep)
+      : (uasM.invite_received_ms ?? 0) + offset - ESTIMATED_TRANSIT_MS
     events.push({
       t: cmInviteMs,
       label: 'INVITE',
@@ -163,7 +177,9 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
 
   if (uasM.invite_received_ms != null) {
     events.push({
-      t: (uasM.invite_received_ms ?? 0) + offset,
+      t: clockDriftDetected
+        ? legBBase + (++legBStep)
+        : (uasM.invite_received_ms ?? 0) + offset,
       label: 'INVITE',
       from: 'sbcR',
       to: 'uas',
@@ -173,7 +189,9 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
 
   if (uasM.ringing_180_sent_ms) {
     events.push({
-      t: uasM.ringing_180_sent_ms + offset,
+      t: clockDriftDetected
+        ? legBBase + (++legBStep)
+        : uasM.ringing_180_sent_ms + offset,
       label: '180 Ringing',
       from: 'uas',
       to: 'sbcR',
@@ -183,7 +201,9 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
 
   if (uasM.ok_200_sent_ms) {
     events.push({
-      t: uasM.ok_200_sent_ms + offset,
+      t: clockDriftDetected
+        ? legBBase + (++legBStep)
+        : uasM.ok_200_sent_ms + offset,
       label: '200 OK',
       from: 'uas',
       to: 'sbcR',
@@ -193,7 +213,9 @@ function buildEventsFromSpine(spine: CallSpine): LadderEvent[] {
 
   if (uasM.ack_received_ms) {
     events.push({
-      t: uasM.ack_received_ms + offset,
+      t: clockDriftDetected
+        ? legBBase + (++legBStep)
+        : uasM.ack_received_ms + offset,
       label: 'ACK',
       from: 'sbcR',
       to: 'uas',
