@@ -146,3 +146,101 @@ export interface ReachabilityStatus {
   checking: boolean
   error?: string
 }
+
+// ---------------------------------------------------------------------------
+// SIP Milestones — mirrors backend SipMilestones dataclass
+// ---------------------------------------------------------------------------
+
+export interface SipMilestones {
+  invite_sent_ms: number
+  invite_received_ms: number
+  trying_100_ms: number
+  trying_100_sent_ms: number
+  ringing_180_ms: number
+  ringing_180_sent_ms: number
+  prack_sent_ms: number
+  prack_received_ms: number
+  prack_200_ms: number
+  prack_200_sent_ms: number
+  ok_200_ms: number
+  ok_200_sent_ms: number
+  ack_sent_ms: number
+  ack_received_ms: number
+  rtp_start_ms: number
+  rtp_end_ms: number
+  bye_sent_ms: number
+  bye_received_ms: number
+  bye_200_ms: number
+  bye_200_sent_ms: number
+  invite_ts_utc: string
+  uas_invite_ts_utc: string
+}
+
+// ---------------------------------------------------------------------------
+// Call Spine — correlated UAC + UAS leg view
+// ---------------------------------------------------------------------------
+
+export interface CallIds {
+  leg_a: string
+  leg_b: string | null
+  b2bua_boundary: string
+  note: string
+}
+
+export interface MediaCrossCheckDir {
+  uac_tx?: number
+  uas_rx?: number
+  uas_rx_total?: number
+  uas_tx?: number
+  uac_rx?: number
+  uac_rx_total?: number
+  delta_pct: number
+  flag: 'OK' | 'WARNING' | 'CRITICAL'
+}
+
+export interface MediaCrossCheck {
+  uac_tx_vs_uas_rx: MediaCrossCheckDir
+  uas_tx_vs_uac_rx: MediaCrossCheckDir
+  overall_status: 'OK' | 'DEGRADED'
+}
+
+export interface CallSpine {
+  spine_id: string
+  correlation_method: string
+  call_ids: CallIds
+  uac_leg: Record<string, unknown>
+  uas_leg: Record<string, unknown> | null
+  media_cross_check: MediaCrossCheck
+  kam_trace: unknown | null
+}
+
+// ---------------------------------------------------------------------------
+// SIP Ladder
+// ---------------------------------------------------------------------------
+
+export type LadderColumnId = 'uac' | 'sbcL' | 'cm' | 'sbcR' | 'uas'
+
+export interface LadderEvent {
+  t: number
+  label: string
+  from?: LadderColumnId
+  to?: LadderColumnId
+  code?: number
+  callId?: string
+  annotation?: string
+  type?: 'rtp' | 'divider'
+  state?: 'active' | 'held'
+  inferred?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios
+// ---------------------------------------------------------------------------
+
+export interface Scenario {
+  id: string
+  name: string
+  description: string
+  status: 'available' | 'coming_soon'
+  assertions: string[]
+}

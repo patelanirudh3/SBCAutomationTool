@@ -1,6 +1,8 @@
 'use client'
 
-import { Activity } from 'lucide-react'
+import Link from 'next/link'
+import { usePathname } from 'next/navigation'
+import { Activity, MessageCircle } from 'lucide-react'
 import { useTrafficStore } from '@/store/traffic'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { SessionMenu } from './SessionMenu'
@@ -35,6 +37,11 @@ export function Navbar() {
   const phase = useTrafficStore((s) => s.phase)
   const wsStatusRaw = useTrafficStore((s) => s.wsStatus)
   const wsStatus = deriveWsStatus(wsStatusRaw)
+  const chatOpen = useTrafficStore((s) => s.chatPanelOpen)
+  const setChatOpen = useTrafficStore((s) => s.setChatPanelOpen)
+  const pathname = usePathname()
+
+  const isScenarioMode = pathname.startsWith('/scenarios')
 
   return (
     <header className="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-border bg-card px-5">
@@ -45,6 +52,35 @@ export function Navbar() {
           CCI Studio
         </span>
       </div>
+
+      {/* Divider */}
+      <div className="h-5 w-px bg-border" />
+
+      {/* Mode toggle */}
+      <nav className="flex items-center rounded-lg border border-border bg-secondary/40 p-0.5">
+        <Link
+          href="/config"
+          className={cn(
+            'rounded-md px-3 py-1 text-xs font-semibold transition-all duration-150',
+            !isScenarioMode
+              ? 'bg-card text-emerald-400 shadow-sm'
+              : 'text-muted-foreground hover:text-foreground'
+          )}
+        >
+          Load Testing
+        </Link>
+        <Link
+          href="/scenarios"
+          className={cn(
+            'rounded-md px-3 py-1 text-xs font-semibold transition-all duration-150',
+            isScenarioMode
+              ? 'bg-card text-violet-400 shadow-sm'
+              : 'text-muted-foreground hover:text-foreground'
+          )}
+        >
+          Feature Scenarios
+        </Link>
+      </nav>
 
       {/* Divider */}
       <div className="h-5 w-px bg-border" />
@@ -62,6 +98,26 @@ export function Navbar() {
 
       {/* Session management dropdown */}
       <SessionMenu />
+
+      {/* Chat toggle */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={() => setChatOpen(!chatOpen)}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 transition-colors',
+              chatOpen
+                ? 'bg-violet-500/15 text-violet-400'
+                : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+            )}
+            aria-label="Toggle AI chat"
+          >
+            <MessageCircle className="size-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">AI Analysis</TooltipContent>
+      </Tooltip>
 
       {/* Divider */}
       <div className="h-5 w-px bg-border/50" />

@@ -314,3 +314,18 @@ export function vmWsUrl(ip: string, port: number): string {
   // Server mounts WS at /metrics/stream (no /api prefix) — see metrics.py line 319
   return `ws://${ip}:${port}/metrics/stream`
 }
+
+// ---------------------------------------------------------------------------
+// Scenarios — GET /api/scenarios on a specific VM (typically UAC)
+// ---------------------------------------------------------------------------
+
+export async function getScenarios(
+  ip: string,
+  port: number
+): Promise<import('@/types').Scenario[]> {
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/scenarios`)
+    if (!res.ok) return []
+    return (await res.json()) as import('@/types').Scenario[]
+  } catch { return [] }
+}

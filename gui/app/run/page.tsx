@@ -3,12 +3,13 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2, Home } from 'lucide-react'
+import { WifiOff, Loader2, Home, TableProperties, GitBranch } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 import { Navbar } from '@/components/layout/Navbar'
 import { StepIndicator } from '@/components/layout/StepIndicator'
+import { ChatPanel } from '@/components/agent/ChatPanel'
 import { ASRGauge } from '@/components/dashboard/ASRGauge'
 import { RunTimer } from '@/components/dashboard/RunTimer'
 import { VMMetricsCard } from '@/components/dashboard/VMMetricsCard'
@@ -17,10 +18,12 @@ import { ConcurrentCallsBar } from '@/components/dashboard/ConcurrentCallsBar'
 import { AggregatePanel } from '@/components/dashboard/AggregatePanel'
 import { SummaryCard } from '@/components/postrun/SummaryCard'
 import { CallTable } from '@/components/postrun/CallTable'
+import { CallSpineCard } from '@/components/postrun/CallSpineCard'
 import { FailureAnalysis } from '@/components/postrun/FailureAnalysis'
 import { DownloadReport } from '@/components/postrun/DownloadReport'
 
 import { useTrafficStore } from '@/store/traffic'
+import type { CallSpine, SipMilestones } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
 import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate } from '@/lib/api'
 import {
@@ -169,8 +172,104 @@ function LiveDashboard({
 // Post-Run — Screen 4
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// PDD Breakdown mini-bar — stacked horizontal bar
+// ---------------------------------------------------------------------------
+
+function PddBreakdown({ spines }: { spines: CallSpine[] }) {
+  const spinesWithMilestones = spines.filter((s) => {
+    const m = (s.uac_leg as Record<string, unknown>)?.sip_milestones as Partial<SipMilestones> | undefined
+    return m && (m.trying_100_ms ?? 0) > 0
+  })
+
+  if (spinesWithMilestones.length === 0) return null
+
+  let inviteTo100 = 0, _100To180 = 0, _180To200 = 0
+
+  for (const s of spinesWithMilestones) {
+    const m = (s.uac_leg as Record<string, unknown>).sip_milestones as SipMilestones
+    inviteTo100 += (m.trying_100_ms ?? 0) - (m.invite_sent_ms ?? 0)
+    _100To180 += (m.ringing_180_ms ?? 0) - (m.trying_100_ms ?? 0)
+    _180To200 += (m.ok_200_ms ?? 0) - (m.ringing_180_ms ?? 0)
+  }
+
+  const count = spinesWithMilestones.length
+  inviteTo100 = Math.round(inviteTo100 / count)
+  _100To180 = Math.round(_100To180 / count)
+  _180To200 = Math.round(_180To200 / count)
+
+  const total = inviteTo100 + _100To180 + _180To200
+  if (total <= 0) return null
+
+  const pctA = (inviteTo100 / total) * 100
+  const pctB = (_100To180 / total) * 100
+  const pctC = (_180To200 / total) * 100
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-center justify-between mb-2.5">
+        <span className="text-[10px] font-bold uppercase tracking-widest text-foreground/60">
+          Avg PDD Breakdown
+        </span>
+        <span className="text-xs font-mono text-foreground/80 font-semibold">
+          {total}ms
+        </span>
+      </div>
+      <div className="flex h-5 rounded-md overflow-hidden">
+        <div
+          className="bg-blue-500/70 flex items-center justify-center group relative"
+          style={{ width: `${pctA}%` }}
+          title={`INVITE→100: ${inviteTo100}ms`}
+        >
+          {pctA > 15 && (
+            <span className="text-[9px] font-bold text-white/90">{inviteTo100}ms</span>
+          )}
+        </div>
+        <div
+          className="bg-amber-500/70 flex items-center justify-center group relative"
+          style={{ width: `${pctB}%` }}
+          title={`100→180: ${_100To180}ms`}
+        >
+          {pctB > 15 && (
+            <span className="text-[9px] font-bold text-white/90">{_100To180}ms</span>
+          )}
+        </div>
+        <div
+          className="bg-emerald-500/70 flex items-center justify-center group relative"
+          style={{ width: `${pctC}%` }}
+          title={`180→200: ${_180To200}ms`}
+        >
+          {pctC > 15 && (
+            <span className="text-[9px] font-bold text-white/90">{_180To200}ms</span>
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-4 mt-2">
+        <Legend color="bg-blue-500/70" label="INVITE→100" />
+        <Legend color="bg-amber-500/70" label="100→180" />
+        <Legend color="bg-emerald-500/70" label="180→200" />
+      </div>
+    </div>
+  )
+}
+
+function Legend({ color, label }: { color: string; label: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className={cn('size-2 rounded-sm', color)} />
+      <span className="text-[10px] text-muted-foreground">{label}</span>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Post-Run — Screen 4
+// ---------------------------------------------------------------------------
+
 function PostRunSummary() {
   const phase = useTrafficStore((s) => s.phase)
+  const callSpines = useTrafficStore((s) => s.callSpines) as unknown as CallSpine[]
+  const [view, setView] = useState<'spine' | 'table'>('spine')
 
   return (
     <motion.div
@@ -180,8 +279,58 @@ function PostRunSummary() {
       className="flex flex-col gap-4 p-4 max-w-5xl mx-auto w-full"
     >
       <SummaryCard />
+
+      {/* PDD Breakdown */}
+      {callSpines.length > 0 && <PddBreakdown spines={callSpines} />}
+
       {phase === 'FAILED' && <FailureAnalysis />}
-      <CallTable />
+
+      {/* View toggle */}
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-widest text-foreground/70">
+          Call Analysis
+        </span>
+        <div className="flex items-center rounded-lg border border-border bg-secondary/40 p-0.5">
+          <button
+            type="button"
+            onClick={() => setView('spine')}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[10px] font-semibold transition-all',
+              view === 'spine'
+                ? 'bg-card text-emerald-400 shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            <GitBranch className="size-3" />
+            Spine View
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('table')}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[10px] font-semibold transition-all',
+              view === 'table'
+                ? 'bg-card text-emerald-400 shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            <TableProperties className="size-3" />
+            Table View
+          </button>
+        </div>
+      </div>
+
+      {/* Call spines or table */}
+      {view === 'spine' && callSpines.length > 0 ? (
+        <div className="flex flex-col gap-3">
+          {callSpines.map((spine, i) => (
+            <CallSpineCard key={spine.spine_id ?? i} spine={spine} index={i} />
+          ))}
+        </div>
+      ) : (
+        <CallTable />
+      )}
+
       <DownloadReport />
     </motion.div>
   )
@@ -548,6 +697,7 @@ export default function RunPage() {
   return (
     <div className="min-h-screen flex flex-col">
       <Navbar />
+      <ChatPanel />
       <ReconnectBanner visible={showReconnectBanner} />
       <div className="relative flex items-center justify-center border-b border-border px-6 py-4">
         <div className="absolute left-6">

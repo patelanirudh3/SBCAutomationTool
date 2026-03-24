@@ -117,6 +117,10 @@ interface TrafficStore {
   currentRunId: string
   setCurrentRunId: (id: string) => void
 
+  // Chat panel
+  chatPanelOpen: boolean
+  setChatPanelOpen: (open: boolean) => void
+
   // Reset
   reset: () => void
 }
@@ -137,6 +141,7 @@ const initialState = {
   callSpines: [] as Record<string, unknown>[],
   aggregate: null,
   currentRunId: '',
+  chatPanelOpen: false,
 }
 
 export const useTrafficStore = create<TrafficStore>((set, get) => ({
@@ -203,6 +208,8 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
   setAggregate: (a) => set({ aggregate: a }),
 
   setCurrentRunId: (id) => set({ currentRunId: id }),
+
+  setChatPanelOpen: (open) => set({ chatPanelOpen: open }),
 
   reset: () => {
     const { runMode, pairs } = get()
