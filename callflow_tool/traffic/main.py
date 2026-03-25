@@ -683,6 +683,32 @@ def _build_call_spines(uac_calls: list, uas_calls: list) -> list:
         uac_ext = uac_call.get("ext") or uac_call.get("caller", "")
         uas_ext = uac_call.get("peer_ext") or uac_call.get("callee", "")
 
+        # Payload integrity: cross-check markers_sent vs markers_received from other side
+        uac_markers_sent = uac_call.get("markers_sent", 0) or 0
+        uac_markers_received = uac_call.get("markers_received", 0) or 0
+        uas_markers_sent = (uas_match or {}).get("markers_sent", 0) or 0
+        uas_markers_received = (uas_match or {}).get("markers_received", 0) or 0
+
+        def _integrity(sent_by_sender: int, received_by_other: int) -> tuple[float, str]:
+            if sent_by_sender == 0:
+                return (100.0, "PASS") if received_by_other == 0 else (0.0, "FAIL")
+            pct = min(100.0, received_by_other / sent_by_sender * 100)
+            if pct >= 95:
+                return (round(pct, 1), "PASS")
+            if pct >= 80:
+                return (round(pct, 1), "WARNING")
+            return (round(pct, 1), "FAIL")
+
+        uac_to_uas_pct, uac_to_uas_verdict = _integrity(uac_markers_sent, uas_markers_received)
+        uas_to_uac_pct, uas_to_uac_verdict = _integrity(uas_markers_sent, uac_markers_received)
+
+        if uac_to_uas_verdict == "PASS" and uas_to_uac_verdict == "PASS":
+            payload_overall = "PASS"
+        elif uac_to_uas_verdict == "FAIL" or uas_to_uac_verdict == "FAIL":
+            payload_overall = "FAIL"
+        else:
+            payload_overall = "WARNING"
+
         spine = {
             "spine_id": f"{uac_ext}->{uas_ext}@{uac_call.get('ts_utc', '')}",
             "correlation_method": strategy_used,
@@ -710,6 +736,21 @@ def _build_call_spines(uac_calls: list, uas_calls: list) -> list:
                     "flag": _flag(b_pct),
                 },
                 "overall_status": "OK" if _flag(a_pct) == "OK" and _flag(b_pct) == "OK" else "DEGRADED",
+            },
+            "payload_integrity": {
+                "uac_to_uas": {
+                    "uac_markers_sent": uac_markers_sent,
+                    "uas_markers_received": uas_markers_received,
+                    "integrity_pct": uac_to_uas_pct,
+                    "verdict": uac_to_uas_verdict,
+                },
+                "uas_to_uac": {
+                    "uas_markers_sent": uas_markers_sent,
+                    "uac_markers_received": uac_markers_received,
+                    "integrity_pct": uas_to_uac_pct,
+                    "verdict": uas_to_uac_verdict,
+                },
+                "overall_verdict": payload_overall,
             },
             "kam_trace": None,
         }

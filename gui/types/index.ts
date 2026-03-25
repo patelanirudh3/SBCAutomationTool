@@ -4,10 +4,15 @@ export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type RunPhase = 'IDLE' | 'PRE_PHASE' | 'TRAFFIC' | 'COMPLETE' | 'FAILED'
 export type RunMode = 'local' | 'multi-vm'
 
+export type RtpMode = '3phase' | 'continuous'
+export type RtpPtime = 20 | 40
+
 export interface AdvancedSettings {
   register_rate: number           // default: 10
   register_timeout: number        // default: 8
   register_retry: number          // default: 3
+  rtp_mode: RtpMode               // default: '3phase'
+  rtp_ptime: RtpPtime             // default: 20 (ms) → 50 PPS
   rtp_burst_seconds: number       // default: 2
   rtp_burst_pps: number           // default: 50
   rtp_keepalive_interval: number  // default: 3
@@ -19,6 +24,8 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   register_rate: 10,
   register_timeout: 8,
   register_retry: 3,
+  rtp_mode: '3phase',
+  rtp_ptime: 20,
   rtp_burst_seconds: 2,
   rtp_burst_pps: 50,
   rtp_keepalive_interval: 3,
@@ -124,6 +131,9 @@ export interface CallEvent {
   rtp_rx_from_sbc_pkts?: number
   rtp_rx_other_pkts?: number
   rtp_asymmetry_flag?: string
+  rtcp_rx_pkts?: number
+  markers_sent?: number
+  markers_received?: number
   sbc_rtp_relay_ip?: string
   sbc_rtp_relay_port?: number
   ts_utc?: string
@@ -204,6 +214,21 @@ export interface MediaCrossCheck {
   overall_status: 'OK' | 'DEGRADED'
 }
 
+export interface PayloadIntegrityDir {
+  uac_markers_sent?: number
+  uas_markers_received?: number
+  uas_markers_sent?: number
+  uac_markers_received?: number
+  integrity_pct: number
+  verdict: 'PASS' | 'WARNING' | 'FAIL'
+}
+
+export interface PayloadIntegrity {
+  uac_to_uas: PayloadIntegrityDir
+  uas_to_uac: PayloadIntegrityDir
+  overall_verdict: 'PASS' | 'WARNING' | 'FAIL'
+}
+
 export interface CallSpine {
   spine_id: string
   correlation_method: string
@@ -211,6 +236,7 @@ export interface CallSpine {
   uac_leg: Record<string, unknown>
   uas_leg: Record<string, unknown> | null
   media_cross_check: MediaCrossCheck
+  payload_integrity?: PayloadIntegrity
   kam_trace: unknown | null
 }
 

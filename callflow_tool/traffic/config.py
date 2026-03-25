@@ -53,6 +53,8 @@ _DEFAULTS: dict[str, Any] = {
     "rtp_keepalive_interval": 5,  # seconds between keepalive packets (must be < SBC inactivity timer)
     "pool_wrap_delay_seconds": 0,  # extra margin beyond auto-computed delay (0 = rely on SIP_BYE_BUFFER)
     "media_enabled": True,           # True = send RTP; False = signaling-only (no RTP)
+    "rtp_mode": "3phase",            # "3phase" | "continuous"
+    "rtp_ptime": 20,                 # ptime in ms: 20 (50 PPS) or 40 (25 PPS)
     # ── Traffic run control ──────────────────────────────────────────────────
     # The GUI (or YAML) sets exactly ONE of the three modes below.
     # CLI --max-calls overrides all three at launch time.
@@ -97,6 +99,8 @@ _ENV_MAP: dict[str, str] = {
     "rtp_keepalive_interval": "RTP_KEEPALIVE_INTERVAL",
     "pool_wrap_delay_seconds": "POOL_WRAP_DELAY_SECONDS",
     "media_enabled":      "MEDIA_ENABLED",
+    "rtp_mode":           "RTP_MODE",
+    "rtp_ptime":          "RTP_PTIME",
     "traffic_mode":       "TRAFFIC_MODE",
     "call_count":         "CALL_COUNT",
     "duration_hours":     "DURATION_HOURS",
@@ -113,7 +117,7 @@ _INT_FIELDS = {
     "metrics_interval", "metrics_port", "register_rate", "register_expires",
     "register_retry", "register_timeout", "max_concurrent_calls", "local_port",
     "rtp_burst_seconds", "rtp_burst_pps", "rtp_keepalive_interval",
-    "pool_wrap_delay_seconds", "call_count",
+    "pool_wrap_delay_seconds", "call_count", "rtp_ptime",
 }
 
 # Fields that should be coerced to float
@@ -155,6 +159,8 @@ class VMConfig:
     rtp_burst_pps: int      = field(default=50)       # burst packet rate (= 1000/ptime)
     rtp_keepalive_interval: int = field(default=5)    # seconds between keepalive packets
     media_enabled: bool     = field(default=True)   # False = signaling-only (no RTP)
+    rtp_mode: str           = field(default="3phase")  # "3phase" | "continuous"
+    rtp_ptime: int          = field(default=20)        # ptime in ms: 20 (50 PPS) or 40 (25 PPS)
     pool_wrap_delay_seconds: int = field(default=0)  # extra margin beyond auto-computed delay (0 = SIP_BYE_BUFFER only)
     # Traffic run control — GUI or YAML sets one mode; CLI --max-calls overrides all
     traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"
@@ -239,6 +245,12 @@ class VMConfig:
 
         if self.rtp_keepalive_interval <= 0:
             errors.append(f"rtp_keepalive_interval must be > 0, got {self.rtp_keepalive_interval}")
+
+        if self.rtp_mode not in ("3phase", "continuous"):
+            errors.append(f"rtp_mode must be '3phase' or 'continuous', got '{self.rtp_mode}'")
+
+        if self.rtp_ptime not in (20, 40):
+            errors.append(f"rtp_ptime must be 20 or 40, got {self.rtp_ptime}")
 
         if self.traffic_mode not in ("smoke", "timed", "unlimited"):
             errors.append(

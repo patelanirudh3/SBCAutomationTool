@@ -150,7 +150,10 @@ class CallResult:
     sip_milestones: SipMilestones = field(default_factory=SipMilestones)
     rtp_rx_from_sbc_pkts: int = 0
     rtp_rx_other_pkts: int = 0
+    rtcp_rx_pkts: int = 0
     rtp_asymmetry_flag: str = ""
+    markers_sent: int = 0
+    markers_received: int = 0
     scenario: str = "basic_call"
     scenario_assertions: dict = field(default_factory=dict)
 
@@ -445,7 +448,7 @@ class CallEngine:
             # ── Allocate RTP endpoint (port goes into SDP offer) ──────
             if self._config.media_enabled:
                 try:
-                    rtp_ep = await RtpEndpoint.create(agent._local_host)
+                    rtp_ep = await RtpEndpoint.create(agent._local_host, ptime_ms=self._config.rtp_ptime)
                 except Exception as exc:
                     log.warning(
                         "ext=%s RTP socket alloc failed (%s) — using port 9 (no media)",
@@ -561,11 +564,13 @@ class CallEngine:
                                   peer_ext=callee,
                                   milestone_ms=milestones.ack_sent_ms)
 
-            # ── RTP 3-phase (BURST → KEEPALIVE → BURST) ──────────────
+            # ── RTP send (3-phase or continuous) ─────────────────────
             cfg = self._config
+            is_continuous = cfg.rtp_mode == "continuous"
             if rtp_ep:
                 milestones.rtp_start_ms = (time.monotonic() - call_start) * 1000
-                self._emit_call_event(call_id, agent.ext, "RTP_BURST_START",
+                self._emit_call_event(call_id, agent.ext,
+                                      "RTP_CONTINUOUS_START" if is_continuous else "RTP_BURST_START",
                                       peer_ext=callee,
                                       milestone_ms=milestones.rtp_start_ms)
                 await rtp_ep.run(
@@ -575,9 +580,11 @@ class CallEngine:
                     burst_seconds=float(cfg.rtp_burst_seconds),
                     burst_pps=cfg.rtp_burst_pps,
                     keepalive_interval=float(cfg.rtp_keepalive_interval),
+                    continuous=is_continuous,
                 )
                 milestones.rtp_end_ms = (time.monotonic() - call_start) * 1000
-                self._emit_call_event(call_id, agent.ext, "RTP_BURST_END",
+                self._emit_call_event(call_id, agent.ext,
+                                      "RTP_CONTINUOUS_END" if is_continuous else "RTP_BURST_END",
                                       peer_ext=callee,
                                       milestone_ms=milestones.rtp_end_ms)
             else:
@@ -606,6 +613,9 @@ class CallEngine:
             rtp_rx = 0
             rtp_rx_from_sbc = 0
             rtp_rx_other = 0
+            rtcp_rx = 0
+            markers_sent_val = 0
+            markers_received_val = 0
             media_ok = False
             if rtp_ep:
                 st = rtp_ep.stats
@@ -613,6 +623,9 @@ class CallEngine:
                 rtp_rx = st.rtp_rx_pkts
                 rtp_rx_from_sbc = st.rtp_rx_from_sbc
                 rtp_rx_other = st.rtp_rx_other
+                rtcp_rx = st.rtcp_rx_pkts
+                markers_sent_val = rtp_ep.markers_sent
+                markers_received_val = st.markers_received
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
                 milestones.media_verified_ms = (time.monotonic() - call_start) * 1000
@@ -621,6 +634,9 @@ class CallEngine:
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
                     rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
                     rtp_rx_other_pkts=rtp_rx_other,
+                    rtcp_rx_pkts=rtcp_rx,
+                    markers_sent=markers_sent_val,
+                    markers_received=markers_received_val,
                     direction="uac",
                     milestone_ms=milestones.media_verified_ms,
                 )
@@ -653,7 +669,10 @@ class CallEngine:
                 sip_milestones=milestones,
                 rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
                 rtp_rx_other_pkts=rtp_rx_other,
+                rtcp_rx_pkts=rtcp_rx,
                 rtp_asymmetry_flag=self._compute_rtp_asymmetry_flag(rtp_tx, rtp_rx_from_sbc, rtp_rx),
+                markers_sent=markers_sent_val,
+                markers_received=markers_received_val,
             )
             self._calls_completed += 1
             self._emit_call_event(
@@ -973,7 +992,7 @@ class UasAutoAnswer:
             # ── Allocate RTP endpoint before 200 OK (port goes in SDP) ──
             if self._config.media_enabled:
                 try:
-                    rtp_ep = await RtpEndpoint.create(agent._local_host)
+                    rtp_ep = await RtpEndpoint.create(agent._local_host, ptime_ms=self._config.rtp_ptime)
                 except Exception as exc:
                     log.warning(
                         "ext=%s RTP endpoint alloc failed (%s) — using port 9 (no media)",
@@ -1051,6 +1070,7 @@ class UasAutoAnswer:
                         burst_seconds=float(cfg.rtp_burst_seconds),
                         burst_pps=cfg.rtp_burst_pps,
                         keepalive_interval=float(cfg.rtp_keepalive_interval),
+                        continuous=(cfg.rtp_mode == "continuous"),
                     ),
                     name=f"rtp-uas-{call_id}",
                 )
@@ -1077,6 +1097,9 @@ class UasAutoAnswer:
             rtp_rx = 0
             rtp_rx_from_sbc = 0
             rtp_rx_other = 0
+            rtcp_rx = 0
+            markers_sent_val = 0
+            markers_received_val = 0
             media_ok = False
             if rtp_task and not rtp_task.done():
                 rtp_task.cancel()
@@ -1087,6 +1110,9 @@ class UasAutoAnswer:
                 rtp_rx = st.rtp_rx_pkts
                 rtp_rx_from_sbc = st.rtp_rx_from_sbc
                 rtp_rx_other = st.rtp_rx_other
+                rtcp_rx = st.rtcp_rx_pkts
+                markers_sent_val = rtp_ep.markers_sent
+                markers_received_val = st.markers_received
                 media_ok = rtp_rx > 0
                 media_event = _classify_media(st, float(cfg.hold_time_seconds))
                 self._emit_call_event(
@@ -1094,6 +1120,9 @@ class UasAutoAnswer:
                     rtp_tx_pkts=rtp_tx, rtp_rx_pkts=rtp_rx,
                     rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
                     rtp_rx_other_pkts=rtp_rx_other,
+                    rtcp_rx_pkts=rtcp_rx,
+                    markers_sent=markers_sent_val,
+                    markers_received=markers_received_val,
                     direction="uas",
                 )
 
@@ -1116,7 +1145,10 @@ class UasAutoAnswer:
                 sip_milestones=milestones,
                 rtp_rx_from_sbc_pkts=rtp_rx_from_sbc,
                 rtp_rx_other_pkts=rtp_rx_other,
+                rtcp_rx_pkts=rtcp_rx,
                 rtp_asymmetry_flag=self._compute_rtp_asymmetry_flag(rtp_tx, rtp_rx_from_sbc, rtp_rx),
+                markers_sent=markers_sent_val,
+                markers_received=markers_received_val,
             )
             self._emit_call_event(call_id, agent.ext, "UAS_CALL_COMPLETE",
                                   peer_ext=caller_ext,

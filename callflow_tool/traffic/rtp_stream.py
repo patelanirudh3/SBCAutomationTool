@@ -5,17 +5,24 @@ Unified asyncio RTP endpoint for bidirectional media-plane load testing.
 
 RFC 3550 RTP + G.711 MU-law (PCMU, PT=0) — matches CM Codec Set:
   - 8 000 Hz sample rate
-  - 20 ms ptime  ->  160 bytes payload  ->  50 pps at full rate
-  - Silence payload: 0x7F x 160  (MU-law +0 dBm0, ITU-T G.711)
+  - Configurable ptime (20 ms default, 40 ms option)
+  - Payload: 1 kHz tone (PCMU-encoded sine wave)
   - No silence suppression (matches CM "Silence Suppression: n")
 
-3-Phase send pattern (per call, per direction):
-  BURST_START  : rtp_burst_pps for rtp_burst_seconds  (establish media path)
-  KEEPALIVE    : 1 pkt / rtp_keepalive_interval       (prevent SBC timeout)
-  BURST_END    : rtp_burst_pps for rtp_burst_seconds  (verify path before BYE)
+Two send modes:
+  3-Phase (default for traffic):
+    BURST_START → KEEPALIVE → BURST_END
+  Continuous (default for smoke/scenario):
+    Full PPS for entire hold_time
+
+Marker payload validation:
+  Every N packets (default 100), the sender embeds a 4-byte magic + 4-byte
+  sequence in the payload.  The receiver inspects every incoming RTP packet
+  for the magic bytes and increments a counter.  Cross-check at the spine
+  level compares markers_sent vs markers_received from the other side.
 
 Both UAC and UAS use the same RtpEndpoint class — one UDP socket per call leg
-that sends (3-phase) and receives (counting protocol).
+that sends and receives (counting protocol).
 
 Corner cases handled:
   - CancelledError (SIGTERM / early BYE)  -> loop exits, re-raises
@@ -29,30 +36,94 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# RTP / codec constants (G.711 MU-law, 20 ms ptime, CM-aligned)
+# RTP / codec constants
 # ---------------------------------------------------------------------------
 
 _PT_PCMU      = 0           # G.711 MU-law payload type (RFC 3551)
-_PTIME_SEC    = 0.020       # 20 ms per packet
-_TS_INC       = 160         # timestamp increment per packet (8000 Hz x 20 ms)
-_PCMU_SILENCE = bytes([0x7F] * 160)  # MU-law silence (positive zero, 160 bytes)
+_SAMPLE_RATE  = 8000        # G.711 sample rate
+
+# Marker payload magic bytes (embedded every N packets for validation)
+_MARKER_MAGIC = b'\xCC\x11\xCC\x11'
+_MARKER_INTERVAL = 100      # embed marker every 100th packet (internal, not on GUI)
 
 
 # ---------------------------------------------------------------------------
-# RTP packet builder  (12-byte header + 160-byte payload = 172 bytes total)
+# Ptime-aware payload and constants
 # ---------------------------------------------------------------------------
 
-def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
+def _compute_ptime_params(ptime_ms: int = 20) -> tuple[int, int, bytes, bytes]:
+    """
+    Compute (ts_increment, payload_size, tone_payload, marker_template)
+    for the given ptime.
+
+    Returns:
+        ts_inc:           RTP timestamp increment per packet
+        payload_size:     bytes per packet payload
+        tone_payload:     1 kHz tone PCMU-encoded
+        marker_template:  marker payload (magic + 4 zero bytes + tone tail)
+    """
+    samples = _SAMPLE_RATE * ptime_ms // 1000   # 160 for 20ms, 320 for 40ms
+    ts_inc  = samples
+
+    # Build 1 kHz tone as PCMU-encoded samples
+    tone = bytearray(samples)
+    for i in range(samples):
+        t = i / _SAMPLE_RATE
+        linear = int(16384 * math.sin(2 * math.pi * 1000 * t))
+        tone[i] = _linear_to_ulaw(linear)
+    tone_payload = bytes(tone)
+
+    # Marker: magic(4) + seq(4) + remaining tone
+    marker = bytearray(samples)
+    marker[0:4] = _MARKER_MAGIC
+    marker[4:8] = b'\x00\x00\x00\x00'  # placeholder for sequence
+    marker[8:] = tone_payload[8:]
+    marker_template = bytes(marker)
+
+    return ts_inc, samples, tone_payload, marker_template
+
+
+def _linear_to_ulaw(sample: int) -> int:
+    """Convert a signed 16-bit linear PCM sample to G.711 mu-law."""
+    BIAS = 0x84
+    CLIP = 32635
+    sign = 0
+    if sample < 0:
+        sign = 0x80
+        sample = -sample
+    if sample > CLIP:
+        sample = CLIP
+    sample += BIAS
+    exponent = 7
+    for exp_val in (0x4000, 0x2000, 0x1000, 0x800, 0x400, 0x200, 0x100):
+        if sample >= exp_val:
+            break
+        exponent -= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return ~(sign | (exponent << 4) | mantissa) & 0xFF
+
+
+# Pre-compute default payloads (20ms)
+_DEFAULT_TS_INC, _DEFAULT_PAYLOAD_SIZE, _DEFAULT_TONE, _DEFAULT_MARKER = \
+    _compute_ptime_params(20)
+
+
+# ---------------------------------------------------------------------------
+# RTP packet builder
+# ---------------------------------------------------------------------------
+
+def _pack_rtp(seq: int, ts: int, ssrc: int, payload: bytes) -> bytes:
     """
     Build a minimal RFC 3550 RTP packet.
       Byte 1 : V=2  P=0  X=0  CC=0   -> 0x80
@@ -63,12 +134,19 @@ def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
     """
     return struct.pack(
         "!BBHII",
-        0x80,                    # V=2, P=0, X=0, CC=0
-        _PT_PCMU,                # M=0, PT=0
+        0x80,
+        _PT_PCMU,
         seq  & 0xFFFF,
         ts   & 0xFFFFFFFF,
         ssrc & 0xFFFFFFFF,
-    ) + _PCMU_SILENCE
+    ) + payload
+
+
+def _build_marker_payload(template: bytes, marker_seq: int) -> bytes:
+    """Embed the marker sequence number into the marker template."""
+    buf = bytearray(template)
+    struct.pack_into("!I", buf, 4, marker_seq)
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -77,32 +155,33 @@ def _pack_rtp(seq: int, ts: int, ssrc: int) -> bytes:
 
 @dataclass(frozen=True)
 class RtpStats:
-    """Immutable snapshot of an RtpEndpoint's receive counters (three-tier classification)."""
-    rtp_rx_pkts: int            # all valid RTP received (primary, unchanged semantics)
-    rtp_rx_from_sbc: int        # valid RTP from expected SBC relay address
-    rtp_rx_other: int           # valid RTP from other sources (probes, etc.)
+    """Immutable snapshot of an RtpEndpoint's counters."""
+    rtp_rx_pkts: int
+    rtp_rx_from_sbc: int
+    rtp_rx_other: int
+    rtcp_rx_pkts: int
+    markers_received: int
     first_rx_ms: float | None
     last_rx_ms: float | None
 
 
 # ---------------------------------------------------------------------------
-# Counting DatagramProtocol — three-tier RTP receive counter
+# Counting DatagramProtocol — with RTCP filter and marker detection
 # ---------------------------------------------------------------------------
 
 class _CountingProtocol(asyncio.DatagramProtocol):
     """
-    Counts incoming UDP datagrams with three-tier classification:
-    - packets_received: ALL valid RTP (version=2, len>=12) — primary counter, unchanged semantics
-    - pkts_from_expected_src: valid RTP from the known SBC relay address only
-    - pkts_from_other_src: valid RTP from any other source (SBC probes, RTCP-over-RTP, etc.)
-
-    Non-RTP packets (version != 2 or len < 12) are silently ignored and not counted in any bucket.
-    This prevents SBC keep-alive probes and RTCP packets from appearing as RTP traffic.
+    Counts incoming UDP datagrams with classification:
+    - RTP (PT < 200): counted by source (expected SBC vs other)
+    - RTCP (PT >= 200): counted separately, not mixed into RTP
+    - Marker detection: inspects payload for magic bytes
     """
     def __init__(self):
         self.packets_received: int = 0
         self.pkts_from_expected_src: int = 0
         self.pkts_from_other_src: int = 0
+        self.rtcp_received: int = 0
+        self.markers_received: int = 0
         self.first_recv_ts: float | None = None
         self.last_recv_ts: float | None = None
         self._expected_src: tuple[str, int] | None = None
@@ -112,12 +191,6 @@ class _CountingProtocol(asyncio.DatagramProtocol):
         self._transport = transport
 
     def set_expected_src(self, ip: str, port: int) -> None:
-        """
-        Register the SBC RTP relay address after SDP negotiation.
-        Until called, all valid RTP is counted in packets_received but
-        pkts_from_expected_src remains 0 (pre-answer phase packets are
-        attributed to pkts_from_other_src).
-        """
         self._expected_src = (ip, port)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
@@ -125,6 +198,12 @@ class _CountingProtocol(asyncio.DatagramProtocol):
             return
 
         if (data[0] >> 6) != 2:
+            return
+
+        # RTCP filter: PT byte in RTP/RTCP is byte[1] & 0x7F
+        pt = data[1] & 0x7F
+        if pt >= 200:
+            self.rtcp_received += 1
             return
 
         now = time.monotonic() * 1000
@@ -138,6 +217,10 @@ class _CountingProtocol(asyncio.DatagramProtocol):
         else:
             self.pkts_from_other_src += 1
 
+        # Marker detection: check for magic bytes in payload (after 12-byte RTP header)
+        if len(data) >= 16 and data[12:16] == _MARKER_MAGIC:
+            self.markers_received += 1
+
     def error_received(self, exc: Exception) -> None:
         log.debug("RTP socket error: %s", exc)
 
@@ -146,7 +229,7 @@ class _CountingProtocol(asyncio.DatagramProtocol):
 
 
 # ---------------------------------------------------------------------------
-# RtpEndpoint — unified bidirectional endpoint (replaces RtpStream + RtpAbsorber)
+# RtpEndpoint — unified bidirectional endpoint
 # ---------------------------------------------------------------------------
 
 class RtpEndpoint:
@@ -154,41 +237,36 @@ class RtpEndpoint:
     Bidirectional G.711 PCMU RTP endpoint — used by both UAC and UAS.
 
     Binds one OS-assigned UDP port (advertised in SDP).  Sends using the
-    3-phase heartbeat pattern and receives via _CountingProtocol.
-
-    Usage (one instance per active call leg):
-        ep = await RtpEndpoint.create(local_ip)
-        # advertise ep.local_port in SDP m=audio line
-        await ep.run(remote_ip, remote_port, hold_seconds, burst_sec, burst_pps, ka_interval)
-        stats = ep.stats
-        await ep.close()
+    configured mode (3-phase or continuous) and receives via _CountingProtocol.
     """
 
     __slots__ = ("_transport", "_protocol", "_local_port", "_closed", "_tx_pkts",
-                 "_remote_ip", "_remote_port")
+                 "_markers_sent", "_remote_ip", "_remote_port",
+                 "_ts_inc", "_tone_payload", "_marker_template")
 
     def __init__(
         self,
         transport: asyncio.DatagramTransport,
         protocol: _CountingProtocol,
         local_port: int,
+        ptime_ms: int = 20,
     ) -> None:
         self._transport = transport
         self._protocol  = protocol
         self._local_port = local_port
         self._closed    = False
         self._tx_pkts   = 0
+        self._markers_sent = 0
         self._remote_ip: str = ""
         self._remote_port: int = 0
 
-    # ------------------------------------------------------------------
+        ts_inc, _, tone, marker = _compute_ptime_params(ptime_ms)
+        self._ts_inc = ts_inc
+        self._tone_payload = tone
+        self._marker_template = marker
 
     @classmethod
-    async def create(cls, local_ip: str) -> "RtpEndpoint":
-        """
-        Bind a UDP socket on an OS-assigned ephemeral port.
-        Raises OSError if the bind fails (caller logs and falls back).
-        """
+    async def create(cls, local_ip: str, ptime_ms: int = 20) -> "RtpEndpoint":
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
             _CountingProtocol,
@@ -196,10 +274,8 @@ class RtpEndpoint:
         )
         sock = transport.get_extra_info("socket")
         port = sock.getsockname()[1]
-        log.debug("RtpEndpoint: bound %s:%d", local_ip, port)
-        return cls(transport, protocol, port)
-
-    # ------------------------------------------------------------------
+        log.debug("RtpEndpoint: bound %s:%d (ptime=%dms)", local_ip, port, ptime_ms)
+        return cls(transport, protocol, port, ptime_ms)
 
     @property
     def local_port(self) -> int:
@@ -207,16 +283,13 @@ class RtpEndpoint:
 
     @property
     def tx_pkts(self) -> int:
-        """Total RTP packets sent by this endpoint."""
         return self._tx_pkts
 
+    @property
+    def markers_sent(self) -> int:
+        return self._markers_sent
+
     def set_remote_rtp_addr(self, ip: str, port: int) -> None:
-        """
-        Called by CallEngine after parsing 200 OK SDP answer (UAC) or INVITE SDP (UAS).
-        Registers the SBC relay address with the counting protocol so it can
-        distinguish SBC media traffic from SBC probes/RTCP.
-        Safe to call before or after run() — protocol is updated immediately if running.
-        """
         self._remote_ip = ip
         self._remote_port = port
         if self._protocol is not None:
@@ -224,17 +297,32 @@ class RtpEndpoint:
 
     @property
     def stats(self) -> RtpStats:
-        """Snapshot of receive counters (three-tier).  Safe to read after run() completes."""
         if self._protocol is None:
-            return RtpStats(0, 0, 0, None, None)
+            return RtpStats(0, 0, 0, 0, 0, None, None)
         return RtpStats(
             rtp_rx_pkts=self._protocol.packets_received,
             rtp_rx_from_sbc=self._protocol.pkts_from_expected_src,
             rtp_rx_other=self._protocol.pkts_from_other_src,
+            rtcp_rx_pkts=self._protocol.rtcp_received,
+            markers_received=self._protocol.markers_received,
             first_rx_ms=self._protocol.first_recv_ts,
             last_rx_ms=self._protocol.last_recv_ts,
         )
 
+    # ------------------------------------------------------------------
+    # Payload helpers
+    # ------------------------------------------------------------------
+
+    def _get_payload(self) -> bytes:
+        """Get the payload for the next packet, embedding a marker every N packets."""
+        self._tx_pkts += 1
+        if self._tx_pkts % _MARKER_INTERVAL == 0:
+            self._markers_sent += 1
+            return _build_marker_payload(self._marker_template, self._markers_sent)
+        return self._tone_payload
+
+    # ------------------------------------------------------------------
+    # 3-Phase mode (UAC)
     # ------------------------------------------------------------------
 
     async def run(
@@ -245,21 +333,20 @@ class RtpEndpoint:
         burst_seconds: float = 2.0,
         burst_pps: int = 50,
         keepalive_interval: float = 5.0,
+        continuous: bool = False,
     ) -> None:
         """
-        3-phase send loop:
-          BURST_START  -> burst_pps for burst_seconds
-          KEEPALIVE    -> 1 pkt / keepalive_interval
-          BURST_END    -> burst_pps for burst_seconds
+        UAC send loop.
 
-        Falls back to asyncio.sleep when remote endpoint is invalid (port 0/9).
-        Handles CancelledError cleanly — re-raises for task infrastructure.
+        continuous=False (3-phase):
+          BURST_START -> KEEPALIVE -> BURST_END
+
+        continuous=True:
+          Full PPS for entire duration_seconds
         """
         if not remote_ip or remote_port <= 0 or remote_port == 9:
-            log.debug(
-                "RtpEndpoint: remote %s:%d — discard/invalid, sleeping %.1fs",
-                remote_ip, remote_port, duration_seconds,
-            )
+            log.debug("RtpEndpoint: remote %s:%d — discard/invalid, sleeping %.1fs",
+                      remote_ip, remote_port, duration_seconds)
             await asyncio.sleep(duration_seconds)
             return
 
@@ -268,103 +355,62 @@ class RtpEndpoint:
         seq  = random.randint(0, 0xFFFF)
         ts   = random.randint(0, 0xFFFFFFFF)
         dest = (remote_ip, remote_port)
-
         call_deadline = loop.time() + duration_seconds
-        burst_end_start = call_deadline - burst_seconds
 
         try:
-            # ── Phase 1: BURST_START ──────────────────────────────────
-            seq, ts = await self._send_burst(
-                dest, ssrc, seq, ts,
-                min(loop.time() + burst_seconds, call_deadline),
-                burst_pps, loop,
-            )
+            if continuous:
+                seq, ts = await self._send_burst(
+                    dest, ssrc, seq, ts, call_deadline, burst_pps, loop,
+                )
+            else:
+                burst_end_start = call_deadline - burst_seconds
 
-            # ── Phase 2: KEEPALIVE ────────────────────────────────────
-            while loop.time() < burst_end_start:
-                remaining = burst_end_start - loop.time()
-                sleep_for = min(keepalive_interval, remaining)
-                if sleep_for <= 0:
-                    break
-                await asyncio.sleep(sleep_for)
-
-                if loop.time() >= call_deadline:
-                    break
-
-                pkt = _pack_rtp(seq, ts, ssrc)
-                try:
-                    self._transport.sendto(pkt, dest)
-                    self._tx_pkts += 1
-                except Exception as exc:
-                    log.debug("RtpEndpoint: keepalive sendto error: %s", exc)
-                    break
-
-                seq = (seq + 1) & 0xFFFF
-                ts  = (ts + _TS_INC) & 0xFFFFFFFF
-
-            # ── Phase 3: BURST_END ────────────────────────────────────
-            if loop.time() < call_deadline:
+                # Phase 1: BURST_START
                 seq, ts = await self._send_burst(
                     dest, ssrc, seq, ts,
-                    call_deadline,
+                    min(loop.time() + burst_seconds, call_deadline),
                     burst_pps, loop,
                 )
 
+                # Phase 2: KEEPALIVE
+                while loop.time() < burst_end_start:
+                    remaining = burst_end_start - loop.time()
+                    sleep_for = min(keepalive_interval, remaining)
+                    if sleep_for <= 0:
+                        break
+                    await asyncio.sleep(sleep_for)
+                    if loop.time() >= call_deadline:
+                        break
+
+                    payload = self._get_payload()
+                    pkt = _pack_rtp(seq, ts, ssrc, payload)
+                    try:
+                        self._transport.sendto(pkt, dest)
+                    except Exception as exc:
+                        log.debug("RtpEndpoint: keepalive sendto error: %s", exc)
+                        break
+
+                    seq = (seq + 1) & 0xFFFF
+                    ts  = (ts + self._ts_inc) & 0xFFFFFFFF
+
+                # Phase 3: BURST_END
+                if loop.time() < call_deadline:
+                    seq, ts = await self._send_burst(
+                        dest, ssrc, seq, ts, call_deadline, burst_pps, loop,
+                    )
+
         except asyncio.CancelledError:
-            log.debug(
-                "RtpEndpoint: cancelled after %d tx / %d rx -> %s:%d",
-                self._tx_pkts, self._protocol.packets_received,
-                remote_ip, remote_port,
-            )
+            log.debug("RtpEndpoint: cancelled after %d tx / %d rx -> %s:%d",
+                      self._tx_pkts, self._protocol.packets_received,
+                      remote_ip, remote_port)
             raise
 
-        log.debug(
-            "RtpEndpoint: done — tx=%d rx=%d -> %s:%d (%.1fs)",
-            self._tx_pkts, self._protocol.packets_received,
-            remote_ip, remote_port, duration_seconds,
-        )
+        log.debug("RtpEndpoint: done — tx=%d rx=%d markers_sent=%d -> %s:%d (%.1fs)",
+                  self._tx_pkts, self._protocol.packets_received,
+                  self._markers_sent, remote_ip, remote_port, duration_seconds)
 
     # ------------------------------------------------------------------
-
-    async def _send_burst(
-        self,
-        dest: Tuple[str, int],
-        ssrc: int,
-        seq: int,
-        ts: int,
-        deadline: float,
-        pps: int,
-        loop: asyncio.AbstractEventLoop,
-    ) -> Tuple[int, int]:
-        """
-        Send at `pps` packets/sec until `deadline`.
-        Returns updated (seq, ts).  Drift-correcting pacing.
-        """
-        interval = 1.0 / pps
-        next_send = loop.time()
-
-        while loop.time() < deadline:
-            pkt = _pack_rtp(seq, ts, ssrc)
-            try:
-                self._transport.sendto(pkt, dest)
-                self._tx_pkts += 1
-            except Exception as exc:
-                log.debug("RtpEndpoint: burst sendto error: %s — stopping burst", exc)
-                remaining = deadline - loop.time()
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
-                break
-
-            seq = (seq + 1) & 0xFFFF
-            ts  = (ts + _TS_INC) & 0xFFFFFFFF
-
-            next_send += interval
-            sleep_for = next_send - loop.time()
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-
-        return seq, ts
-
+    # UAS variant: runs until cancelled
     # ------------------------------------------------------------------
 
     async def run_until_cancelled(
@@ -374,19 +420,17 @@ class RtpEndpoint:
         burst_seconds: float = 2.0,
         burst_pps: int = 50,
         keepalive_interval: float = 5.0,
+        continuous: bool = False,
     ) -> None:
         """
-        UAS variant: runs indefinitely until externally cancelled.
-        Sends BURST_START, then KEEPALIVE forever.  No BURST_END (BYE
-        cancels the task, which is the signal to stop).
+        UAS variant: runs indefinitely until externally cancelled (BYE).
 
-        On cancellation the caller reads .stats for verification.
+        continuous=False: BURST_START → KEEPALIVE forever
+        continuous=True:  Full PPS forever
         """
         if not remote_ip or remote_port <= 0 or remote_port == 9:
-            log.debug(
-                "RtpEndpoint: remote %s:%d — discard/invalid, waiting for cancel",
-                remote_ip, remote_port,
-            )
+            log.debug("RtpEndpoint: remote %s:%d — discard/invalid, waiting for cancel",
+                      remote_ip, remote_port)
             try:
                 while True:
                     await asyncio.sleep(1.0)
@@ -401,33 +445,75 @@ class RtpEndpoint:
         dest = (remote_ip, remote_port)
 
         try:
-            # ── BURST_START ───────────────────────────────────────────
-            burst_deadline = loop.time() + burst_seconds
-            seq, ts = await self._send_burst(
-                dest, ssrc, seq, ts,
-                burst_deadline, burst_pps, loop,
-            )
+            if continuous:
+                # Send at full PPS forever until cancelled
+                far_future = loop.time() + 86400  # 24 hours — cancelled long before
+                seq, ts = await self._send_burst(
+                    dest, ssrc, seq, ts, far_future, burst_pps, loop,
+                )
+            else:
+                # BURST_START
+                burst_deadline = loop.time() + burst_seconds
+                seq, ts = await self._send_burst(
+                    dest, ssrc, seq, ts, burst_deadline, burst_pps, loop,
+                )
 
-            # ── KEEPALIVE (forever until cancelled) ───────────────────
-            while True:
-                await asyncio.sleep(keepalive_interval)
-
-                pkt = _pack_rtp(seq, ts, ssrc)
-                try:
-                    self._transport.sendto(pkt, dest)
-                    self._tx_pkts += 1
-                except Exception:
-                    pass
-
-                seq = (seq + 1) & 0xFFFF
-                ts  = (ts + _TS_INC) & 0xFFFFFFFF
+                # KEEPALIVE forever until cancelled
+                while True:
+                    await asyncio.sleep(keepalive_interval)
+                    payload = self._get_payload()
+                    pkt = _pack_rtp(seq, ts, ssrc, payload)
+                    try:
+                        self._transport.sendto(pkt, dest)
+                    except Exception:
+                        pass
+                    seq = (seq + 1) & 0xFFFF
+                    ts  = (ts + self._ts_inc) & 0xFFFFFFFF
 
         except asyncio.CancelledError:
-            log.debug(
-                "RtpEndpoint: UAS cancelled — tx=%d rx=%d -> %s:%d",
-                self._tx_pkts, self._protocol.packets_received,
-                remote_ip, remote_port,
-            )
+            log.debug("RtpEndpoint: UAS cancelled — tx=%d rx=%d markers_sent=%d -> %s:%d",
+                      self._tx_pkts, self._protocol.packets_received,
+                      self._markers_sent, remote_ip, remote_port)
+
+    # ------------------------------------------------------------------
+    # Burst sender (shared by both modes)
+    # ------------------------------------------------------------------
+
+    async def _send_burst(
+        self,
+        dest: Tuple[str, int],
+        ssrc: int,
+        seq: int,
+        ts: int,
+        deadline: float,
+        pps: int,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Tuple[int, int]:
+        """Send at `pps` packets/sec until `deadline`. Drift-correcting pacing."""
+        interval = 1.0 / pps
+        next_send = loop.time()
+
+        while loop.time() < deadline:
+            payload = self._get_payload()
+            pkt = _pack_rtp(seq, ts, ssrc, payload)
+            try:
+                self._transport.sendto(pkt, dest)
+            except Exception as exc:
+                log.debug("RtpEndpoint: burst sendto error: %s — stopping burst", exc)
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                break
+
+            seq = (seq + 1) & 0xFFFF
+            ts  = (ts + self._ts_inc) & 0xFFFFFFFF
+
+            next_send += interval
+            sleep_for = next_send - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        return seq, ts
 
     # ------------------------------------------------------------------
 
@@ -442,7 +528,7 @@ class RtpEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible aliases (import sites that haven't migrated)
+# Backward-compatible aliases
 # ---------------------------------------------------------------------------
 
 RtpStream = RtpEndpoint

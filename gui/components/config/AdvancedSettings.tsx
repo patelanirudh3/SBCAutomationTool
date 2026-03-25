@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTrafficStore } from '@/store/traffic'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
-import type { AdvancedSettings as AdvancedSettingsType } from '@/types'
+import type { AdvancedSettings as AdvancedSettingsType, RtpMode, RtpPtime } from '@/types'
 import { cn } from '@/lib/utils'
 import { FieldError, FieldHint } from './ConfigValidator'
 
@@ -128,11 +128,15 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
     ? 'natural'
     : `auto ${analysis.autoDelay.toFixed(0)}s + ${Math.max(0, analysis.userMargin)}s`
 
+  const pps = 1000 / (s.rtp_ptime || 20)
+  const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
+
   const tokens = [
     `reg_rate: ${s.register_rate}`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
-    `rtp_burst: ${s.rtp_burst_seconds}s / ${s.rtp_burst_pps}pps`,
+    `rtp: ${modeLabel} ${s.rtp_ptime || 20}ms/${pps}pps`,
+    `burst: ${s.rtp_burst_seconds}s`,
     `keepalive: ${s.rtp_keepalive_interval}s`,
     `pool_wrap_delay: ${s.pool_wrap_delay_seconds}s`,
     `metrics: ${s.metrics_interval}s`,
@@ -222,8 +226,10 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
   const handleSave = () => {
     const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds'])
+    const SKIP_NUMERIC: Set<string> = new Set(['rtp_mode', 'rtp_ptime'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
+      if (SKIP_NUMERIC.has(key)) continue
       const v = val as number
       if (!Number.isFinite(v)) {
         newErrors[key as keyof AdvancedSettingsType] = 'Must be a number'
@@ -371,29 +377,101 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     RTP
                     <span className="h-px flex-1 bg-violet-500/20" />
                   </h3>
-                  <AdvancedField
-                    label="RTP Burst Duration (s)"
-                    value={draft.rtp_burst_seconds}
-                    disabled={disabled}
-                    error={errors.rtp_burst_seconds}
-                    tooltip="Duration of the high-rate RTP burst at the start and end of each call. Example: for a 180s hold, a burst of 2s means RTP fires at 50 pps during 0–2s and 178–180s. The middle period (2–178s) uses RTP Keepalive Interval for low-rate heartbeat packets."
-                    onChange={set('rtp_burst_seconds')}
-                  />
-                  <AdvancedField
-                    label="RTP Burst PPS"
-                    value={draft.rtp_burst_pps}
-                    disabled={disabled}
-                    error={errors.rtp_burst_pps}
-                    onChange={set('rtp_burst_pps')}
-                  />
-                  <AdvancedField
-                    label="RTP Keepalive Interval (s)"
-                    value={draft.rtp_keepalive_interval}
-                    disabled={disabled}
-                    error={errors.rtp_keepalive_interval}
-                    tooltip="Interval between low-rate RTP heartbeat packets during the middle of a call (between the start and end bursts). Example: 3s interval during the 2–178s mid-period of a 180s call."
-                    onChange={set('rtp_keepalive_interval')}
-                  />
+
+                  {/* RTP Mode toggle */}
+                  <div className="space-y-1">
+                    <Label className="text-xs font-semibold text-slate-200/90">RTP Mode</Label>
+                    <div className="flex gap-2">
+                      {(['3phase', 'continuous'] as const).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => setDraft((prev) => ({ ...prev, rtp_mode: m as RtpMode }))}
+                          className={cn(
+                            'flex-1 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                            draft.rtp_mode === m
+                              ? 'border-violet-500 bg-violet-500/20 text-violet-200'
+                              : 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:border-violet-500/40',
+                            disabled && 'opacity-55 cursor-default',
+                          )}
+                        >
+                          {m === '3phase' ? '3-Phase Burst' : 'Continuous'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Codec ptime dropdown */}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs font-semibold text-slate-200/90">Codec ptime</Label>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+                            <Info className="size-3" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+                          G.711 PCMU packetization time. Determines packets per second: PPS = 1000 ÷ ptime
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <select
+                      disabled={disabled}
+                      value={draft.rtp_ptime}
+                      onChange={(e) => {
+                        const pt = Number(e.target.value) as RtpPtime
+                        setDraft((prev) => ({
+                          ...prev,
+                          rtp_ptime: pt,
+                          rtp_burst_pps: 1000 / pt,
+                        }))
+                      }}
+                      className={cn(
+                        'w-full rounded-md border px-3 py-2 font-mono text-sm',
+                        'border-zinc-600/60 bg-zinc-800/70 text-slate-100',
+                        'focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/30 focus:outline-none',
+                        disabled && 'cursor-default opacity-55',
+                      )}
+                    >
+                      <option value={20}>20 ms (50 PPS)</option>
+                      <option value={40}>40 ms (25 PPS)</option>
+                    </select>
+                    <p className="font-mono text-[10px] text-violet-300/60">
+                      Formula: PPS = 1000 ÷ {draft.rtp_ptime} = {1000 / (draft.rtp_ptime || 20)} PPS
+                    </p>
+                  </div>
+
+                  {/* Payload (read-only) */}
+                  <div className="space-y-1">
+                    <Label className="text-xs font-semibold text-slate-200/90">Payload</Label>
+                    <div className="rounded-md border border-zinc-600/40 bg-zinc-800/50 px-3 py-2 font-mono text-sm text-emerald-300/80">
+                      1 kHz Tone (PCMU)
+                    </div>
+                  </div>
+
+                  {/* 3-Phase-only fields */}
+                  {draft.rtp_mode === '3phase' && (
+                    <>
+                      <AdvancedField
+                        label="Burst Duration (s)"
+                        value={draft.rtp_burst_seconds}
+                        disabled={disabled}
+                        error={errors.rtp_burst_seconds}
+                        tooltip="Duration of the high-rate RTP burst at the start and end of each call."
+                        onChange={set('rtp_burst_seconds')}
+                      />
+                      <AdvancedField
+                        label="Keepalive Interval (s)"
+                        value={draft.rtp_keepalive_interval}
+                        disabled={disabled}
+                        error={errors.rtp_keepalive_interval}
+                        tooltip="Interval between keepalive packets during the mid-call period (between start and end bursts)."
+                        onChange={set('rtp_keepalive_interval')}
+                      />
+                    </>
+                  )}
                 </div>
               </div>
 

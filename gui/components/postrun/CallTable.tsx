@@ -24,6 +24,12 @@ const CORRELATION_BADGE: Record<string, { label: string; cls: string }> = {
   unmatched: { label: 'unmatched', cls: 'bg-amber-400/15 text-amber-400' },
 }
 
+const PAYLOAD_BADGE: Record<string, { label: string; cls: string }> = {
+  PASS: { label: 'PASS', cls: 'text-emerald-400' },
+  WARNING: { label: 'WARN', cls: 'text-amber-400' },
+  FAIL: { label: 'FAIL', cls: 'text-rose-500' },
+}
+
 interface SpineRow {
   spineId: string
   uacExt: string
@@ -34,6 +40,12 @@ interface SpineRow {
   hold_ms: number
   uacMedia: string
   uasMedia: string
+  uacRtpTx: number
+  uacRtpRx: number
+  uasRtpTx: number
+  uasRtpRx: number
+  payloadVerdict: string
+  payloadPct: number
   correlationMethod: string
   legACallId: string
   legBCallId: string
@@ -71,6 +83,14 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
     }
   }
 
+  const pi = (spine.payload_integrity ?? {}) as Record<string, unknown>
+  const piOverall = (pi.overall_verdict as string) ?? ''
+  const piUacToUas = (pi.uac_to_uas ?? {}) as Record<string, unknown>
+  const piUasToUac = (pi.uas_to_uac ?? {}) as Record<string, unknown>
+  const pctA = (piUacToUas.integrity_pct as number) ?? 0
+  const pctB = (piUasToUac.integrity_pct as number) ?? 0
+  const avgPct = piOverall ? Math.round((pctA + pctB) / 2) : 0
+
   return {
     spineId: (spine.spine_id as string) ?? '',
     uacExt: (uac.caller as string) ?? (uac.ext as string) ?? '',
@@ -81,6 +101,12 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
     hold_ms: (uac.hold_ms as number) ?? 0,
     uacMedia,
     uasMedia,
+    uacRtpTx: (uac.rtp_tx_pkts as number) ?? 0,
+    uacRtpRx: (uac.rtp_rx_pkts as number) ?? 0,
+    uasRtpTx: (uas.rtp_tx_pkts as number) ?? 0,
+    uasRtpRx: (uas.rtp_rx_pkts as number) ?? 0,
+    payloadVerdict: piOverall,
+    payloadPct: avgPct,
     correlationMethod: (spine.correlation_method as string) ?? 'unmatched',
     legACallId: (callIds.leg_a as string) ?? '',
     legBCallId: (callIds.leg_b as string) ?? '',
@@ -139,6 +165,12 @@ export function CallTable({ className }: CallTableProps) {
           hold_ms: ev.hold_ms,
           uacMedia: ev.media_status,
           uasMedia: 'NO_MEDIA',
+          uacRtpTx: ev.rtp_tx_pkts ?? 0,
+          uacRtpRx: ev.rtp_rx_pkts ?? 0,
+          uasRtpTx: 0,
+          uasRtpRx: 0,
+          payloadVerdict: '',
+          payloadPct: 0,
           correlationMethod: 'unmatched',
           legACallId: ev.call_id,
           legBCallId: '',
@@ -210,8 +242,10 @@ export function CallTable({ className }: CallTableProps) {
               <Th>Hold ms</Th>
               <Th>UAC Media</Th>
               <Th>UAS Media</Th>
+              <Th>UAC TX/RX</Th>
+              <Th>UAS TX/RX</Th>
+              <Th>Payload</Th>
               <Th>Correlated</Th>
-              <Th>Leg A / Leg B</Th>
               <Th>Reason</Th>
             </tr>
           </thead>
@@ -251,6 +285,26 @@ export function CallTable({ className }: CallTableProps) {
                   <Td>
                     <span className={cn('font-mono text-xs', uasM.cls)}>{uasM.label}</span>
                   </Td>
+                  <Td mono muted>
+                    {row.uacRtpTx > 0
+                      ? `${row.uacRtpTx.toLocaleString()} / ${row.uacRtpRx.toLocaleString()}`
+                      : '—'}
+                  </Td>
+                  <Td mono muted>
+                    {row.uasRtpTx > 0 || row.uasRtpRx > 0
+                      ? `${row.uasRtpTx.toLocaleString()} / ${row.uasRtpRx.toLocaleString()}`
+                      : '—'}
+                  </Td>
+                  <Td>
+                    {row.payloadVerdict ? (
+                      <span className={cn('font-mono text-xs font-bold', (PAYLOAD_BADGE[row.payloadVerdict] ?? PAYLOAD_BADGE.FAIL).cls)}>
+                        {(PAYLOAD_BADGE[row.payloadVerdict] ?? PAYLOAD_BADGE.FAIL).label}
+                        <span className="ml-1 font-normal text-foreground/50">{row.payloadPct}%</span>
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </Td>
                   <Td>
                     <span
                       className={cn(
@@ -260,11 +314,6 @@ export function CallTable({ className }: CallTableProps) {
                     >
                       {corr.label}
                     </span>
-                  </Td>
-                  <Td mono muted>
-                    <span title={row.legACallId}>{truncateCallId(row.legACallId)}</span>
-                    {' / '}
-                    <span title={row.legBCallId}>{truncateCallId(row.legBCallId)}</span>
                   </Td>
                   <Td mono muted>
                     {row.failureReason ?? '—'}
