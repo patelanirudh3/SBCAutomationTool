@@ -887,6 +887,11 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
     collector = ctx.collector
     stop_event = ctx.stop_event
 
+    # Defensive: ensure the stop_event is clean at the start of every lifecycle.
+    # PUT /api/config already clears it on COMPLETE→CONFIGURED transition, but
+    # this guards against any edge case where the event is still set.
+    stop_event.clear()
+
     # Setup file logging now that we have run_id, pair_id, vm_id
     log_file = _auto_log_file(ctx.run_id, ctx.pair_id, config.vm_id)
     _setup_logging(ctx.log_level, log_file=log_file)

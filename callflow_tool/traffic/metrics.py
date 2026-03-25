@@ -569,6 +569,16 @@ def build_app(
         except Exception as exc:
             return JSONResponse(status_code=500, content={"error": f"Failed to write YAML: {exc}"})
 
+        # Auto-reset stale stop_event and metrics when reconfiguring after a
+        # completed/failed run.  Without this, a subsequent POST /api/test/start
+        # would immediately exit because the stop_event is still set from the
+        # previous run's POST /api/test/stop.
+        if process_ctx.state in ("COMPLETE", "FAILED"):
+            process_ctx.stop_event.clear()
+            process_ctx._lifecycle_task = None
+            await collector.reset()
+            log.info("Auto-reset from %s → CONFIGURED (stop_event cleared, metrics reset)", process_ctx.state)
+
         process_ctx.config = cfg
         process_ctx.yaml_path = yaml_path
         process_ctx.state = "CONFIGURED"
