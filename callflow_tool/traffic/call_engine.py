@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -455,6 +456,10 @@ class CallEngine:
                         agent.ext, exc,
                     )
             rtp_port = rtp_ep.local_port if rtp_ep else 9
+
+            if self._config.rtp_pcap and rtp_ep:
+                pcap_path = os.path.join("logs", f"rtp_uac_{agent.ext}_{rtp_ep.local_port}.pcap")
+                rtp_ep.enable_pcap(pcap_path)
 
             # ── INVITE ────────────────────────────────────────────────
             dialog = await agent.send_invite(callee, rtp_port=rtp_port)
@@ -999,6 +1004,10 @@ class UasAutoAnswer:
                         agent.ext, exc,
                     )
             rtp_port = rtp_ep.local_port if rtp_ep else 9
+
+            if self._config.rtp_pcap and rtp_ep:
+                pcap_path = os.path.join("logs", f"rtp_uas_{agent.ext}_{rtp_ep.local_port}.pcap")
+                rtp_ep.enable_pcap(pcap_path)
 
             # ── Handle INVITE: sends 100 + 180 ───────────────────────
             dialog = await agent.handle_incoming_invite(raw_invite)

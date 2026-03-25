@@ -85,11 +85,7 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
 
   const pi = (spine.payload_integrity ?? {}) as Record<string, unknown>
   const piOverall = (pi.overall_verdict as string) ?? ''
-  const piUacToUas = (pi.uac_to_uas ?? {}) as Record<string, unknown>
-  const piUasToUac = (pi.uas_to_uac ?? {}) as Record<string, unknown>
-  const pctA = (piUacToUas.integrity_pct as number) ?? 0
-  const pctB = (piUasToUac.integrity_pct as number) ?? 0
-  const avgPct = piOverall ? Math.round((pctA + pctB) / 2) : 0
+  const avgPct = (pi.overall_integrity_pct as number) ?? 0
 
   return {
     spineId: (spine.spine_id as string) ?? '',

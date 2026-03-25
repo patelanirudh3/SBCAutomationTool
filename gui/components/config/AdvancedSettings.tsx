@@ -141,6 +141,7 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
     `pool_wrap_delay: ${s.pool_wrap_delay_seconds}s`,
     `metrics: ${s.metrics_interval}s`,
     `wrap: ${wrapLabel}`,
+    ...(s.rtp_pcap ? ['pcap: on'] : []),
   ]
 
   return (
@@ -226,7 +227,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
   const handleSave = () => {
     const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds'])
-    const SKIP_NUMERIC: Set<string> = new Set(['rtp_mode', 'rtp_ptime'])
+    const SKIP_NUMERIC: Set<string> = new Set(['rtp_mode', 'rtp_ptime', 'rtp_pcap'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
       if (SKIP_NUMERIC.has(key)) continue
@@ -449,6 +450,43 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     <div className="rounded-md border border-zinc-600/40 bg-zinc-800/50 px-3 py-2 font-mono text-sm text-emerald-300/80">
                       1 kHz Tone (PCMU)
                     </div>
+                  </div>
+
+                  {/* PCAP capture toggle */}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs font-semibold text-slate-200/90">PCAP Capture</Label>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+                            <Info className="size-3" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+                          Save RTP packets to .pcap files in logs/. Open in Wireshark to verify the 1 kHz tone payload and RTP flow. Best for smoke tests.
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => setDraft((prev) => ({ ...prev, rtp_pcap: !prev.rtp_pcap }))}
+                      className={cn(
+                        'flex items-center gap-2 w-full rounded-md px-3 py-2 text-xs font-semibold border transition-colors',
+                        draft.rtp_pcap
+                          ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300'
+                          : 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:border-violet-500/40',
+                        disabled && 'opacity-55 cursor-default',
+                      )}
+                    >
+                      <span className={cn(
+                        'inline-block size-3 rounded-sm border-2 transition-colors',
+                        draft.rtp_pcap
+                          ? 'border-emerald-400 bg-emerald-400'
+                          : 'border-zinc-500 bg-transparent'
+                      )} />
+                      {draft.rtp_pcap ? 'Enabled — pcap files saved to logs/' : 'Disabled'}
+                    </button>
                   </div>
 
                   {/* 3-Phase-only fields */}

@@ -55,6 +55,7 @@ _DEFAULTS: dict[str, Any] = {
     "media_enabled": True,           # True = send RTP; False = signaling-only (no RTP)
     "rtp_mode": "3phase",            # "3phase" | "continuous"
     "rtp_ptime": 20,                 # ptime in ms: 20 (50 PPS) or 40 (25 PPS)
+    "rtp_pcap": False,               # True = capture RTP to pcap files (smoke/debug)
     # ── Traffic run control ──────────────────────────────────────────────────
     # The GUI (or YAML) sets exactly ONE of the three modes below.
     # CLI --max-calls overrides all three at launch time.
@@ -101,6 +102,7 @@ _ENV_MAP: dict[str, str] = {
     "media_enabled":      "MEDIA_ENABLED",
     "rtp_mode":           "RTP_MODE",
     "rtp_ptime":          "RTP_PTIME",
+    "rtp_pcap":           "RTP_PCAP",
     "traffic_mode":       "TRAFFIC_MODE",
     "call_count":         "CALL_COUNT",
     "duration_hours":     "DURATION_HOURS",
@@ -123,7 +125,7 @@ _INT_FIELDS = {
 # Fields that should be coerced to float
 _FLOAT_FIELDS = {"duration_hours", "scenario_hold_duration_seconds", "scenario_pre_hold_rtp_seconds", "scenario_post_hold_rtp_seconds"}
 
-_BOOL_FIELDS = {"media_enabled"}
+_BOOL_FIELDS = {"media_enabled", "rtp_pcap"}
 
 
 @dataclass
@@ -161,6 +163,7 @@ class VMConfig:
     media_enabled: bool     = field(default=True)   # False = signaling-only (no RTP)
     rtp_mode: str           = field(default="3phase")  # "3phase" | "continuous"
     rtp_ptime: int          = field(default=20)        # ptime in ms: 20 (50 PPS) or 40 (25 PPS)
+    rtp_pcap: bool          = field(default=False)     # True = capture RTP to pcap files
     pool_wrap_delay_seconds: int = field(default=0)  # extra margin beyond auto-computed delay (0 = SIP_BYE_BUFFER only)
     # Traffic run control — GUI or YAML sets one mode; CLI --max-calls overrides all
     traffic_mode: str       = field(default="unlimited")  # "smoke" | "timed" | "unlimited"

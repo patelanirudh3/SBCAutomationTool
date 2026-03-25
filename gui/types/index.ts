@@ -18,6 +18,7 @@ export interface AdvancedSettings {
   rtp_keepalive_interval: number  // default: 3
   pool_wrap_delay_seconds: number // default: 0 — extra margin beyond auto-computed delay
   metrics_interval: number        // default: 3  — WS push cadence (seconds)
+  rtp_pcap: boolean               // default: false — capture RTP to pcap files
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -31,6 +32,7 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_keepalive_interval: 3,
   pool_wrap_delay_seconds: 0,
   metrics_interval: 3,
+  rtp_pcap: false,
 }
 
 export interface VMConfig {
@@ -215,18 +217,24 @@ export interface MediaCrossCheck {
 }
 
 export interface PayloadIntegrityDir {
+  uac_tx?: number
+  uas_rx?: number
+  uas_tx?: number
+  uac_rx?: number
   uac_markers_sent?: number
-  uas_markers_received?: number
   uas_markers_sent?: number
-  uac_markers_received?: number
+  markers_embedded_ok?: boolean
+  delta_pct: number
   integrity_pct: number
-  verdict: 'PASS' | 'WARNING' | 'FAIL'
+  verdict: 'OK' | 'WARNING' | 'CRITICAL'
 }
 
 export interface PayloadIntegrity {
   uac_to_uas: PayloadIntegrityDir
   uas_to_uac: PayloadIntegrityDir
   overall_verdict: 'PASS' | 'WARNING' | 'FAIL'
+  overall_integrity_pct?: number
+  note?: string
 }
 
 export interface CallSpine {

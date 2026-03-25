@@ -21,6 +21,11 @@ Marker payload validation:
   for the magic bytes and increments a counter.  Cross-check at the spine
   level compares markers_sent vs markers_received from the other side.
 
+PCAP capture (optional):
+  When enabled via enable_pcap(), every TX and RX packet is written to a
+  standard pcap file with synthetic IPv4/UDP headers.  Wireshark opens these
+  files natively and auto-decodes the 1 kHz tone as playable G.711 audio.
+
 Both UAC and UAS use the same RtpEndpoint class — one UDP socket per call leg
 that sends and receives (counting protocol).
 
@@ -37,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import random
 import struct
 import time
@@ -120,6 +126,112 @@ _DEFAULT_TS_INC, _DEFAULT_PAYLOAD_SIZE, _DEFAULT_TONE, _DEFAULT_MARKER = \
 
 
 # ---------------------------------------------------------------------------
+# PCAP writer — standard libpcap file format (Wireshark-native)
+# ---------------------------------------------------------------------------
+
+class PcapWriter:
+    """
+    Write RTP packets to a pcap file with synthetic IPv4/UDP headers.
+
+    File format: standard libpcap (magic 0xa1b2c3d4), link type LINKTYPE_RAW
+    (101 = raw IPv4).  Wireshark opens these directly, auto-detects RTP by
+    port heuristics, and can play back the 1 kHz tone.
+    """
+
+    _PCAP_MAGIC    = 0xa1b2c3d4
+    _VER_MAJOR     = 2
+    _VER_MINOR     = 4
+    _SNAPLEN       = 65535
+    _LINKTYPE_RAW  = 101        # Raw IPv4 — no Ethernet framing needed
+
+    __slots__ = ("_f", "_local_ip", "_local_port", "_pkt_count", "path")
+
+    def __init__(self, path: str, local_ip: str, local_port: int) -> None:
+        self.path = path
+        self._local_ip = local_ip
+        self._local_port = local_port
+        self._pkt_count = 0
+
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        self._f = open(path, "wb")
+        self._f.write(struct.pack(
+            "<IHHiIII",
+            self._PCAP_MAGIC,
+            self._VER_MAJOR,
+            self._VER_MINOR,
+            0,                  # thiszone
+            0,                  # sigfigs
+            self._SNAPLEN,
+            self._LINKTYPE_RAW,
+        ))
+
+    @property
+    def packet_count(self) -> int:
+        return self._pkt_count
+
+    @staticmethod
+    def _ip_bytes(ip: str) -> bytes:
+        return bytes(int(octet) for octet in ip.split("."))
+
+    def _frame(
+        self,
+        rtp_data: bytes,
+        src_ip: str, src_port: int,
+        dst_ip: str, dst_port: int,
+    ) -> bytes:
+        """Build raw IPv4 + UDP + RTP payload frame."""
+        udp_len   = 8 + len(rtp_data)
+        total_len = 20 + udp_len
+
+        ip_hdr = struct.pack(
+            "!BBHHHBBH4s4s",
+            0x45,                       # ver=4, IHL=5 (20 bytes, no options)
+            0x00,                       # DSCP / ECN
+            total_len,
+            0,                          # identification
+            0x4000,                     # flags=DF, frag_offset=0
+            64,                         # TTL
+            17,                         # protocol = UDP
+            0,                          # checksum (0 = let Wireshark recalc)
+            self._ip_bytes(src_ip),
+            self._ip_bytes(dst_ip),
+        )
+        udp_hdr = struct.pack("!HHHH", src_port, dst_port, udp_len, 0)
+        return ip_hdr + udp_hdr + rtp_data
+
+    def _write(
+        self,
+        rtp_data: bytes,
+        src_ip: str, src_port: int,
+        dst_ip: str, dst_port: int,
+    ) -> None:
+        frame = self._frame(rtp_data, src_ip, src_port, dst_ip, dst_port)
+        now = time.time()
+        ts_sec  = int(now)
+        ts_usec = int((now - ts_sec) * 1_000_000)
+
+        self._f.write(struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame)))
+        self._f.write(frame)
+        self._pkt_count += 1
+
+    def write_tx(self, rtp_data: bytes, dst_ip: str, dst_port: int) -> None:
+        """Record a transmitted RTP packet."""
+        self._write(rtp_data, self._local_ip, self._local_port, dst_ip, dst_port)
+
+    def write_rx(self, rtp_data: bytes, src_ip: str, src_port: int) -> None:
+        """Record a received RTP packet (including RTCP — useful in Wireshark)."""
+        self._write(rtp_data, src_ip, src_port, self._local_ip, self._local_port)
+
+    def close(self) -> None:
+        if self._f and not self._f.closed:
+            self._f.flush()
+            self._f.close()
+
+
+# ---------------------------------------------------------------------------
 # RTP packet builder
 # ---------------------------------------------------------------------------
 
@@ -175,6 +287,7 @@ class _CountingProtocol(asyncio.DatagramProtocol):
     - RTP (PT < 200): counted by source (expected SBC vs other)
     - RTCP (PT >= 200): counted separately, not mixed into RTP
     - Marker detection: inspects payload for magic bytes
+    - PCAP: optionally writes every RX packet to a PcapWriter
     """
     def __init__(self):
         self.packets_received: int = 0
@@ -186,6 +299,7 @@ class _CountingProtocol(asyncio.DatagramProtocol):
         self.last_recv_ts: float | None = None
         self._expected_src: tuple[str, int] | None = None
         self._transport = None
+        self._pcap: PcapWriter | None = None
 
     def connection_made(self, transport) -> None:
         self._transport = transport
@@ -200,9 +314,16 @@ class _CountingProtocol(asyncio.DatagramProtocol):
         if (data[0] >> 6) != 2:
             return
 
-        # RTCP filter: PT byte in RTP/RTCP is byte[1] & 0x7F
-        pt = data[1] & 0x7F
-        if pt >= 200:
+        if self._pcap:
+            try:
+                self._pcap.write_rx(data, addr[0], addr[1])
+            except Exception:
+                pass
+
+        # RTCP filter: RTCP packet types occupy the full byte[1] (200-207).
+        # In RTP byte[1] is M(1)|PT(7) so valid RTP PTs are 0-127 even with
+        # the marker bit set (128+PT).  RTCP types 200-207 never collide.
+        if 200 <= data[1] <= 207:
             self.rtcp_received += 1
             return
 
@@ -217,8 +338,17 @@ class _CountingProtocol(asyncio.DatagramProtocol):
         else:
             self.pkts_from_other_src += 1
 
-        # Marker detection: check for magic bytes in payload (after 12-byte RTP header)
-        if len(data) >= 16 and data[12:16] == _MARKER_MAGIC:
+        # Marker detection: compute actual payload offset accounting for
+        # CSRC entries (CC field) and header extensions (X bit) that the
+        # SBC may add when relaying packets.
+        cc = data[0] & 0x0F
+        has_ext = bool(data[0] & 0x10)
+        payload_off = 12 + cc * 4
+        if has_ext and len(data) >= payload_off + 4:
+            ext_len = int.from_bytes(data[payload_off + 2:payload_off + 4], 'big')
+            payload_off += 4 + ext_len * 4
+
+        if len(data) >= payload_off + 4 and data[payload_off:payload_off + 4] == _MARKER_MAGIC:
             self.markers_received += 1
 
     def error_received(self, exc: Exception) -> None:
@@ -238,27 +368,36 @@ class RtpEndpoint:
 
     Binds one OS-assigned UDP port (advertised in SDP).  Sends using the
     configured mode (3-phase or continuous) and receives via _CountingProtocol.
+
+    Optional pcap capture: call enable_pcap(path) after create() to write
+    every TX and RX packet to a standard pcap file.  Wireshark opens the
+    file natively and can play back the 1 kHz tone as audio.
     """
 
-    __slots__ = ("_transport", "_protocol", "_local_port", "_closed", "_tx_pkts",
+    __slots__ = ("_transport", "_protocol", "_local_port", "_local_ip",
+                 "_closed", "_tx_pkts",
                  "_markers_sent", "_remote_ip", "_remote_port",
-                 "_ts_inc", "_tone_payload", "_marker_template")
+                 "_ts_inc", "_tone_payload", "_marker_template",
+                 "_pcap")
 
     def __init__(
         self,
         transport: asyncio.DatagramTransport,
         protocol: _CountingProtocol,
         local_port: int,
+        local_ip: str = "",
         ptime_ms: int = 20,
     ) -> None:
         self._transport = transport
         self._protocol  = protocol
         self._local_port = local_port
+        self._local_ip  = local_ip
         self._closed    = False
         self._tx_pkts   = 0
         self._markers_sent = 0
         self._remote_ip: str = ""
         self._remote_port: int = 0
+        self._pcap: PcapWriter | None = None
 
         ts_inc, _, tone, marker = _compute_ptime_params(ptime_ms)
         self._ts_inc = ts_inc
@@ -275,7 +414,7 @@ class RtpEndpoint:
         sock = transport.get_extra_info("socket")
         port = sock.getsockname()[1]
         log.debug("RtpEndpoint: bound %s:%d (ptime=%dms)", local_ip, port, ptime_ms)
-        return cls(transport, protocol, port, ptime_ms)
+        return cls(transport, protocol, port, local_ip, ptime_ms)
 
     @property
     def local_port(self) -> int:
@@ -294,6 +433,21 @@ class RtpEndpoint:
         self._remote_port = port
         if self._protocol is not None:
             self._protocol.set_expected_src(ip, port)
+
+    def enable_pcap(self, path: str) -> None:
+        """Enable pcap capture. Call after create(), before run()."""
+        try:
+            self._pcap = PcapWriter(path, self._local_ip, self._local_port)
+            self._protocol._pcap = self._pcap
+            log.info("RtpEndpoint: pcap capture enabled -> %s", path)
+        except Exception as exc:
+            log.warning("RtpEndpoint: pcap init failed (%s) — continuing without capture", exc)
+            self._pcap = None
+
+    @property
+    def pcap_path(self) -> str:
+        """Return the pcap file path, or empty string if capture is not enabled."""
+        return self._pcap.path if self._pcap else ""
 
     @property
     def stats(self) -> RtpStats:
@@ -390,6 +544,12 @@ class RtpEndpoint:
                         log.debug("RtpEndpoint: keepalive sendto error: %s", exc)
                         break
 
+                    if self._pcap:
+                        try:
+                            self._pcap.write_tx(pkt, dest[0], dest[1])
+                        except Exception:
+                            pass
+
                     seq = (seq + 1) & 0xFFFF
                     ts  = (ts + self._ts_inc) & 0xFFFFFFFF
 
@@ -467,6 +627,13 @@ class RtpEndpoint:
                         self._transport.sendto(pkt, dest)
                     except Exception:
                         pass
+
+                    if self._pcap:
+                        try:
+                            self._pcap.write_tx(pkt, dest[0], dest[1])
+                        except Exception:
+                            pass
+
                     seq = (seq + 1) & 0xFFFF
                     ts  = (ts + self._ts_inc) & 0xFFFFFFFF
 
@@ -492,6 +659,7 @@ class RtpEndpoint:
         """Send at `pps` packets/sec until `deadline`. Drift-correcting pacing."""
         interval = 1.0 / pps
         next_send = loop.time()
+        pcap = self._pcap
 
         while loop.time() < deadline:
             payload = self._get_payload()
@@ -504,6 +672,12 @@ class RtpEndpoint:
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 break
+
+            if pcap:
+                try:
+                    pcap.write_tx(pkt, dest[0], dest[1])
+                except Exception:
+                    pass
 
             seq = (seq + 1) & 0xFFFF
             ts  = (ts + self._ts_inc) & 0xFFFFFFFF
@@ -518,13 +692,20 @@ class RtpEndpoint:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the underlying UDP socket.  Safe to call multiple times."""
+        """Close the underlying UDP socket and pcap file.  Safe to call multiple times."""
         if not self._closed:
             self._closed = True
             try:
                 self._transport.close()
             except Exception:
                 pass
+            if self._pcap:
+                self._pcap.close()
+                log.info(
+                    "RtpEndpoint: pcap saved -> %s (%d packets)",
+                    self._pcap.path, self._pcap.packet_count,
+                )
+                self._pcap = None
 
 
 # ---------------------------------------------------------------------------
