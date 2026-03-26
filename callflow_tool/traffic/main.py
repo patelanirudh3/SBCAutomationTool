@@ -257,6 +257,41 @@ def _create_agents(config: VMConfig) -> dict[str, ExtensionAgent]:
     return agents
 
 
+async def _connect_transports_batched(
+    agents: dict[str, ExtensionAgent],
+    config: VMConfig,
+) -> None:
+    """
+    Open TCP/UDP transports in batches of config.register_rate with a 500 ms
+    pause between batches.  This keeps the burst of new TCP SYNs within the
+    SBC DATAIFPROTECT limit (≤ 20 new connections/sec per source-IP).
+    """
+    all_agents = list(agents.values())
+    total = len(all_agents)
+    batch_size = config.register_rate
+    BATCH_DELAY_S = 0.5
+
+    log.info(
+        "Connecting %d transports in batches of %d (%.0f ms gap)…",
+        total, batch_size, BATCH_DELAY_S * 1000,
+    )
+
+    for batch_start in range(0, total, batch_size):
+        batch = all_agents[batch_start : batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+
+        log.info(
+            "Transport batch %d: connecting %s–%s (%d agents)",
+            batch_num, batch[0].ext, batch[-1].ext, len(batch),
+        )
+        await asyncio.gather(*[a.start() for a in batch])
+        log.info("Transport batch %d: %d connected", batch_num, len(batch))
+
+        if batch_start + batch_size < total:
+            log.debug("Pausing %.0f ms before next transport batch…", BATCH_DELAY_S * 1000)
+            await asyncio.sleep(BATCH_DELAY_S)
+
+
 # ---------------------------------------------------------------------------
 # Main coroutine
 # ---------------------------------------------------------------------------
@@ -346,8 +381,7 @@ async def run(
     agents = _create_agents(config)
     log.info("Starting %d extension agent transports…", len(agents))
 
-    # Start all transports concurrently
-    await asyncio.gather(*[a.start() for a in agents.values()])
+    await _connect_transports_batched(agents, config)
     collector.update_counts(sockets=len(agents))
     log.info("All transports connected")
 
@@ -923,7 +957,7 @@ async def _run_traffic_lifecycle(ctx: ProcessContext) -> None:
         # ── Create agents ─────────────────────────────────────────────
         agents = _create_agents(config)
         log.info("Starting %d extension agent transports…", len(agents))
-        await asyncio.gather(*[a.start() for a in agents.values()])
+        await _connect_transports_batched(agents, config)
         collector.update_counts(sockets=len(agents))
         log.info("All transports connected")
 

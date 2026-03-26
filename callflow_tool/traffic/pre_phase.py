@@ -4,9 +4,10 @@ traffic/pre_phase.py
 Pre-phase: Bulk REGISTER + SUBSCRIBE for all extensions before any INVITE.
 
 Rules (per Phase 1 spec):
-  - Max 50 REGISTER/sec (configurable via VMConfig.register_rate)
-  - Retry up to VMConfig.register_retry times on timeout
-  - asyncio.gather() barrier: ALL extensions must register before continuing
+  - Sequential batches of VMConfig.register_rate extensions at a time
+  - 500 ms pause between batches to stay within SBC DATAIFPROTECT limits
+  - Retry up to VMConfig.register_retry times on timeout (per extension)
+  - Batch barrier: entire batch must finish before next batch starts
   - Same pattern for SUBSCRIBE
   - Log "ALL EXTENSIONS READY" only when both barriers clear
 
@@ -59,7 +60,14 @@ async def register_all(
     progress_callback=None,
 ) -> list[str]:
     """
-    Register all extensions at max config.register_rate/sec.
+    Register extensions in sequential batches of config.register_rate.
+
+    Each batch fires its REGISTERs concurrently and waits for every extension
+    in the batch to either receive 200 OK or exhaust all retries.  Only then
+    do we sleep BATCH_DELAY_S before launching the next batch.  This caps the
+    burst of new TCP connections (including reconnects triggered by RST) to
+    ≤ batch_size per window, satisfying the SBC DATAIFPROTECT iptables rule
+    (≤ 20 new TCP/sec per source-IP to 5060).
 
     Args:
         agents:             List of ExtensionAgent instances to register.
@@ -68,54 +76,73 @@ async def register_all(
 
     Returns:
         List of extension numbers that FAILED to register.
-
-    Raises:
-        RuntimeError if any extension fails after all retries.
     """
     total = len(agents)
     failed: list[str] = []
     done = 0
+    batch_size = config.register_rate
+    BATCH_DELAY_S = 0.5
 
-    # Semaphore enforces max register_rate concurrent REGISTERs
-    semaphore = asyncio.Semaphore(config.register_rate)
-
-    async def throttled_register(agent: ExtensionAgent) -> None:
+    async def _register_one(agent: ExtensionAgent) -> bool:
+        """Attempt registration with retries.  Returns True on 200 OK."""
         nonlocal done
-        async with semaphore:
-            for attempt in range(1, config.register_retry + 1):
-                try:
-                    await asyncio.wait_for(
-                        agent.register(),
-                        timeout=float(config.register_timeout),
-                    )
-                    done += 1
-                    if progress_callback:
-                        await progress_callback(done, total)
-                    return
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "ext=%s REGISTER attempt %d/%d timed out",
-                        agent.ext, attempt, config.register_retry,
-                    )
-                except Exception as exc:
-                    log.error(
-                        "ext=%s REGISTER attempt %d/%d error: %s",
-                        agent.ext, attempt, config.register_retry, exc,
-                    )
-                # Exponential backoff between retries
-                if attempt < config.register_retry:
-                    await asyncio.sleep(0.5 * attempt)
+        for attempt in range(1, config.register_retry + 1):
+            try:
+                await asyncio.wait_for(
+                    agent.register(),
+                    timeout=float(config.register_timeout),
+                )
+                done += 1
+                if progress_callback:
+                    await progress_callback(done, total)
+                return True
+            except asyncio.TimeoutError:
+                log.warning(
+                    "ext=%s REGISTER attempt %d/%d timed out",
+                    agent.ext, attempt, config.register_retry,
+                )
+            except Exception as exc:
+                log.error(
+                    "ext=%s REGISTER attempt %d/%d error: %s",
+                    agent.ext, attempt, config.register_retry, exc,
+                )
+            if attempt < config.register_retry:
+                await asyncio.sleep(0.5 * attempt)
 
-            log.error(
-                "ext=%s failed to register after %d attempts",
-                agent.ext, config.register_retry,
-            )
-            failed.append(agent.ext)
+        log.error(
+            "ext=%s failed to register after %d attempts",
+            agent.ext, config.register_retry,
+        )
+        failed.append(agent.ext)
+        return False
 
-    log.info("Pre-phase: registering %d extensions at max %d/sec…", total, config.register_rate)
+    log.info(
+        "Pre-phase: registering %d extensions in batches of %d "
+        "(%.0f ms gap between batches)…",
+        total, batch_size, BATCH_DELAY_S * 1000,
+    )
     start = time.monotonic()
 
-    await asyncio.gather(*[throttled_register(a) for a in agents])
+    for batch_start in range(0, total, batch_size):
+        batch = agents[batch_start : batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+
+        log.info(
+            "REGISTER batch %d: %s–%s (%d extensions)",
+            batch_num, batch[0].ext, batch[-1].ext, len(batch),
+        )
+
+        results = await asyncio.gather(*[_register_one(a) for a in batch])
+
+        succeeded = sum(1 for ok in results if ok)
+        log.info(
+            "REGISTER batch %d complete: %d/%d OK",
+            batch_num, succeeded, len(batch),
+        )
+
+        if batch_start + batch_size < total:
+            log.debug("Pausing %.0f ms before next batch…", BATCH_DELAY_S * 1000)
+            await asyncio.sleep(BATCH_DELAY_S)
 
     elapsed = time.monotonic() - start
     success = total - len(failed)
