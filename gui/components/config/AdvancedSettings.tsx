@@ -45,7 +45,7 @@ function AdvancedField({
         {tooltip && (
           <Tooltip>
             <TooltipTrigger asChild>
-              <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+              <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
                 <Info className="size-3" />
               </button>
             </TooltipTrigger>
@@ -63,9 +63,9 @@ function AdvancedField({
         disabled={disabled}
         onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
         className={cn(
-          'font-mono border-zinc-600/60 bg-zinc-800/70 text-slate-100',
-          'focus-visible:border-violet-500/60 focus-visible:ring-1 focus-visible:ring-violet-500/30',
-          disabled && 'cursor-default opacity-55'
+          'font-mono border-slate-600/50 bg-slate-800/80 text-slate-100',
+          'focus-visible:border-indigo-400/60 focus-visible:ring-1 focus-visible:ring-indigo-400/30',
+          disabled && 'cursor-default opacity-75'
         )}
       />
       {error && <FieldError error={error} />}
@@ -152,12 +152,12 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
             'font-mono text-[11px] font-medium',
             tok.startsWith('wrap:')
               ? analysis.naturalSpacing ? 'text-emerald-400' : 'text-amber-400'
-              : 'text-cyan-300/80'
+              : 'text-slate-300'
           )}>
             {tok}
           </span>
           {i < tokens.length - 1 && (
-            <span className="text-violet-400/40">·</span>
+            <span className="text-slate-600">·</span>
           )}
         </span>
       ))}
@@ -258,9 +258,8 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
     <div
       ref={panelRef}
       className={cn(
-        'border-t-2 border-violet-500/50 bg-violet-950/20',
-        'shadow-[0_-1px_12px_oklch(0.35_0.10_290/0.25)]',
-        'ring-1 ring-violet-500/15',
+        'rounded-b-lg border border-indigo-500/20 bg-[#0f1729]',
+        'shadow-lg shadow-indigo-950/30',
       )}
     >
       {/* ── Header row ──────────────────────────────────────────── */}
@@ -270,25 +269,25 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
           onClick={() => !isEditing && setIsOpen((o) => !o)}
           className="flex flex-1 items-center gap-2 text-left"
         >
-          <Settings2 className="size-4 shrink-0 text-violet-400 drop-shadow-[0_0_6px_oklch(0.60_0.18_290/0.7)]" />
-          <span className="text-[11px] font-semibold uppercase tracking-widest text-foreground/80">
+          <Settings2 className="size-4 shrink-0 text-indigo-400" />
+          <span className="text-[11px] font-bold uppercase tracking-widest text-slate-100">
             Advanced Settings — Registration &amp; RTP
           </span>
-          <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+          <span className="rounded border border-indigo-400/25 bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-200">
             shared for this VM Pair
           </span>
           <ChevronDown
             className={cn(
-              'ml-0.5 size-3.5 shrink-0 text-foreground/50 transition-transform duration-200',
+              'ml-0.5 size-3.5 shrink-0 text-slate-400 transition-transform duration-200',
               isOpen && 'rotate-180'
             )}
           />
         </button>
 
         <div className="flex shrink-0 items-center gap-3">
-          <span className="flex items-center gap-1 text-[11px] font-medium text-foreground/60">
+          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
             <span className="inline-block size-1.5 rounded-full bg-blue-400" />
-            <span className="inline-block size-1.5 rounded-full bg-violet-400" />
+            <span className="inline-block size-1.5 rounded-full bg-indigo-400" />
             Affects both UAC and UAS
           </span>
 
@@ -298,7 +297,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
               onClick={handleEdit}
               className={cn(
                 'flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-semibold',
-                'border border-violet-500/40 text-violet-300',
+                'border border-indigo-400/40 text-indigo-300',
                 'transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/10 hover:text-emerald-400'
               )}
             >
@@ -320,7 +319,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
       {/* ── Token row (collapsed, always visible below header) ─── */}
       {!isOpen && (
-        <div className="border-t border-border/30 px-5 py-2">
+        <div className="border-t border-slate-700/40 px-5 py-2">
           <TokenRow s={saved} analysis={analysis} />
         </div>
       )}
@@ -336,16 +335,16 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
             transition={{ duration: 0.2, ease: 'easeInOut' }}
             className="overflow-hidden"
           >
-            <div className="border-t border-border/30 px-5 py-4 space-y-4">
+            <div className="border-t border-slate-700/40 px-5 py-4 space-y-4">
 
               {/* 2-column grid */}
               <div className="grid grid-cols-2 gap-x-8 gap-y-3">
                 {/* Left column — Registration */}
                 <div className="space-y-3">
-                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-blue-300">
+                  <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
                     Registration
-                    <span className="h-px flex-1 bg-blue-500/20" />
+                    <span className="h-px flex-1 bg-blue-400/30" />
                   </h3>
                   <AdvancedField
                     label="Register Rate (reg/s)"
@@ -373,10 +372,10 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
                 {/* Right column — RTP */}
                 <div className="space-y-3">
-                  <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-violet-300">
-                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-violet-400" />
+                  <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-indigo-300">
+                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-indigo-400" />
                     RTP
-                    <span className="h-px flex-1 bg-violet-500/20" />
+                    <span className="h-px flex-1 bg-indigo-400/30" />
                   </h3>
 
                   {/* RTP Mode toggle */}
@@ -390,11 +389,11 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                           disabled={disabled}
                           onClick={() => setDraft((prev) => ({ ...prev, rtp_mode: m as RtpMode }))}
                           className={cn(
-                            'flex-1 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                            'flex-1 rounded-md px-3 py-2 text-xs font-bold border transition-colors',
                             draft.rtp_mode === m
-                              ? 'border-violet-500 bg-violet-500/20 text-violet-200'
-                              : 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:border-violet-500/40',
-                            disabled && 'opacity-55 cursor-default',
+                              ? 'border-indigo-500/70 bg-indigo-600/25 text-white'
+                              : 'border-slate-600/60 bg-slate-800/70 text-slate-300 hover:border-indigo-500/40 hover:text-slate-200',
+                            disabled && 'opacity-70 cursor-default',
                           )}
                         >
                           {m === '3phase' ? '3-Phase Burst' : 'Continuous'}
@@ -409,7 +408,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                       <Label className="text-xs font-semibold text-slate-200/90">Codec ptime</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+                          <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
                             <Info className="size-3" />
                           </button>
                         </TooltipTrigger>
@@ -431,23 +430,23 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                       }}
                       className={cn(
                         'w-full rounded-md border px-3 py-2 font-mono text-sm',
-                        'border-zinc-600/60 bg-zinc-800/70 text-slate-100',
-                        'focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/30 focus:outline-none',
-                        disabled && 'cursor-default opacity-55',
+                        'border-slate-600/50 bg-slate-800/80 text-slate-100',
+                        'focus:border-indigo-400/60 focus:ring-1 focus:ring-indigo-400/30 focus:outline-none',
+                        disabled && 'cursor-default opacity-75',
                       )}
                     >
-                      <option value={20}>20 ms (50 PPS)</option>
-                      <option value={40}>40 ms (25 PPS)</option>
+                      <option value={20} className="bg-slate-800 text-slate-100">20 ms (50 PPS)</option>
+                      <option value={40} className="bg-slate-800 text-slate-100">40 ms (25 PPS)</option>
                     </select>
-                    <p className="font-mono text-[10px] text-violet-300/60">
-                      Formula: PPS = 1000 ÷ {draft.rtp_ptime} = {1000 / (draft.rtp_ptime || 20)} PPS
+                    <p className="font-mono text-[11px] text-slate-300">
+                      Formula: PPS = 1000 ÷ {draft.rtp_ptime} = <span className="font-bold text-emerald-400">{1000 / (draft.rtp_ptime || 20)} PPS</span>
                     </p>
                   </div>
 
                   {/* Payload (read-only) */}
                   <div className="space-y-1">
                     <Label className="text-xs font-semibold text-slate-200/90">Payload</Label>
-                    <div className="rounded-md border border-zinc-600/40 bg-zinc-800/50 px-3 py-2 font-mono text-sm text-emerald-300/80">
+                    <div className="rounded-md border border-slate-600/40 bg-slate-800/60 px-3 py-2 font-mono text-sm font-medium text-emerald-400">
                       1 kHz Tone (PCMU)
                     </div>
                   </div>
@@ -458,7 +457,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                       <Label className="text-xs font-semibold text-slate-200/90">PCAP Capture</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <button type="button" className="text-violet-400/70 hover:text-violet-300 transition-colors">
+                          <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
                             <Info className="size-3" />
                           </button>
                         </TooltipTrigger>
@@ -472,18 +471,18 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                       disabled={disabled}
                       onClick={() => setDraft((prev) => ({ ...prev, rtp_pcap: !prev.rtp_pcap }))}
                       className={cn(
-                        'flex items-center gap-2 w-full rounded-md px-3 py-2 text-xs font-semibold border transition-colors',
+                        'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
                         draft.rtp_pcap
-                          ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300'
-                          : 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:border-violet-500/40',
-                        disabled && 'opacity-55 cursor-default',
+                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                          : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-indigo-400/40',
+                        disabled && 'opacity-70 cursor-default',
                       )}
                     >
                       <span className={cn(
                         'inline-block size-3 rounded-sm border-2 transition-colors',
                         draft.rtp_pcap
                           ? 'border-emerald-400 bg-emerald-400'
-                          : 'border-zinc-500 bg-transparent'
+                          : 'border-zinc-400 bg-transparent'
                       )} />
                       {draft.rtp_pcap ? 'Enabled — pcap files saved to logs/' : 'Disabled'}
                     </button>
@@ -514,7 +513,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
               </div>
 
               {/* Full-width — Pool Wrap Delay */}
-              <div className="border-t border-border/30 pt-3">
+              <div className="border-t border-slate-700/30 pt-3">
                 <AdvancedField
                   label="Pool Wrap Delay — Extra Margin (s)"
                   value={draft.pool_wrap_delay_seconds}
@@ -528,7 +527,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
               </div>
 
               {/* Full-width — Metrics Interval */}
-              <div className="border-t border-border/30 pt-3">
+              <div className="border-t border-slate-700/30 pt-3">
                 <AdvancedField
                   label="Metrics Interval (s)"
                   value={draft.metrics_interval}
@@ -543,7 +542,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
               {/* Current token row (read-only summary while expanded) */}
               {!isEditing && (
-                <div className="border-t border-border/30 pt-2">
+                <div className="border-t border-slate-700/30 pt-2">
                   <TokenRow s={saved} analysis={analysis} />
                 </div>
               )}

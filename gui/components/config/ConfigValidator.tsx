@@ -1,6 +1,6 @@
 'use client'
 
-import { AlertCircle, AlertTriangle } from 'lucide-react'
+import { AlertCircle, AlertTriangle, Info } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ReactNode } from 'react'
 
@@ -31,7 +31,7 @@ export function FieldHint({
   className?: string
 }) {
   return (
-    <p className={cn('mt-0.5 text-xs text-muted-foreground', className)}>{children}</p>
+    <p className={cn('mt-0.5 text-xs text-slate-400', className)}>{children}</p>
   )
 }
 
@@ -63,11 +63,11 @@ export function FieldWarning({
   return (
     <p
       className={cn(
-        'mt-1 flex items-start gap-1.5 rounded border border-amber-500/25 bg-amber-500/8 px-2 py-1.5 text-xs text-amber-300',
+        'mt-1 flex items-start gap-1.5 rounded border border-slate-600/40 bg-slate-800/40 px-2 py-1.5 text-xs text-slate-300',
         className
       )}
     >
-      <AlertTriangle className="mt-px size-3 shrink-0" />
+      <Info className="mt-px size-3 shrink-0 text-blue-400" />
       <span>{children}</span>
     </p>
   )

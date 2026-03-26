@@ -207,15 +207,9 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
   return (
     <div className="space-y-3">
       {/* Live Wrap Analysis */}
-      <div
-        className={cn(
-          'rounded-lg border p-3.5 space-y-2.5',
-          naturalSpacing
-            ? 'border-emerald-500/30 bg-emerald-950/20'
-            : 'border-amber-500/30 bg-amber-950/20',
-        )}
-      >
-        <p className="text-[10px] font-bold uppercase tracking-[0.1em] text-foreground/80">
+      <div className="rounded-lg border border-slate-700/60 bg-slate-800/70 p-3.5 space-y-2.5">
+
+        <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-100">
           Live Wrap Analysis
         </p>
 
@@ -223,7 +217,7 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
           {naturalSpacing ? (
             <CheckCircle2 className="size-3.5 text-emerald-400" />
           ) : (
-            <AlertTriangle className="size-3.5 text-amber-400" />
+            <span className="flex size-3.5 items-center justify-center rounded-full bg-amber-500/20 text-[9px] font-bold text-amber-300">!</span>
           )}
           <span
             className={cn(
@@ -235,18 +229,18 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
           </span>
         </div>
 
-        <div className="space-y-1 font-mono text-[11px] leading-relaxed text-slate-200">
+        <div className="space-y-1.5 font-mono text-[12px] leading-relaxed">
           <div className="flex justify-between">
             <span className="text-slate-300">pool_count</span>
-            <span>{poolCount}</span>
+            <span className="font-medium text-slate-100">{poolCount}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-slate-300">wrap_time</span>
-            <span>{wrapTime.toFixed(1)}s</span>
+            <span className="font-medium text-slate-100">{wrapTime.toFixed(1)}s</span>
           </div>
           <div className="flex justify-between">
             <span className="text-slate-300">hold_time</span>
-            <span>{holdTime}s</span>
+            <span className="font-medium text-slate-100">{holdTime}s</span>
           </div>
           {!naturalSpacing && (
             <>
@@ -260,67 +254,55 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
         </div>
 
         {!naturalSpacing && (
-          <p className="text-[10px] leading-relaxed text-slate-300">
-            Need <span className="font-mono font-semibold text-cyan-300">{minPoolForNatural}</span> pool_count for natural spacing
+          <p className="text-[11px] leading-relaxed text-slate-200">
+            Need <span className="font-mono font-bold text-emerald-400">{minPoolForNatural}</span> pool_count for natural spacing
           </p>
         )}
       </div>
 
       {/* How It Works — collapsible */}
-      <div
-        className={cn(
-          'rounded-lg border p-3.5',
-          naturalSpacing
-            ? 'border-emerald-500/20 bg-emerald-950/10'
-            : 'border-amber-500/20 bg-amber-950/10',
-        )}
-      >
+      <div className="rounded-lg border border-slate-700/50 bg-slate-800/50 p-3.5">
+
         <button
           type="button"
           onClick={() => setHowItWorksOpen((o) => !o)}
           className="flex w-full items-center justify-between"
         >
-          <p className="text-[10px] font-bold uppercase tracking-[0.1em] text-foreground/80">
+          <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-100">
             How It Works
           </p>
           <ChevronDown
             className={cn(
-              'size-3.5 text-foreground/70 transition-transform duration-200',
+              'size-3.5 text-slate-400 transition-transform duration-200',
               howItWorksOpen && 'rotate-180',
             )}
           />
         </button>
         {howItWorksOpen && (
-          <div className="mt-2.5 space-y-1.5 font-mono text-[10px] leading-relaxed text-slate-300">
+          <div className="mt-2.5 space-y-1.5 font-mono text-[11px] leading-relaxed text-slate-200">
             <div>
-              <span className="text-slate-400">pool_count</span> = LCM({uacCount}, {uasCount}) ={' '}
-              <span className="font-semibold text-cyan-300">{poolCount}</span>
+              <span className="text-slate-300">pool_count</span> = LCM({uacCount}, {uasCount}) ={' '}
+              <span className="font-bold text-emerald-400">{poolCount}</span>
             </div>
             <div>
-              <span className="text-slate-400">wrap_time</span> = {poolCount} / {cps.toFixed(1)} ={' '}
-              <span className="font-semibold text-cyan-300">{wrapTime.toFixed(1)}s</span>
+              <span className="text-slate-300">wrap_time</span> = {poolCount} / {cps.toFixed(1)} ={' '}
+              <span className="font-bold text-emerald-400">{wrapTime.toFixed(1)}s</span>
             </div>
             <div>
-              <span className="text-slate-400">natural</span> = wrap_time {'>='} hold + {SIP_BYE_BUFFER}s
+              <span className="text-slate-300">natural</span> = wrap_time {'>='} hold + {SIP_BYE_BUFFER}s
             </div>
             <div>
-              <span className="text-slate-400">min_pool</span> = ⌈CPS × (hold + {SIP_BYE_BUFFER})⌉ ={' '}
-              <span className="font-semibold text-cyan-300">{minPoolForNatural}</span>
+              <span className="text-slate-300">min_pool</span> = ⌈CPS × (hold + {SIP_BYE_BUFFER})⌉ ={' '}
+              <span className="font-bold text-emerald-400">{minPoolForNatural}</span>
             </div>
           </div>
         )}
       </div>
 
       {/* Config Summary */}
-      <div
-        className={cn(
-          'rounded-lg border p-3.5 space-y-2.5',
-          naturalSpacing
-            ? 'border-emerald-500/20 bg-emerald-950/10'
-            : 'border-amber-500/20 bg-amber-950/10',
-        )}
-      >
-        <p className="text-[10px] font-bold uppercase tracking-[0.1em] text-foreground/80">
+      <div className="rounded-lg border border-slate-700/50 bg-slate-800/50 p-3.5 space-y-2.5">
+
+        <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-100">
           Config Summary
         </p>
         <div className="space-y-1.5 text-[11px] leading-relaxed">
@@ -363,17 +345,11 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
 
 export function VMPairBook() {
   const router = useRouter()
-  const { updatePair, activePairIndex, pairs } = useTrafficStore()
+  const { updatePair, activePairIndex, pairs, hydrateVmIps } = useTrafficStore()
 
   const pair = pairs[activePairIndex]
-  const [uacRaw, setUacRaw] = useState<RawVMFormValues>(() => ({
-    ...UAC_DEFAULTS,
-    vm_ip: pair?.uac.vm_ip || UAC_DEFAULTS.vm_ip,
-  }))
-  const [uasRaw, setUasRaw] = useState<RawVMFormValues>(() => ({
-    ...UAS_DEFAULTS,
-    vm_ip: pair?.uas.vm_ip || UAS_DEFAULTS.vm_ip,
-  }))
+  const [uacRaw, setUacRaw] = useState<RawVMFormValues>(UAC_DEFAULTS)
+  const [uasRaw, setUasRaw] = useState<RawVMFormValues>(UAS_DEFAULTS)
   const [uacTouched, setUacTouched] = useState<Set<string>>(new Set())
   const [uasTouched, setUasTouched] = useState<Set<string>>(new Set())
   const [uacReachability, setUacReachability] = useState<ReachabilityStatus | null>(null)
@@ -382,6 +358,24 @@ export function VMPairBook() {
   const [isSaving, setIsSaving] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
   const reachabilityTriggeredRef = useRef(false)
+
+  // Hydrate persisted VM IPs from localStorage after mount (avoids SSR mismatch)
+  useEffect(() => {
+    hydrateVmIps()
+  }, [hydrateVmIps])
+
+  // Sync persisted VM IPs from store → form after hydration
+  useEffect(() => {
+    const p = pairs[activePairIndex]
+    if (!p) return
+    if (p.uac.vm_ip !== UAC_DEFAULTS.vm_ip) {
+      setUacRaw(prev => prev.vm_ip === p.uac.vm_ip ? prev : { ...prev, vm_ip: p.uac.vm_ip })
+    }
+    if (p.uas.vm_ip !== UAS_DEFAULTS.vm_ip) {
+      setUasRaw(prev => prev.vm_ip === p.uas.vm_ip ? prev : { ...prev, vm_ip: p.uas.vm_ip })
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairs[activePairIndex]?.uac.vm_ip, pairs[activePairIndex]?.uas.vm_ip])
 
   // Auto-derive UAC peer_stop_url from UAS vm_ip + metrics_port (per spec)
   useEffect(() => {

@@ -47,8 +47,6 @@ interface MetricsHistoryPoint {
 }
 
 function makePair(index: number): VMPair {
-  const savedIps = _loadVmIps()
-  const ips = savedIps[index]
   const pairId = `pair-${index + 1}`
   return {
     pair_id: pairId,
@@ -56,7 +54,7 @@ function makePair(index: number): VMPair {
     uac: {
       vm_role: 'UAC',
       vm_id: 'uac-local',
-      vm_ip: ips?.uac ?? '127.0.0.1',
+      vm_ip: '127.0.0.1',
       uac_ext_start: 4001000,
       uac_ext_end: 4001004,
       uas_ext_start: 4001005,
@@ -76,7 +74,7 @@ function makePair(index: number): VMPair {
     uas: {
       vm_role: 'UAS',
       vm_id: 'uas-local',
-      vm_ip: ips?.uas ?? '127.0.0.1',
+      vm_ip: '127.0.0.1',
       uac_ext_start: 4001000,
       uac_ext_end: 4001004,
       uas_ext_start: 4001005,
@@ -149,6 +147,9 @@ interface TrafficStore {
   // Chat panel
   chatPanelOpen: boolean
   setChatPanelOpen: (open: boolean) => void
+
+  // Hydrate persisted VM IPs from localStorage (call after mount to avoid SSR mismatch)
+  hydrateVmIps: () => void
 
   // Reset
   reset: () => void
@@ -240,6 +241,23 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
   setCurrentRunId: (id) => set({ currentRunId: id }),
 
   setChatPanelOpen: (open) => set({ chatPanelOpen: open }),
+
+  hydrateVmIps: () => {
+    const saved = _loadVmIps()
+    if (!saved.length) return
+    const current = get().pairs
+    const pairs = current.map((p, i) => {
+      const ips = saved[i]
+      if (!ips) return p
+      if (p.uac.vm_ip === ips.uac && p.uas.vm_ip === ips.uas) return p
+      return {
+        ...p,
+        uac: { ...p.uac, vm_ip: ips.uac },
+        uas: { ...p.uas, vm_ip: ips.uas },
+      }
+    })
+    set({ pairs })
+  },
 
   reset: () => {
     const { runMode, pairs } = get()

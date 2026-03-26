@@ -285,9 +285,12 @@ export function VMConfigPanel({
 
         {/* Health check URL + reachability status */}
         <div className="space-y-1">
-          <FieldHint>
-            {`Health check: http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
-          </FieldHint>
+          <p className="mt-0.5 text-xs text-slate-400">
+            Health check:{' '}
+            <span className="font-mono text-sky-400 underline decoration-sky-400/30 underline-offset-2">
+              {`http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
+            </span>
+          </p>
           <FieldWarning>
             The FastAPI backend must already be running on this port before the
             GUI can connect. Start it first:{' '}
@@ -302,6 +305,7 @@ export function VMConfigPanel({
           )}
         </div>
 
+        <div className="pt-1" />
         <FormField label="SSH User (optional)" error={e('ssh_user')}>
           <Input
             value={raw.ssh_user}
@@ -400,9 +404,9 @@ export function VMConfigPanel({
             {/* UAC Range — Start + Count → derived End */}
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold text-foreground/70">UAC Range</span>
+                <span className="text-[11px] font-semibold text-slate-200">UAC Range</span>
                 {uacExtCount > 0 && (
-                  <span className="flex items-center gap-1 rounded bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-cyan-300/80">
+                  <span className="flex items-center gap-1 rounded border border-slate-600/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-slate-100">
                     → {raw.uac_ext_end} · {uacExtCount} ext
                   </span>
                 )}
@@ -438,35 +442,35 @@ export function VMConfigPanel({
             <div className="space-y-1">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[11px] font-semibold text-foreground/70">UAS Range</span>
-                  <ArrowDownToLine className="size-2.5 text-muted-foreground/40" />
+                  <span className="text-[11px] font-semibold text-slate-200">UAS Range</span>
+                  <ArrowDownToLine className="size-2.5 text-slate-400" />
                 </div>
                 {uasExtCount > 0 && (
-                  <span className="flex items-center gap-1 rounded bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-cyan-300/80">
+                  <span className="flex items-center gap-1 rounded border border-slate-600/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-slate-100">
                     {raw.uas_ext_start} → {raw.uas_ext_end} · {uasExtCount} ext
                   </span>
                 )}
               </div>
-              <p className="text-[10px] leading-relaxed text-muted-foreground/60">
+              <p className="text-[11px] font-medium leading-relaxed text-slate-300">
                 UAS Start = UAC End + 1, same count
               </p>
             </div>
           </>
         ) : (
           /* UAS card: read-only, auto-synced from UAC */
-          <div className="rounded-md border border-border/40 bg-secondary/20 px-3 py-2.5 space-y-2">
+          <div className="rounded-md border border-border/50 bg-secondary/30 px-3 py-2.5 space-y-2">
             <div className="flex items-center gap-1.5">
-              <Lock className="size-3 text-muted-foreground/40" />
-              <span className="text-[10px] font-semibold tracking-wide text-muted-foreground/60">Auto-synced from UAC</span>
+              <Lock className="size-3 text-slate-400" />
+              <span className="text-[11px] font-semibold tracking-wide text-slate-300">Auto-synced from UAC</span>
             </div>
-            <div className="font-mono text-[11px] leading-relaxed text-slate-300/70 space-y-0.5">
+            <div className="font-mono text-[12px] leading-relaxed space-y-0.5">
               <div className="flex items-center justify-between">
-                <span className="text-slate-400/70">UAC</span>
-                <span className="text-cyan-300/70">{raw.uac_ext_start} → {raw.uac_ext_end} ({uacExtCount} ext)</span>
+                <span className="font-medium text-slate-300">UAC</span>
+                <span className="font-semibold text-slate-100">{raw.uac_ext_start} → {raw.uac_ext_end} ({uacExtCount} ext)</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-400/70">UAS</span>
-                <span className="text-cyan-300/70">{raw.uas_ext_start} → {raw.uas_ext_end} ({uasExtCount} ext)</span>
+                <span className="font-medium text-slate-300">UAS</span>
+                <span className="font-semibold text-slate-100">{raw.uas_ext_start} → {raw.uas_ext_end} ({uasExtCount} ext)</span>
               </div>
             </div>
           </div>
@@ -508,8 +512,8 @@ export function VMConfigPanel({
           /* UAS: Hold Time only, read-only — auto-mirrored from UAC */
           <div className="space-y-1">
             <div className="flex items-center gap-1.5">
-              <Label className="text-xs font-medium text-foreground/80">Hold Time (s)</Label>
-              <ArrowDownToLine className="size-3 text-muted-foreground/50" />
+              <Label className="text-xs font-medium text-slate-200">Hold Time (s)</Label>
+              <ArrowDownToLine className="size-3 text-slate-400" />
             </div>
             <Input
               readOnly
@@ -544,10 +548,15 @@ export function VMConfigPanel({
         )}
 
         {isUAC && (
-          <div className="inline-flex items-center gap-3 rounded-md border border-border/40 bg-secondary/20 px-3 py-2">
+          <div className={cn(
+            'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
+            raw.media_enabled
+              ? 'border-emerald-500/30 bg-emerald-950/20'
+              : 'border-amber-500/30 bg-amber-950/20',
+          )}>
             <div className="space-y-0.5">
-              <Label className="text-xs font-bold tracking-wide text-foreground">Media (RTP)</Label>
-              <p className="text-[10px] leading-relaxed text-foreground/60">
+              <Label className="text-xs font-bold tracking-wide text-slate-100">Media (RTP)</Label>
+              <p className="text-[11px] leading-relaxed text-slate-300">
                 {raw.media_enabled
                   ? 'RTP packets will be sent during calls'
                   : 'Signaling-only — no RTP packets (MEDIA_DISABLED)'}
@@ -594,18 +603,14 @@ export function VMConfigPanel({
             <SectionHeader>Coordination</SectionHeader>
             <div className="space-y-1">
               <div className="flex items-center gap-1.5">
-                <Label className="text-xs font-medium text-foreground/80">Peer Stop URL</Label>
-                <Link2 className="size-3 text-muted-foreground/50" />
+                <Label className="text-xs font-medium text-slate-200">Peer Stop URL</Label>
+                <Link2 className="size-3 text-sky-400/70" />
               </div>
-              <Input
-                readOnly
-                value={raw.peer_stop_url}
-                tabIndex={-1}
-                className={cn(
-                  'cursor-default select-all font-mono text-xs text-muted-foreground',
-                  'bg-secondary/30 focus-visible:ring-0 focus-visible:border-input'
-                )}
-              />
+              <div className="rounded-md border border-zinc-600/40 bg-zinc-800/40 px-3 py-2">
+                <span className="font-mono text-xs text-sky-400 underline decoration-sky-400/30 underline-offset-2 select-all">
+                  {raw.peer_stop_url || '—'}
+                </span>
+              </div>
               <FieldHint>Auto-derived from UAS VM IP + metrics port</FieldHint>
             </div>
           </div>
