@@ -365,8 +365,15 @@ export function VMPairBook() {
   const router = useRouter()
   const { updatePair, activePairIndex, pairs } = useTrafficStore()
 
-  const [uacRaw, setUacRaw] = useState<RawVMFormValues>(UAC_DEFAULTS)
-  const [uasRaw, setUasRaw] = useState<RawVMFormValues>(UAS_DEFAULTS)
+  const pair = pairs[activePairIndex]
+  const [uacRaw, setUacRaw] = useState<RawVMFormValues>(() => ({
+    ...UAC_DEFAULTS,
+    vm_ip: pair?.uac.vm_ip || UAC_DEFAULTS.vm_ip,
+  }))
+  const [uasRaw, setUasRaw] = useState<RawVMFormValues>(() => ({
+    ...UAS_DEFAULTS,
+    vm_ip: pair?.uas.vm_ip || UAS_DEFAULTS.vm_ip,
+  }))
   const [uacTouched, setUacTouched] = useState<Set<string>>(new Set())
   const [uasTouched, setUasTouched] = useState<Set<string>>(new Set())
   const [uacReachability, setUacReachability] = useState<ReachabilityStatus | null>(null)

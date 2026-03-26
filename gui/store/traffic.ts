@@ -12,6 +12,33 @@ import type {
 } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
+// ---------------------------------------------------------------------------
+// Persist VM IPs across page reloads (localStorage — only vm_ip per side)
+// ---------------------------------------------------------------------------
+
+const VM_IPS_KEY = 'cci-studio-vm-ips'
+
+interface SavedVmIps { uac: string; uas: string }
+
+function _loadVmIps(): SavedVmIps[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(VM_IPS_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch { return [] }
+}
+
+function _saveVmIps(pairs: VMPair[]): void {
+  if (typeof window === 'undefined') return
+  try {
+    const data: SavedVmIps[] = pairs.map(p => ({
+      uac: p.uac.vm_ip,
+      uas: p.uas.vm_ip,
+    }))
+    window.localStorage.setItem(VM_IPS_KEY, JSON.stringify(data))
+  } catch { /* localStorage unavailable */ }
+}
+
 interface MetricsHistoryPoint {
   t: number
   asr: number
@@ -20,6 +47,8 @@ interface MetricsHistoryPoint {
 }
 
 function makePair(index: number): VMPair {
+  const savedIps = _loadVmIps()
+  const ips = savedIps[index]
   const pairId = `pair-${index + 1}`
   return {
     pair_id: pairId,
@@ -27,7 +56,7 @@ function makePair(index: number): VMPair {
     uac: {
       vm_role: 'UAC',
       vm_id: 'uac-local',
-      vm_ip: '127.0.0.1',
+      vm_ip: ips?.uac ?? '127.0.0.1',
       uac_ext_start: 4001000,
       uac_ext_end: 4001004,
       uas_ext_start: 4001005,
@@ -47,7 +76,7 @@ function makePair(index: number): VMPair {
     uas: {
       vm_role: 'UAS',
       vm_id: 'uas-local',
-      vm_ip: '127.0.0.1',
+      vm_ip: ips?.uas ?? '127.0.0.1',
       uac_ext_start: 4001000,
       uac_ext_end: 4001004,
       uas_ext_start: 4001005,
@@ -158,6 +187,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     set((state) => {
       const pairs = [...state.pairs]
       pairs[index] = pair
+      _saveVmIps(pairs)
       return { pairs }
     }),
 
