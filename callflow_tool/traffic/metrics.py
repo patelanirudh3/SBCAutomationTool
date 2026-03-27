@@ -169,6 +169,17 @@ class MetricsCollector:
         self._rtp_health_counts: dict = {"OK": 0, "WARNING": 0, "CRITICAL": 0}
         self._scenario_assertion_results: list = []
 
+        # SIP message counters — UAC side
+        self._invites_sent: int = 0
+        self._acks_sent: int = 0
+        self._byes_sent: int = 0
+        self._bye_200_received: int = 0
+        # SIP message counters — UAS side
+        self._invites_received: int = 0
+        self._acks_received: int = 0
+        self._byes_received: int = 0
+        self._bye_200_sent: int = 0
+
     def set_concurrent_provider(self, provider: Optional[ConcurrentProvider]) -> None:
         """Set callable that returns current active call count (UAC only). Used for real-time /metrics."""
         self._concurrent_provider = provider
@@ -251,6 +262,12 @@ class MetricsCollector:
         self._raw_events.append(event)
         if len(self._raw_events) > 10000:
             self._raw_events = self._raw_events[-10000:]
+
+    def increment_sip_counter(self, name: str) -> None:
+        """Increment one of the 8 named SIP message counters (thread-safe via GIL for int ops)."""
+        attr = f"_{name}"
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + 1)
 
     def get_all_events(self) -> list[dict]:
         """Return all raw call events (for per-call-id lookup)."""
@@ -425,6 +442,14 @@ class MetricsCollector:
             self._pdd_breakdown_samples.clear()
             self._rtp_health_counts = {"OK": 0, "WARNING": 0, "CRITICAL": 0}
             self._scenario_assertion_results.clear()
+            self._invites_sent = 0
+            self._acks_sent = 0
+            self._byes_sent = 0
+            self._bye_200_received = 0
+            self._invites_received = 0
+            self._acks_received = 0
+            self._byes_received = 0
+            self._bye_200_sent = 0
             self._vm_id = "unconfigured"
             self._latest = TrafficMetrics(vm_id="unconfigured")
 
@@ -1099,6 +1124,19 @@ def write_traffic_summary(
     lines.append(f"  avg_total_ms:     {snap.avg_total_ms:.2f}")
     if peak_concurrent > 0:
         lines.append(f"  peak_concurrent:  {peak_concurrent}")
+    lines.append("")
+    if config.is_uac:
+        lines.append("--- SIP message counters (UAC) ---")
+        lines.append(f"  invites_sent:       {collector._invites_sent}")
+        lines.append(f"  acks_sent:          {collector._acks_sent}")
+        lines.append(f"  byes_sent:          {collector._byes_sent}")
+        lines.append(f"  bye_200_received:   {collector._bye_200_received}")
+    else:
+        lines.append("--- SIP message counters (UAS) ---")
+        lines.append(f"  invites_received:   {collector._invites_received}")
+        lines.append(f"  acks_received:      {collector._acks_received}")
+        lines.append(f"  byes_received:      {collector._byes_received}")
+        lines.append(f"  bye_200_sent:       {collector._bye_200_sent}")
     lines.append("")
     lines.append("--- RTP media verification ---")
     lines.append(f"  MEDIA_VERIFIED:   {media_verified} / {media_total} successful calls")

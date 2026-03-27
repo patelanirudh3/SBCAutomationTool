@@ -470,6 +470,8 @@ class CallEngine:
             invite_ts_utc = datetime.now(timezone.utc).isoformat()
             milestones.invite_sent_ms = 0.0
             milestones.invite_ts_utc = invite_ts_utc
+            if self._metrics:
+                self._metrics.increment_sip_counter("invites_sent")
             self._emit_call_event(call_id, agent.ext, "INVITE_SENT",
                                   peer_ext=callee, milestone_ms=0.0, callee=callee)
 
@@ -565,6 +567,8 @@ class CallEngine:
             # ── ACK ───────────────────────────────────────────────────
             await agent.send_ack(dialog)
             milestones.ack_sent_ms = (time.monotonic() - call_start) * 1000
+            if self._metrics:
+                self._metrics.increment_sip_counter("acks_sent")
             self._emit_call_event(call_id, agent.ext, "ACK_SENT",
                                   peer_ext=callee,
                                   milestone_ms=milestones.ack_sent_ms)
@@ -599,6 +603,8 @@ class CallEngine:
             # ── BYE ───────────────────────────────────────────────────
             await agent.send_bye(dialog)
             milestones.bye_sent_ms = (time.monotonic() - call_start) * 1000
+            if self._metrics:
+                self._metrics.increment_sip_counter("byes_sent")
             self._emit_call_event(call_id, agent.ext, "BYE_SENT",
                                   peer_ext=callee,
                                   milestone_ms=milestones.bye_sent_ms)
@@ -607,6 +613,8 @@ class CallEngine:
             try:
                 await asyncio.wait_for(bye_200_q.get(), timeout=timeout)
                 milestones.bye_200_ms = (time.monotonic() - call_start) * 1000
+                if self._metrics:
+                    self._metrics.increment_sip_counter("bye_200_received")
                 self._emit_call_event(call_id, agent.ext, "BYE_200",
                                       peer_ext=callee, sip_code=200,
                                       milestone_ms=milestones.bye_200_ms)
@@ -1022,6 +1030,8 @@ class UasAutoAnswer:
             _offset = (time.monotonic() - call_start) * 1000
             milestones.trying_100_sent_ms = _offset
             milestones.ringing_180_sent_ms = _offset
+            if self._metrics:
+                self._metrics.increment_sip_counter("invites_received")
             self._emit_call_event(call_id, agent.ext, "UAS_INVITE_RECEIVED",
                                   peer_ext=caller_ext, milestone_ms=0.0)
             self._emit_call_event(call_id, agent.ext, "UAS_TRYING_100_SENT",
@@ -1063,6 +1073,8 @@ class UasAutoAnswer:
                 await asyncio.wait_for(ack_q.get(), timeout=timeout)
                 dialog.state = "ESTABLISHED"
                 milestones.ack_received_ms = (time.monotonic() - call_start) * 1000
+                if self._metrics:
+                    self._metrics.increment_sip_counter("acks_received")
                 self._emit_call_event(call_id, agent.ext, "UAS_ACK_RECEIVED",
                                       peer_ext=caller_ext,
                                       milestone_ms=milestones.ack_received_ms)
@@ -1090,11 +1102,15 @@ class UasAutoAnswer:
                 hold_timeout = float(cfg.hold_time_seconds + 60)
                 raw_bye = await asyncio.wait_for(bye_q.get(), timeout=hold_timeout)
                 milestones.bye_received_ms = (time.monotonic() - call_start) * 1000
+                if self._metrics:
+                    self._metrics.increment_sip_counter("byes_received")
                 self._emit_call_event(call_id, agent.ext, "UAS_BYE_RECEIVED",
                                       peer_ext=caller_ext,
                                       milestone_ms=milestones.bye_received_ms)
                 await agent.handle_bye(raw_bye, dialog)
                 milestones.bye_200_sent_ms = (time.monotonic() - call_start) * 1000
+                if self._metrics:
+                    self._metrics.increment_sip_counter("bye_200_sent")
                 self._emit_call_event(call_id, agent.ext, "UAS_200_BYE_SENT",
                                       peer_ext=caller_ext, sip_code=200,
                                       milestone_ms=milestones.bye_200_sent_ms)
