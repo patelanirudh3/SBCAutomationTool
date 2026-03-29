@@ -10,9 +10,9 @@ which entity caused it, and whether CM kept stations stuck.
 ## Fixed Topology (always keep in context)
 
 ```
-UAC → SBC → kamailio-lb → kamailio-backend → CM (B2BUA)
-                                              ↓
-                    UAS ← SBC ← kamailio-lb ← kamailio-backend
+UAC → SBC → kamailio-lb → kamailio-backend → kamailio-lb -> CM (B2BUA)
+                                                            ↓
+          UAS ← SBC ← kamailio-lb ← kamailio-backend <- kamailio-lb
 ```
 
 | Entity | IP | Role |

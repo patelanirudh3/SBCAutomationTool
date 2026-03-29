@@ -54,6 +54,28 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Lightweight SIP header extractors used by zombie / 481 handler.
+# These are intentionally simple string-scan helpers — fast and dependency-free.
+# ---------------------------------------------------------------------------
+
+def _extract_call_id(raw: str) -> str:
+    """Return the Call-ID value from a raw SIP message without full parsing."""
+    for line in raw.split(CRLF):
+        lower = line.lower()
+        if lower.startswith("call-id:") or lower.startswith("i:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _has_to_tag(raw: str) -> bool:
+    """Return True if the To header in a raw SIP message contains a tag parameter."""
+    for line in raw.split(CRLF):
+        if line.lower().startswith("to:") or line.lower().startswith("t:"):
+            return "tag=" in line.lower()
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Lightweight dialog state (replaces UASession for traffic path)
 # ---------------------------------------------------------------------------
 
@@ -169,6 +191,11 @@ class ExtensionAgent:
         # Active in-flight dialogs: call_id → DialogState
         self.active_dialogs: dict[str, DialogState] = {}
 
+        # Dialogs abandoned on timeout but still potentially receiving late
+        # BYE/CANCEL from CM.  The zombie handler auto-responds 200 OK so
+        # CM can release the station immediately.  Entries expire after 120 s.
+        self.zombie_dialogs: dict[str, DialogState] = {}
+
         # Queue of (event_code, raw_message) tuples from the transport
         self._recv_queue: asyncio.Queue = asyncio.Queue()
 
@@ -280,6 +307,55 @@ class ExtensionAgent:
         except Exception:
             log.exception("ext=%s failed to respond 200 to NOTIFY", self.ext)
 
+    async def _respond_200_to_request(self, raw_msg: str) -> None:
+        """
+        Send 200 OK mirroring all mandatory headers from an inbound SIP request.
+        Used by the zombie handler for late BYE/CANCEL arriving on abandoned dialogs.
+        Mirrors the same header-copy pattern as handle_bye / handle_prack.
+        """
+        try:
+            parts = raw_msg.split(CRLF + CRLF, 1)
+            req = parseHeaders(parts[0])
+            resp = SipMessage()
+            resp.setResponseLine("SIP/2.0 200 OK")
+            for hdr in (SipHeaders.VIA, SipHeaders.FROM, SipHeaders.TO,
+                        SipHeaders.CALLID, SipHeaders.CSEQ):
+                vals = req.getHeader(hdr.value)
+                if vals:
+                    for v in vals:
+                        resp.addHeader(hdr.value, v)
+            resp.addHeader(SipHeaders.CONTENTLENGTH.value, "0")
+            await self._send(resp)
+            log.debug("ext=%s zombie: 200 OK → late %s (call_id=%s)",
+                      self.ext, req.getMethod() if hasattr(req, "getMethod") else "?",
+                      req.getCallID() if hasattr(req, "getCallID") else "?")
+        except Exception:
+            log.exception("ext=%s zombie: failed to send 200 OK to late request", self.ext)
+
+    async def _respond_481_to_request(self, raw_msg: str) -> None:
+        """
+        Send 481 Call/Transaction Does Not Exist for an in-dialog request whose
+        Call-ID is unknown to this agent.  RFC 3261 §12.2.2.
+        Ensures CM does not keep retrying teardown for a ghost dialog.
+        """
+        try:
+            parts = raw_msg.split(CRLF + CRLF, 1)
+            req = parseHeaders(parts[0])
+            resp = SipMessage()
+            resp.setResponseLine("SIP/2.0 481 Call/Transaction Does Not Exist")
+            for hdr in (SipHeaders.VIA, SipHeaders.FROM, SipHeaders.TO,
+                        SipHeaders.CALLID, SipHeaders.CSEQ):
+                vals = req.getHeader(hdr.value)
+                if vals:
+                    for v in vals:
+                        resp.addHeader(hdr.value, v)
+            resp.addHeader(SipHeaders.CONTENTLENGTH.value, "0")
+            await self._send(resp)
+            log.debug("ext=%s 481 → unknown in-dialog request (call_id=%s)",
+                      self.ext, req.getCallID() if hasattr(req, "getCallID") else "?")
+        except Exception:
+            log.exception("ext=%s failed to send 481 to unknown dialog request", self.ext)
+
     # ------------------------------------------------------------------
     # Background receive / dispatch loop
     # ------------------------------------------------------------------
@@ -319,6 +395,26 @@ class ExtensionAgent:
                         "ext=%s unhandled event=%s (%.60s…)",
                         self.ext, event_code, raw.replace(CRLF, " "),
                     )
+
+                # ── Zombie / 481 handler ──────────────────────────────────
+                # Fires for BYE and CANCEL regardless of whether the message
+                # was already delivered to a specific queue.  Guard: only when
+                # Call-ID is NOT in active_dialogs (i.e. the normal _handle_call
+                # is NOT processing this dialog — no risk of double response).
+                if event_code in ("BYE", "CANCEL"):
+                    cid = _extract_call_id(raw)
+                    if cid and cid not in self.active_dialogs:
+                        if cid in self.zombie_dialogs:
+                            asyncio.create_task(
+                                self._respond_200_to_request(raw),
+                                name=f"zombie-200-{cid[:12]}",
+                            )
+                        elif _has_to_tag(raw):
+                            asyncio.create_task(
+                                self._respond_481_to_request(raw),
+                                name=f"unknown-481-{cid[:12]}",
+                            )
+
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -822,6 +918,49 @@ class ExtensionAgent:
 
         await self._send(ack)
         log.debug("ext=%s sent ACK for failure response (call_id=%s)", self.ext, dialog.call_id)
+
+    # ------------------------------------------------------------------
+    # UAC: Send CANCEL
+    # ------------------------------------------------------------------
+
+    async def send_cancel(self, dialog: DialogState) -> None:
+        """
+        Send CANCEL for a pending INVITE (our Timer B fired, no final response).
+        RFC 3261 §9.1: CANCEL MUST reuse the same branch ID as the original
+        INVITE Via header so the network can match them to the same transaction.
+        Fire-and-forget — caller does not await a response.
+        """
+        if dialog.invite_msg is None:
+            log.warning("ext=%s send_cancel: no invite_msg on dialog (call_id=%s)",
+                        self.ext, dialog.call_id)
+            return
+        try:
+            orig_via_hdrs = dialog.invite_msg.getHeader(SipHeaders.VIA.value)
+            orig_via = (orig_via_hdrs[0] if orig_via_hdrs else
+                        f"SIP/2.0/{self.config.sip_transport} "
+                        f"{self._local_host};branch={_util.createBranchID()}")
+            from_hdrs = dialog.invite_msg.getHeader(SipHeaders.FROM.value)
+            to_base = f"<sip:{dialog.remote_ext}@{dialog.domain}>"
+            to_val = (f"{to_base};tag={dialog.remote_tag}"
+                      if dialog.remote_tag else to_base)
+
+            cancel = SipMessage()
+            cancel.setRequestLine(
+                f"CANCEL sip:{dialog.remote_ext}@{self.config.domain} SIP/2.0"
+            )
+            cancel.addHeader(SipHeaders.CALLID.value, dialog.call_id)
+            cancel.addHeader(SipHeaders.FROM.value, from_hdrs[0] if from_hdrs else "")
+            cancel.addHeader(SipHeaders.TO.value, to_val)
+            cancel.addHeader(SipHeaders.VIA.value, orig_via)
+            cancel.addHeader(SipHeaders.MAXFORWARDS.value, "70")
+            cancel.addHeader(SipHeaders.CSEQ.value, f"{dialog.cseq} CANCEL")
+            cancel.addHeader(SipHeaders.CONTENTLENGTH.value, "0")
+
+            await self._send(cancel)
+            log.debug("ext=%s sent CANCEL (call_id=%s)", self.ext, dialog.call_id)
+        except Exception:
+            log.exception("ext=%s failed to send CANCEL (call_id=%s)",
+                          self.ext, dialog.call_id)
 
     # ------------------------------------------------------------------
     # UAC: Send BYE

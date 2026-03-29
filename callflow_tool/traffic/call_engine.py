@@ -48,6 +48,11 @@ from .rtp_stream import RtpEndpoint, RtpStats
 
 log = logging.getLogger(__name__)
 
+# SIP signalling timeout used for both UAC (Timer B — INVITE wait) and
+# UAS (Timer H — ACK wait).  Set high enough to survive CM's slow signalling
+# under load while remaining below Kamailio backend fr_timer (30 s).
+_SIP_TIMEOUT = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Structured JSON call event logger
@@ -475,7 +480,7 @@ class CallEngine:
             self._emit_call_event(call_id, agent.ext, "INVITE_SENT",
                                   peer_ext=callee, milestone_ms=0.0, callee=callee)
 
-            timeout = float(self._config.register_timeout * 2)
+            timeout = _SIP_TIMEOUT
 
             # ── Wait for provisional + handle 407 + handle final failures
             _FINAL_FAIL = (
@@ -722,6 +727,16 @@ class CallEngine:
             self._calls_failed += 1
             self._emit_call_event(call_id, agent.ext if agent else "?",
                                   "CALL_TIMEOUT", peer_ext=callee)
+            # Fire-and-forget CANCEL: notify the network that this INVITE is
+            # abandoned.  CM receives the CANCEL, stops waiting, and sends
+            # BYE to the UAS leg — which the zombie handler will answer.
+            # Only send when the transaction is still alive (no final response
+            # received yet, meaning dialog is in INVITE_SENT/RINGING state).
+            if dialog and dialog.state in ("INVITE_SENT", "RINGING", "PROVRESP_RCVD"):
+                asyncio.create_task(
+                    agent.send_cancel(dialog),
+                    name=f"cancel-timeout-{call_id[:12]}",
+                )
 
         except asyncio.CancelledError:
             if dialog and dialog.state == "ESTABLISHED":
@@ -993,7 +1008,7 @@ class UasAutoAnswer:
         call_start = time.monotonic()
         dialog: Optional[DialogState] = None
         call_id = "pending"
-        timeout = float(self._config.register_timeout * 4)
+        timeout = _SIP_TIMEOUT
         rtp_ep: Optional[RtpEndpoint] = None
         rtp_task: Optional[asyncio.Task] = None
         result: Optional[CallResult] = None
@@ -1184,6 +1199,17 @@ class UasAutoAnswer:
                                   peer_ext=caller_ext)
             if dialog and dialog.call_id in agent.active_dialogs:
                 agent.active_dialogs.pop(dialog.call_id, None)
+            # Register as zombie so the dispatch loop can auto-respond 200 OK
+            # to any late BYE/CANCEL arriving from CM after this timeout.
+            # This ensures CM releases the station immediately instead of
+            # waiting for its own internal cleanup timer (1-5 min).
+            if dialog:
+                cid = dialog.call_id
+                agent.zombie_dialogs[cid] = dialog
+                asyncio.get_running_loop().call_later(
+                    120.0,
+                    lambda c=cid: agent.zombie_dialogs.pop(c, None),
+                )
             result = CallResult(
                 call_id=call_id, caller=caller_ext or "remote", callee=agent.ext,
                 success=False, failure_reason="timeout",
