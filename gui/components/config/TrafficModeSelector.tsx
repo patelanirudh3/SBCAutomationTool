@@ -29,6 +29,7 @@ const MODES = [
 ]
 
 const DURATION_PRESETS = [
+  { label: '5 min', value: '0.083' },
   { label: '15 min', value: '0.25' },
   { label: '1h BHCC', value: '1' },
   { label: '8h', value: '8' },
