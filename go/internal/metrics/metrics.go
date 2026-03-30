@@ -621,6 +621,8 @@ type ProcessContext struct {
 	Config      any    // parsed *config.VMConfig (stored as any to avoid import cycle)
 	RawConfig   map[string]any
 	State       string
+	VMID        string // set by PUT /api/config; used by effectiveVMID
+	Role        string // set by PUT /api/config; used by effectiveRole
 	YAMLPath    string
 	LogLevel    string
 	RunID       string
@@ -702,11 +704,12 @@ func BuildMux(
 	mux := http.NewServeMux()
 
 	effectiveVMID := func() string {
-		if processCtx != nil && processCtx.Config != nil {
-			if m, ok := processCtx.Config.(map[string]any); ok {
-				if v, ok := m["vm_id"].(string); ok {
-					return v
-				}
+		if processCtx != nil {
+			processCtx.Mu.Lock()
+			v := processCtx.VMID
+			processCtx.Mu.Unlock()
+			if v != "" {
+				return v
 			}
 		}
 		if vmID != "" {
@@ -716,11 +719,12 @@ func BuildMux(
 	}
 
 	effectiveRole := func() string {
-		if processCtx != nil && processCtx.Config != nil {
-			if m, ok := processCtx.Config.(map[string]any); ok {
-				if v, ok := m["vm_role"].(string); ok {
-					return v
-				}
+		if processCtx != nil {
+			processCtx.Mu.Lock()
+			v := processCtx.Role
+			processCtx.Mu.Unlock()
+			if v != "" {
+				return v
 			}
 		}
 		if role != "" {
@@ -847,6 +851,8 @@ func BuildMux(
 		processCtx.Config = parsedCfg
 		processCtx.RawConfig = body
 		processCtx.YAMLPath = yamlPath
+		processCtx.VMID = cfgVMID
+		processCtx.Role = cfgRole
 		processCtx.State = "CONFIGURED"
 		processCtx.Mu.Unlock()
 
@@ -981,8 +987,9 @@ func BuildMux(
 
 		processCtx.State = "IDLE"
 		processCtx.Config = nil
+		processCtx.VMID = ""
+		processCtx.Role = ""
 		processCtx.YAMLPath = ""
-		// Re-create stop channel.
 		processCtx.StopEvent = make(chan struct{}, 1)
 		processCtx.Mu.Unlock()
 

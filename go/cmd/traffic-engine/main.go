@@ -115,7 +115,7 @@ func main() {
 	}
 
 	// Run the full lifecycle
-	exitCode := runLifecycle(cfg, *skipSubscribe, maxCalls, *prePhaseOnly, *noUnregister, *apiOnly, *guiDrainSeconds, runID, pairID, *logDir)
+	exitCode := runLifecycle(cfg, *skipSubscribe, maxCalls, *prePhaseOnly, *noUnregister, *apiOnly, *guiDrainSeconds, runID, pairID, *logDir, nil, nil)
 	slog.Info("Process exiting", "pid", os.Getpid(), "code", exitCode)
 	os.Exit(exitCode)
 }
@@ -129,32 +129,54 @@ func runLifecycle(
 	apiOnly bool,
 	guiDrainSeconds int,
 	runID, pairID, logDir string,
+	extCollector *metrics.MetricsCollector,
+	extCtx context.Context,
 ) int {
 	overallStart := time.Now()
-	ctx, cancel := context.WithCancel(context.Background())
+
+	// GUI mode: reuse the shared collector and derive context from the caller
+	// (cancelled by StopEvent / POST /api/shutdown).
+	// CLI mode: create own collector, signal handler, and metrics server.
+	guiMode := extCollector != nil
+
+	var collector *metrics.MetricsCollector
+	var ctx context.Context
+	var cancel context.CancelFunc
+
+	if guiMode {
+		collector = extCollector
+		ctx, cancel = context.WithCancel(extCtx)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		go func() {
+			sig := <-sigCh
+			slog.Info("Received signal, initiating graceful shutdown", "signal", sig)
+			cancel()
+		}()
+		collector = metrics.NewMetricsCollector(cfg.VMID, cfg.MetricsInterval)
+	}
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		sig := <-sigCh
-		slog.Info("Received signal, initiating graceful shutdown", "signal", sig)
-		cancel()
-	}()
-
-	// Metrics collector
-	collector := metrics.NewMetricsCollector(cfg.VMID, cfg.MetricsInterval)
 	collector.SetPhase("INIT")
 
-	// Start metrics HTTP server
-	stopCh := make(chan struct{})
-	actualPort, err := metrics.StartServer(collector, cfg.VMID, cfg.VMRole, cfg.MetricsPort, stopCh, nil)
-	if err != nil {
-		slog.Warn("Could not start metrics server", "err", err)
-	} else {
-		slog.Info("Metrics server started", "port", actualPort)
+	// Start metrics HTTP server only in CLI mode
+	var stopCh chan struct{}
+	if !guiMode {
+		stopCh = make(chan struct{})
+		actualPort, err := metrics.StartServer(collector, cfg.VMID, cfg.VMRole, cfg.MetricsPort, stopCh, nil)
+		if err != nil {
+			slog.Warn("Could not start metrics server", "err", err)
+		} else {
+			slog.Info("Metrics server started", "port", actualPort)
+		}
 	}
-	defer close(stopCh)
+	defer func() {
+		if stopCh != nil {
+			close(stopCh)
+		}
+	}()
 
 	// API-only mode with config
 	if apiOnly {
@@ -799,6 +821,7 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		cfg, ok := pctx.Config.(*config.VMConfig)
 		runID := pctx.RunID
 		pairID := pctx.PairID
+		stopEvent := pctx.StopEvent
 		pctx.Mu.Unlock()
 
 		if !ok || cfg == nil {
@@ -829,9 +852,22 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 			"max_calls", maxCalls,
 		)
 
+		// Create a context cancelled by StopEvent (POST /api/shutdown,
+		// POST /api/test/stop) or by runAPIOnly's parent context (Ctrl+C).
+		stopCtx, stopCancel := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-stopEvent:
+				stopCancel()
+			case <-stopCtx.Done():
+			}
+		}()
+
 		lifecycleRunning.Lock()
-		exitCode := runLifecycle(cfg, false, maxCalls, false, false, false, 0, runID, pairID, "logs")
+		exitCode := runLifecycle(cfg, false, maxCalls, false, false, false, 0, runID, pairID, "logs", collector, stopCtx)
 		lifecycleRunning.Unlock()
+
+		stopCancel() // clean up the StopEvent goroutine
 
 		pctx.Mu.Lock()
 		if exitCode == 0 {
