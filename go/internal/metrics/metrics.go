@@ -329,6 +329,43 @@ func (c *MetricsCollector) GetAllEvents() []map[string]any {
 	return out
 }
 
+// SIPCounters holds SIP message counter values needed by the traffic summary.
+type SIPCounters struct {
+	InvitesSent     int
+	AcksSent        int
+	ByesSent        int
+	Bye200Received  int
+	InvitesReceived int
+	AcksReceived    int
+	ByesReceived    int
+	Bye200Sent      int
+}
+
+// GetSIPCounters returns a snapshot of SIP message counters.
+func (c *MetricsCollector) GetSIPCounters() SIPCounters {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return SIPCounters{
+		InvitesSent:     c.invitesSent,
+		AcksSent:        c.acksSent,
+		ByesSent:        c.byesSent,
+		Bye200Received:  c.bye200Received,
+		InvitesReceived: c.invitesReceived,
+		AcksReceived:    c.acksReceived,
+		ByesReceived:    c.byesReceived,
+		Bye200Sent:      c.bye200Sent,
+	}
+}
+
+// GetCallResultsCopy returns a copy of all call results for the summary writer.
+func (c *MetricsCollector) GetCallResultsCopy() []CallResultData {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]CallResultData, len(c.callResults))
+	copy(out, c.callResults)
+	return out
+}
+
 // GetRTPHealthSnapshot returns a copy of the RTP health counters.
 func (c *MetricsCollector) GetRTPHealthSnapshot() map[string]int {
 	c.mu.Lock()
@@ -581,14 +618,20 @@ type ProcessContext struct {
 	StopEvent   chan struct{}
 	ProcessExit chan struct{}
 	Port        int
-	Config      any
+	Config      any    // parsed *config.VMConfig (stored as any to avoid import cycle)
+	RawConfig   map[string]any
 	State       string
 	YAMLPath    string
 	LogLevel    string
 	RunID       string
 	PairID      string
 	StartFunc   func()
-	mu          sync.Mutex
+	Mu          sync.Mutex
+
+	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
+	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
+	// Injected by main.go to avoid importing the config package from metrics.
+	OnConfigReceived func(body map[string]any) (vmID, role, yamlPath string, parsedCfg any, err error)
 }
 
 // NewProcessContext creates a ProcessContext in IDLE state.
@@ -688,9 +731,9 @@ func BuildMux(
 
 	stateStr := func() string {
 		if processCtx != nil {
-			processCtx.mu.Lock()
+			processCtx.Mu.Lock()
 			s := processCtx.State
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			return s
 		}
 		return "CLI"
@@ -756,15 +799,15 @@ func BuildMux(
 			return
 		}
 
-		processCtx.mu.Lock()
+		processCtx.Mu.Lock()
 		if processCtx.State == "RUNNING" {
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Cannot push config while traffic is running",
 			})
 			return
 		}
-		processCtx.mu.Unlock()
+		processCtx.Mu.Unlock()
 
 		body, err := readJSONBody(r)
 		if err != nil {
@@ -772,9 +815,26 @@ func BuildMux(
 			return
 		}
 
-		processCtx.mu.Lock()
+		slog.Info("PUT /api/config received", "keys", len(body))
+
+		// Validate config and write YAML via the callback injected by main.go
+		var cfgVMID, cfgRole, yamlPath string
+		var parsedCfg any
+		if processCtx.OnConfigReceived != nil {
+			cfgVMID, cfgRole, yamlPath, parsedCfg, err = processCtx.OnConfigReceived(body)
+			if err != nil {
+				slog.Error("Config validation failed", "err", err)
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+				return
+			}
+		} else {
+			cfgVMID, _ = body["vm_id"].(string)
+			cfgRole, _ = body["vm_role"].(string)
+			parsedCfg = body
+		}
+
+		processCtx.Mu.Lock()
 		if processCtx.State == "COMPLETE" || processCtx.State == "FAILED" {
-			// Re-open the stop channel for the next run.
 			select {
 			case <-processCtx.StopEvent:
 			default:
@@ -784,20 +844,27 @@ func BuildMux(
 			slog.Info("Auto-reset from previous state to CONFIGURED", "prev", processCtx.State)
 		}
 
-		processCtx.Config = body
+		processCtx.Config = parsedCfg
+		processCtx.RawConfig = body
+		processCtx.YAMLPath = yamlPath
 		processCtx.State = "CONFIGURED"
-		processCtx.mu.Unlock()
+		processCtx.Mu.Unlock()
 
-		if vid, ok := body["vm_id"].(string); ok {
+		if cfgVMID != "" {
 			collector.mu.Lock()
-			collector.vmID = vid
+			collector.vmID = cfgVMID
 			collector.mu.Unlock()
 		}
 
+		slog.Info("Config accepted from GUI",
+			"vm_id", cfgVMID, "role", cfgRole, "yaml_path", yamlPath,
+		)
+
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "configured",
-			"vm_id":  effectiveVMID(),
-			"role":   effectiveRole(),
+			"status":    "configured",
+			"vm_id":     cfgVMID,
+			"role":      cfgRole,
+			"yaml_path": yamlPath,
 		})
 	})
 
@@ -827,9 +894,9 @@ func BuildMux(
 			return
 		}
 
-		processCtx.mu.Lock()
+		processCtx.Mu.Lock()
 		if processCtx.State == "RUNNING" {
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Traffic is already running",
 			})
@@ -837,14 +904,14 @@ func BuildMux(
 		}
 		if processCtx.State != "CONFIGURED" {
 			st := processCtx.State
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": fmt.Sprintf("Cannot start: state is '%s', expected 'CONFIGURED'. Push config first via PUT /api/config.", st),
 			})
 			return
 		}
 		if processCtx.StartFunc == nil {
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": "Lifecycle starter not registered — internal error",
 			})
@@ -855,7 +922,7 @@ func BuildMux(
 		processCtx.PairID = pairID
 		processCtx.State = "RUNNING"
 		startFn := processCtx.StartFunc
-		processCtx.mu.Unlock()
+		processCtx.Mu.Unlock()
 
 		go startFn()
 
@@ -869,9 +936,9 @@ func BuildMux(
 	// POST /api/test/stop
 	mux.HandleFunc("POST /api/test/stop", func(w http.ResponseWriter, r *http.Request) {
 		if processCtx != nil {
-			processCtx.mu.Lock()
+			processCtx.Mu.Lock()
 			st := processCtx.State
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 
 			select {
 			case processCtx.StopEvent <- struct{}{}:
@@ -895,9 +962,9 @@ func BuildMux(
 			return
 		}
 
-		processCtx.mu.Lock()
+		processCtx.Mu.Lock()
 		if processCtx.State == "RUNNING" {
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Cannot reset while traffic is running — stop first",
 			})
@@ -905,7 +972,7 @@ func BuildMux(
 		}
 		if processCtx.State != "COMPLETE" && processCtx.State != "FAILED" && processCtx.State != "CONFIGURED" {
 			st := processCtx.State
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": fmt.Sprintf("Nothing to reset: state is '%s'", st),
 			})
@@ -917,7 +984,7 @@ func BuildMux(
 		processCtx.YAMLPath = ""
 		// Re-create stop channel.
 		processCtx.StopEvent = make(chan struct{}, 1)
-		processCtx.mu.Unlock()
+		processCtx.Mu.Unlock()
 
 		collector.Reset()
 
@@ -931,9 +998,9 @@ func BuildMux(
 	// POST /api/shutdown
 	mux.HandleFunc("POST /api/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		if processCtx != nil {
-			processCtx.mu.Lock()
+			processCtx.Mu.Lock()
 			st := processCtx.State
-			processCtx.mu.Unlock()
+			processCtx.Mu.Unlock()
 
 			select {
 			case processCtx.StopEvent <- struct{}{}:
@@ -1143,9 +1210,9 @@ func StartServer(
 	}
 
 	if processCtx != nil {
-		processCtx.mu.Lock()
+		processCtx.Mu.Lock()
 		processCtx.Port = actualPort
-		processCtx.mu.Unlock()
+		processCtx.Mu.Unlock()
 	}
 
 	mux := BuildMux(collector, vmID, role, processCtx)

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,7 +372,16 @@ func shutdownCleanup(
 	}
 
 	collector.SetPhase("DONE")
-	slog.Info("SIP cleanup complete")
+
+	// Final metrics flush + log (matches Python step 6)
+	snap := collector.Latest()
+	snapJSON, _ := json.Marshal(snap)
+	slog.Info("Final metrics: " + string(snapJSON))
+
+	// Write traffic_summary_*.log (matches Python write_traffic_summary)
+	writeTrafficSummary(collector, cfg, "logs", runID, pairID, eng, agents)
+
+	slog.Info("SIP cleanup complete — metrics server still serving")
 }
 
 func postPeerStop(peerURL string) {
@@ -452,6 +462,192 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		return
 	}
 	slog.Info("Run JSON written", "path", path)
+}
+
+// writeTrafficSummary writes a human-readable summary log matching the Python
+// write_traffic_summary format: traffic_summary_<runID>_<pairID>_<vmID>.log
+func writeTrafficSummary(
+	collector *metrics.MetricsCollector,
+	cfg *config.VMConfig,
+	logDir string,
+	runID, pairID string,
+	eng *engine.CallEngine,
+	agents map[string]*agent.ExtensionAgent,
+) {
+	vmID := cfg.VMID
+	path := fmt.Sprintf("%s/traffic_summary_%s_%s_%s.log", logDir, runID, pairID, vmID)
+	os.MkdirAll(logDir, 0755)
+
+	results := collector.GetCallResultsCopy()
+	snap := collector.Latest()
+	sipC := collector.GetSIPCounters()
+
+	// SIP ephemeral ports
+	sipPortsByExt := make(map[string]int)
+	for ext, ag := range agents {
+		port := ag.LocalPort()
+		if port != 0 {
+			sipPortsByExt[ext] = port
+		}
+	}
+
+	// RTP UDP ports
+	type rtpEntry struct {
+		caller, callee string
+		port           int
+	}
+	var rtpPorts []rtpEntry
+	for _, r := range results {
+		if r.RTPLocalPort > 0 && r.RTPLocalPort != 9 {
+			rtpPorts = append(rtpPorts, rtpEntry{r.Caller, r.Callee, r.RTPLocalPort})
+		}
+	}
+
+	// Media verification
+	var mediaVerified, mediaTotal int
+	for _, r := range results {
+		if r.Success {
+			mediaTotal++
+			if r.MediaVerified {
+				mediaVerified++
+			}
+		}
+	}
+
+	// Peak concurrent (UAC only)
+	peakConcurrent := 0
+	if eng != nil {
+		peakConcurrent = eng.PeakActiveCalls()
+	}
+
+	// Pool wrap pairings
+	pairingsByWrap := make(map[int][]struct{ caller, callee string })
+	for _, r := range results {
+		if r.Caller != "remote" {
+			pairingsByWrap[r.PoolWrapIndex] = append(pairingsByWrap[r.PoolWrapIndex], struct{ caller, callee string }{r.Caller, r.Callee})
+		}
+	}
+
+	var lines []string
+	lines = append(lines, strings.Repeat("=", 70))
+	lines = append(lines, fmt.Sprintf("TRAFFIC RUN SUMMARY — %s — %s", vmID, cfg.VMRole))
+	lines = append(lines, fmt.Sprintf("Timestamp: %s", time.Now().Format("2006-01-02T15:04:05.000000")))
+	lines = append(lines, strings.Repeat("=", 70))
+	lines = append(lines, "")
+	lines = append(lines, "--- Overall metrics ---")
+	lines = append(lines, fmt.Sprintf("  calls_attempted:  %d", snap.CallsAttempted))
+	lines = append(lines, fmt.Sprintf("  calls_completed:  %d", snap.CallsCompleted))
+	lines = append(lines, fmt.Sprintf("  calls_failed:     %d", snap.CallsFailed))
+	lines = append(lines, fmt.Sprintf("  ASR:              %.1f%%", snap.ASR))
+	lines = append(lines, fmt.Sprintf("  avg_pdd_ms:       %.2f", snap.AvgPDDMs))
+	lines = append(lines, fmt.Sprintf("  avg_hold_ms:      %.2f", snap.AvgHoldMs))
+	lines = append(lines, fmt.Sprintf("  avg_total_ms:     %.2f", snap.AvgTotalMs))
+	if peakConcurrent > 0 {
+		lines = append(lines, fmt.Sprintf("  peak_concurrent:  %d", peakConcurrent))
+	}
+	lines = append(lines, "")
+
+	if cfg.IsUAC() {
+		lines = append(lines, "--- SIP message counters (UAC) ---")
+		lines = append(lines, fmt.Sprintf("  invites_sent:       %d", sipC.InvitesSent))
+		lines = append(lines, fmt.Sprintf("  acks_sent:          %d", sipC.AcksSent))
+		lines = append(lines, fmt.Sprintf("  byes_sent:          %d", sipC.ByesSent))
+		lines = append(lines, fmt.Sprintf("  bye_200_received:   %d", sipC.Bye200Received))
+	} else {
+		lines = append(lines, "--- SIP message counters (UAS) ---")
+		lines = append(lines, fmt.Sprintf("  invites_received:   %d", sipC.InvitesReceived))
+		lines = append(lines, fmt.Sprintf("  acks_received:      %d", sipC.AcksReceived))
+		lines = append(lines, fmt.Sprintf("  byes_received:      %d", sipC.ByesReceived))
+		lines = append(lines, fmt.Sprintf("  bye_200_sent:       %d", sipC.Bye200Sent))
+	}
+	lines = append(lines, "")
+
+	lines = append(lines, "--- RTP media verification ---")
+	lines = append(lines, fmt.Sprintf("  MEDIA_VERIFIED:   %d / %d successful calls", mediaVerified, mediaTotal))
+	mediaFailed := mediaTotal - mediaVerified
+	if mediaFailed > 0 {
+		lines = append(lines, fmt.Sprintf("  MEDIA_FAILED:     %d", mediaFailed))
+	}
+	lines = append(lines, "")
+
+	lines = append(lines, "--- Ephemeral SIP ports (used and closed by extensions) ---")
+	if len(sipPortsByExt) > 0 {
+		sortedExts := sortedKeys(sipPortsByExt)
+		for _, ext := range sortedExts {
+			lines = append(lines, fmt.Sprintf("  ext %s: port %d", ext, sipPortsByExt[ext]))
+		}
+	} else {
+		lines = append(lines, "  (none recorded)")
+	}
+	lines = append(lines, "")
+
+	lines = append(lines, "--- UDP RTP ports (created and closed per call) ---")
+	if len(rtpPorts) > 0 {
+		limit := 50
+		for i, rp := range rtpPorts {
+			if i >= limit {
+				break
+			}
+			lines = append(lines, fmt.Sprintf("  %s -> %s: port %d", rp.caller, rp.callee, rp.port))
+		}
+		if len(rtpPorts) > limit {
+			lines = append(lines, fmt.Sprintf("  ... and %d more", len(rtpPorts)-limit))
+		}
+	} else {
+		lines = append(lines, "  (none recorded)")
+	}
+	lines = append(lines, "")
+
+	if len(pairingsByWrap) > 0 {
+		lines = append(lines, "--- UAC-to-UAS call pairings by pool wrap ---")
+		sortedWraps := sortedIntKeys(pairingsByWrap)
+		for _, wrap := range sortedWraps {
+			lines = append(lines, fmt.Sprintf("  Wrap %d:", wrap+1))
+			for _, pair := range pairingsByWrap[wrap] {
+				lines = append(lines, fmt.Sprintf("    %s -> %s", pair.caller, pair.callee))
+			}
+		}
+	}
+	lines = append(lines, "")
+
+	lines = append(lines, "--- Config ---")
+	lines = append(lines, fmt.Sprintf("  cps: %d  hold_time_seconds: %d", cfg.CPS, cfg.HoldTimeSeconds))
+	lines = append(lines, fmt.Sprintf("  uac_ext: %d-%d", cfg.UACExtStart, cfg.UACExtEnd))
+	lines = append(lines, fmt.Sprintf("  uas_ext: %d-%d", cfg.UASExtStart, cfg.UASExtEnd))
+	lines = append(lines, strings.Repeat("=", 70))
+
+	content := strings.Join(lines, "\n")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		slog.Warn("Could not write traffic summary", "err", err)
+	} else {
+		slog.Info("Traffic summary written", "path", path)
+	}
+}
+
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	// Sort numerically by converting to int, fall back to string sort
+	sort.Slice(keys, func(i, j int) bool {
+		ni, ei := strconv.Atoi(keys[i])
+		nj, ej := strconv.Atoi(keys[j])
+		if ei == nil && ej == nil {
+			return ni < nj
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
+}
+
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 func createAgents(cfg *config.VMConfig) map[string]*agent.ExtensionAgent {
@@ -539,17 +735,120 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
+	processExitCh := make(chan struct{}, 1)
+
+	// Second Ctrl+C triggers immediate exit (interruptible GUI drain)
+	secondSigCh := make(chan struct{}, 1)
+	sigCount := 0
+	var sigMu sync.Mutex
+
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
-		<-sigCh
-		cancel()
+		for sig := range sigCh {
+			sigMu.Lock()
+			sigCount++
+			n := sigCount
+			sigMu.Unlock()
+
+			if n == 1 {
+				slog.Info("Signal received, initiating shutdown", "signal", sig)
+				cancel()
+				select {
+				case processExitCh <- struct{}{}:
+				default:
+				}
+			} else {
+				slog.Info("Second signal received, forcing immediate exit", "signal", sig)
+				select {
+				case secondSigCh <- struct{}{}:
+				default:
+				}
+			}
+		}
 	}()
 
 	collector := metrics.NewMetricsCollector("unconfigured", 3)
 	collector.SetPhase("IDLE")
 
 	pctx := metrics.NewProcessContext(collector, port)
+	pctx.ProcessExit = processExitCh
+	pctx.LogLevel = logLevel
+
+	// Channel signalled when lifecycle goroutine finishes
+	lifecycleDone := make(chan struct{}, 1)
+	var lifecycleRunning sync.Mutex
+
+	// Wire the config validation callback — called by PUT /api/config.
+	pctx.OnConfigReceived = func(body map[string]any) (string, string, string, any, error) {
+		cfg, err := config.ConfigFromDict(body)
+		if err != nil {
+			return "", "", "", nil, err
+		}
+		yamlFilename := strings.ToLower(cfg.VMRole) + ".yaml"
+		yamlPath, err := config.WriteConfigYAML(cfg, yamlFilename)
+		if err != nil {
+			return "", "", "", nil, fmt.Errorf("failed to write YAML: %w", err)
+		}
+		return cfg.VMID, cfg.VMRole, yamlPath, cfg, nil
+	}
+
+	// Wire the lifecycle start callback — called by POST /api/test/start.
+	pctx.StartFunc = func() {
+		pctx.Mu.Lock()
+		cfg, ok := pctx.Config.(*config.VMConfig)
+		runID := pctx.RunID
+		pairID := pctx.PairID
+		pctx.Mu.Unlock()
+
+		if !ok || cfg == nil {
+			slog.Error("StartFunc: no valid VMConfig on ProcessContext")
+			pctx.Mu.Lock()
+			pctx.State = "FAILED"
+			pctx.Mu.Unlock()
+			collector.SetPhase("FAILED")
+			return
+		}
+
+		maxCalls := 0
+		if cfg.IsUAC() {
+			switch cfg.TrafficMode {
+			case "smoke":
+				maxCalls = cfg.CallCount
+			case "timed":
+				maxCalls = int(float64(cfg.CPS) * cfg.DurationHours * 3600)
+			}
+		}
+
+		logFile := autoLogFile(runID, pairID, cfg.VMID, "logs")
+		setupFileLogging(logLevel, logFile)
+
+		slog.Info("Traffic lifecycle starting via API",
+			"vm_id", cfg.VMID, "role", cfg.VMRole,
+			"run_id", runID, "pair_id", pairID,
+			"max_calls", maxCalls,
+		)
+
+		lifecycleRunning.Lock()
+		exitCode := runLifecycle(cfg, false, maxCalls, false, false, false, 0, runID, pairID, "logs")
+		lifecycleRunning.Unlock()
+
+		pctx.Mu.Lock()
+		if exitCode == 0 {
+			pctx.State = "COMPLETE"
+		} else {
+			pctx.State = "FAILED"
+		}
+		pctx.Mu.Unlock()
+
+		setupLogging(logLevel)
+		slog.Info("Traffic lifecycle finished", "exit_code", exitCode)
+
+		select {
+		case lifecycleDone <- struct{}{}:
+		default:
+		}
+	}
 
 	stopCh := make(chan struct{})
 	actualPort, err := metrics.StartServer(collector, "unconfigured", "unconfigured", port, stopCh, pctx)
@@ -560,17 +859,50 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	slog.Info("API server started", "port", actualPort)
 
 	slog.Info("============================================================")
-	slog.Info("GUI-DRIVEN mode — FastAPI server running", "port", port)
+	slog.Info("GUI-DRIVEN mode — server running", "port", actualPort)
 	slog.Info("  PUT /api/config | POST /api/test/start | GET /api/ping")
 	slog.Info("============================================================")
 
-	_ = pctx // ProcessContext will be wired to mux in future
-	<-ctx.Done()
-	close(stopCh)
-
-	if guiDrainSeconds > 0 {
-		time.Sleep(time.Duration(guiDrainSeconds) * time.Second)
+	// Wait for process exit (Ctrl+C, SIGTERM, or POST /api/shutdown)
+	select {
+	case <-ctx.Done():
+	case <-processExitCh:
 	}
+
+	// If lifecycle is still running, wait for it to complete (up to 60s)
+	// This matches Python: await asyncio.wait_for(ctx._lifecycle_task, timeout=60.0)
+	if lifecycleRunning.TryLock() {
+		lifecycleRunning.Unlock()
+	} else {
+		slog.Info("Waiting for traffic lifecycle to complete shutdown (up to 60s)")
+		select {
+		case <-lifecycleDone:
+			slog.Info("Traffic lifecycle shutdown complete")
+		case <-time.After(60 * time.Second):
+			slog.Warn("Lifecycle task did not finish in 60s")
+		case <-secondSigCh:
+			slog.Info("GUI drain interrupted — exiting immediately")
+			close(stopCh)
+			return 0
+		}
+	}
+
+	// Brief drain so GUI can fetch last data before process dies
+	// Interruptible by second Ctrl+C (matches Python asyncio.CancelledError)
+	if guiDrainSeconds > 0 {
+		slog.Info("GUI drain: keeping server alive",
+			"seconds", guiDrainSeconds,
+			"phase", "DONE, all endpoints serving final data",
+		)
+		select {
+		case <-time.After(time.Duration(guiDrainSeconds) * time.Second):
+		case <-secondSigCh:
+			slog.Info("GUI drain interrupted — exiting immediately")
+		}
+	}
+
+	close(stopCh)
+	slog.Info("API-only shutdown complete")
 	return 0
 }
 

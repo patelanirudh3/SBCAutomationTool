@@ -95,6 +95,9 @@ func NewCallEngine(agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig
 // ActiveCallCount returns the number of currently in-flight calls.
 func (e *CallEngine) ActiveCallCount() int { return int(e.activeCount.Load()) }
 
+// PeakActiveCalls returns the high-water mark of concurrent active calls.
+func (e *CallEngine) PeakActiveCalls() int { return int(e.peakActiveCalls) }
+
 // CallsAttempted returns the total number of calls launched so far.
 func (e *CallEngine) CallsAttempted() int { return int(e.callsAttempted.Load()) }
 
