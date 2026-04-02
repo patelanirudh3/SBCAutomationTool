@@ -335,8 +335,9 @@ func buildAndStoreSpines(cfg *config.VMConfig, collector *metrics.MetricsCollect
 	collector.StoreCallSpines(callSpines)
 
 	correlated := 0
-	for _, s := range callSpines {
-		if m, ok := s["correlation_method"].(string); ok && m != "unmatched" {
+	for _, raw := range callSpines {
+		// Quick scan for "unmatched" without full unmarshal — sufficient for the log counter.
+		if !strings.Contains(string(raw), `"unmatched"`) {
 			correlated++
 		}
 	}
@@ -1040,12 +1041,10 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		MarkersReceived:  r.MarkersReceived,
 		Scenario:         r.Scenario,
 	}
-	// Marshal SipMilestones into a generic map so it can be included in JSON exports.
+	// Serialize SipMilestones struct directly to json.RawMessage so the struct
+	// field order (UAC keys then UAS keys) is preserved in all JSON outputs.
 	if raw, err := json.Marshal(r.SipMilestones); err == nil {
-		var ms map[string]any
-		if json.Unmarshal(raw, &ms) == nil {
-			d.SipMilestones = ms
-		}
+		d.SipMilestones = raw
 	}
 	return d
 }

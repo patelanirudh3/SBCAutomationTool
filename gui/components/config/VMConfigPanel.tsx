@@ -62,6 +62,8 @@ export interface VMConfigPanelProps {
   warnings: Record<string, string>
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
+  /** UAC form values — supplied to the UAS card so SIP Server section can mirror them read-only */
+  peerRaw?: RawVMFormValues
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +214,7 @@ export function VMConfigPanel({
   warnings,
   reachability,
   onCheckReachability,
+  peerRaw,
 }: VMConfigPanelProps) {
   const isUAC = role === 'UAC'
 
@@ -334,124 +337,169 @@ export function VMConfigPanel({
       <div className="space-y-3">
         <SectionHeader>SIP Server</SectionHeader>
 
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="Primary Host" error={e('sbc_host')} hint="IP or FQDN">
-            <Input
-              value={raw.sbc_host}
-              onChange={(ev) => onChange('sbc_host', ev.target.value)}
-              onBlur={() => onBlur('sbc_host')}
-              placeholder="10.133.63.117"
-              aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
-            />
-          </FormField>
-          <FormField label="Primary Port" error={e('sbc_port')} warning={w('sbc_port')}>
-            <Input
-              type="number"
-              value={raw.sbc_port}
-              onChange={(ev) => onChange('sbc_port', ev.target.value)}
-              onBlur={() => onBlur('sbc_port')}
-              placeholder="5060"
-              className="font-mono"
-              aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
-            />
-          </FormField>
-        </div>
+        {isUAC ? (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label="Primary Host" error={e('sbc_host')} hint="IP or FQDN">
+                <Input
+                  value={raw.sbc_host}
+                  onChange={(ev) => onChange('sbc_host', ev.target.value)}
+                  onBlur={() => onBlur('sbc_host')}
+                  placeholder="10.133.63.117"
+                  aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+                />
+              </FormField>
+              <FormField label="Primary Port" error={e('sbc_port')} warning={w('sbc_port')}>
+                <Input
+                  type="number"
+                  value={raw.sbc_port}
+                  onChange={(ev) => onChange('sbc_port', ev.target.value)}
+                  onBlur={() => onBlur('sbc_port')}
+                  placeholder="5060"
+                  className="font-mono"
+                  aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+                />
+              </FormField>
+            </div>
 
-        {/* Enable Failover toggle */}
-        <div className={cn(
-          'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
-          raw.failover_enabled
-            ? 'border-amber-500/30 bg-amber-950/20'
-            : 'border-slate-600/30 bg-slate-800/20',
-        )}>
-          <div className="space-y-0.5">
-            <Label className="text-xs font-bold tracking-wide text-slate-100">Enable Failover</Label>
-            <p className="text-[11px] leading-relaxed text-slate-300">
-              {raw.failover_enabled
-                ? 'Secondary host configured for failover'
-                : 'Single host — no failover target configured'}
-            </p>
-          </div>
-          <Switch
-            checked={raw.failover_enabled}
-            onCheckedChange={(checked) => onChange('failover_enabled', checked)}
-          />
-        </div>
+            {/* Enable Failover toggle — UAC only */}
+            <div className={cn(
+              'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
+              raw.failover_enabled
+                ? 'border-amber-500/30 bg-amber-950/20'
+                : 'border-slate-600/30 bg-slate-800/20',
+            )}>
+              <div className="space-y-0.5">
+                <Label className="text-xs font-bold tracking-wide text-slate-100">Enable Failover</Label>
+                <p className="text-[11px] leading-relaxed text-slate-300">
+                  {raw.failover_enabled
+                    ? 'Secondary host configured for failover'
+                    : 'Single host — no failover target configured'}
+                </p>
+              </div>
+              <Switch
+                checked={raw.failover_enabled}
+                onCheckedChange={(checked) => onChange('failover_enabled', checked)}
+              />
+            </div>
 
-        {/* Secondary Host/Port (visible only when failover is enabled) */}
-        {raw.failover_enabled && (
-          <div className="grid grid-cols-2 gap-3">
-            <FormField label="Secondary Host" hint="IP or FQDN">
+            {/* Secondary Host/Port (visible only when failover is enabled) */}
+            {raw.failover_enabled && (
+              <div className="grid grid-cols-2 gap-3">
+                <FormField label="Secondary Host" hint="IP or FQDN">
+                  <Input
+                    value={raw.secondary_host}
+                    onChange={(ev) => onChange('secondary_host', ev.target.value)}
+                    onBlur={() => onBlur('secondary_host')}
+                    placeholder="10.133.63.118"
+                  />
+                </FormField>
+                <FormField label="Secondary Port">
+                  <Input
+                    type="number"
+                    value={raw.secondary_port}
+                    onChange={(ev) => onChange('secondary_port', ev.target.value)}
+                    onBlur={() => onBlur('secondary_port')}
+                    placeholder="5060"
+                    className="font-mono"
+                  />
+                </FormField>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label="Transport" error={e('sip_transport')}>
+                <Select
+                  value={raw.sip_transport}
+                  onValueChange={(v) => {
+                    onChange('sip_transport', v as SipTransport)
+                    onBlur('sip_transport')
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="TCP">TCP</SelectItem>
+                    <SelectItem value="TLS">TLS</SelectItem>
+                    <SelectItem value="UDP">UDP</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FormField>
+              <FormField label="Domain" error={e('domain')}>
+                <Input
+                  value={raw.domain}
+                  onChange={(ev) => onChange('domain', ev.target.value)}
+                  onBlur={() => onBlur('domain')}
+                  placeholder="avaya.com"
+                  aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+                />
+              </FormField>
+            </div>
+
+            <FormField label="SIP Password" error={e('sip_password')}>
               <Input
-                value={raw.secondary_host}
-                onChange={(ev) => onChange('secondary_host', ev.target.value)}
-                onBlur={() => onBlur('secondary_host')}
-                placeholder="10.133.63.118"
+                type="password"
+                value={raw.sip_password}
+                onChange={(ev) => onChange('sip_password', ev.target.value)}
+                onBlur={() => onBlur('sip_password')}
+                placeholder="••••••••"
+                aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
               />
             </FormField>
-            <FormField label="Secondary Port">
+
+            <FormField label="DNS Servers (optional)" hint="Comma-separated DNS server IPs for FQDN resolution. Leave empty to use system DNS.">
               <Input
-                type="number"
-                value={raw.secondary_port}
-                onChange={(ev) => onChange('secondary_port', ev.target.value)}
-                onBlur={() => onBlur('secondary_port')}
-                placeholder="5060"
-                className="font-mono"
+                value={raw.dns_servers}
+                onChange={(ev) => onChange('dns_servers', ev.target.value)}
+                onBlur={() => onBlur('dns_servers')}
+                placeholder="10.0.0.53, 168.63.129.16"
+                className="font-mono text-xs"
               />
             </FormField>
+          </>
+        ) : (
+          /* UAS: read-only inner card mirroring UAC SIP Server config */
+          <div className="rounded-md border border-border/50 bg-secondary/30 px-3 py-2.5 space-y-2.5">
+            <div className="flex items-center gap-1.5">
+              <Lock className="size-3 text-slate-400" />
+              <span className="text-[11px] font-semibold tracking-wide text-slate-300">Auto-synced from UAC</span>
+            </div>
+            {(() => {
+              const p = peerRaw ?? raw
+              return (
+                <div className="space-y-2 font-mono text-[12px]">
+                  <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1.5">
+                    <span className="text-slate-400">Primary Host</span>
+                    <span className="text-right font-semibold text-slate-100">{p.sbc_host || '—'}</span>
+                    <span className="text-slate-400">Primary Port</span>
+                    <span className="text-right font-semibold text-slate-100">{p.sbc_port || '—'}</span>
+                    <span className="text-slate-400">Transport</span>
+                    <span className="text-right font-semibold text-slate-100">{p.sip_transport}</span>
+                    <span className="text-slate-400">Domain</span>
+                    <span className="text-right font-semibold text-slate-100">{p.domain || '—'}</span>
+                    <span className="text-slate-400">Password</span>
+                    <span className="text-right font-semibold text-slate-400">{'•'.repeat(Math.min((p.sip_password || '').length || 6, 8))}</span>
+                    {p.dns_servers && (
+                      <>
+                        <span className="text-slate-400">DNS</span>
+                        <span className="text-right font-semibold text-slate-100 text-[11px] break-all">{p.dns_servers}</span>
+                      </>
+                    )}
+                    {p.failover_enabled && (
+                      <>
+                        <span className="text-slate-400">Failover</span>
+                        <span className="text-right font-semibold text-amber-400">Enabled</span>
+                        <span className="text-slate-400">Secondary</span>
+                        <span className="text-right font-semibold text-slate-100">{p.secondary_host}:{p.secondary_port}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )
+            })()}
           </div>
         )}
-
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="Transport" error={e('sip_transport')}>
-            <Select
-              value={raw.sip_transport}
-              onValueChange={(v) => {
-                onChange('sip_transport', v as SipTransport)
-                onBlur('sip_transport')
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="TCP">TCP</SelectItem>
-                <SelectItem value="TLS">TLS</SelectItem>
-                <SelectItem value="UDP">UDP</SelectItem>
-              </SelectContent>
-            </Select>
-          </FormField>
-          <FormField label="Domain" error={e('domain')}>
-            <Input
-              value={raw.domain}
-              onChange={(ev) => onChange('domain', ev.target.value)}
-              onBlur={() => onBlur('domain')}
-              placeholder="avaya.com"
-              aria-invalid={t('domain') && !!errors.domain ? true : undefined}
-            />
-          </FormField>
-        </div>
-
-        <FormField label="SIP Password" error={e('sip_password')}>
-          <Input
-            type="password"
-            value={raw.sip_password}
-            onChange={(ev) => onChange('sip_password', ev.target.value)}
-            onBlur={() => onBlur('sip_password')}
-            placeholder="••••••••"
-            aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
-          />
-        </FormField>
-
-        <FormField label="DNS Servers (optional)" hint="Comma-separated DNS server IPs for FQDN resolution. Leave empty to use system DNS.">
-          <Input
-            value={raw.dns_servers}
-            onChange={(ev) => onChange('dns_servers', ev.target.value)}
-            onBlur={() => onBlur('dns_servers')}
-            placeholder="10.0.0.53, 168.63.129.16"
-            className="font-mono text-xs"
-          />
-        </FormField>
       </div>
 
       {/* ── Extensions ────────────────────────────────────────── */}

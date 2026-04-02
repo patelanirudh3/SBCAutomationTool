@@ -61,11 +61,17 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
   let result: 'COMPLETED' | 'FAILED' = 'FAILED'
   if (uacSuccess === true || uacResult === 'COMPLETED') result = 'COMPLETED'
 
+  const uacRtpNested = (uac.rtp ?? {}) as Record<string, unknown>
+  const uasRtpNested = (uas.rtp ?? {}) as Record<string, unknown>
+
   const uacMediaVerified = uac.media_verified as boolean | undefined
   let uacMedia = 'NO_MEDIA'
   if (uacMediaVerified) {
     uacMedia = 'MEDIA_VERIFIED'
-  } else if (((uac.rtp_tx_pkts as number) ?? 0) > 0 || ((uac.rtp_rx_pkts as number) ?? 0) > 0) {
+  } else if (
+    ((uacRtpNested.tx as number) ?? (uac.rtp_tx_pkts as number) ?? 0) > 0 ||
+    ((uacRtpNested.rx as number) ?? (uac.rtp_rx_pkts as number) ?? 0) > 0
+  ) {
     uacMedia = 'MEDIA_PARTIAL'
   }
 
@@ -76,16 +82,21 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
     if (uasMediaVerified || uasMediaStatus === 'MEDIA_VERIFIED') {
       uasMedia = 'MEDIA_VERIFIED'
     } else if (
-      ((uas.rtp_tx_pkts as number) ?? 0) > 0 ||
-      ((uas.rtp_rx_pkts as number) ?? 0) > 0
+      ((uasRtpNested.tx as number) ?? (uas.rtp_tx_pkts as number) ?? 0) > 0 ||
+      ((uasRtpNested.rx as number) ?? (uas.rtp_rx_pkts as number) ?? 0) > 0
     ) {
       uasMedia = 'MEDIA_PARTIAL'
     }
   }
 
-  const pi = (spine.payload_integrity ?? {}) as Record<string, unknown>
-  const piOverall = (pi.overall_verdict as string) ?? ''
-  const avgPct = (pi.overall_integrity_pct as number) ?? 0
+  // Support new media_integrity block (current format) and legacy payload_integrity (old JSON files).
+  const pi = (spine.media_integrity ?? spine.payload_integrity ?? {}) as Record<string, unknown>
+  const piOverall = (pi.verdict as string) ?? (pi.overall_verdict as string) ?? ''
+  const avgPct = (pi.integrity_pct as number) ?? (pi.overall_integrity_pct as number) ?? 0
+
+  // Support both nested rtp object (new format) and flat fields (legacy fallback).
+  const uacRtp = (uac.rtp ?? {}) as Record<string, unknown>
+  const uasRtp = (uas.rtp ?? {}) as Record<string, unknown>
 
   return {
     spineId: (spine.spine_id as string) ?? '',
@@ -97,10 +108,10 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
     hold_ms: (uac.hold_ms as number) ?? 0,
     uacMedia,
     uasMedia,
-    uacRtpTx: (uac.rtp_tx_pkts as number) ?? 0,
-    uacRtpRx: (uac.rtp_rx_pkts as number) ?? 0,
-    uasRtpTx: (uas.rtp_tx_pkts as number) ?? 0,
-    uasRtpRx: (uas.rtp_rx_pkts as number) ?? 0,
+    uacRtpTx: (uacRtp.tx as number) ?? (uac.rtp_tx_pkts as number) ?? 0,
+    uacRtpRx: (uacRtp.rx as number) ?? (uac.rtp_rx_from_sbc_pkts as number) ?? (uac.rtp_rx_pkts as number) ?? 0,
+    uasRtpTx: (uasRtp.tx as number) ?? (uas.rtp_tx_pkts as number) ?? 0,
+    uasRtpRx: (uasRtp.rx as number) ?? (uas.rtp_rx_from_sbc_pkts as number) ?? (uas.rtp_rx_pkts as number) ?? 0,
     payloadVerdict: piOverall,
     payloadPct: avgPct,
     correlationMethod: (spine.correlation_method as string) ?? 'unmatched',
@@ -236,10 +247,8 @@ export function CallTable({ className }: CallTableProps) {
                 PDD ms
               </Th>
               <Th>Hold ms</Th>
-              <Th>UAC Media</Th>
-              <Th>UAS Media</Th>
-              <Th>UAC TX/RX</Th>
-              <Th>UAS TX/RX</Th>
+              <Th>UAC</Th>
+              <Th>UAS</Th>
               <Th>Payload</Th>
               <Th>Correlated</Th>
               <Th>Reason</Th>
@@ -276,20 +285,28 @@ export function CallTable({ className }: CallTableProps) {
                   <Td mono>{row.pdd_ms > 0 ? row.pdd_ms.toFixed(1) : '—'}</Td>
                   <Td mono>{row.hold_ms > 0 ? row.hold_ms.toLocaleString() : '—'}</Td>
                   <Td>
-                    <span className={cn('font-mono text-xs', uacM.cls)}>{uacM.label}</span>
+                    <div className="flex flex-col gap-0.5 min-w-[80px]">
+                      <span className={cn('font-mono text-[11px] font-semibold leading-tight', uacM.cls)}>
+                        {uacM.label}
+                      </span>
+                      {row.uacRtpTx > 0 && (
+                        <span className="font-mono text-[10px] text-foreground/50 leading-tight">
+                          {row.uacRtpTx}↑ {row.uacRtpRx}↓
+                        </span>
+                      )}
+                    </div>
                   </Td>
                   <Td>
-                    <span className={cn('font-mono text-xs', uasM.cls)}>{uasM.label}</span>
-                  </Td>
-                  <Td mono muted>
-                    {row.uacRtpTx > 0
-                      ? `${row.uacRtpTx.toLocaleString()} / ${row.uacRtpRx.toLocaleString()}`
-                      : '—'}
-                  </Td>
-                  <Td mono muted>
-                    {row.uasRtpTx > 0 || row.uasRtpRx > 0
-                      ? `${row.uasRtpTx.toLocaleString()} / ${row.uasRtpRx.toLocaleString()}`
-                      : '—'}
+                    <div className="flex flex-col gap-0.5 min-w-[80px]">
+                      <span className={cn('font-mono text-[11px] font-semibold leading-tight', uasM.cls)}>
+                        {uasM.label}
+                      </span>
+                      {(row.uasRtpTx > 0 || row.uasRtpRx > 0) && (
+                        <span className="font-mono text-[10px] text-foreground/50 leading-tight">
+                          {row.uasRtpTx}↑ {row.uasRtpRx}↓
+                        </span>
+                      )}
+                    </div>
                   </Td>
                   <Td>
                     {row.payloadVerdict ? (

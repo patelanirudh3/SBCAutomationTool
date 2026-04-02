@@ -402,6 +402,34 @@ export function VMPairBook() {
     setUasRaw((prev) => ({ ...prev, hold_time_seconds: uacRaw.hold_time_seconds }))
   }, [uacRaw.hold_time_seconds])
 
+  // Mirror SIP Server fields from UAC → UAS so the config pushed to the UAS
+  // backend always matches what is shown in the read-only UAS SIP Server card.
+  useEffect(() => {
+    setUasRaw((prev) => ({
+      ...prev,
+      sbc_host:        uacRaw.sbc_host,
+      sbc_port:        uacRaw.sbc_port,
+      sip_transport:   uacRaw.sip_transport,
+      domain:          uacRaw.domain,
+      sip_password:    uacRaw.sip_password,
+      dns_servers:     uacRaw.dns_servers,
+      failover_enabled: uacRaw.failover_enabled,
+      secondary_host:  uacRaw.secondary_host,
+      secondary_port:  uacRaw.secondary_port,
+    }))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    uacRaw.sbc_host,
+    uacRaw.sbc_port,
+    uacRaw.sip_transport,
+    uacRaw.domain,
+    uacRaw.sip_password,
+    uacRaw.dns_servers,
+    uacRaw.failover_enabled,
+    uacRaw.secondary_host,
+    uacRaw.secondary_port,
+  ])
+
   // Derive all extension ranges from UAC Start + Count.
   // UAC End = Start + Count - 1; UAS Start = UAC End + 1; UAS End = UAS Start + Count - 1.
   // Both UAC and UAS raw values stay in sync automatically.
@@ -703,6 +731,7 @@ export function VMPairBook() {
                     onCheckReachability={() =>
                       checkReachability('UAS', uasRaw.vm_ip, parseInt(uasRaw.metrics_port) || 0)
                     }
+                    peerRaw={uacRaw}
                   />
                 </div>
               </div>

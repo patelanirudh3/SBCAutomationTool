@@ -156,50 +156,34 @@ export function TrafficModeSelector({
         </div>
       )}
 
-      {/* Timed: H + M split input with presets */}
+      {/* Timed: H + M split inputs with presets inline */}
       {value === 'timed' && (
         <div className="space-y-2">
-          <Label className="text-xs font-medium text-foreground/80">Duration</Label>
+          {/* Visible "Duration" section label */}
+          <p className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-200">
+            <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-slate-400" />
+            Duration
+          </p>
 
-          {/* Preset chips */}
-          <div className="flex flex-wrap gap-1">
-            {DURATION_PRESETS.map((p) => {
-              const presetVal = String(p.hours + p.mins / 60)
-              const isActive = hours === p.hours && mins === p.mins
-              return (
-                <button
-                  key={p.label}
-                  type="button"
-                  onClick={() => handlePreset(p.hours, p.mins)}
-                  className={cn(
-                    'rounded border px-2 py-0.5 text-[10px] font-medium transition-colors',
-                    isActive
-                      ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
-                      : 'border-border text-muted-foreground hover:border-border/80 hover:text-foreground'
-                  )}
-                >
-                  {p.label}
-                </button>
-              )
-            })}
-          </div>
-
-          {/* H + M split inputs */}
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1.5">
+          {/* H + M inputs + presets on the same row */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Hours input */}
+            <div className="flex items-center gap-1">
               <Input
                 type="number"
                 min={0}
                 value={hours}
                 onChange={(e) => handleHoursChange(e.target.value)}
                 onBlur={() => onBlur('duration_hours')}
-                className="w-16 font-mono text-center"
+                className="w-14 font-mono text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                 aria-label="hours"
                 aria-invalid={touched.duration_hours && !!errors.duration_hours ? true : undefined}
               />
               <span className="text-xs font-medium text-slate-400">h</span>
             </div>
-            <div className="flex items-center gap-1.5">
+
+            {/* Minutes input */}
+            <div className="flex items-center gap-1">
               <Input
                 type="number"
                 min={0}
@@ -207,33 +191,57 @@ export function TrafficModeSelector({
                 value={mins}
                 onChange={(e) => handleMinsChange(e.target.value)}
                 onBlur={() => onBlur('duration_hours')}
-                className="w-16 font-mono text-center"
+                className="w-14 font-mono text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                 aria-label="minutes"
               />
               <span className="text-xs font-medium text-slate-400">min</span>
+            </div>
+
+            {/* Preset chips — inline beside inputs */}
+            <div className="flex flex-wrap gap-1">
+              {DURATION_PRESETS.map((p) => {
+                const isActive = hours === p.hours && mins === p.mins
+                return (
+                  <button
+                    key={p.label}
+                    type="button"
+                    onClick={() => handlePreset(p.hours, p.mins)}
+                    className={cn(
+                      'rounded border px-2 py-1 text-[10px] font-semibold transition-colors',
+                      isActive
+                        ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
+                        : 'border-slate-600 bg-slate-800/50 text-slate-300 hover:border-slate-500 hover:text-slate-100'
+                    )}
+                  >
+                    {p.label}
+                  </button>
+                )
+              })}
             </div>
           </div>
 
           {touched.duration_hours && <FieldError error={errors.duration_hours} />}
           {touched.duration_hours && !errors.duration_hours && <FieldSoftWarning warning={warnings.duration_hours} />}
 
-          {/* Max calls footer — bold amber, BHCC label when duration = exactly 1h */}
-          {maxCalls !== null && maxCalls > 0 && (
-            <div className="flex items-center gap-2 rounded border border-amber-500/20 bg-amber-950/20 px-2.5 py-1.5">
-              <span className="text-xs font-bold text-amber-400">
-                ≈ {maxCalls.toLocaleString()} max calls
-              </span>
-              {isExactlyOneHour ? (
+          {/* Footer: always shows BHCC equivalent regardless of duration */}
+          {maxCalls !== null && maxCalls > 0 && (() => {
+            const bhcc = formatBHCC(maxCalls)
+            const bhccEquiv = formatBHCC(Math.round(maxCalls / 3600))
+            const durationLabel = `${hours > 0 ? `${hours}h` : ''}${mins > 0 ? ` ${mins}m` : ''}`.trim()
+            return (
+              <div className="flex flex-wrap items-baseline gap-1.5 rounded border border-amber-500/20 bg-amber-950/20 px-2.5 py-1.5">
+                <span className="text-xs font-bold text-amber-400">
+                  ≈ {maxCalls.toLocaleString()} max calls
+                </span>
+                <span className="text-[11px] text-amber-400/70">
+                  at {cps} CPS × {durationLabel}
+                </span>
                 <span className="text-xs font-semibold text-amber-300">
-                  = {formatBHCC(maxCalls)} BHCC
+                  ≈ {isExactlyOneHour ? `${bhcc} BHCC` : `${bhcc} BHCC equivalent`}
                 </span>
-              ) : (
-                <span className="text-[11px] text-amber-400/60">
-                  at {cps} CPS × {hours > 0 ? `${hours}h` : ''}{mins > 0 ? ` ${mins}m` : ''}
-                </span>
-              )}
-            </div>
-          )}
+              </div>
+            )
+          })()}
         </div>
       )}
 

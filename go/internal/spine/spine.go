@@ -11,12 +11,169 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// Spine record types — field order here controls JSON output order.
+// ---------------------------------------------------------------------------
+
+// RTPStats is the nested RTP block for each spine leg, replacing flat top-level fields.
+// JitterMs is null until jitter measurement is wired into rtp/session.go.
+type RTPStats struct {
+	TX              int      `json:"tx"`
+	RX              int      `json:"rx"`
+	RXOther         int      `json:"rx_other"`
+	RTCPRx          int      `json:"rtcp_rx"`
+	MarkersSent     int      `json:"markers_sent"`
+	MarkersReceived int      `json:"markers_received"`
+	LossPct         float64  `json:"loss_pct"`
+	JitterMs        *float64 `json:"jitter_ms,omitempty"`
+}
+
+// SpineLeg is a structured leg record with nested rtp block.
+// Field declaration order controls JSON key order.
+type SpineLeg struct {
+	CallID          string          `json:"call_id"`
+	Caller          string          `json:"caller"`
+	Callee          string          `json:"callee"`
+	Direction       string          `json:"direction"`
+	Success         bool            `json:"success"`
+	FailureReason   string          `json:"failure_reason"`
+	PDDMs           float64         `json:"pdd_ms"`
+	HoldMs          float64         `json:"hold_ms"`
+	TotalMs         float64         `json:"total_ms"`
+	MediaVerified   bool            `json:"media_verified"`
+	RTP             RTPStats        `json:"rtp"`
+	RTPLocalPort    int             `json:"rtp_local_port"`
+	SBCRTPRelayIP   string          `json:"sbc_rtp_relay_ip"`
+	SBCRTPRelayPort int             `json:"sbc_rtp_relay_port"`
+	SipMilestones   json.RawMessage `json:"sip_milestones,omitempty"`
+	PeerExt         string          `json:"peer_ext"`
+	TsUTC           string          `json:"ts_utc"`
+	PoolWrapIndex   int             `json:"pool_wrap_index"`
+	Scenario        string          `json:"scenario,omitempty"`
+}
+
+type spineCallIDs struct {
+	LegA          string `json:"leg_a"`
+	LegB          any    `json:"leg_b"`
+	B2BUABoundary string `json:"b2bua_boundary"`
+	Note          string `json:"note"`
+}
+
+// spineMediaIntegrityDir: UAC→UAS direction.
+// Cross-leg marker check: uac_markers_sent vs uas_markers_received.
+// The *_markers_received suffix makes the cross-leg origin explicit.
+type spineMediaIntegrityDir struct {
+	UACTX              int     `json:"uac_tx"`
+	UASRX              int     `json:"uas_rx"`
+	DeltaPct           float64 `json:"delta_pct"`
+	UACMarkersSent     int     `json:"uac_markers_sent"`
+	UASMarkersReceived int     `json:"uas_markers_received"`
+	MarkersOK          bool    `json:"markers_ok"`
+	Status             string  `json:"status"`
+}
+
+// spineMediaIntegrityDirRev: UAS→UAC direction.
+// Cross-leg marker check: uas_markers_sent vs uac_markers_received.
+type spineMediaIntegrityDirRev struct {
+	UASTX              int     `json:"uas_tx"`
+	UACRX              int     `json:"uac_rx"`
+	DeltaPct           float64 `json:"delta_pct"`
+	UASMarkersSent     int     `json:"uas_markers_sent"`
+	UACMarkersReceived int     `json:"uac_markers_received"`
+	MarkersOK          bool    `json:"markers_ok"`
+	Status             string  `json:"status"`
+}
+
+// spineMediaIntegrity merges what were previously two separate blocks
+// (media_cross_check + payload_integrity) into one concise structure.
+// When jitter is implemented, it slots into each directional sub-block.
+type spineMediaIntegrity struct {
+	UACtoUAS     spineMediaIntegrityDir    `json:"uac_to_uas"`
+	UAStoUAC     spineMediaIntegrityDirRev `json:"uas_to_uac"`
+	Verdict      string                   `json:"verdict"`
+	IntegrityPct float64                  `json:"integrity_pct"`
+}
+
+// SpineRecord is the top-level correlated call record.
+// Field declaration order controls JSON key order.
+type SpineRecord struct {
+	SpineID           string              `json:"spine_id"`
+	CorrelationMethod string              `json:"correlation_method"`
+	CallIDs           spineCallIDs        `json:"call_ids"`
+	UACLeg            json.RawMessage     `json:"uac_leg"`
+	UASLeg            json.RawMessage     `json:"uas_leg"`
+	MediaIntegrity    spineMediaIntegrity `json:"media_integrity"`
+	KamTrace          any                 `json:"kam_trace"`
+}
+
+// mapToSpineLeg converts a flat call-result map into a SpineLeg with nested rtp block.
+func mapToSpineLeg(m map[string]any) SpineLeg {
+	if m == nil {
+		return SpineLeg{}
+	}
+
+	tx := getIntField(m, "rtp_tx_pkts")
+	rxFromSBC := getIntField(m, "rtp_rx_from_sbc_pkts")
+	rxTotal := getIntField(m, "rtp_rx_pkts")
+	effectiveRx := rxFromSBC
+	if rxFromSBC == 0 && rxTotal > 0 {
+		effectiveRx = rxTotal
+	}
+
+	lossPct := 0.0
+	if tx > 0 {
+		lossPct = round1(math.Abs(float64(tx-effectiveRx)) / float64(tx) * 100)
+	}
+
+	// Preserve sip_milestones raw JSON so field order is maintained in output.
+	var milestones json.RawMessage
+	switch v := m["sip_milestones"].(type) {
+	case json.RawMessage:
+		milestones = v
+	case map[string]any:
+		if b, err := json.Marshal(v); err == nil {
+			milestones = b
+		}
+	}
+
+	return SpineLeg{
+		CallID:          getStrField(m, "call_id"),
+		Caller:          getStrField(m, "caller"),
+		Callee:          getStrField(m, "callee"),
+		Direction:       getStrField(m, "direction"),
+		Success:         getBoolField(m, "success"),
+		FailureReason:   getStrField(m, "failure_reason"),
+		PDDMs:           getFloat64Field(m, "pdd_ms"),
+		HoldMs:          getFloat64Field(m, "hold_ms"),
+		TotalMs:         getFloat64Field(m, "total_ms"),
+		MediaVerified:   getBoolField(m, "media_verified"),
+		RTP: RTPStats{
+			TX:              tx,
+			RX:              effectiveRx,
+			RXOther:         getIntField(m, "rtp_rx_other_pkts"),
+			RTCPRx:          getIntField(m, "rtcp_rx_pkts"),
+			MarkersSent:     getIntField(m, "markers_sent"),
+			MarkersReceived: getIntField(m, "markers_received"),
+			LossPct:         lossPct,
+		},
+		RTPLocalPort:    getIntField(m, "rtp_local_port"),
+		SBCRTPRelayIP:   getStrField(m, "sbc_rtp_relay_ip"),
+		SBCRTPRelayPort: getIntField(m, "sbc_rtp_relay_port"),
+		SipMilestones:   milestones,
+		PeerExt:         getStrField(m, "peer_ext"),
+		TsUTC:           getStrField(m, "ts_utc", "timestamp"),
+		PoolWrapIndex:   getIntField(m, "pool_wrap_index"),
+		Scenario:        getStrField(m, "scenario"),
+	}
+}
+
 // BuildCallSpines correlates UAC and UAS call results into spine records.
 // Each UAC call is matched to at most one UAS call using the strategy chain
 // (GSID exact match first, then ext+time window). Unmatched UAC calls still
 // produce a spine with a nil UAS leg.
-func BuildCallSpines(uacCalls, uasCalls []map[string]any) []map[string]any {
-	spines := make([]map[string]any, 0, len(uacCalls))
+// Returns []json.RawMessage so each spine preserves exact key ordering.
+func BuildCallSpines(uacCalls, uasCalls []map[string]any) []json.RawMessage {
+	spines := make([]json.RawMessage, 0, len(uacCalls))
 	usedUAS := make([]bool, len(uasCalls))
 
 	for _, uac := range uacCalls {
@@ -45,40 +202,29 @@ func BuildCallSpines(uacCalls, uasCalls []map[string]any) []map[string]any {
 		uacExt := getStrField(uac, "ext", "caller")
 		uasExt := getStrField(uac, "peer_ext", "callee")
 
+		// Markers from each leg's own sending side.
 		uacMarkersSent := getIntField(uac, "markers_sent")
 		uasMarkersSent := getIntField(uasMatch, "markers_sent")
 
-		uacExpectedMarkers := 0
-		if uacTx > 0 {
-			uacExpectedMarkers = uacTx / 100
-		}
-		uasExpectedMarkers := 0
-		if uasTx > 0 {
-			uasExpectedMarkers = uasTx / 100
-		}
+		// Cross-leg received: what the OTHER side received.
+		// uacMarkersReceived: UAC received markers sent by UAS (uas_to_uac check).
+		// uasMarkersReceived: UAS received markers sent by UAC (uac_to_uas check).
+		uacMarkersReceived := getIntField(uac, "markers_received")
+		uasMarkersReceived := getIntField(uasMatch, "markers_received")
 
-		uacEmbedOK := uacMarkersSent == uacExpectedMarkers
-		if uacExpectedMarkers == 0 {
-			uacEmbedOK = uacMarkersSent == 0
-		}
-		uasEmbedOK := uasMarkersSent == uasExpectedMarkers
-		if uasExpectedMarkers == 0 {
-			uasEmbedOK = uasMarkersSent == 0
-		}
+		// markers_ok = the sender's count matches what the receiver actually received.
+		uacToUASMarkersOK := uasMatch == nil || uacMarkersSent == uasMarkersReceived
+		uasToUACMarkersOK := uasMatch == nil || uasMarkersSent == uacMarkersReceived
 
-		mediaOK := deltaFlag(aPct) == "OK" && deltaFlag(bPct) == "OK"
 		worstDelta := math.Max(aPct, bPct)
-
-		var payloadOverall string
+		var verdict string
 		switch {
-		case uacEmbedOK && uasEmbedOK && mediaOK:
-			payloadOverall = "PASS"
-		case mediaOK:
-			payloadOverall = "PASS"
+		case worstDelta <= 5:
+			verdict = "PASS"
 		case worstDelta <= 15:
-			payloadOverall = "WARNING"
+			verdict = "WARNING"
 		default:
-			payloadOverall = "FAIL"
+			verdict = "FAIL"
 		}
 		integrityPct := round1(100.0 - worstDelta)
 
@@ -87,70 +233,64 @@ func BuildCallSpines(uacCalls, uasCalls []map[string]any) []map[string]any {
 			legBCallID = getStrField(uasMatch, "call_id")
 		}
 
-		var uasLeg any
+		// Convert flat leg maps to structured SpineLeg with nested rtp block.
+		uacLeg := mapToSpineLeg(uac)
+		var uasLeg *SpineLeg
 		if uasMatch != nil {
-			uasLeg = uasMatch
+			leg := mapToSpineLeg(uasMatch)
+			uasLeg = &leg
 		}
 
-		uasRxTotal := getIntField(uasMatch, "rtp_rx_pkts")
-		uacRxTotal := getIntField(uac, "rtp_rx_pkts")
-
-		spine := map[string]any{
-			"spine_id":           fmt.Sprintf("%s->%s@%s", uacExt, uasExt, getStrField(uac, "ts_utc")),
-			"correlation_method": strategy,
-			"call_ids": map[string]any{
-				"leg_a":          getStrField(uac, "call_id"),
-				"leg_b":          legBCallID,
-				"b2bua_boundary": "avaya_cm",
-				"note":           "CM generates a new Call-ID for Leg B. Legs correlated by: " + strategy,
-			},
-			"uac_leg": uac,
-			"uas_leg": uasLeg,
-			"media_cross_check": map[string]any{
-				"uac_tx_vs_uas_rx": map[string]any{
-					"uac_tx":    uacTx,
-					"uas_rx":    uasRx,
-					"uas_rx_total": uasRxTotal,
-					"delta_pct": aPct,
-					"flag":      deltaFlag(aPct),
-				},
-				"uas_tx_vs_uac_rx": map[string]any{
-					"uas_tx":    uasTx,
-					"uac_rx":    uacRx,
-					"uac_rx_total": uacRxTotal,
-					"delta_pct": bPct,
-					"flag":      deltaFlag(bPct),
-				},
-				"overall_status": overallMediaStatus(aPct, bPct),
-			},
-			"payload_integrity": map[string]any{
-				"uac_to_uas": map[string]any{
-					"uac_tx":              uacTx,
-					"uas_rx":              uasRx,
-					"uac_markers_sent":    uacMarkersSent,
-					"uac_markers_expected": uacExpectedMarkers,
-					"markers_embedded_ok": uacEmbedOK,
-					"delta_pct":           aPct,
-					"integrity_pct":       round1(100.0 - aPct),
-					"verdict":             deltaFlag(aPct),
-				},
-				"uas_to_uac": map[string]any{
-					"uas_tx":              uasTx,
-					"uac_rx":              uacRx,
-					"uas_markers_sent":    uasMarkersSent,
-					"uas_markers_expected": uasExpectedMarkers,
-					"markers_embedded_ok": uasEmbedOK,
-					"delta_pct":           bPct,
-					"integrity_pct":       round1(100.0 - bPct),
-					"verdict":             deltaFlag(bPct),
-				},
-				"overall_verdict":       payloadOverall,
-				"overall_integrity_pct": integrityPct,
-				"note":                  "Markers verified locally (B2BUA rewrites payload); flow verified by packet count cross-check",
-			},
-			"kam_trace": nil,
+		uacLegRaw, _ := json.Marshal(uacLeg)
+		var uasLegRaw json.RawMessage
+		if uasLeg != nil {
+			uasLegRaw, _ = json.Marshal(uasLeg)
+		} else {
+			uasLegRaw = json.RawMessage("null")
 		}
-		spines = append(spines, spine)
+
+		rec := SpineRecord{
+			SpineID:           fmt.Sprintf("%s->%s@%s", uacExt, uasExt, getStrField(uac, "ts_utc")),
+			CorrelationMethod: strategy,
+			CallIDs: spineCallIDs{
+				LegA:          getStrField(uac, "call_id"),
+				LegB:          legBCallID,
+				B2BUABoundary: "avaya_cm",
+				Note:          "CM generates a new Call-ID for Leg B. Legs correlated by: " + strategy,
+			},
+			UACLeg: uacLegRaw,
+			UASLeg: uasLegRaw,
+			MediaIntegrity: spineMediaIntegrity{
+				UACtoUAS: spineMediaIntegrityDir{
+					UACTX:              uacTx,
+					UASRX:              uasRx,
+					DeltaPct:           aPct,
+					UACMarkersSent:     uacMarkersSent,
+					UASMarkersReceived: uasMarkersReceived,
+					MarkersOK:          uacToUASMarkersOK,
+					Status:             deltaFlag(aPct),
+				},
+				UAStoUAC: spineMediaIntegrityDirRev{
+					UASTX:              uasTx,
+					UACRX:              uacRx,
+					DeltaPct:           bPct,
+					UASMarkersSent:     uasMarkersSent,
+					UACMarkersReceived: uacMarkersReceived,
+					MarkersOK:          uasToUACMarkersOK,
+					Status:             deltaFlag(bPct),
+				},
+				Verdict:      verdict,
+				IntegrityPct: integrityPct,
+			},
+			KamTrace: nil,
+		}
+
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			slog.Error("Failed to marshal spine record", "err", err)
+			continue
+		}
+		spines = append(spines, json.RawMessage(raw))
 	}
 
 	return spines
@@ -185,11 +325,31 @@ func CollectUASCallResults(uasBaseURL string, timeoutSeconds float64) []map[stri
 		return nil
 	}
 
-	var results []map[string]any
-	if err := json.Unmarshal(body, &results); err != nil {
+	// Parse each result as map[string]json.RawMessage so that the
+	// sip_milestones nested object is kept as raw JSON bytes — when we later
+	// re-marshal the spine's uas_leg the field order from the UAS is preserved.
+	var rawResults []map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawResults); err != nil {
 		slog.Warn("Failed to decode UAS call-results JSON",
 			"url", url, "error", err)
 		return nil
+	}
+
+	results := make([]map[string]any, 0, len(rawResults))
+	for _, rr := range rawResults {
+		m := make(map[string]any, len(rr))
+		for k, v := range rr {
+			if k == "sip_milestones" {
+				// Keep as json.RawMessage; json.Marshal will embed it as-is.
+				m[k] = v
+				continue
+			}
+			var val any
+			if err := json.Unmarshal(v, &val); err == nil {
+				m[k] = val
+			}
+		}
+		results = append(results, m)
 	}
 
 	slog.Info("Collected UAS CallResults", "count", len(results), "url", url)
@@ -343,13 +503,53 @@ func getStrField(m map[string]any, keys ...string) string {
 	return ""
 }
 
-func overallMediaStatus(aPct, bPct float64) string {
-	if deltaFlag(aPct) == "OK" && deltaFlag(bPct) == "OK" {
-		return "OK"
-	}
-	return "DEGRADED"
-}
-
 func round1(v float64) float64 {
 	return math.Round(v*10) / 10
+}
+
+// getBoolField reads a boolean value from a map by key. Returns false if absent or wrong type.
+func getBoolField(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return false
+	}
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return false
+}
+
+// getFloat64Field reads a float64 value from a map by key, handling json.Number and int types.
+func getFloat64Field(m map[string]any, keys ...string) float64 {
+	if m == nil {
+		return 0
+	}
+	for _, k := range keys {
+		v, ok := m[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch n := v.(type) {
+		case float64:
+			if n != 0 {
+				return n
+			}
+		case int:
+			if n != 0 {
+				return float64(n)
+			}
+		case int64:
+			if n != 0 {
+				return float64(n)
+			}
+		case json.Number:
+			if f, err := n.Float64(); err == nil && f != 0 {
+				return f
+			}
+		}
+	}
+	return 0
 }

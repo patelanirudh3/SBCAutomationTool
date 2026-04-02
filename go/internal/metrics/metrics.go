@@ -78,7 +78,7 @@ type CallResultData struct {
 	MarkersSent      int
 	MarkersReceived  int
 	Scenario         string
-	SipMilestones    map[string]any
+	SipMilestones    json.RawMessage
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ type MetricsCollector struct {
 
 	callResults        []CallResultData
 	rawEvents          []map[string]any
-	callSpines         []map[string]any
+	callSpines         []json.RawMessage
 	concurrentProvider func() int
 
 	rtpHealthCounts map[string]int
@@ -311,7 +311,7 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"scenario":             r.Scenario,
 		}
 		if len(r.SipMilestones) > 0 {
-			m["sip_milestones"] = r.SipMilestones
+			m["sip_milestones"] = r.SipMilestones // json.RawMessage embeds as-is, preserving field order
 		}
 		out = append(out, m)
 	}
@@ -384,19 +384,20 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 	return out
 }
 
-// StoreCallSpines stores correlated call spines built by the spine builder.
-func (c *MetricsCollector) StoreCallSpines(spines []map[string]any) {
+// StoreCallSpines stores correlated call spines as pre-serialized JSON blobs.
+// Using json.RawMessage preserves the key ordering of each spine record.
+func (c *MetricsCollector) StoreCallSpines(spines []json.RawMessage) {
 	c.mu.Lock()
-	c.callSpines = make([]map[string]any, len(spines))
+	c.callSpines = make([]json.RawMessage, len(spines))
 	copy(c.callSpines, spines)
 	c.mu.Unlock()
 }
 
-// GetCallSpines returns a copy of the stored correlated call spines.
-func (c *MetricsCollector) GetCallSpines() []map[string]any {
+// GetCallSpines returns a copy of the stored spine blobs.
+func (c *MetricsCollector) GetCallSpines() []json.RawMessage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]map[string]any, len(c.callSpines))
+	out := make([]json.RawMessage, len(c.callSpines))
 	copy(out, c.callSpines)
 	return out
 }
@@ -1301,7 +1302,7 @@ func BuildMux(
 	// GET /api/call-spines
 	mux.HandleFunc("GET /api/call-spines", func(w http.ResponseWriter, r *http.Request) {
 		collector.mu.Lock()
-		spines := make([]map[string]any, len(collector.callSpines))
+		spines := make([]json.RawMessage, len(collector.callSpines))
 		copy(spines, collector.callSpines)
 		collector.mu.Unlock()
 		writeJSON(w, http.StatusOK, spines)
