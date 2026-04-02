@@ -47,7 +47,10 @@ func main() {
 	setupLogging(*logLevel)
 
 	slog.Info("============================================================")
-	slog.Info("SBC Traffic Engine — Go")
+	slog.Info("SBC Traffic Engine — Go",
+		"pid", os.Getpid(),
+		"log_level", *logLevel,
+	)
 	slog.Info("============================================================")
 
 	// GUI-driven mode: --api-only without --config
@@ -705,8 +708,13 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 	if batchSize <= 0 {
 		batchSize = 10
 	}
+	batchDelay := cfg.BatchDelay()
 
-	slog.Info("Connecting transports in batches", "total", total, "batch_size", batchSize)
+	slog.Info("Connecting transports in batches",
+		"total", total,
+		"batch_size", batchSize,
+		"batch_delay_ms", batchDelay.Milliseconds(),
+	)
 
 	for batchStart := 0; batchStart < total; batchStart += batchSize {
 		batchEnd := batchStart + batchSize
@@ -746,7 +754,7 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(batchDelay):
 			}
 		}
 	}
@@ -892,11 +900,15 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		slog.Error("Could not start API server", "err", err)
 		return 1
 	}
-	slog.Info("API server started", "port", actualPort)
+	slog.Info("API server started", "port", actualPort, "pid", os.Getpid())
 
 	slog.Info("============================================================")
-	slog.Info("GUI-DRIVEN mode — server running", "port", actualPort)
-	slog.Info("  PUT /api/config | POST /api/test/start | GET /api/ping")
+	slog.Info("GUI-DRIVEN mode — server running",
+		"port", actualPort,
+		"pid", os.Getpid(),
+		"endpoints", "PUT /api/config | POST /api/test/start | POST /api/test/stop | POST /api/test/reset | POST /api/shutdown | GET /api/ping | GET /metrics | WS /metrics/stream",
+	)
+	slog.Info("Press Ctrl+C to initiate graceful shutdown")
 	slog.Info("============================================================")
 
 	// Wait for process exit (Ctrl+C, SIGTERM, or POST /api/shutdown)
@@ -974,19 +986,27 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 
 // Logging setup
 
-func setupLogging(level string) {
-	lvl := slog.LevelInfo
+func parseLogLevel(level string) slog.Level {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "WARNING", "WARN":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "ERROR":
-		lvl = slog.LevelError
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
+}
+
+func setupLogging(level string) {
+	lvl := parseLogLevel(level)
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})))
 }
 
+// setupFileLogging creates a dual-output logger: console (stdout) at the
+// requested level + file at DEBUG. This mirrors the Python behaviour where
+// StreamHandler and RotatingFileHandler coexist.
 func setupFileLogging(level, path string) {
 	dir := ""
 	if idx := strings.LastIndex(path, "/"); idx >= 0 {
@@ -1002,18 +1022,58 @@ func setupFileLogging(level, path string) {
 		return
 	}
 
-	lvl := slog.LevelInfo
-	switch strings.ToUpper(level) {
-	case "DEBUG":
-		lvl = slog.LevelDebug
-	case "WARNING", "WARN":
-		lvl = slog.LevelWarn
-	case "ERROR":
-		lvl = slog.LevelError
-	}
+	consoleLvl := parseLogLevel(level)
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: lvl})))
-	slog.Info("Log file opened", "path", path)
+	consoleHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: consoleLvl})
+	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+
+	slog.SetDefault(slog.New(newMultiHandler(consoleHandler, fileHandler)))
+	slog.Info("Log file opened (dual: console+file)", "path", path, "console_level", level, "file_level", "DEBUG")
+}
+
+// multiHandler fans out log records to multiple slog.Handlers.
+type multiHandler struct {
+	handlers []slog.Handler
+}
+
+func newMultiHandler(handlers ...slog.Handler) *multiHandler {
+	return &multiHandler{handlers: handlers}
+}
+
+func (m *multiHandler) Enabled(_ context.Context, level slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(context.Background(), level) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, r.Level) {
+			if err := h.Handle(ctx, r.Clone()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithAttrs(attrs)
+	}
+	return &multiHandler{handlers: handlers}
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithGroup(name)
+	}
+	return &multiHandler{handlers: handlers}
 }
 
 func autoLogFile(runID, pairID, vmID, logDir string) string {

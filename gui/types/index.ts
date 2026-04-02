@@ -8,22 +8,24 @@ export type RtpMode = '3phase' | 'continuous'
 export type RtpPtime = 20 | 40
 
 export interface AdvancedSettings {
-  register_rate: number           // default: 10
-  register_timeout: number        // default: 8
-  register_retry: number          // default: 3
-  rtp_mode: RtpMode               // default: '3phase'
-  rtp_ptime: RtpPtime             // default: 20 (ms) → 50 PPS
-  rtp_burst_seconds: number       // default: 2
-  rtp_burst_pps: number           // default: 50
-  rtp_keepalive_interval: number  // default: 3
-  pool_wrap_delay_seconds: number // default: 0 — extra margin beyond auto-computed delay
-  metrics_interval: number        // default: 3  — WS push cadence (seconds)
-  rtp_pcap: boolean               // default: false — capture RTP to pcap files
+  register_rate: number                // default: 10 — batch size for TCP socket creation, REGISTER, and concurrency limit for SUBSCRIBE/Flush
+  register_batch_delay_ms: number      // default: 500 — delay (ms) between TCP socket / REGISTER batches
+  register_timeout: number             // default: 5
+  register_retry: number               // default: 3
+  rtp_mode: RtpMode                    // default: '3phase'
+  rtp_ptime: RtpPtime                  // default: 20 (ms) → 50 PPS
+  rtp_burst_seconds: number            // default: 2
+  rtp_burst_pps: number                // default: 50
+  rtp_keepalive_interval: number       // default: 3
+  pool_wrap_delay_seconds: number      // default: 0 — extra margin beyond auto-computed delay
+  metrics_interval: number             // default: 3  — WS push cadence (seconds)
+  rtp_pcap: boolean                    // default: false — capture RTP to pcap files
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   register_rate: 10,
-  register_timeout: 8,
+  register_batch_delay_ms: 500,
+  register_timeout: 5,
   register_retry: 3,
   rtp_mode: '3phase',
   rtp_ptime: 20,
@@ -51,12 +53,18 @@ export interface VMConfig {
   uas_ext_start: number
   uas_ext_end: number
 
-  // SIP Connection
+  // SIP Connection (Primary)
   sbc_host: string
   sbc_port: number
   sip_transport: SipTransport
   domain: string
   sip_password: string
+
+  // SIP Connection (Secondary / Failover)
+  secondary_host?: string
+  secondary_port?: number
+  failover_enabled?: boolean
+  dns_servers?: string
 
   // Traffic
   cps: number

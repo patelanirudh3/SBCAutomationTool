@@ -107,7 +107,7 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		}
 	}
 
-	t, err := sip.CreateTransport(a.Config.SIPTransport, a.localHost, a.Config.SBCHost, a.Config.SBCPort)
+	t, err := sip.CreateTransport(a.Config.SIPTransport, a.localHost, a.Config.SBCHost, a.Config.SBCPort, a.Config.BuildResolver())
 	if err != nil {
 		return fmt.Errorf("ext=%s create transport: %w", a.Ext, err)
 	}

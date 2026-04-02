@@ -3,7 +3,7 @@ package rtp
 import (
 	"context"
 	"encoding/binary"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"sync"
@@ -231,7 +231,7 @@ func (ep *RtpEndpoint) Run(
 			payload := ep.getPayload()
 			pkt := packRTP(seq, ts, ssrc, payload)
 			if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
-				log.Printf("rtp: keepalive sendto error: %v", err)
+				slog.Warn("RTP keepalive sendto error", "err", err, "dest", dest.String())
 				break
 			}
 

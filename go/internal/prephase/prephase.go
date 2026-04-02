@@ -22,7 +22,6 @@ import (
 	"github.com/cci/traffic-engine/internal/config"
 )
 
-const batchDelay = 500 * time.Millisecond
 
 // PrePhaseResult holds success/failure counts from the pre-phase pipeline.
 type PrePhaseResult struct {
@@ -51,8 +50,17 @@ func (r *PrePhaseResult) AllReady() bool {
 
 // RegisterAll registers extensions in sequential batches of cfg.RegisterRate.
 // Each batch fires concurrently and must complete before the next batch starts.
-// A 500 ms pause separates batches to stay within SBC DATAIFPROTECT limits.
+// A configurable pause (RegisterBatchDelayMs) separates batches to stay
+// within SBC DATAIFPROTECT limits.
 // Returns the list of extension numbers that failed to register.
+//
+// TODO(failover): When failover_enabled is true, extensions should register
+// on BOTH the primary and secondary hosts (forking model). Only SUBSCRIBE
+// should target the primary. During a traffic-run failover event, extensions
+// that fail to re-register on the primary should move their subscription
+// (re-SUBSCRIBE) to the secondary — they do NOT re-register on secondary
+// because the forking model already keeps them registered there.
+// This requires a separate registration flow and is not yet implemented.
 func RegisterAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
@@ -64,6 +72,8 @@ func RegisterAll(
 	if batchSize <= 0 {
 		batchSize = 10
 	}
+
+	batchDelay := cfg.BatchDelay()
 
 	var (
 		mu     sync.Mutex
@@ -157,7 +167,7 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 	}
 	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
 	if timeout <= 0 {
-		timeout = 8 * time.Second
+		timeout = 5 * time.Second
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -191,6 +201,12 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 
 // SubscribeAll subscribes all extensions with a semaphore limiting concurrency
 // to cfg.RegisterRate. Returns the list of extension numbers that failed.
+//
+// TODO(failover): SUBSCRIBE should only target the primary host. During a
+// failover event (triggered during traffic run), extensions that lose their
+// primary registration should re-SUBSCRIBE to the secondary host. The
+// re-SUBSCRIBE flow is separate from re-REGISTER and will be implemented
+// as part of the failover engine.
 func SubscribeAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
@@ -258,7 +274,7 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 	}
 	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
 	if timeout <= 0 {
-		timeout = 8 * time.Second
+		timeout = 5 * time.Second
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {

@@ -136,6 +136,7 @@ type TCPTransport struct {
 
 	useTLS    bool
 	tlsConfig *tls.Config
+	resolver  *net.Resolver
 
 	conn      net.Conn
 	recvCh    chan string
@@ -178,9 +179,11 @@ func (t *TCPTransport) dial(ctx context.Context) error {
 		return fmt.Errorf("resolve local: %w", err)
 	}
 
+	netDialer := &net.Dialer{LocalAddr: localAddr, Resolver: t.resolver}
+
 	if t.useTLS {
 		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{LocalAddr: localAddr},
+			NetDialer: netDialer,
 			Config:    t.tlsConfig,
 		}
 		conn, dialErr := dialer.DialContext(ctx, "tcp", remoteAddr)
@@ -189,8 +192,7 @@ func (t *TCPTransport) dial(ctx context.Context) error {
 		}
 		t.setConn(conn)
 	} else {
-		dialer := &net.Dialer{LocalAddr: localAddr}
-		conn, dialErr := dialer.DialContext(ctx, "tcp", remoteAddr)
+		conn, dialErr := netDialer.DialContext(ctx, "tcp", remoteAddr)
 		if dialErr != nil {
 			return fmt.Errorf("tcp dial: %w", dialErr)
 		}
@@ -371,14 +373,21 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 // CreateTransport creates the appropriate Transport for the given type string
 // ("TCP", "UDP", or "TLS"). The returned transport is unconnected; call
 // Connect before use.
-func CreateTransport(transportType, localHost, remoteHost string, remotePort int) (Transport, error) {
+// CreateTransport builds the appropriate Transport for the given type.
+// The resolver parameter is optional — when non-nil it is used for FQDN
+// resolution of remoteHost (custom DNS servers); nil falls back to system DNS.
+func CreateTransport(transportType, localHost, remoteHost string, remotePort int, resolver *net.Resolver) (Transport, error) {
 	switch strings.ToUpper(transportType) {
 	case "UDP":
 		return NewUDPTransport(localHost, remoteHost, remotePort), nil
 	case "TCP":
-		return NewTCPTransport(localHost, remoteHost, remotePort, false, nil), nil
+		t := NewTCPTransport(localHost, remoteHost, remotePort, false, nil)
+		t.resolver = resolver
+		return t, nil
 	case "TLS":
-		return NewTCPTransport(localHost, remoteHost, remotePort, true, nil), nil
+		t := NewTCPTransport(localHost, remoteHost, remotePort, true, nil)
+		t.resolver = resolver
+		return t, nil
 	default:
 		return nil, fmt.Errorf("unknown SIP transport type: %q", transportType)
 	}

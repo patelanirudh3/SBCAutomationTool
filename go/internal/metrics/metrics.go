@@ -666,6 +666,55 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 // ---------------------------------------------------------------------------
+// Request logging middleware
+// ---------------------------------------------------------------------------
+
+// statusRecorder captures the HTTP status code written by the handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.statusCode = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// requestLoggingMiddleware logs every inbound HTTP request with method, path,
+// status, and duration. WebSocket upgrade and high-frequency read-only
+// endpoints (GET /metrics, /metrics/stream) are logged at DEBUG to avoid noise.
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		elapsed := time.Since(start)
+
+		path := r.URL.Path
+		isQuiet := (r.Method == http.MethodGet &&
+			(path == "/metrics" || path == "/metrics/stream" || path == "/api/ping"))
+
+		if isQuiet {
+			slog.Debug("HTTP request",
+				"method", r.Method,
+				"path", path,
+				"status", rec.statusCode,
+				"duration_ms", elapsed.Milliseconds(),
+				"remote", r.RemoteAddr,
+			)
+		} else {
+			slog.Info("HTTP request",
+				"method", r.Method,
+				"path", path,
+				"status", rec.statusCode,
+				"duration_ms", elapsed.Milliseconds(),
+				"remote", r.RemoteAddr,
+			)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // JSON helpers
 // ---------------------------------------------------------------------------
 
@@ -753,13 +802,15 @@ func BuildMux(
 	mux.HandleFunc("/metrics/stream", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
 		if err != nil {
-			slog.Error("ws upgrade", "err", err)
+			slog.Error("WebSocket upgrade failed", "err", err, "remote", r.RemoteAddr)
 			return
 		}
+		slog.Info("WebSocket client connected", "remote", r.RemoteAddr)
 		collector.addWSClient(conn)
 		defer func() {
 			collector.removeWSClient(conn)
 			conn.Close()
+			slog.Info("WebSocket client disconnected", "remote", r.RemoteAddr)
 		}()
 
 		// Block until the client disconnects (read pump drains control frames).
@@ -796,7 +847,10 @@ func BuildMux(
 
 	// PUT /api/config
 	mux.HandleFunc("PUT /api/config", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Config push received via API", "remote", r.RemoteAddr)
+
 		if processCtx == nil {
+			slog.Warn("Config push rejected — CLI mode, use YAML files")
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": "Config push not supported in CLI mode — use YAML files",
 			})
@@ -806,6 +860,7 @@ func BuildMux(
 		processCtx.Mu.Lock()
 		if processCtx.State == "RUNNING" {
 			processCtx.Mu.Unlock()
+			slog.Warn("Config push rejected — traffic is running")
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Cannot push config while traffic is running",
 			})
@@ -815,11 +870,12 @@ func BuildMux(
 
 		body, err := readJSONBody(r)
 		if err != nil {
+			slog.Error("Config push failed — invalid JSON body", "err", err)
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 			return
 		}
 
-		slog.Info("PUT /api/config received", "keys", len(body))
+		slog.Info("PUT /api/config parsed", "keys", len(body))
 
 		// Validate config and write YAML via the callback injected by main.go
 		var cfgVMID, cfgRole, yamlPath string
@@ -876,7 +932,10 @@ func BuildMux(
 
 	// POST /api/test/start
 	mux.HandleFunc("POST /api/test/start", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Test start requested via API", "remote", r.RemoteAddr)
+
 		if processCtx == nil {
+			slog.Info("Test start accepted (CLI mode — engine controlled via CLI/env vars)")
 			writeJSON(w, http.StatusOK, map[string]any{
 				"status":  "accepted",
 				"message": "Traffic engine controlled via CLI/env vars",
@@ -886,6 +945,7 @@ func BuildMux(
 
 		body, err := readJSONBody(r)
 		if err != nil {
+			slog.Error("Test start failed — invalid JSON body", "err", err)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
@@ -893,6 +953,7 @@ func BuildMux(
 		runID, _ := body["run_id"].(string)
 		pairID, _ := body["pair_id"].(string)
 		if runID == "" || pairID == "" {
+			slog.Warn("Test start rejected — missing run_id or pair_id", "run_id", runID, "pair_id", pairID)
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error":   "run_id and pair_id are required in request body",
 				"example": map[string]string{"run_id": "run-20260318_113204", "pair_id": "pair-1"},
@@ -903,6 +964,7 @@ func BuildMux(
 		processCtx.Mu.Lock()
 		if processCtx.State == "RUNNING" {
 			processCtx.Mu.Unlock()
+			slog.Warn("Test start rejected — traffic already running", "vm_id", effectiveVMID())
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Traffic is already running",
 			})
@@ -911,6 +973,7 @@ func BuildMux(
 		if processCtx.State != "CONFIGURED" {
 			st := processCtx.State
 			processCtx.Mu.Unlock()
+			slog.Warn("Test start rejected — state not CONFIGURED", "state", st, "vm_id", effectiveVMID())
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": fmt.Sprintf("Cannot start: state is '%s', expected 'CONFIGURED'. Push config first via PUT /api/config.", st),
 			})
@@ -918,6 +981,7 @@ func BuildMux(
 		}
 		if processCtx.StartFunc == nil {
 			processCtx.Mu.Unlock()
+			slog.Error("Test start failed — lifecycle starter not registered (internal error)")
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": "Lifecycle starter not registered — internal error",
 			})
@@ -932,7 +996,11 @@ func BuildMux(
 
 		go startFn()
 
-		slog.Info("Traffic lifecycle started via API", "vm_id", effectiveVMID(), "run_id", runID)
+		slog.Info("Traffic lifecycle started via API",
+			"vm_id", effectiveVMID(),
+			"run_id", runID,
+			"pair_id", pairID,
+		)
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"status": "started",
 			"vm_id":  effectiveVMID(),
@@ -946,9 +1014,13 @@ func BuildMux(
 			st := processCtx.State
 			processCtx.Mu.Unlock()
 
+			slog.Info("Stop requested via API", "state", st, "vm_id", effectiveVMID())
+
 			select {
 			case processCtx.StopEvent <- struct{}{}:
+				slog.Info("StopEvent signalled successfully")
 			default:
+				slog.Warn("StopEvent channel already signalled (duplicate stop request)")
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"status": "stopping",
@@ -956,12 +1028,16 @@ func BuildMux(
 			})
 			return
 		}
+		slog.Warn("Stop requested but no ProcessContext registered (CLI mode)")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "no_stop_callback_registered"})
 	})
 
 	// POST /api/test/reset
 	mux.HandleFunc("POST /api/test/reset", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Reset requested via API", "vm_id", effectiveVMID())
+
 		if processCtx == nil {
+			slog.Warn("Reset not supported in CLI mode")
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": "Reset not supported in CLI mode",
 			})
@@ -969,18 +1045,20 @@ func BuildMux(
 		}
 
 		processCtx.Mu.Lock()
-		if processCtx.State == "RUNNING" {
+		prevState := processCtx.State
+		if prevState == "RUNNING" {
 			processCtx.Mu.Unlock()
+			slog.Warn("Reset rejected — traffic is still running", "state", prevState)
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "Cannot reset while traffic is running — stop first",
 			})
 			return
 		}
-		if processCtx.State != "COMPLETE" && processCtx.State != "FAILED" && processCtx.State != "CONFIGURED" {
-			st := processCtx.State
+		if prevState != "COMPLETE" && prevState != "FAILED" && prevState != "CONFIGURED" {
 			processCtx.Mu.Unlock()
+			slog.Warn("Reset rejected — nothing to reset", "state", prevState)
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": fmt.Sprintf("Nothing to reset: state is '%s'", st),
+				"error": fmt.Sprintf("Nothing to reset: state is '%s'", prevState),
 			})
 			return
 		}
@@ -995,7 +1073,7 @@ func BuildMux(
 
 		collector.Reset()
 
-		slog.Info("State reset to IDLE — ready for new config push")
+		slog.Info("State reset to IDLE — ready for new config push", "prev_state", prevState)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "reset",
 			"state":  "IDLE",
@@ -1007,24 +1085,35 @@ func BuildMux(
 		if processCtx != nil {
 			processCtx.Mu.Lock()
 			st := processCtx.State
+			vmid := processCtx.VMID
 			processCtx.Mu.Unlock()
+
+			slog.Info("Shutdown requested via API",
+				"state", st,
+				"vm_id", vmid,
+				"remote", r.RemoteAddr,
+			)
 
 			select {
 			case processCtx.StopEvent <- struct{}{}:
+				slog.Info("StopEvent signalled for shutdown")
 			default:
+				slog.Debug("StopEvent already signalled")
 			}
 			select {
 			case processCtx.ProcessExit <- struct{}{}:
+				slog.Info("ProcessExit signalled — process will terminate")
 			default:
+				slog.Debug("ProcessExit already signalled")
 			}
 
-			slog.Info("Shutdown requested via API", "state", st)
 			writeJSON(w, http.StatusAccepted, map[string]any{
 				"status": "shutting_down",
 				"state":  st,
 			})
 			return
 		}
+		slog.Warn("Shutdown requested but not supported in CLI mode")
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Shutdown not supported"})
 	})
 
@@ -1223,7 +1312,7 @@ func StartServer(
 	}
 
 	mux := BuildMux(collector, vmID, role, processCtx)
-	handler := corsMiddleware(mux)
+	handler := requestLoggingMiddleware(corsMiddleware(mux))
 
 	server := &http.Server{Handler: handler}
 

@@ -34,6 +34,10 @@ export type RawVMFormValues = {
   uas_override: boolean
   sbc_host: string
   sbc_port: string
+  secondary_host: string
+  secondary_port: string
+  failover_enabled: boolean
+  dns_servers: string
   sip_transport: SipTransport
   domain: string
   sip_password: string
@@ -331,7 +335,7 @@ export function VMConfigPanel({
         <SectionHeader>SIP Server</SectionHeader>
 
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="SBC Host" error={e('sbc_host')}>
+          <FormField label="Primary Host" error={e('sbc_host')} hint="IP or FQDN">
             <Input
               value={raw.sbc_host}
               onChange={(ev) => onChange('sbc_host', ev.target.value)}
@@ -340,7 +344,7 @@ export function VMConfigPanel({
               aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
             />
           </FormField>
-          <FormField label="SBC Port" error={e('sbc_port')} warning={w('sbc_port')}>
+          <FormField label="Primary Port" error={e('sbc_port')} warning={w('sbc_port')}>
             <Input
               type="number"
               value={raw.sbc_port}
@@ -352,6 +356,51 @@ export function VMConfigPanel({
             />
           </FormField>
         </div>
+
+        {/* Enable Failover toggle */}
+        <div className={cn(
+          'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
+          raw.failover_enabled
+            ? 'border-amber-500/30 bg-amber-950/20'
+            : 'border-slate-600/30 bg-slate-800/20',
+        )}>
+          <div className="space-y-0.5">
+            <Label className="text-xs font-bold tracking-wide text-slate-100">Enable Failover</Label>
+            <p className="text-[11px] leading-relaxed text-slate-300">
+              {raw.failover_enabled
+                ? 'Secondary host configured for failover'
+                : 'Single host — no failover target configured'}
+            </p>
+          </div>
+          <Switch
+            checked={raw.failover_enabled}
+            onCheckedChange={(checked) => onChange('failover_enabled', checked)}
+          />
+        </div>
+
+        {/* Secondary Host/Port (visible only when failover is enabled) */}
+        {raw.failover_enabled && (
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="Secondary Host" hint="IP or FQDN">
+              <Input
+                value={raw.secondary_host}
+                onChange={(ev) => onChange('secondary_host', ev.target.value)}
+                onBlur={() => onBlur('secondary_host')}
+                placeholder="10.133.63.118"
+              />
+            </FormField>
+            <FormField label="Secondary Port">
+              <Input
+                type="number"
+                value={raw.secondary_port}
+                onChange={(ev) => onChange('secondary_port', ev.target.value)}
+                onBlur={() => onBlur('secondary_port')}
+                placeholder="5060"
+                className="font-mono"
+              />
+            </FormField>
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Transport" error={e('sip_transport')}>
@@ -391,6 +440,16 @@ export function VMConfigPanel({
             onBlur={() => onBlur('sip_password')}
             placeholder="••••••••"
             aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
+          />
+        </FormField>
+
+        <FormField label="DNS Servers (optional)" hint="Comma-separated DNS server IPs for FQDN resolution. Leave empty to use system DNS.">
+          <Input
+            value={raw.dns_servers}
+            onChange={(ev) => onChange('dns_servers', ev.target.value)}
+            onBlur={() => onBlur('dns_servers')}
+            placeholder="10.0.0.53, 168.63.129.16"
+            className="font-mono text-xs"
           />
         </FormField>
       </div>

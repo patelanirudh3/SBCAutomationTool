@@ -53,9 +53,16 @@ export const VMConfigSchema = z
 
     sbc_host: z
       .string()
-      .min(1, 'SBC host is required')
+      .min(1, 'Primary host is required')
       .refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
     sbc_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
+    secondary_host: z
+      .string()
+      .refine((v) => !v || isValidIpOrHostname(v), 'Must be a valid IPv4 address or hostname')
+      .optional(),
+    secondary_port: z.number().int().min(1).max(65535, 'Port must be 1–65535').optional(),
+    failover_enabled: z.boolean().optional(),
+    dns_servers: z.string().optional(),
     sip_transport: SipTransportSchema,
     domain: z
       .string()

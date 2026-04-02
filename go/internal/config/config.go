@@ -3,8 +3,9 @@
 package config
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -23,6 +24,15 @@ type VMConfig struct {
 	UASExtEnd   int  `yaml:"uas_ext_end" json:"uas_ext_end"`
 	SBCHost     string `yaml:"sbc_host" json:"sbc_host"`
 	SBCPort     int    `yaml:"sbc_port" json:"sbc_port"`
+	// TODO(failover): SecondaryHost/Port are stored and validated but not yet
+	// wired into the engine. When failover_enabled is true, the forking model
+	// requires: (1) REGISTER on both primary and secondary during pre-phase,
+	// (2) SUBSCRIBE only on primary, (3) on primary failure during traffic run
+	// re-SUBSCRIBE to secondary (no re-REGISTER needed).
+	SecondaryHost string `yaml:"secondary_host" json:"secondary_host"`
+	SecondaryPort int    `yaml:"secondary_port" json:"secondary_port"`
+	FailoverEnabled bool `yaml:"failover_enabled" json:"failover_enabled"`
+	DNSServers   string `yaml:"dns_servers" json:"dns_servers"`
 	SIPTransport string `yaml:"sip_transport" json:"sip_transport"`
 	Domain       string `yaml:"domain" json:"domain"`
 	SIPPassword  string `yaml:"sip_password" json:"sip_password"`
@@ -33,6 +43,7 @@ type VMConfig struct {
 	MetricsPort      int `yaml:"metrics_port" json:"metrics_port"`
 	CoordinatorURL   string `yaml:"coordinator_url" json:"coordinator_url"`
 	RegisterRate     int `yaml:"register_rate" json:"register_rate"`
+	RegisterBatchDelayMs int `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
 	RegisterExpires  int `yaml:"register_expires" json:"register_expires"`
 	RegisterRetry    int `yaml:"register_retry" json:"register_retry"`
 	RegisterTimeout  int `yaml:"register_timeout" json:"register_timeout"`
@@ -106,10 +117,57 @@ func (c *VMConfig) IsUAS() bool {
 	return strings.EqualFold(c.VMRole, "UAS")
 }
 
+// BatchDelay returns the inter-batch delay for TCP socket creation and
+// REGISTER batches as a time.Duration.
+func (c *VMConfig) BatchDelay() time.Duration {
+	if c.RegisterBatchDelayMs > 0 {
+		return time.Duration(c.RegisterBatchDelayMs) * time.Millisecond
+	}
+	return 500 * time.Millisecond
+}
+
+// BuildResolver returns a custom *net.Resolver using the configured DNS
+// servers for FQDN resolution. Returns nil when DNSServers is empty,
+// which causes Go to fall back to the system resolver.
+func (c *VMConfig) BuildResolver() *net.Resolver {
+	if c.DNSServers == "" {
+		return nil
+	}
+	parts := strings.Split(c.DNSServers, ",")
+	var servers []string
+	for _, s := range parts {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			servers = append(servers, s)
+		}
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	slog.Info("Using custom DNS resolver", "servers", servers)
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			for _, srv := range servers {
+				addr := net.JoinHostPort(srv, "53")
+				conn, err := d.DialContext(ctx, "udp", addr)
+				if err == nil {
+					return conn, nil
+				}
+				slog.Debug("DNS server unreachable, trying next", "server", srv, "err", err)
+			}
+			return nil, fmt.Errorf("all configured DNS servers unreachable: %v", servers)
+		},
+	}
+}
+
 // LoadConfig reads a YAML file, unmarshals it into a VMConfig, applies
 // defaults for zero-valued fields, auto-detects LocalHost if empty, and
 // validates the result.
 func LoadConfig(path string) (*VMConfig, error) {
+	slog.Info("Loading config from YAML", "path", path)
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
@@ -125,8 +183,9 @@ func LoadConfig(path string) (*VMConfig, error) {
 	if cfg.LocalHost == "" {
 		if ip, err := detectLocalIP(); err == nil {
 			cfg.LocalHost = ip
+			slog.Info("Auto-detected local IP", "ip", ip)
 		} else {
-			log.Printf("config: auto-detect local IP failed: %v", err)
+			slog.Warn("Auto-detect local IP failed", "err", err)
 		}
 	}
 
@@ -140,6 +199,8 @@ func LoadConfig(path string) (*VMConfig, error) {
 // JSON API body). It marshals the map to YAML, unmarshals into the struct,
 // then applies defaults and validates.
 func ConfigFromDict(data map[string]interface{}) (*VMConfig, error) {
+	slog.Info("Parsing config from GUI JSON body")
+
 	raw, err := yaml.Marshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("config: marshal dict: %w", err)
@@ -155,8 +216,9 @@ func ConfigFromDict(data map[string]interface{}) (*VMConfig, error) {
 	if cfg.LocalHost == "" {
 		if ip, err := detectLocalIP(); err == nil {
 			cfg.LocalHost = ip
+			slog.Info("Auto-detected local IP", "ip", ip)
 		} else {
-			log.Printf("config: auto-detect local IP failed: %v", err)
+			slog.Warn("Auto-detect local IP failed", "err", err)
 		}
 	}
 
@@ -183,6 +245,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RegisterRate == 0 {
 		cfg.RegisterRate = 10
 	}
+	if cfg.RegisterBatchDelayMs == 0 {
+		cfg.RegisterBatchDelayMs = 500
+	}
 	if cfg.RegisterExpires == 0 {
 		cfg.RegisterExpires = 3600
 	}
@@ -190,7 +255,7 @@ func ApplyDefaults(cfg *VMConfig) {
 		cfg.RegisterRetry = 3
 	}
 	if cfg.RegisterTimeout == 0 {
-		cfg.RegisterTimeout = 8
+		cfg.RegisterTimeout = 5
 	}
 	if cfg.RTPBurstSeconds == 0 {
 		cfg.RTPBurstSeconds = 2
@@ -291,10 +356,24 @@ func Validate(cfg *VMConfig) error {
 	cfg.VMRole = role
 	cfg.SIPTransport = transport
 
-	log.Printf("VMConfig OK | role=%s vm_id=%s sbc=%s:%d transport=%s cps=%d hold=%ds ext=%d-%d concurrent_estimate=%d",
-		cfg.VMRole, cfg.VMID, cfg.SBCHost, cfg.SBCPort,
-		cfg.SIPTransport, cfg.CPS, cfg.HoldTimeSeconds,
-		cfg.UACExtStart, cfg.UACExtEnd, cfg.EffectiveMaxConcurrent())
+	slog.Info("VMConfig validated",
+		"role", cfg.VMRole,
+		"vm_id", cfg.VMID,
+		"primary_host", fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort),
+		"failover_enabled", cfg.FailoverEnabled,
+		"secondary_host", fmt.Sprintf("%s:%d", cfg.SecondaryHost, cfg.SecondaryPort),
+		"dns_servers", cfg.DNSServers,
+		"transport", cfg.SIPTransport,
+		"cps", cfg.CPS,
+		"hold_s", cfg.HoldTimeSeconds,
+		"ext_range", fmt.Sprintf("%d-%d", cfg.UACExtStart, cfg.UACExtEnd),
+		"concurrent_estimate", cfg.EffectiveMaxConcurrent(),
+		"register_batch_size", cfg.RegisterRate,
+		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
+		"register_timeout", cfg.RegisterTimeout,
+		"rtp_mode", cfg.RTPMode,
+		"traffic_mode", cfg.TrafficMode,
+	)
 
 	return nil
 }
@@ -333,7 +412,7 @@ func WriteConfigYAML(cfg *VMConfig, path string) (string, error) {
 			abs = wd + "/" + path
 		}
 	}
-	log.Printf("config: YAML written to %s", abs)
+	slog.Info("Config YAML written", "path", abs, "role", cfg.VMRole, "vm_id", cfg.VMID)
 	return abs, nil
 }
 

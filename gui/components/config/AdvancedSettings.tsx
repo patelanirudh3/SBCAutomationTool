@@ -132,7 +132,8 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
   const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
 
   const tokens = [
-    `reg_rate: ${s.register_rate}`,
+    `batch_size: ${s.register_rate}`,
+    `batch_delay: ${s.register_batch_delay_ms}ms`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
     `rtp: ${modeLabel} ${s.rtp_ptime || 20}ms/${pps}pps`,
@@ -226,7 +227,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
   }
 
   const handleSave = () => {
-    const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds'])
+    const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds', 'register_batch_delay_ms'])
     const SKIP_NUMERIC: Set<string> = new Set(['rtp_mode', 'rtp_ptime', 'rtp_pcap'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
@@ -346,12 +347,27 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     Registration
                     <span className="h-px flex-1 bg-blue-400/30" />
                   </h3>
+                  <div className="space-y-1">
+                    <AdvancedField
+                      label="Register Batch Size"
+                      value={draft.register_rate}
+                      disabled={disabled}
+                      error={errors.register_rate}
+                      tooltip="Number of extensions per batch for TCP socket creation, REGISTER, and concurrency limit for SUBSCRIBE and Flush operations."
+                      onChange={set('register_rate')}
+                    />
+                    <p className="font-mono text-[11px] text-slate-300">
+                      Batch size: <span className="font-bold text-emerald-400">{draft.register_rate}</span> ext/batch
+                    </p>
+                  </div>
                   <AdvancedField
-                    label="Register Rate (reg/s)"
-                    value={draft.register_rate}
+                    label="Batch Delay (ms)"
+                    value={draft.register_batch_delay_ms}
                     disabled={disabled}
-                    error={errors.register_rate}
-                    onChange={set('register_rate')}
+                    min={0}
+                    error={errors.register_batch_delay_ms}
+                    tooltip="Delay in milliseconds between TCP socket creation and REGISTER batches. Prevents overwhelming the SBC connection rate limits."
+                    onChange={set('register_batch_delay_ms')}
                   />
                   <AdvancedField
                     label="Register Timeout (s)"
