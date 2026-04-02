@@ -14,6 +14,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +23,32 @@ import (
 	"github.com/cci/traffic-engine/internal/agent"
 	"github.com/cci/traffic-engine/internal/config"
 )
+
+// batchMinExt returns the numerically smallest extension in the batch.
+func batchMinExt(batch []*agent.ExtensionAgent) string {
+	min := math.MaxInt
+	minExt := ""
+	for _, a := range batch {
+		if n, err := strconv.Atoi(a.Ext); err == nil && n < min {
+			min = n
+			minExt = a.Ext
+		}
+	}
+	return minExt
+}
+
+// batchMaxExt returns the numerically largest extension in the batch.
+func batchMaxExt(batch []*agent.ExtensionAgent) string {
+	max := math.MinInt
+	maxExt := ""
+	for _, a := range batch {
+		if n, err := strconv.Atoi(a.Ext); err == nil && n > max {
+			max = n
+			maxExt = a.Ext
+		}
+	}
+	return maxExt
+}
 
 
 // PrePhaseResult holds success/failure counts from the pre-phase pipeline.
@@ -48,7 +76,7 @@ func (r *PrePhaseResult) AllReady() bool {
 	return len(r.FailedRegister) == 0 && len(r.FailedSubscribe) == 0
 }
 
-// RegisterAll registers extensions in sequential batches of cfg.RegisterRate.
+// RegisterAll registers extensions in sequential batches of cfg.RegisterBatchSize.
 // Each batch fires concurrently and must complete before the next batch starts.
 // A configurable pause (RegisterBatchDelayMs) separates batches to stay
 // within SBC DATAIFPROTECT limits.
@@ -68,7 +96,7 @@ func RegisterAll(
 	progressCb func(done, total int),
 ) []string {
 	total := len(agents)
-	batchSize := cfg.RegisterRate
+	batchSize := cfg.RegisterBatchSize
 	if batchSize <= 0 {
 		batchSize = 10
 	}
@@ -97,7 +125,7 @@ func RegisterAll(
 
 		slog.Info("REGISTER batch",
 			"batch", batchNum,
-			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext,
+			"from", batchMinExt(batch), "to", batchMaxExt(batch),
 			"count", len(batch))
 
 		var wg sync.WaitGroup
@@ -200,7 +228,7 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 }
 
 // SubscribeAll subscribes all extensions with a semaphore limiting concurrency
-// to cfg.RegisterRate. Returns the list of extension numbers that failed.
+// to cfg.SubscribeConcurrency. Returns the list of extension numbers that failed.
 //
 // TODO(failover): SUBSCRIBE should only target the primary host. During a
 // failover event (triggered during traffic run), extensions that lose their
@@ -214,7 +242,7 @@ func SubscribeAll(
 	progressCb func(done, total int),
 ) []string {
 	total := len(agents)
-	concurrency := cfg.RegisterRate
+	concurrency := cfg.SubscribeConcurrency
 	if concurrency <= 0 {
 		concurrency = 10
 	}
@@ -314,7 +342,7 @@ func FlushStaleRegistrations(
 	cfg *config.VMConfig,
 ) {
 	total := len(agents)
-	concurrency := cfg.RegisterRate
+	concurrency := cfg.SubscribeConcurrency
 	if concurrency <= 0 {
 		concurrency = 10
 	}

@@ -500,7 +500,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("BYE_SENT", 0, milestones.ByeSentMs, nil)
 
-	if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200"); err != nil {
+	if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE"); err != nil {
 		result := fail("bye_200 timeout")
 		e.complete(result)
 		return

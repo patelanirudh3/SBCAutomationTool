@@ -42,11 +42,12 @@ type VMConfig struct {
 	MetricsInterval  int `yaml:"metrics_interval" json:"metrics_interval"`
 	MetricsPort      int `yaml:"metrics_port" json:"metrics_port"`
 	CoordinatorURL   string `yaml:"coordinator_url" json:"coordinator_url"`
-	RegisterRate     int `yaml:"register_rate" json:"register_rate"`
+	RegisterBatchSize    int `yaml:"register_batch_size" json:"register_batch_size"`
 	RegisterBatchDelayMs int `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
-	RegisterExpires  int `yaml:"register_expires" json:"register_expires"`
-	RegisterRetry    int `yaml:"register_retry" json:"register_retry"`
-	RegisterTimeout  int `yaml:"register_timeout" json:"register_timeout"`
+	RegisterExpires      int `yaml:"register_expires" json:"register_expires"`
+	RegisterRetry        int `yaml:"register_retry" json:"register_retry"`
+	RegisterTimeout      int `yaml:"register_timeout" json:"register_timeout"`
+	SubscribeConcurrency int `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
 	LocalHost  string `yaml:"local_host" json:"local_host"`
 	LocalPort  int    `yaml:"local_port" json:"local_port"`
@@ -242,8 +243,11 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.MetricsInterval == 0 {
 		cfg.MetricsInterval = 3
 	}
-	if cfg.RegisterRate == 0 {
-		cfg.RegisterRate = 10
+	if cfg.RegisterBatchSize == 0 {
+		cfg.RegisterBatchSize = 10
+	}
+	if cfg.SubscribeConcurrency == 0 {
+		cfg.SubscribeConcurrency = 10
 	}
 	if cfg.RegisterBatchDelayMs == 0 {
 		cfg.RegisterBatchDelayMs = 500
@@ -368,7 +372,8 @@ func Validate(cfg *VMConfig) error {
 		"hold_s", cfg.HoldTimeSeconds,
 		"ext_range", fmt.Sprintf("%d-%d", cfg.UACExtStart, cfg.UACExtEnd),
 		"concurrent_estimate", cfg.EffectiveMaxConcurrent(),
-		"register_batch_size", cfg.RegisterRate,
+		"register_batch_size", cfg.RegisterBatchSize,
+		"subscribe_concurrency", cfg.SubscribeConcurrency,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
 		"register_timeout", cfg.RegisterTimeout,
 		"rtp_mode", cfg.RTPMode,

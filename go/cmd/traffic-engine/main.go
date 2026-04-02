@@ -441,7 +441,7 @@ func postPeerStop(peerURL string) {
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	for _, p := range portsToTry {
-		u := fmt.Sprintf("%s://%s:%d%s", parsed.Scheme, hostname, p, parsed.Path)
+		u := fmt.Sprintf("%s://%s:%d%s?source=uac", parsed.Scheme, hostname, p, parsed.Path)
 		slog.Info("Signaling UAS shutdown", "url", u)
 		resp, err := client.Post(u, "application/json", nil)
 		if err == nil {
@@ -455,26 +455,67 @@ func postPeerStop(peerURL string) {
 
 func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, runID, pairID, logDir string) {
 	os.MkdirAll(logDir, 0755)
-	path := fmt.Sprintf("%s/run-%s_%s_%s.json", logDir, runID, pairID, cfg.VMID)
+	// File is named <runID>_<pairID>_<vmID>.json — no "run-" prefix duplication.
+	path := fmt.Sprintf("%s/%s_%s_%s.json", logDir, runID, pairID, cfg.VMID)
 
-	results := collector.GetCallResultsAsDicts()
-	spines := collector.GetAllEvents()
-	summary := collector.GetFinalSummary()
 	snap := collector.Latest()
+	callEvents := collector.GetCallEvents()
+	callSpines := collector.GetCallSpines()
 
-	summary["calls_attempted"] = snap.CallsAttempted
-	summary["calls_completed"] = snap.CallsCompleted
-	summary["calls_failed"] = snap.CallsFailed
-	summary["asr"] = snap.ASR
+	asr := 0.0
+	if snap.CallsAttempted > 0 {
+		asr = math.Round(float64(snap.CallsCompleted)/float64(snap.CallsAttempted)*1000) / 10
+	}
+
+	startedAt := ""
+	endedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if snap.RunElapsedSec > 0 {
+		startTs := time.Now().Add(-time.Duration(snap.RunElapsedSec * float64(time.Second)))
+		startedAt = startTs.UTC().Format(time.RFC3339Nano)
+	}
+
+	aggregate := map[string]any{
+		"run_id":          runID,
+		"pair_id":         pairID,
+		"started_at":      startedAt,
+		"ended_at":        endedAt,
+		"total_attempted": snap.CallsAttempted,
+		"total_completed": snap.CallsCompleted,
+		"total_failed":    snap.CallsFailed,
+		"aggregate_asr":   asr,
+	}
+
+	// Build config snapshot for the report
+	cfgMap := map[string]any{
+		"vm_role":            cfg.VMRole,
+		"vm_id":             cfg.VMID,
+		"uac_ext_start":     cfg.UACExtStart,
+		"uac_ext_end":       cfg.UACExtEnd,
+		"uas_ext_start":     cfg.UASExtStart,
+		"uas_ext_end":       cfg.UASExtEnd,
+		"sbc_host":          cfg.SBCHost,
+		"sbc_port":          cfg.SBCPort,
+		"sip_transport":     cfg.SIPTransport,
+		"domain":            cfg.Domain,
+		"cps":               cfg.CPS,
+		"hold_time_seconds": cfg.HoldTimeSeconds,
+		"ramp_up_seconds":   cfg.RampUpSeconds,
+		"media_enabled":     cfg.MediaEnabled,
+		"metrics_port":      cfg.MetricsPort,
+		"traffic_mode":      cfg.TrafficMode,
+	}
 
 	output := map[string]any{
-		"run_id":       runID,
-		"pair_id":      pairID,
-		"vm_id":        cfg.VMID,
-		"vm_role":      cfg.VMRole,
-		"call_results": results,
-		"call_spines":  spines,
-		"summary":      summary,
+		"generated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+		"run_id":         runID,
+		"pair_id":        pairID,
+		"vm_id":          cfg.VMID,
+		"vm_role":        cfg.VMRole,
+		"aggregate":      aggregate,
+		"final_metrics":  snap,
+		"config":         cfgMap,
+		"call_events":    callEvents,
+		"call_spines":    callSpines,
 	}
 
 	data, err := json.MarshalIndent(output, "", "  ")
@@ -698,13 +739,19 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	for _, a := range agents {
 		out = append(out, a)
 	}
+	// Sort by extension number so batch from/to log lines always show the correct min→max range.
+	sort.Slice(out, func(i, j int) bool {
+		ni, _ := strconv.Atoi(out[i].Ext)
+		nj, _ := strconv.Atoi(out[j].Ext)
+		return ni < nj
+	})
 	return out
 }
 
 func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig) error {
 	allAgents := agentsToSlice(agents)
 	total := len(allAgents)
-	batchSize := cfg.RegisterRate
+	batchSize := cfg.RegisterBatchSize
 	if batchSize <= 0 {
 		batchSize = 10
 	}
@@ -726,7 +773,7 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 
 		slog.Info("Transport batch connecting",
 			"batch", batchNum, "count", len(batch),
-			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext,
+			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext, // slice is sorted, so [0]=min [last]=max
 		)
 
 		var wg sync.WaitGroup
@@ -903,11 +950,22 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	slog.Info("API server started", "port", actualPort, "pid", os.Getpid())
 
 	slog.Info("============================================================")
-	slog.Info("GUI-DRIVEN mode — server running",
-		"port", actualPort,
-		"pid", os.Getpid(),
-		"endpoints", "PUT /api/config | POST /api/test/start | POST /api/test/stop | POST /api/test/reset | POST /api/shutdown | GET /api/ping | GET /metrics | WS /metrics/stream",
-	)
+	slog.Info("GUI-DRIVEN mode — server running", "port", actualPort, "pid", os.Getpid())
+	slog.Info("------------------------------------------------------------")
+	slog.Info("  PUT  /api/config            — push VM configuration")
+	slog.Info("  POST /api/test/start        — start traffic lifecycle")
+	slog.Info("  POST /api/test/stop         — stop traffic")
+	slog.Info("  POST /api/test/reset        — reset state to IDLE")
+	slog.Info("  POST /api/shutdown          — graceful process shutdown")
+	slog.Info("  GET  /api/ping              — health check")
+	slog.Info("  GET  /api/test/status       — current phase/state")
+	slog.Info("  GET  /api/calls             — call events (formatted)")
+	slog.Info("  GET  /api/call-results      — raw call results")
+	slog.Info("  GET  /api/call-spines       — correlated call spines")
+	slog.Info("  GET  /api/scenarios         — available test scenarios")
+	slog.Info("  GET  /metrics               — latest TrafficMetrics snapshot")
+	slog.Info("  WS   /metrics/stream        — real-time metrics WebSocket")
+	slog.Info("------------------------------------------------------------")
 	slog.Info("Press Ctrl+C to initiate graceful shutdown")
 	slog.Info("============================================================")
 
@@ -955,7 +1013,7 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 }
 
 func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
-	return metrics.CallResultData{
+	d := metrics.CallResultData{
 		CallID:           r.CallID,
 		Caller:           r.Caller,
 		Callee:           r.Callee,
@@ -982,6 +1040,14 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		MarkersReceived:  r.MarkersReceived,
 		Scenario:         r.Scenario,
 	}
+	// Marshal SipMilestones into a generic map so it can be included in JSON exports.
+	if raw, err := json.Marshal(r.SipMilestones); err == nil {
+		var ms map[string]any
+		if json.Unmarshal(raw, &ms) == nil {
+			d.SipMilestones = ms
+		}
+	}
+	return d
 }
 
 // Logging setup

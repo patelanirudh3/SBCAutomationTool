@@ -465,8 +465,12 @@ export function VMConfigPanel({
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-semibold text-slate-200">UAC Range</span>
                 {uacExtCount > 0 && (
-                  <span className="flex items-center gap-1 rounded border border-slate-600/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-slate-100">
-                    → {raw.uac_ext_end} · {uacExtCount} ext
+                  <span className="flex items-center gap-1 rounded border border-slate-700/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px]">
+                    <span className="font-bold text-amber-400">{raw.uac_ext_start}</span>
+                    <span className="text-slate-500">→</span>
+                    <span className="font-bold text-amber-400">{raw.uac_ext_end}</span>
+                    <span className="text-slate-500">·</span>
+                    <span className="text-slate-400">{uacExtCount} ext</span>
                   </span>
                 )}
               </div>
@@ -496,24 +500,6 @@ export function VMConfigPanel({
                 </FormField>
               </div>
             </div>
-
-            {/* UAS Range — auto-derived from UAC */}
-            <div className="space-y-1">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[11px] font-semibold text-slate-200">UAS Range</span>
-                  <ArrowDownToLine className="size-2.5 text-slate-400" />
-                </div>
-                {uasExtCount > 0 && (
-                  <span className="flex items-center gap-1 rounded border border-slate-600/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-slate-100">
-                    {raw.uas_ext_start} → {raw.uas_ext_end} · {uasExtCount} ext
-                  </span>
-                )}
-              </div>
-              <p className="text-[11px] font-medium leading-relaxed text-slate-300">
-                UAS Start = UAC End + 1, same count
-              </p>
-            </div>
           </>
         ) : (
           /* UAS card: read-only, auto-synced from UAC */
@@ -524,12 +510,22 @@ export function VMConfigPanel({
             </div>
             <div className="font-mono text-[12px] leading-relaxed space-y-0.5">
               <div className="flex items-center justify-between">
-                <span className="font-medium text-slate-300">UAC</span>
-                <span className="font-semibold text-slate-100">{raw.uac_ext_start} → {raw.uac_ext_end} ({uacExtCount} ext)</span>
+                <span className="font-medium text-slate-400">UAC</span>
+                <span className="font-semibold">
+                  <span className="text-amber-400">{raw.uac_ext_start}</span>
+                  <span className="text-slate-500"> → </span>
+                  <span className="text-amber-400">{raw.uac_ext_end}</span>
+                  <span className="text-slate-500"> ({uacExtCount} ext)</span>
+                </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="font-medium text-slate-300">UAS</span>
-                <span className="font-semibold text-slate-100">{raw.uas_ext_start} → {raw.uas_ext_end} ({uasExtCount} ext)</span>
+                <span className="font-medium text-slate-400">UAS</span>
+                <span className="font-semibold">
+                  <span className="text-amber-400">{raw.uas_ext_start}</span>
+                  <span className="text-slate-500"> → </span>
+                  <span className="text-amber-400">{raw.uas_ext_end}</span>
+                  <span className="text-slate-500"> ({uasExtCount} ext)</span>
+                </span>
               </div>
             </div>
           </div>
@@ -543,18 +539,36 @@ export function VMConfigPanel({
         {isUAC ? (
           /* UAC: CPS + Hold Time side-by-side (both editable) */
           <div className="grid grid-cols-2 gap-3">
-            <FormField label="CPS" error={e('cps')} warning={w('cps')} hint="Calls per second">
-              <Input
-                type="number"
-                min={0.1}
-                step={0.1}
-                value={raw.cps}
-                onChange={(ev) => onChange('cps', ev.target.value)}
-                onBlur={() => onBlur('cps')}
-                className="font-mono"
-                aria-invalid={t('cps') && !!errors.cps ? true : undefined}
-              />
-            </FormField>
+            <div className="space-y-1">
+              <FormField label="CPS" error={e('cps')} warning={w('cps')} hint="Calls per second">
+                <Input
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  value={raw.cps}
+                  onChange={(ev) => onChange('cps', ev.target.value)}
+                  onBlur={() => onBlur('cps')}
+                  className="font-mono"
+                  aria-invalid={t('cps') && !!errors.cps ? true : undefined}
+                />
+              </FormField>
+              {(() => {
+                const cpsNum = parseFloat(raw.cps)
+                if (!Number.isFinite(cpsNum) || cpsNum <= 0) return null
+                const perHour = Math.round(cpsNum * 3600)
+                const bhcc = perHour < 1000
+                  ? perHour.toLocaleString()
+                  : ((n) => {
+                      const s = (n / 1000).toFixed(1)
+                      return (s.endsWith('.0') ? s.slice(0, -2) : s) + 'k'
+                    })(perHour)
+                return (
+                  <p className="font-mono text-[11px] text-amber-400/80">
+                    = {perHour.toLocaleString()} calls/hr · <span className="font-bold text-amber-400">{bhcc} BHCC</span>
+                  </p>
+                )
+              })()}
+            </div>
             <FormField label="Hold Time (s)" error={e('hold_time_seconds')} warning={w('hold_time_seconds')}>
               <Input
                 type="number"

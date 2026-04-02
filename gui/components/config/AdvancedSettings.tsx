@@ -132,10 +132,11 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
   const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
 
   const tokens = [
-    `batch_size: ${s.register_rate}`,
+    `batch_size: ${s.register_batch_size}`,
     `batch_delay: ${s.register_batch_delay_ms}ms`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
+    `subscribe: ${s.subscribe_concurrency}`,
     `rtp: ${modeLabel} ${s.rtp_ptime || 20}ms/${pps}pps`,
     `burst: ${s.rtp_burst_seconds}s`,
     `keepalive: ${s.rtp_keepalive_interval}s`,
@@ -340,24 +341,24 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
 
               {/* 2-column grid */}
               <div className="grid grid-cols-2 gap-x-8 gap-y-3">
-                {/* Left column — Registration */}
+                {/* Left column — Pre-Phase Settings */}
                 <div className="space-y-3">
                   <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
-                    Registration
+                    Pre-Phase Settings
                     <span className="h-px flex-1 bg-blue-400/30" />
                   </h3>
                   <div className="space-y-1">
                     <AdvancedField
-                      label="Register Batch Size"
-                      value={draft.register_rate}
+                      label="Batch Size"
+                      value={draft.register_batch_size}
                       disabled={disabled}
-                      error={errors.register_rate}
-                      tooltip="Number of extensions per batch for TCP socket creation, REGISTER, and concurrency limit for SUBSCRIBE and Flush operations."
-                      onChange={set('register_rate')}
+                      error={errors.register_batch_size}
+                      tooltip="Number of extensions per batch for TCP socket creation and concurrent REGISTER operations."
+                      onChange={set('register_batch_size')}
                     />
                     <p className="font-mono text-[11px] text-slate-300">
-                      Batch size: <span className="font-bold text-emerald-400">{draft.register_rate}</span> ext/batch
+                      Batch size: <span className="font-bold text-emerald-400">{draft.register_batch_size}</span> ext/batch
                     </p>
                   </div>
                   <AdvancedField
@@ -370,19 +371,29 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     onChange={set('register_batch_delay_ms')}
                   />
                   <AdvancedField
-                    label="Register Timeout (s)"
+                    label="Timeout (s)"
                     value={draft.register_timeout}
                     disabled={disabled}
                     error={errors.register_timeout}
+                    tooltip="Max wait per REGISTER or SUBSCRIBE response. Applies to both pre-phase operations."
                     onChange={set('register_timeout')}
                   />
                   <AdvancedField
-                    label="Register Retry"
+                    label="Retry Attempts"
                     value={draft.register_retry}
                     min={0}
                     disabled={disabled}
                     error={errors.register_retry}
+                    tooltip="Number of retries on no-response for both REGISTER and SUBSCRIBE."
                     onChange={set('register_retry')}
+                  />
+                  <AdvancedField
+                    label="Subscribe Concurrency"
+                    value={draft.subscribe_concurrency}
+                    disabled={disabled}
+                    error={errors.subscribe_concurrency}
+                    tooltip="Max concurrent SUBSCRIBE operations. Controls how many extensions subscribe simultaneously (independent of REGISTER batch size)."
+                    onChange={set('subscribe_concurrency')}
                   />
                 </div>
 

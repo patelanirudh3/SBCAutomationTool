@@ -129,7 +129,7 @@ function parseRaw(raw: RawVMFormValues, role: 'UAC' | 'UAS'): unknown {
     cps: parseFloat(raw.cps) || 0,
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
     ramp_up_seconds: role === 'UAC' && raw.ramp_up_seconds !== '' ? parseFloat(raw.ramp_up_seconds) : undefined,
-    media_enabled: role === 'UAC' ? raw.media_enabled : undefined,
+    media_enabled: raw.media_enabled,
     metrics_port: parseInt(raw.metrics_port) || 0,
     peer_stop_url: raw.peer_stop_url || undefined,
     traffic_mode: role === 'UAC' ? raw.traffic_mode || undefined : undefined,

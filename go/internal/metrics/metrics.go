@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -77,6 +78,7 @@ type CallResultData struct {
 	MarkersSent      int
 	MarkersReceived  int
 	Scenario         string
+	SipMilestones    map[string]any
 }
 
 // ---------------------------------------------------------------------------
@@ -274,14 +276,14 @@ func (c *MetricsCollector) RecordAttempt() {
 // Data accessors
 // ---------------------------------------------------------------------------
 
-// GetCallResultsAsDicts returns call results as generic maps.
+// GetCallResultsAsDicts returns call results as generic maps (raw format for /api/call-results).
 func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	out := make([]map[string]any, 0, len(c.callResults))
 	for _, r := range c.callResults {
-		out = append(out, map[string]any{
+		m := map[string]any{
 			"call_id":              r.CallID,
 			"caller":              r.Caller,
 			"callee":              r.Callee,
@@ -307,7 +309,77 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"markers_sent":         r.MarkersSent,
 			"markers_received":     r.MarkersReceived,
 			"scenario":             r.Scenario,
-		})
+		}
+		if len(r.SipMilestones) > 0 {
+			m["sip_milestones"] = r.SipMilestones
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// GetCallEvents returns call results in the formatted call-events style (same as GET /api/calls).
+func (c *MetricsCollector) GetCallEvents() []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := make([]map[string]any, 0, len(c.callResults))
+	for i, cr := range c.callResults {
+		media := "NO_MEDIA"
+		if cr.MediaVerified {
+			media = "MEDIA_VERIFIED"
+		} else if cr.RTPTxPkts > 0 || cr.RTPRxPkts > 0 {
+			media = "MEDIA_PARTIAL"
+		}
+
+		ts := cr.TsUTC
+		if ts == "" {
+			ts = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+
+		direction := cr.Direction
+		if direction == "" {
+			direction = "uac"
+		}
+		caller := cr.Caller
+		callee := cr.Callee
+
+		ext := caller
+		if direction == "uas" {
+			ext = callee
+		}
+
+		callID := cr.CallID
+		if callID == "" {
+			callID = fmt.Sprintf("call-%04d", i)
+		}
+
+		m := map[string]any{
+			"call_id":              callID,
+			"uac_ext":             caller,
+			"uas_ext":             callee,
+			"ext":                 ext,
+			"peer_ext":            cr.PeerExt,
+			"direction":           direction,
+			"result":              ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+			"failure_reason":      nilIfEmpty(cr.FailureReason),
+			"pdd_ms":             cr.PDDMs,
+			"hold_ms":            cr.HoldMs,
+			"media_status":       media,
+			"rtp_tx_pkts":        cr.RTPTxPkts,
+			"rtp_rx_pkts":        cr.RTPRxPkts,
+			"rtp_rx_from_sbc_pkts": cr.RTPRxFromSBCPkts,
+			"rtp_rx_other_pkts":    cr.RTPRxOtherPkts,
+			"rtp_asymmetry_flag":   cr.RTPAsymmetryFlag,
+			"rtcp_rx_pkts":         cr.RTCPRxPkts,
+			"markers_sent":         cr.MarkersSent,
+			"markers_received":     cr.MarkersReceived,
+			"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
+			"ts_utc":              ts,
+			"timestamp":           ts,
+		}
+		out = append(out, m)
 	}
 	return out
 }
@@ -318,6 +390,15 @@ func (c *MetricsCollector) StoreCallSpines(spines []map[string]any) {
 	c.callSpines = make([]map[string]any, len(spines))
 	copy(c.callSpines, spines)
 	c.mu.Unlock()
+}
+
+// GetCallSpines returns a copy of the stored correlated call spines.
+func (c *MetricsCollector) GetCallSpines() []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]map[string]any, len(c.callSpines))
+	copy(out, c.callSpines)
+	return out
 }
 
 // GetAllEvents returns a copy of all raw call events.
@@ -680,6 +761,15 @@ func (sr *statusRecorder) WriteHeader(code int) {
 	sr.ResponseWriter.WriteHeader(code)
 }
 
+// Hijack forwards the Hijack call to the underlying ResponseWriter so that
+// WebSocket upgrades work correctly through this logging middleware wrapper.
+func (sr *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := sr.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+}
+
 // requestLoggingMiddleware logs every inbound HTTP request with method, path,
 // status, and duration. WebSocket upgrade and high-frequency read-only
 // endpoints (GET /metrics, /metrics/stream) are logged at DEBUG to avoid noise.
@@ -1014,7 +1104,11 @@ func BuildMux(
 			st := processCtx.State
 			processCtx.Mu.Unlock()
 
-			slog.Info("Stop requested via API", "state", st, "vm_id", effectiveVMID())
+			if r.URL.Query().Get("source") == "uac" {
+				slog.Info("Received stop signal from UAC peer — stopping traffic lifecycle", "state", st, "vm_id", effectiveVMID())
+			} else {
+				slog.Info("Stop requested via API", "state", st, "vm_id", effectiveVMID())
+			}
 
 			select {
 			case processCtx.StopEvent <- struct{}{}:

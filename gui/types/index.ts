@@ -8,10 +8,11 @@ export type RtpMode = '3phase' | 'continuous'
 export type RtpPtime = 20 | 40
 
 export interface AdvancedSettings {
-  register_rate: number                // default: 10 — batch size for TCP socket creation, REGISTER, and concurrency limit for SUBSCRIBE/Flush
+  register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
   register_batch_delay_ms: number      // default: 500 — delay (ms) between TCP socket / REGISTER batches
-  register_timeout: number             // default: 5
-  register_retry: number               // default: 3
+  register_timeout: number             // default: 5 — per-REGISTER and per-SUBSCRIBE response wait (s)
+  register_retry: number               // default: 3 — retry attempts for REGISTER and SUBSCRIBE
+  subscribe_concurrency: number        // default: 10 — max concurrent SUBSCRIBE operations
   rtp_mode: RtpMode                    // default: '3phase'
   rtp_ptime: RtpPtime                  // default: 20 (ms) → 50 PPS
   rtp_burst_seconds: number            // default: 2
@@ -23,10 +24,11 @@ export interface AdvancedSettings {
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
-  register_rate: 10,
+  register_batch_size: 10,
   register_batch_delay_ms: 500,
   register_timeout: 5,
   register_retry: 3,
+  subscribe_concurrency: 10,
   rtp_mode: '3phase',
   rtp_ptime: 20,
   rtp_burst_seconds: 2,
