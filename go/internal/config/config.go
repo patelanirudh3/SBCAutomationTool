@@ -79,33 +79,40 @@ func (c *VMConfig) UASExtCount() int {
 	return c.UASExtEnd - c.UASExtStart + 1
 }
 
-// PoolWrapCount returns total calls per full pool wrap, based on the
-// extension count for the VM's role.
+// PoolWrapCount returns the number of calls per full pool wrap — the LCM of
+// UAC and UAS extension counts. This is purely an extension-geometry question
+// (how many calls until every unique pair has been used once) and is
+// independent of call_count, traffic_mode, or any other run-level setting.
 func (c *VMConfig) PoolWrapCount() int {
-	if c.IsUAC() {
-		count := c.UACExtCount()
-		if count == 0 {
-			return 0
-		}
-		return c.CallCount / count
-	}
-	count := c.UASExtCount()
-	if count == 0 {
+	uac := c.UACExtCount()
+	uas := c.UASExtCount()
+	if uac <= 0 || uas <= 0 {
 		return 0
 	}
-	return c.CallCount / count
+	return lcm(uac, uas)
 }
 
 // EffectiveMaxConcurrent returns MaxConcurrentCalls if explicitly set,
-// otherwise the extension count for the VM's role.
+// otherwise CPS × HoldTimeSeconds — the theoretical steady-state concurrency.
 func (c *VMConfig) EffectiveMaxConcurrent() int {
 	if c.MaxConcurrentCalls > 0 {
 		return c.MaxConcurrentCalls
 	}
-	if c.IsUAC() {
-		return c.UACExtCount()
+	return c.CPS * c.HoldTimeSeconds
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
 	}
-	return c.UASExtCount()
+	return a
+}
+
+func lcm(a, b int) int {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	return (a / gcd(a, b)) * b
 }
 
 // IsUAC reports whether the VM is configured as a UAC.

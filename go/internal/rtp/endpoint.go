@@ -109,13 +109,24 @@ func (ep *RtpEndpoint) MarkersSent() int {
 	return ep.markersSent
 }
 
-// SetRemoteRTPAddr sets the expected source address for the three-counter receive.
+// SetRemoteRTPAddr sets the expected source address for the three-counter
+// receive and resets all RX counters. Any packets received before this call
+// (pre-SDP noise) are discarded from the stats so that only packets arriving
+// after the SDP offer/answer is established are counted.
 func (ep *RtpEndpoint) SetRemoteRTPAddr(ip string, port int) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	ep.remoteIP = ip
 	ep.remotePort = port
 	ep.expectedSrc = &net.UDPAddr{IP: net.ParseIP(ip), Port: port}
+
+	ep.packetsReceived = 0
+	ep.pktsFromExpectedSrc = 0
+	ep.pktsFromOtherSrc = 0
+	ep.rtcpReceived = 0
+	ep.markersReceived = 0
+	ep.firstRecvTs = nil
+	ep.lastRecvTs = nil
 }
 
 // EnablePcap starts writing every TX/RX packet to a pcap file.

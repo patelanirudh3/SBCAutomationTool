@@ -241,7 +241,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	}
 	emit("UAS_ACK_RECEIVED", 0, milestones.AckReceivedMs, nil)
 
-	// ── Start RTP (run until cancelled) ─────────────────────────────
+	// ── Start RTP (bounded to HoldTimeSeconds, same as UAC) ─────────
 	var rtpDone chan struct{}
 	if rtpEP != nil {
 		rtpDone = make(chan struct{})
@@ -249,10 +249,11 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		rtpCtx, rtpCancel = context.WithCancel(ctx)
 		go func() {
 			defer close(rtpDone)
-			rtpEP.RunUntilCancelled(
+			rtpEP.Run(
 				rtpCtx,
 				dialog.RTPRemoteIP,
 				dialog.RTPRemotePort,
+				float64(cfg.HoldTimeSeconds),
 				float64(cfg.RTPBurstSeconds),
 				cfg.RTPBurstPPS,
 				float64(cfg.RTPKeepaliveInterval),

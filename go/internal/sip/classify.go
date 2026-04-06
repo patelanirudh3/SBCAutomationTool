@@ -28,6 +28,8 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 				return "200_INVITE", raw
 			case "BYE":
 				return "200_BYE", raw
+			case "CANCEL":
+				return "200_CANCEL", raw
 			}
 		}
 		return code, raw

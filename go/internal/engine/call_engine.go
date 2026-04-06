@@ -189,10 +189,10 @@ func (e *CallEngine) Run(ctx context.Context) error {
 			continue
 		}
 
-	// Pool wrap delay
-	poolCount := cfg.PoolWrapCount()
-	if poolCount > 0 && attempted > 0 && attempted%poolCount == 0 {
-		wrapTime := float64(poolCount) / math.Max(float64(cfg.CPS), 0.001)
+		// Pool wrap delay
+		poolCount := cfg.PoolWrapCount()
+		if poolCount > 0 && attempted > 0 && attempted%poolCount == 0 {
+			wrapTime := float64(poolCount) / math.Max(float64(cfg.CPS), 0.001)
 			holdTime := float64(cfg.HoldTimeSeconds)
 			extraMargin := float64(cfg.PoolWrapDelaySeconds)
 
@@ -287,13 +287,16 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	milestones := SipMilestones{}
 	inviteTsUTC := ""
 	cfg := e.config
+	added := false // tracks whether activeCount was incremented
 
 	defer func() {
 		if rtpEP != nil {
 			rtpEP.Close()
 		}
-		e.activeCalls.Delete(callID)
-		e.activeCount.Add(-1)
+		if added {
+			e.activeCalls.Delete(callID)
+			e.activeCount.Add(-1)
+		}
 		ag.RemoveDialog(callID)
 	}()
 
@@ -343,6 +346,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	callID = dialog.CallID
 	e.activeCalls.Store(callID, struct{}{})
 	e.activeCount.Add(1)
+	added = true
 	if peak := e.activeCount.Load(); peak > e.peakActiveCalls {
 		e.peakActiveCalls = peak
 	}
@@ -362,7 +366,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
 			if dialog.State == "INVITE_SENT" || dialog.State == "RINGING" || dialog.State == "PROVRESP_RCVD" {
-				go ag.SendCancel(dialog)
+				if err := ag.SendCancel(dialog); err != nil {
+					slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", err)
+				} else if e.metrics != nil {
+					e.metrics.IncrementSIPCounter("cancels_sent")
+				}
 			}
 			result := CallResult{
 				CallID: callID, Caller: ag.Ext, Callee: callee,
