@@ -241,19 +241,20 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	}
 	emit("UAS_ACK_RECEIVED", 0, milestones.AckReceivedMs, nil)
 
-	// ── Start RTP (bounded to HoldTimeSeconds, same as UAC) ─────────
+	// ── Start RTP (safety cap = 2× hold_time; real stop via rtpCancel on BYE) ──
 	var rtpDone chan struct{}
 	if rtpEP != nil {
 		rtpDone = make(chan struct{})
 		var rtpCtx context.Context
 		rtpCtx, rtpCancel = context.WithCancel(ctx)
+		safetyCap := float64(cfg.HoldTimeSeconds) * 2
 		go func() {
 			defer close(rtpDone)
 			rtpEP.Run(
 				rtpCtx,
 				dialog.RTPRemoteIP,
 				dialog.RTPRemotePort,
-				float64(cfg.HoldTimeSeconds),
+				safetyCap,
 				float64(cfg.RTPBurstSeconds),
 				cfg.RTPBurstPPS,
 				float64(cfg.RTPKeepaliveInterval),

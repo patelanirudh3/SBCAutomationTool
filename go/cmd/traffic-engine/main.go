@@ -371,16 +371,33 @@ func shutdownCleanup(
 		uas.Stop()
 	}
 
-	// Unregister
+	// Unregister with semaphore-limited concurrency (scales to 1k-5k extensions)
 	if !noUnregister {
-		slog.Info("Unregistering extensions", "count", len(agents))
-		unregCtx, unregCancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout*2)*time.Second)
+		concurrency := cfg.SubscribeConcurrency
+		if concurrency <= 0 {
+			concurrency = 10
+		}
+		perExtTimeout := time.Duration(cfg.RegisterTimeout) * time.Second
+		waves := (len(agents) + concurrency - 1) / concurrency
+		outerTimeout := time.Duration(waves)*perExtTimeout + 10*time.Second
+
+		slog.Info("Unregistering extensions",
+			"count", len(agents),
+			"concurrency", concurrency,
+			"waves", waves,
+			"outer_timeout_s", outerTimeout.Seconds(),
+		)
+		unregCtx, unregCancel := context.WithTimeout(ctx, outerTimeout)
 		defer unregCancel()
+
+		sem := make(chan struct{}, concurrency)
 		var wg sync.WaitGroup
 		for _, ag := range agents {
 			wg.Add(1)
 			go func(a *agent.ExtensionAgent) {
 				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
 				if err := a.Unregister(unregCtx); err != nil {
 					slog.Debug("Unregister error", "ext", a.Ext, "err", err)
 				}

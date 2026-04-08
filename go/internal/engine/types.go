@@ -95,15 +95,25 @@ func ClassifyMedia(stats rtp.RtpStats, holdSeconds float64) string {
 // ComputeRTPAsymmetryFlag computes asymmetry using filtered (SBC-only) rx
 // count.  Falls back to total rx if expected_src was never set
 // (rxFromSBC == 0 but rxTotal > 0).
+//
+// The denominator is max(tx, effectiveRx) so that the percentage stays
+// sensible when RX slightly exceeds TX (e.g. reporting nuances).
 func ComputeRTPAsymmetryFlag(txPkts, rxFromSBC, rxTotal int) string {
-	if txPkts == 0 {
+	if txPkts == 0 && rxFromSBC == 0 && rxTotal == 0 {
 		return "OK"
 	}
 	effectiveRx := rxFromSBC
 	if rxFromSBC == 0 && rxTotal > 0 {
 		effectiveRx = rxTotal
 	}
-	deltaPct := math.Abs(float64(txPkts-effectiveRx)) / float64(txPkts) * 100
+	base := txPkts
+	if effectiveRx > base {
+		base = effectiveRx
+	}
+	if base == 0 {
+		return "OK"
+	}
+	deltaPct := math.Abs(float64(txPkts-effectiveRx)) / float64(base) * 100
 	if deltaPct <= 5 {
 		return "OK"
 	}

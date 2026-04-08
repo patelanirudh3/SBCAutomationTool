@@ -47,7 +47,8 @@ type RtpEndpoint struct {
 	tonePayload    []byte
 	markerTemplate []byte
 
-	expectedSrc *net.UDPAddr
+	expectedSrc    *net.UDPAddr
+	preSdpSourceIP string
 
 	packetsReceived     int
 	pktsFromExpectedSrc int
@@ -110,9 +111,15 @@ func (ep *RtpEndpoint) MarkersSent() int {
 }
 
 // SetRemoteRTPAddr sets the expected source address for the three-counter
-// receive and resets all RX counters. Any packets received before this call
-// (pre-SDP noise) are discarded from the stats so that only packets arriving
-// after the SDP offer/answer is established are counted.
+// receive classification.
+//
+// Pre-SDP packets that arrived before the SDP answer are handled with a
+// guarded reclassification: if the first pre-SDP packet came from the same
+// IP as the now-known expected source (the SBC relay), those packets are
+// promoted to the "expected" bucket.  Packets from any other IP are left in
+// the "other" bucket as genuine stray traffic.  This is safe at scale
+// (3k-5k extensions) because the freshly allocated OS-assigned UDP port is
+// only known to the SBC via the SDP offer.
 func (ep *RtpEndpoint) SetRemoteRTPAddr(ip string, port int) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
@@ -120,13 +127,10 @@ func (ep *RtpEndpoint) SetRemoteRTPAddr(ip string, port int) {
 	ep.remotePort = port
 	ep.expectedSrc = &net.UDPAddr{IP: net.ParseIP(ip), Port: port}
 
-	ep.packetsReceived = 0
-	ep.pktsFromExpectedSrc = 0
-	ep.pktsFromOtherSrc = 0
-	ep.rtcpReceived = 0
-	ep.markersReceived = 0
-	ep.firstRecvTs = nil
-	ep.lastRecvTs = nil
+	if ep.pktsFromOtherSrc > 0 && ep.preSdpSourceIP == ip {
+		ep.pktsFromExpectedSrc += ep.pktsFromOtherSrc
+		ep.pktsFromOtherSrc = 0
+	}
 }
 
 // EnablePcap starts writing every TX/RX packet to a pcap file.
@@ -442,6 +446,10 @@ func (ep *RtpEndpoint) receiveLoop() {
 		latest := nowMs
 		ep.lastRecvTs = &latest
 		ep.packetsReceived++
+
+		if ep.expectedSrc == nil && ep.preSdpSourceIP == "" {
+			ep.preSdpSourceIP = addr.IP.String()
+		}
 
 		if ep.expectedSrc != nil && addr.IP.Equal(ep.expectedSrc.IP) && addr.Port == ep.expectedSrc.Port {
 			ep.pktsFromExpectedSrc++

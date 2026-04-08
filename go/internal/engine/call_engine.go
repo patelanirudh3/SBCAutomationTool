@@ -519,6 +519,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("BYE_200", 200, milestones.Bye200Ms, nil)
 
+	// Allow tail-end RTP packets to arrive after BYE completes.
+	if rtpEP != nil {
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	// ── Talk-path verification ─────────────────────────────────────
 	var (
 		rtpTx, rtpRx          int
