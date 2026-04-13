@@ -264,7 +264,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	}
 
 	// ── Wait for BYE ───────────────────────────────────────────────
-	holdTimeout := time.Duration(cfg.HoldTimeSeconds+60) * time.Second
+	holdTimeout := time.Duration(cfg.HoldTimeSeconds)*time.Second + uasSIPTimeout + 5*time.Second
 	rawBye, err := ag.WaitForSIPEvent(ctx, holdTimeout, "BYE")
 	if err != nil {
 		// Cancel RTP before handling timeout

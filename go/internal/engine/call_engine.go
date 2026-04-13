@@ -45,6 +45,7 @@ type CallEngine struct {
 	StopEvent chan struct{}
 
 	activeCalls   sync.Map // set of call_id → struct{}
+	busyExts      sync.Map // set of caller_ext (int) → struct{}; prevents overlapping INVITEs
 	activeCount   atomic.Int32
 	callsAttempted atomic.Int32
 	callsCompleted atomic.Int32
@@ -232,7 +233,15 @@ func (e *CallEngine) Run(ctx context.Context) error {
 			interval = fullInterval
 		}
 
-		caller, callee := e.nextPair()
+		caller, callee, free := e.nextFreePair()
+		if !free {
+			slog.Warn("All extensions busy — waiting for free pair",
+				"pool_size", cfg.UACExtCount(),
+				"active_calls", e.activeCount.Load(),
+			)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 		ag, ok := e.agents[fmt.Sprintf("%d", caller)]
 		if !ok {
 			slog.Error("No agent for extension", "ext", caller)
@@ -263,14 +272,22 @@ func (e *CallEngine) Run(ctx context.Context) error {
 	}
 }
 
-// nextPair returns the next (caller_ext, callee_ext) pair.  UAC and UAS pools
-// cycle independently — no 1:1 binding.
-func (e *CallEngine) nextPair() (caller, callee int) {
+// nextFreePair returns the next (caller_ext, callee_ext) pair whose caller is
+// not currently busy.  It advances the pool index past any busy extensions so
+// that pool wrap semantics are preserved.  When every extension is busy it
+// returns ok=false so the caller can apply back-pressure.
+func (e *CallEngine) nextFreePair() (caller, callee int, ok bool) {
 	cfg := e.config
-	caller = cfg.UACExtStart + (e.index % cfg.UACExtCount())
-	callee = cfg.UASExtStart + (e.index % cfg.UASExtCount())
-	e.index++
-	return
+	poolSize := cfg.UACExtCount()
+	for attempts := 0; attempts < poolSize; attempts++ {
+		caller = cfg.UACExtStart + (e.index % poolSize)
+		callee = cfg.UASExtStart + (e.index % cfg.UASExtCount())
+		e.index++
+		if _, busy := e.busyExts.Load(caller); !busy {
+			return caller, callee, true
+		}
+	}
+	return 0, 0, false
 }
 
 // executeCall runs a single UAC call through the full SIP+RTP sequence:
@@ -288,6 +305,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	inviteTsUTC := ""
 	cfg := e.config
 	added := false // tracks whether activeCount was incremented
+	callerExt := atoi(ag.Ext)
 
 	defer func() {
 		if rtpEP != nil {
@@ -297,6 +315,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.activeCalls.Delete(callID)
 			e.activeCount.Add(-1)
 		}
+		e.busyExts.Delete(callerExt)
 		ag.RemoveDialog(callID)
 	}()
 
@@ -345,6 +364,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	callID = dialog.CallID
 	e.activeCalls.Store(callID, struct{}{})
+	e.busyExts.Store(callerExt, struct{}{})
 	e.activeCount.Add(1)
 	added = true
 	if peak := e.activeCount.Load(); peak > e.peakActiveCalls {
@@ -429,6 +449,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		emit("PRACK_SENT", 0, milestones.PrackSentMs, nil)
 
 		if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK"); err != nil {
+			if cerr := ag.SendCancel(dialog); cerr != nil {
+				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
+			} else if e.metrics != nil {
+				e.metrics.IncrementSIPCounter("cancels_sent")
+			}
 			result := fail("prack_200 timeout")
 			e.complete(result)
 			return
@@ -440,6 +465,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
 	raw200, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE")
 	if err != nil {
+		if cerr := ag.SendCancel(dialog); cerr != nil {
+			slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
+		} else if e.metrics != nil {
+			e.metrics.IncrementSIPCounter("cancels_sent")
+		}
 		result := fail("200_invite timeout")
 		e.complete(result)
 		return
