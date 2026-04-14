@@ -273,12 +273,10 @@ func runLifecycle(
 		<-ctx.Done()
 	}
 
-	// Call spine correlation (UAC only, before shutdown)
-	if cfg.IsUAC() {
-		buildAndStoreSpines(cfg, collector)
-	}
-
-	// Graceful shutdown
+	// Graceful shutdown — this signals the UAS peer to stop and drains all
+	// active calls before returning.  Spine correlation is intentionally
+	// performed AFTER shutdown so that the UAS has had time to finalize and
+	// record its last completed call legs before the UAC fetches them.
 	collector.SetPhase("STOPPING")
 	collector.SetRunning(false)
 	slog.Info("Initiating graceful shutdown")
@@ -286,6 +284,13 @@ func runLifecycle(
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 	shutdownCleanup(shutdownCtx, agents, callEngine, uasEngine, collector, cfg, runID, pairID, noUnregister)
+
+	// Call spine correlation AFTER shutdown — UAS peer has been signaled to
+	// stop and all active call BYEs have been drained, so its results are
+	// fully flushed before we fetch them for correlation.
+	if cfg.IsUAC() {
+		buildAndStoreSpines(cfg, collector)
+	}
 
 	elapsed := time.Since(overallStart).Seconds()
 	snap := collector.Latest()

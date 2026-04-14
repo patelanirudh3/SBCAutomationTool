@@ -378,10 +378,21 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee})
 
+	// Pre-register a "200_INVITE" handler BEFORE the got180 loop.
+	// This closes the race window where the SBC sends 180 and 200 in rapid
+	// succession: if 200 arrives in the microsecond gap between the loop
+	// exiting and the next WaitForSIPEvent registering, it is buffered here
+	// and never silently dropped.
+	invite200Ch := ag.PreRegisterSIPEvent("200_INVITE")
+	defer ag.DeregisterSIPEvent(invite200Ch, "200_INVITE")
+
 	// ── Wait for provisional / 407 / final fail ────────────────────
 	got180 := false
 	for !got180 {
-		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407")
+		// Include "200_INVITE" so we exit cleanly if the SBC answers without
+		// a prior 180 (direct answer), and so invite200Ch is not the only
+		// channel capturing a simultaneous 200.
+		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407", "200_INVITE")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
@@ -419,9 +430,17 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			emit("RINGING_180", atoi(code), milestones.Ringing180Ms, map[string]any{"pdd_ms": pdd})
 			got180 = true
 
+		case code == "200_INVITE":
+			// 200 arrived before or without a 180 — treat as answered directly.
+			// invite200Ch also has this message buffered; DrainSIPEvent below
+			// will return it immediately without re-blocking.
+			milestones.Ringing180Ms = msSince(callStart)
+			emit("RINGING_180", 200, milestones.Ringing180Ms, map[string]any{"pdd_ms": 0})
+			got180 = true
+
 		case code == "407":
 			emit("AUTH_407", 407, 0, nil)
-			if err := ag.Handle407Invite(dialog, raw); err != nil {
+			if err := ag.Handle407Invite(dialog, raw, rtpPort); err != nil {
 				result := fail(fmt.Sprintf("407 handling: %v", err))
 				e.complete(result)
 				return
@@ -485,7 +504,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
-	raw200, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE")
+	// Use the pre-registered invite200Ch to drain the 200 OK.  If the 200
+	// arrived simultaneously with the 180 (or was processed in the loop
+	// above), it is already buffered and this returns immediately.
+	raw200, err := ag.DrainSIPEvent(ctx, invite200Ch, sipTimeout)
 	if err != nil {
 		if cerr := ag.SendCancel(dialog); cerr != nil {
 			slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
@@ -560,10 +582,24 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("BYE_SENT", 0, milestones.ByeSentMs, nil)
 
-	if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE"); err != nil {
+	byeResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE", "407_BYE")
+	if err != nil {
 		result := fail("bye_200 timeout")
 		e.complete(result)
 		return
+	}
+	if byeCode, _ := sip.ClassifyMessage(byeResp); byeCode == "407_BYE" {
+		emit("BYE_AUTH_407", 407, 0, nil)
+		if err := ag.Handle407Bye(dialog, byeResp); err != nil {
+			result := fail(fmt.Sprintf("bye_407_handling: %v", err))
+			e.complete(result)
+			return
+		}
+		if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE"); err != nil {
+			result := fail("bye_200 timeout after auth")
+			e.complete(result)
+			return
+		}
 	}
 	milestones.Bye200Ms = msSince(callStart)
 	if e.metrics != nil {

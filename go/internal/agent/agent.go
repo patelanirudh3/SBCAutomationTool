@@ -942,8 +942,48 @@ func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) erro
 	return a.Send(msg, "")
 }
 
+// Handle407Bye re-sends BYE with Proxy-Authorization after a 407 challenge.
+func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error {
+	challenge := sip.Parse407Challenge(raw407)
+	realm := challenge.Realm
+	if realm == "" {
+		realm = a.Config.Domain
+	}
+	cnonce := sip.GenCNonce()
+	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "BYE", cnonce, "00000001", "auth")
+
+	dialog.CSeq++
+	target := dialog.RemoteTarget
+	if target == "" {
+		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	}
+
+	msg := sip.NewSipMessage()
+	msg.SetRequestLine(fmt.Sprintf("BYE %s SIP/2.0", target))
+	msg.AddHeader(sip.HdrCallID, dialog.CallID)
+	if dialog.InviteMsg != nil {
+		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
+			msg.AddHeader(sip.HdrFrom, fh[0])
+		}
+	}
+	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>;tag=%s", dialog.RemoteExt, dialog.Domain, dialog.RemoteTag))
+	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+	msg.AddHeader(sip.HdrMaxForwards, "70")
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d BYE", dialog.CSeq))
+	for _, route := range dialog.RouteSet {
+		msg.AddHeader(sip.HdrRoute, route)
+	}
+	msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	msg.AddHeader(sip.HdrContentLength, "0")
+
+	return a.Send(msg, "")
+}
+
 // Handle407Invite re-sends INVITE with Proxy-Authorization after 407.
-func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string) error {
+// It first sends the mandatory ACK for the 407 (RFC 3261 §17.1.1.3) and then
+// retransmits the INVITE with the correct rtpPort in the SDP body.
+func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtpPort int) error {
 	challenge := sip.Parse407Challenge(raw407)
 	realm := challenge.Realm
 	if realm == "" {
@@ -954,16 +994,93 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string) err
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth")
 
 	if dialog.InviteMsg != nil {
+		// ACK must be sent BEFORE CSeq is incremented and Via is replaced,
+		// so that the ACK matches the original INVITE transaction exactly.
+		if err := a.sendAckFor407(dialog, raw407); err != nil {
+			slog.Warn("ACK for 407 INVITE failed (non-fatal)", "ext", a.Ext, "err", err)
+		}
+
 		dialog.CSeq++
 		dialog.InviteMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d INVITE", dialog.CSeq))
 		dialog.InviteMsg.RemoveHeader(sip.HdrProxyAuthorization)
 		dialog.InviteMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 		dialog.InviteMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
 
-		sdpBody := BuildSDP(a.localHost, 9) // default port
+		sdpBody := BuildSDP(a.localHost, rtpPort)
+		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
 		return a.Send(dialog.InviteMsg, sdpBody)
 	}
 	return nil
+}
+
+// sendAckFor407 sends ACK for a 407 Proxy Authentication Required to INVITE.
+// Per RFC 3261 §17.1.1.3 the ACK must reuse the original INVITE's Via branch,
+// the same CSeq sequence number (method changed to ACK), and the To header
+// must include the remote tag assigned by the proxy in the 407.
+// Must be called before dialog.CSeq is incremented or InviteMsg.Via is replaced.
+func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error {
+	parts := strings.SplitN(raw407, "\r\n\r\n", 2)
+	resp407 := sip.ParseHeaders(parts[0])
+
+	// The Via branch MUST equal the top Via of the original INVITE.
+	origVia := fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID())
+	if dialog.InviteMsg != nil {
+		if v := dialog.InviteMsg.GetHeader(sip.HdrVia); len(v) > 0 {
+			origVia = v[0]
+		}
+	}
+
+	ack := sip.NewSipMessage()
+	ack.SetRequestLine(fmt.Sprintf("ACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	ack.AddHeader(sip.HdrCallID, dialog.CallID)
+	if dialog.InviteMsg != nil {
+		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
+			ack.AddHeader(sip.HdrFrom, fh[0])
+		}
+	}
+	// To header must include the remote tag from the 407 response.
+	if toHdrs := resp407.GetHeader(sip.HdrTo); len(toHdrs) > 0 {
+		ack.AddHeader(sip.HdrTo, toHdrs[0])
+	} else {
+		toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, a.Config.Domain)
+		if dialog.RemoteTag != "" {
+			ack.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
+		} else {
+			ack.AddHeader(sip.HdrTo, toBase)
+		}
+	}
+	ack.AddHeader(sip.HdrVia, origVia)
+	ack.AddHeader(sip.HdrMaxForwards, "70")
+	ack.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d ACK", dialog.CSeq))
+	ack.AddHeader(sip.HdrContentLength, "0")
+
+	return a.Send(ack, "")
+}
+
+// PreRegisterSIPEvent registers a buffered channel for the given event codes
+// WITHOUT blocking. The caller must call DeregisterSIPEvent when done.
+// Use this to "pre-arm" a handler before a waiting loop so that a message
+// arriving in the gap between two WaitForSIPEvent calls is never dropped.
+func (a *ExtensionAgent) PreRegisterSIPEvent(codes ...string) chan string {
+	return a.waitForEvent(codes...)
+}
+
+// DeregisterSIPEvent removes a channel registered via PreRegisterSIPEvent.
+func (a *ExtensionAgent) DeregisterSIPEvent(ch chan string, codes ...string) {
+	a.deregisterCh(ch, codes...)
+}
+
+// DrainSIPEvent waits on a pre-registered channel for the next buffered or
+// incoming message, with an independent timeout.
+func (a *ExtensionAgent) DrainSIPEvent(ctx context.Context, ch chan string, timeout time.Duration) (string, error) {
+	tCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case raw := <-ch:
+		return raw, nil
+	case <-tCtx.Done():
+		return "", tCtx.Err()
+	}
 }
 
 // Internal helpers
