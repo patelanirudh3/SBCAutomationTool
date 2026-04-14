@@ -32,6 +32,9 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 				return "200_CANCEL", raw
 			}
 		}
+		if code == "407" && cseqMethod(raw) == "PRACK" {
+			return "407_PRACK", raw
+		}
 		return code, raw
 	}
 

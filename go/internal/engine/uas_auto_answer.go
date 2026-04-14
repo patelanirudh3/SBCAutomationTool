@@ -205,21 +205,23 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		rtpEP.SetRemoteRTPAddr(dialog.RTPRemoteIP, dialog.RTPRemotePort)
 	}
 
-	// ── Wait for PRACK ─────────────────────────────────────────────
-	rawPrack, err := ag.WaitForSIPEvent(ctx, timeout, "PRACK")
-	if err != nil {
-		u.handleTimeout(ag, dialog, callStart, callID, callerExt, rtpEP, milestones, uasInviteTsUTC)
-		return
-	}
-	milestones.PrackReceivedMs = msSince(callStart)
-	emit("UAS_PRACK_RECEIVED", 0, milestones.PrackReceivedMs, nil)
+	// ── Wait for PRACK (only when UAS advertised 100rel in its 180) ──
+	if dialog.IsReliable {
+		rawPrack, err := ag.WaitForSIPEvent(ctx, timeout, "PRACK")
+		if err != nil {
+			u.handleTimeout(ag, dialog, callStart, callID, callerExt, rtpEP, milestones, uasInviteTsUTC)
+			return
+		}
+		milestones.PrackReceivedMs = msSince(callStart)
+		emit("UAS_PRACK_RECEIVED", 0, milestones.PrackReceivedMs, nil)
 
-	if err := ag.HandlePrack(rawPrack, dialog); err != nil {
-		slog.Error("UAS handle PRACK failed", "ext", ag.Ext, "err", err)
-		return
+		if err := ag.HandlePrack(rawPrack, dialog); err != nil {
+			slog.Error("UAS handle PRACK failed", "ext", ag.Ext, "err", err)
+			return
+		}
+		milestones.Prack200SentMs = msSince(callStart)
+		emit("UAS_200_PRACK_SENT", 200, milestones.Prack200SentMs, nil)
 	}
-	milestones.Prack200SentMs = msSince(callStart)
-	emit("UAS_200_PRACK_SENT", 200, milestones.Prack200SentMs, nil)
 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
 	if err := ag.Send200Invite(dialog, rtpPort); err != nil {

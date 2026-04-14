@@ -448,7 +448,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		milestones.PrackSentMs = msSince(callStart)
 		emit("PRACK_SENT", 0, milestones.PrackSentMs, nil)
 
-		if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK"); err != nil {
+		rawPrackResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "407_PRACK")
+		if err != nil {
 			if cerr := ag.SendCancel(dialog); cerr != nil {
 				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
 			} else if e.metrics != nil {
@@ -458,6 +459,27 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.complete(result)
 			return
 		}
+
+		prackCode, _ := sip.ClassifyMessage(rawPrackResp)
+		if prackCode == "407_PRACK" {
+			emit("PRACK_AUTH_407", 407, 0, nil)
+			if err := ag.Handle407Prack(dialog, rawPrackResp); err != nil {
+				result := fail(fmt.Sprintf("prack_407_handling: %v", err))
+				e.complete(result)
+				return
+			}
+			if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK"); err != nil {
+				if cerr := ag.SendCancel(dialog); cerr != nil {
+					slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
+				} else if e.metrics != nil {
+					e.metrics.IncrementSIPCounter("cancels_sent")
+				}
+				result := fail("prack_200 timeout after auth")
+				e.complete(result)
+				return
+			}
+		}
+
 		milestones.Prack200Ms = msSince(callStart)
 		emit("PRACK_200", 200, milestones.Prack200Ms, nil)
 	}

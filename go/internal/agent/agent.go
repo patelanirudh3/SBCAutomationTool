@@ -474,7 +474,6 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, "1 INVITE")
-	msg.AddHeader(sip.HdrRequire, "100rel")
 	msg.AddHeader(sip.HdrSupported, "100rel")
 	msg.AddHeader(sip.HdrContentType, "application/sdp")
 	msg.AddHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
@@ -679,7 +678,7 @@ func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, erro
 		CSeq:      cseq,
 		State:     "INVITE_RCVD",
 		InviteMsg: invite,
-		IsReliable: true,
+		IsReliable: false,
 	}
 
 	a.mu.Lock()
@@ -697,10 +696,8 @@ func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, erro
 	// 100 Trying
 	a.sendProvisional(invite, "100", "Trying", localTag, false, 0)
 
-	// 180 Ringing
-	rseq := int(sip.GenRSeq())
-	dialog.RSeq = rseq
-	a.sendProvisional(invite, "180", "Ringing", localTag, true, rseq)
+	// 180 Ringing — no 100rel; omit RSeq/Require so the SBC does not need to PRACK us
+	a.sendProvisional(invite, "180", "Ringing", localTag, true, 0)
 	dialog.State = "PROVRESP_SENT"
 
 	return dialog, nil
@@ -902,6 +899,47 @@ func (a *ExtensionAgent) DeregisterWildcardListener(ch chan WildcardEvent) {
 			break
 		}
 	}
+}
+
+// Handle407Prack re-sends PRACK with Proxy-Authorization after a 407 challenge.
+// After SendPrack, dialog.CSeq was incremented once; so the INVITE CSeq used in
+// the original RAck is dialog.CSeq-1. The retry gets a new CSeq (dialog.CSeq++).
+func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) error {
+	challenge := sip.Parse407Challenge(raw407)
+	realm := challenge.Realm
+	if realm == "" {
+		realm = a.Config.Domain
+	}
+	cnonce := sip.GenCNonce()
+	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, "00000001", "auth")
+
+	rackValue := fmt.Sprintf("%d %d INVITE", dialog.RSeq, dialog.CSeq-1)
+	dialog.CSeq++
+
+	msg := sip.NewSipMessage()
+	msg.SetRequestLine(fmt.Sprintf("PRACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	msg.AddHeader(sip.HdrCallID, dialog.CallID)
+	if dialog.InviteMsg != nil {
+		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
+			msg.AddHeader(sip.HdrFrom, fh[0])
+		}
+	}
+	toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, a.Config.Domain)
+	if dialog.RemoteTag != "" {
+		msg.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
+	} else {
+		msg.AddHeader(sip.HdrTo, toBase)
+	}
+	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d>", a.Ext, a.localHost, a.localPort))
+	msg.AddHeader(sip.HdrMaxForwards, "70")
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d PRACK", dialog.CSeq))
+	msg.AddHeader(sip.HdrRAck, rackValue)
+	msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	msg.AddHeader(sip.HdrContentLength, "0")
+
+	return a.Send(msg, "")
 }
 
 // Handle407Invite re-sends INVITE with Proxy-Authorization after 407.
