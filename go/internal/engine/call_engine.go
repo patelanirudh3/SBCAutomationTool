@@ -323,17 +323,61 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		emitCallEvent(e.metrics, callID, ag.Ext, event, "uac", callee, sipCode, ms, extra)
 	}
 
+	// Pre-declared so the fail closure can read dialog.RTPRemoteIP/Port even on
+	// failure paths that occur after the 200 OK has been parsed (e.g. BYE
+	// timeout).  The `:=` assignment below re-assigns this variable.
+	var dialog *agent.DialogState
+
 	fail := func(reason string) CallResult {
 		e.callsFailed.Add(1)
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
+
+		// Collect RTP stats even on failure so the call table shows correct
+		// packet counts when the call was torn down mid-flight (e.g. BYE 407
+		// timeout after RTP has been running for the full hold time).
+		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv int
+		var mediaOK bool
+		if rtpEP != nil {
+			st := rtpEP.Stats()
+			rtpTx = rtpEP.TxPkts()
+			rtpRx = st.RTPRxPkts
+			rtpRxFromSBC = st.RTPRxFromSBC
+			rtpRxOt = st.RTPRxOther
+			rtcpRx = st.RTCPRxPkts
+			markersSent = rtpEP.MarkersSent()
+			markersRecv = st.MarkersReceived
+			mediaOK = rtpRx > 0
+		}
+		sbcRelayIP, sbcRelayPort := "", 0
+		if dialog != nil {
+			sbcRelayIP = dialog.RTPRemoteIP
+			sbcRelayPort = dialog.RTPRemotePort
+		}
+
 		return CallResult{
-			CallID: callID, Caller: ag.Ext, Callee: callee,
-			Success: false, FailureReason: reason,
-			TotalMs:       msSince(callStart),
-			RTPLocalPort:  rtpLocalPort(rtpEP),
-			PoolWrapIndex: poolWrapIndex,
-			PeerExt: callee, TsUTC: inviteTsUTC, Direction: "uac",
-			SipMilestones: milestones,
+			CallID:           callID,
+			Caller:           ag.Ext,
+			Callee:           callee,
+			Success:          false,
+			FailureReason:    reason,
+			TotalMs:          msSince(callStart),
+			RTPLocalPort:     rtpLocalPort(rtpEP),
+			RTPTxPkts:        rtpTx,
+			RTPRxPkts:        rtpRx,
+			MediaVerified:    mediaOK,
+			RTPRxFromSBCPkts: rtpRxFromSBC,
+			RTPRxOtherPkts:   rtpRxOt,
+			RTCPRxPkts:       rtcpRx,
+			MarkersSent:      markersSent,
+			MarkersReceived:  markersRecv,
+			SBCRTPRelayIP:    sbcRelayIP,
+			SBCRTPRelayPort:  sbcRelayPort,
+			RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+			PoolWrapIndex:    poolWrapIndex,
+			PeerExt:          callee,
+			TsUTC:            inviteTsUTC,
+			Direction:        "uac",
+			SipMilestones:    milestones,
 		}
 	}
 
