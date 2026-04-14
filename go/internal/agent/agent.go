@@ -355,7 +355,8 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 	}
 }
 
-// Subscribe performs the SUBSCRIBE flow with 407 handling.
+// Subscribe performs the SUBSCRIBE flow handling both 407 (Proxy-Auth) and
+// 401 (WWW-Auth) challenges. Avaya Session Manager issues 401 for SUBSCRIBE.
 func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
@@ -377,9 +378,11 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	msg.AddHeader(sip.HdrSupported, "100rel")
 
 	ch407 := a.waitForEvent("407")
+	ch401 := a.waitForEvent("401")
 	ch200 := a.waitForEvent("200")
 	ch202 := a.waitForEvent("202")
 	defer a.deregisterCh(ch407, "407")
+	defer a.deregisterCh(ch401, "401")
 	defer a.deregisterCh(ch200, "200")
 	defer a.deregisterCh(ch202, "202")
 
@@ -390,27 +393,53 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
 	defer cancel()
 
-	select {
-	case raw407 := <-ch407:
-		challenge := sip.Parse407Challenge(raw407)
-		realm := challenge.Realm
+	// sendAuthRetry builds a re-SUBSCRIBE with the appropriate auth header.
+	// use401=true → WWW-Authenticate challenge → Authorization header (SM/401)
+	// use401=false → Proxy-Authenticate challenge → Proxy-Authorization header (SBC/407)
+	sendAuthRetry := func(rawChallenge string, use401 bool) error {
+		var realm, nonce string
+		if use401 {
+			ch := sip.Parse401Challenge(rawChallenge)
+			realm, nonce = ch.Realm, ch.Nonce
+		} else {
+			ch := sip.Parse407Challenge(rawChallenge)
+			realm, nonce = ch.Realm, ch.Nonce
+		}
 		if realm == "" {
 			realm = a.Config.Domain
 		}
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth")
 
 		cseq++
 		retryMsg := sip.CloneSipMessage(msg)
 		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
 		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", cseq))
-		retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+		if use401 {
+			retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
+		} else {
+			retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+		}
+		return a.Send(retryMsg, "")
+	}
 
-		if err := a.Send(retryMsg, ""); err != nil {
+	select {
+	case raw407 := <-ch407:
+		if err := sendAuthRetry(raw407, false); err != nil {
 			return err
 		}
+		select {
+		case <-ch200:
+		case <-ch202:
+		case <-tCtx.Done():
+			return tCtx.Err()
+		}
 
+	case raw401 := <-ch401:
+		if err := sendAuthRetry(raw401, true); err != nil {
+			return err
+		}
 		select {
 		case <-ch200:
 		case <-ch202:
