@@ -386,18 +386,54 @@ func (u *UasAutoAnswer) handleTimeout(
 		ag.RegisterZombie(dialog, 120*time.Second)
 	}
 
+	var (
+		rtpTx, rtpRx          int
+		rtpRxFromSBC, rtpRxOt int
+		rtcpRx                int
+		markersSent           int
+		markersRecv           int
+		mediaOK               bool
+	)
+	if rtpEP != nil {
+		st := rtpEP.Stats()
+		rtpTx = rtpEP.TxPkts()
+		rtpRx = st.RTPRxPkts
+		rtpRxFromSBC = st.RTPRxFromSBC
+		rtpRxOt = st.RTPRxOther
+		rtcpRx = st.RTCPRxPkts
+		markersSent = rtpEP.MarkersSent()
+		markersRecv = st.MarkersReceived
+		mediaOK = rtpRx > 0
+	}
+	sbcRelayIP, sbcRelayPort := "", 0
+	if dialog != nil {
+		sbcRelayIP = dialog.RTPRemoteIP
+		sbcRelayPort = dialog.RTPRemotePort
+	}
+
 	result := CallResult{
-		CallID:        callID,
-		Caller:        callerOrRemote(callerExt),
-		Callee:        ag.Ext,
-		Success:       false,
-		FailureReason: "timeout",
-		TotalMs:       msSince(callStart),
-		RTPLocalPort:  rtpLocalPort(rtpEP),
-		PeerExt:       callerExt,
-		TsUTC:         uasInviteTsUTC,
-		Direction:     "uas",
-		SipMilestones: milestones,
+		CallID:           callID,
+		Caller:           callerOrRemote(callerExt),
+		Callee:           ag.Ext,
+		Success:          false,
+		FailureReason:    "timeout",
+		TotalMs:          msSince(callStart),
+		RTPLocalPort:     rtpLocalPort(rtpEP),
+		RTPTxPkts:        rtpTx,
+		RTPRxPkts:        rtpRx,
+		MediaVerified:    mediaOK,
+		RTPRxFromSBCPkts: rtpRxFromSBC,
+		RTPRxOtherPkts:   rtpRxOt,
+		RTCPRxPkts:       rtcpRx,
+		MarkersSent:      markersSent,
+		MarkersReceived:  markersRecv,
+		SBCRTPRelayIP:    sbcRelayIP,
+		SBCRTPRelayPort:  sbcRelayPort,
+		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+		PeerExt:          callerExt,
+		TsUTC:            uasInviteTsUTC,
+		Direction:        "uas",
+		SipMilestones:    milestones,
 	}
 	u.complete(result)
 }
