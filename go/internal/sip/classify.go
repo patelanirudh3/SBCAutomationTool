@@ -1,6 +1,9 @@
 package sip
 
-import "strings"
+import (
+	"log/slog"
+	"strings"
+)
 
 // ClassifyMessage determines the SIP event code from a raw message.
 //
@@ -19,32 +22,61 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 		if len(parts) > 1 {
 			code = parts[1]
 		}
+		method := cseqMethod(raw)
 		if code == "200" {
-			method := cseqMethod(raw)
 			switch method {
 			case "PRACK":
+				slog.Debug("ClassifyMessage", "eventCode", "200_PRACK", "code", code, "method", method)
 				return "200_PRACK", raw
 			case "INVITE":
+				slog.Debug("ClassifyMessage", "eventCode", "200_INVITE", "code", code, "method", method)
 				return "200_INVITE", raw
 			case "BYE":
+				slog.Debug("ClassifyMessage", "eventCode", "200_BYE", "code", code, "method", method)
 				return "200_BYE", raw
 			case "CANCEL":
+				slog.Debug("ClassifyMessage", "eventCode", "200_CANCEL", "code", code, "method", method)
 				return "200_CANCEL", raw
 			}
 		}
 		if code == "407" {
-			switch cseqMethod(raw) {
+			switch method {
 			case "PRACK":
+				slog.Debug("ClassifyMessage", "eventCode", "407_PRACK", "code", code, "method", method)
 				return "407_PRACK", raw
 			case "BYE":
+				slog.Debug("ClassifyMessage", "eventCode", "407_BYE", "code", code, "method", method)
 				return "407_BYE", raw
 			}
 		}
-		return code, raw
+		ec := code
+		if ec == "" || firstLine == "" {
+			slog.Warn("ClassifyMessage: unexpected empty classification",
+				"eventCode", ec, "code", code, "method", method,
+				"firstLine", firstLine, "rawLen", len(raw),
+				"rawHead", truncHead(raw, 120))
+		} else {
+			slog.Debug("ClassifyMessage", "eventCode", ec, "code", code, "method", method)
+		}
+		return ec, raw
 	}
 
 	method := strings.SplitN(firstLine, " ", 2)[0]
+	if method == "" {
+		slog.Warn("ClassifyMessage: empty method from request line",
+			"firstLine", firstLine, "rawLen", len(raw),
+			"rawHead", truncHead(raw, 120))
+	} else {
+		slog.Debug("ClassifyMessage", "eventCode", method, "method", method)
+	}
 	return method, raw
+}
+
+func truncHead(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // cseqMethod extracts the method token from the CSeq header

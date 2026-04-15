@@ -267,6 +267,9 @@ func (t *TCPTransport) readLoop() {
 				break
 			}
 			buf = buf[consumed:]
+			if msg == "" {
+				continue
+			}
 			select {
 			case t.recvCh <- msg:
 			default:
@@ -337,6 +340,20 @@ var crlfcrlfBytes = []byte(CRLFCRLF)
 // It returns the decoded message string and the number of bytes consumed.
 // If the buffer does not yet contain a complete message, consumed is 0.
 func extractSIPMessage(buf []byte) (msg string, consumed int) {
+	// RFC 3261 §7.5: ignore any CRLF appearing before the start-line
+	// on stream-oriented transports.
+	skip := 0
+	for skip+1 < len(buf) && buf[skip] == '\r' && buf[skip+1] == '\n' {
+		skip += 2
+	}
+	if skip > 0 {
+		slog.Debug("extractSIPMessage: stripped leading CRLF", "bytes", skip, "bufRemaining", len(buf)-skip)
+		buf = buf[skip:]
+	}
+	if len(buf) == 0 {
+		return "", skip
+	}
+
 	sepIdx := bytes.Index(buf, crlfcrlfBytes)
 	if sepIdx < 0 {
 		return "", 0
@@ -363,7 +380,7 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 		return "", 0
 	}
 
-	return string(buf[:totalNeeded]), totalNeeded
+	return string(buf[:totalNeeded]), skip + totalNeeded
 }
 
 // ---------------------------------------------------------------------------

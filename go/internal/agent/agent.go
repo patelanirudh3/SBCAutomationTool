@@ -1115,6 +1115,11 @@ func (a *ExtensionAgent) dispatchLoop() {
 					a.earlyResponses = a.earlyResponses[1:]
 				}
 				a.earlyResponses = append(a.earlyResponses, earlyResponse{code: eventCode, raw: raw})
+				slog.Debug("dispatchLoop: no handler, buffered as earlyResponse",
+					"ext", a.Ext, "eventCode", eventCode, "earlyBufLen", len(a.earlyResponses))
+			} else {
+				slog.Debug("dispatchLoop: dispatching to handler",
+					"ext", a.Ext, "eventCode", eventCode, "handlers", len(queues))
 			}
 			wcs := make([]chan WildcardEvent, len(a.wildcards))
 			copy(wcs, a.wildcards)
