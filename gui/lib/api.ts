@@ -178,13 +178,25 @@ export async function getCallsFor(
 
 export async function getCallSpinesFor(
   ip: string,
-  port: number
+  port: number,
+  retries = 2,
+  delayMs = 2000
 ): Promise<Record<string, unknown>[]> {
-  try {
-    const res = await fetch(`http://${ip}:${port}/api/call-spines`)
-    if (!res.ok) return []
-    return (await res.json()) as Record<string, unknown>[]
-  } catch { return [] }
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`http://${ip}:${port}/api/call-spines`)
+      if (!res.ok) return []
+      const spines = (await res.json()) as Record<string, unknown>[]
+      if (spines.length > 0) return spines
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, delayMs))
+      }
+    } catch {
+      if (attempt >= retries) return []
+      await new Promise((r) => setTimeout(r, delayMs))
+    }
+  }
+  return []
 }
 
 // ---------------------------------------------------------------------------

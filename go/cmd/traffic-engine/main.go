@@ -205,6 +205,7 @@ func runLifecycle(
 	if err != nil {
 		slog.Error("Pre-phase failed", "err", err)
 		shutdownCleanup(ctx, agents, nil, nil, collector, cfg, runID, pairID, noUnregister)
+		collector.SetPhase("DONE")
 		return 1
 	}
 	collector.UpdateCounts(0, len(agents), preResult.Registered, preResult.Subscribed)
@@ -214,6 +215,7 @@ func runLifecycle(
 		collector.SetPhase("READY_PRE_PHASE_ONLY")
 		<-ctx.Done()
 		shutdownCleanup(ctx, agents, nil, nil, collector, cfg, runID, pairID, noUnregister)
+		collector.SetPhase("DONE")
 		return 0
 	}
 
@@ -306,6 +308,11 @@ func runLifecycle(
 
 	// Write run-*.json
 	writeRunJSON(collector, cfg, runID, pairID, logDir)
+
+	// All post-run data (spines, run JSON, summaries) is now materialized.
+	// Only NOW advertise DONE so the GUI never fetches stale/empty data.
+	collector.SetPhase("DONE")
+	slog.Info("Phase set to DONE — all post-run data ready for GUI")
 
 	// GUI drain
 	if guiDrainSeconds > 0 {
@@ -418,8 +425,6 @@ func shutdownCleanup(
 	for _, ag := range agents {
 		ag.Close()
 	}
-
-	collector.SetPhase("DONE")
 
 	// Final metrics flush + log (matches Python step 6)
 	snap := collector.Latest()
