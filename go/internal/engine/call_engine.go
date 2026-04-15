@@ -298,6 +298,8 @@ func (e *CallEngine) nextFreePair() (caller, callee int, ok bool) {
 // It handles 407 re-INVITE with auth, final failure codes (4xx/5xx/6xx → ACK + fail),
 // timeouts (→ CANCEL), and RTP allocation failures (degrade to port 9).
 func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, callee string, poolWrapIndex int) {
+	ag.ClearEarlyResponses()
+
 	callStart := time.Now()
 	callID := "pending"
 	var rtpEP *rtp.RtpEndpoint
@@ -422,20 +424,13 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee})
 
-	// Pre-register a "200_INVITE" handler BEFORE the got180 loop.
-	// This closes the race window where the SBC sends 180 and 200 in rapid
-	// succession: if 200 arrives in the microsecond gap between the loop
-	// exiting and the next WaitForSIPEvent registering, it is buffered here
-	// and never silently dropped.
-	invite200Ch := ag.PreRegisterSIPEvent("200_INVITE")
-	defer ag.DeregisterSIPEvent(invite200Ch, "200_INVITE")
-
 	// ── Wait for provisional / 407 / final fail ────────────────────
+	// The earlyResponse buffer in the agent guarantees that a 200_INVITE
+	// arriving between loop iterations (or between loop exit and the explicit
+	// WaitForSIPEvent below) is never silently dropped.
+	var raw200 string
 	got180 := false
 	for !got180 {
-		// Include "200_INVITE" so we exit cleanly if the SBC answers without
-		// a prior 180 (direct answer), and so invite200Ch is not the only
-		// channel capturing a simultaneous 200.
 		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407", "200_INVITE")
 		if err != nil {
 			e.callsFailed.Add(1)
@@ -475,11 +470,9 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			got180 = true
 
 		case code == "200_INVITE":
-			// 200 arrived before or without a 180 — treat as answered directly.
-			// invite200Ch also has this message buffered; DrainSIPEvent below
-			// will return it immediately without re-blocking.
 			milestones.Ringing180Ms = msSince(callStart)
 			emit("RINGING_180", 200, milestones.Ringing180Ms, map[string]any{"pdd_ms": 0})
+			raw200 = raw
 			got180 = true
 
 		case code == "407":
@@ -548,19 +541,23 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
-	// Use the pre-registered invite200Ch to drain the 200 OK.  If the 200
-	// arrived simultaneously with the 180 (or was processed in the loop
-	// above), it is already buffered and this returns immediately.
-	raw200, err := ag.DrainSIPEvent(ctx, invite200Ch, sipTimeout)
-	if err != nil {
-		if cerr := ag.SendCancel(dialog); cerr != nil {
-			slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
-		} else if e.metrics != nil {
-			e.metrics.IncrementSIPCounter("cancels_sent")
+	// If the 200 arrived inside the provisional loop (direct answer without
+	// 180), raw200 is already populated.  Otherwise, wait for it now — the
+	// earlyResponse buffer guarantees we pick it up even if it arrived
+	// between loop exit and this call.
+	if raw200 == "" {
+		var err error
+		raw200, err = ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE")
+		if err != nil {
+			if cerr := ag.SendCancel(dialog); cerr != nil {
+				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
+			} else if e.metrics != nil {
+				e.metrics.IncrementSIPCounter("cancels_sent")
+			}
+			result := fail("200_invite timeout")
+			e.complete(result)
+			return
 		}
-		result := fail("200_invite timeout")
-		e.complete(result)
-		return
 	}
 	ag.Parse200Invite(raw200, dialog)
 	milestones.Ok200Ms = msSince(callStart)

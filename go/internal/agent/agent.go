@@ -47,6 +47,18 @@ type WildcardEvent struct {
 	RawMsg    string
 }
 
+// earlyResponse holds a SIP message that arrived before any handler was
+// registered for its event code.  The dispatch loop buffers these so that a
+// subsequent WaitForSIPEvent can retrieve them without a timing race.
+type earlyResponse struct {
+	code string
+	raw  string
+}
+
+// maxEarlyResponses caps the buffer.  Each agent handles one call at a time,
+// so in practice the buffer holds 0-1 entries.  16 is generous headroom.
+const maxEarlyResponses = 16
+
 // ExtensionAgent manages one SIP extension.
 type ExtensionAgent struct {
 	Ext    string
@@ -65,9 +77,10 @@ type ExtensionAgent struct {
 	ZombieDialogs map[string]*DialogState
 	mu            sync.RWMutex
 
-	handlers  map[string][]chan string
-	wildcards []chan WildcardEvent
-	handlerMu sync.Mutex
+	handlers       map[string][]chan string
+	wildcards      []chan WildcardEvent
+	earlyResponses []earlyResponse
+	handlerMu      sync.Mutex
 
 	closed atomic.Bool
 
@@ -1057,31 +1070,6 @@ func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error
 	return a.Send(ack, "")
 }
 
-// PreRegisterSIPEvent registers a buffered channel for the given event codes
-// WITHOUT blocking. The caller must call DeregisterSIPEvent when done.
-// Use this to "pre-arm" a handler before a waiting loop so that a message
-// arriving in the gap between two WaitForSIPEvent calls is never dropped.
-func (a *ExtensionAgent) PreRegisterSIPEvent(codes ...string) chan string {
-	return a.waitForEvent(codes...)
-}
-
-// DeregisterSIPEvent removes a channel registered via PreRegisterSIPEvent.
-func (a *ExtensionAgent) DeregisterSIPEvent(ch chan string, codes ...string) {
-	a.deregisterCh(ch, codes...)
-}
-
-// DrainSIPEvent waits on a pre-registered channel for the next buffered or
-// incoming message, with an independent timeout.
-func (a *ExtensionAgent) DrainSIPEvent(ctx context.Context, ch chan string, timeout time.Duration) (string, error) {
-	tCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	select {
-	case raw := <-ch:
-		return raw, nil
-	case <-tCtx.Done():
-		return "", tCtx.Err()
-	}
-}
 
 // Internal helpers
 
@@ -1122,6 +1110,12 @@ func (a *ExtensionAgent) dispatchLoop() {
 			a.handlerMu.Lock()
 			queues := make([]chan string, len(a.handlers[eventCode]))
 			copy(queues, a.handlers[eventCode])
+			if len(queues) == 0 {
+				if len(a.earlyResponses) >= maxEarlyResponses {
+					a.earlyResponses = a.earlyResponses[1:]
+				}
+				a.earlyResponses = append(a.earlyResponses, earlyResponse{code: eventCode, raw: raw})
+			}
 			wcs := make([]chan WildcardEvent, len(a.wildcards))
 			copy(wcs, a.wildcards)
 			a.handlerMu.Unlock()
@@ -1233,11 +1227,23 @@ func hasToTag(raw string) bool {
 	return false
 }
 
-// RemoveDialog removes a dialog from the active set by call ID.
+// RemoveDialog removes a dialog from the active set by call ID and drains the
+// early-response buffer so stale messages from the finished call cannot leak
+// into the next call on the same agent.
 func (a *ExtensionAgent) RemoveDialog(callID string) {
 	a.mu.Lock()
 	delete(a.ActiveDialogs, callID)
 	a.mu.Unlock()
+	a.ClearEarlyResponses()
+}
+
+// ClearEarlyResponses discards all buffered early responses.
+// Called automatically by RemoveDialog; also available for callers that need
+// an explicit reset (e.g. at the very start of a new call).
+func (a *ExtensionAgent) ClearEarlyResponses() {
+	a.handlerMu.Lock()
+	a.earlyResponses = a.earlyResponses[:0]
+	a.handlerMu.Unlock()
 }
 
 // RegisterZombie moves a dialog to the zombie set for the given TTL.
@@ -1254,10 +1260,30 @@ func (a *ExtensionAgent) RegisterZombie(dialog *DialogState, ttl time.Duration) 
 	}()
 }
 
-// WaitForSIPEvent waits for one of the specified SIP event codes with a separate
-// timeout (independent of the parent context).
+// WaitForSIPEvent waits for one of the specified SIP event codes with a
+// separate timeout (independent of the parent context).
+//
+// Before blocking it scans the earlyResponses buffer for a match, consuming
+// and returning the first hit.  This eliminates the "send then wait" race:
+// if a response arrived before the caller registered a handler, the dispatch
+// loop already buffered it and this call retrieves it instantly.
 func (a *ExtensionAgent) WaitForSIPEvent(ctx context.Context, timeout time.Duration, codes ...string) (string, error) {
-	ch := a.waitForEvent(codes...)
+	a.handlerMu.Lock()
+	for i, msg := range a.earlyResponses {
+		for _, code := range codes {
+			if msg.code == code {
+				a.earlyResponses = append(a.earlyResponses[:i], a.earlyResponses[i+1:]...)
+				a.handlerMu.Unlock()
+				return msg.raw, nil
+			}
+		}
+	}
+	ch := make(chan string, 1)
+	for _, code := range codes {
+		a.handlers[code] = append(a.handlers[code], ch)
+	}
+	a.handlerMu.Unlock()
+
 	defer a.deregisterCh(ch, codes...)
 	tCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

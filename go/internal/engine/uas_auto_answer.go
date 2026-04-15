@@ -129,6 +129,8 @@ func (u *UasAutoAnswer) uasLoop(ctx context.Context, ag *agent.ExtensionAgent) {
 
 // handleCall runs the full UAS SIP+RTP sequence for one inbound call.
 func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent, rawInvite string) {
+	ag.ClearEarlyResponses()
+
 	callStart := time.Now()
 	callID := "pending"
 	timeout := uasSIPTimeout
