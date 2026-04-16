@@ -61,14 +61,17 @@ func ParseDigestChallenge(headerValue string) DigestChallenge {
 //	HA1 = MD5(username:realm:password)
 //	HA2 = MD5(method:uri)
 //	response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-func CalcDigestResponse(username, password, realm, nonce, uri, method, cnonce, nc, qop string) string {
+//
+// [FIX-4] opaque is echoed back from the challenge per RFC 2617 §3.2.2.
+// Revert FIX-4: replace opaque parameter with hardcoded "" in format string.
+func CalcDigestResponse(username, password, realm, nonce, uri, method, cnonce, nc, qop, opaque string) string {
 	ha1 := md5Hex(fmt.Sprintf("%s:%s:%s", username, realm, password))
 	ha2 := md5Hex(fmt.Sprintf("%s:%s", method, uri))
 	response := md5Hex(fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, nonce, nc, cnonce, qop, ha2))
 
 	return fmt.Sprintf(
-		`Digest realm="%s",nonce="%s",uri="%s",opaque="",qop=%s,response="%s",username="%s",cnonce="%s",nc=%s`,
-		realm, nonce, uri, qop, response, username, cnonce, nc,
+		`Digest realm="%s",nonce="%s",uri="%s",opaque="%s",qop=%s,response="%s",username="%s",cnonce="%s",nc=%s`,
+		realm, nonce, uri, opaque, qop, response, username, cnonce, nc,
 	)
 }
 

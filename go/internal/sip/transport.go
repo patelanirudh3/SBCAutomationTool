@@ -336,6 +336,44 @@ func (t *TCPTransport) reconnect() {
 
 var crlfcrlfBytes = []byte(CRLFCRLF)
 
+// [FIX-1] sipResponsePrefix and sipMethods validate that a buffer position
+// contains a legitimate SIP start-line (response or request).
+// Revert FIX-1: remove these vars, looksLikeSIPStart, findSIPBoundary,
+// and the resync block inside extractSIPMessage.
+var sipResponsePrefix = []byte("SIP/2.0 ")
+var sipMethods = [][]byte{
+	[]byte("INVITE "), []byte("ACK "), []byte("BYE "),
+	[]byte("CANCEL "), []byte("REGISTER "), []byte("OPTIONS "),
+	[]byte("PRACK "), []byte("SUBSCRIBE "), []byte("NOTIFY "),
+	[]byte("UPDATE "), []byte("REFER "), []byte("INFO "),
+	[]byte("MESSAGE "), []byte("PUBLISH "),
+}
+
+// [FIX-1] looksLikeSIPStart returns true if data begins with a valid SIP
+// start-line — either a response ("SIP/2.0 ") or a known request method.
+func looksLikeSIPStart(data []byte) bool {
+	if bytes.HasPrefix(data, sipResponsePrefix) {
+		return true
+	}
+	for _, m := range sipMethods {
+		if bytes.HasPrefix(data, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// [FIX-1] findSIPBoundary scans forward through data to find the byte offset
+// where a valid SIP start-line begins. Returns -1 if none found.
+func findSIPBoundary(data []byte) int {
+	for i := 1; i < len(data); i++ {
+		if looksLikeSIPStart(data[i:]) {
+			return i
+		}
+	}
+	return -1
+}
+
 // extractSIPMessage tries to pull one complete SIP message from buf.
 // It returns the decoded message string and the number of bytes consumed.
 // If the buffer does not yet contain a complete message, consumed is 0.
@@ -352,6 +390,22 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	}
 	if len(buf) == 0 {
 		return "", skip
+	}
+
+	// [FIX-1] TCP Framing Recovery: if the buffer does not start with a
+	// valid SIP start-line, scan forward to find the next one and discard
+	// the leading garbage bytes. This recovers from Content-Length mismatches
+	// introduced by upstream elements (e.g. SBC rewriting SDP without
+	// adjusting Content-Length).
+	if !looksLikeSIPStart(buf) {
+		boundary := findSIPBoundary(buf)
+		if boundary < 0 {
+			return "", 0
+		}
+		slog.Warn("extractSIPMessage: discarded non-SIP garbage before valid start-line",
+			"garbage_bytes", boundary, "garbage", string(buf[:boundary]))
+		buf = buf[boundary:]
+		skip += boundary
 	}
 
 	sepIdx := bytes.Index(buf, crlfcrlfBytes)

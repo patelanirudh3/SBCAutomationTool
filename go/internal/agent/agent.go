@@ -39,6 +39,17 @@ type DialogState struct {
 	ProvMsg       *sip.SipMessage
 	RTPRemoteIP   string
 	RTPRemotePort int
+
+	// [FIX-2] Proactive Auth: after the first INVITE 407 challenge is handled,
+	// these fields store the digest credentials so that every subsequent
+	// in-dialog request (PRACK, ACK, BYE) includes Proxy-Authorization
+	// proactively, eliminating the need for a separate 407 round-trip.
+	// Revert FIX-2: remove these four fields, buildProxyAuth helper, and
+	// the proactive-auth blocks in SendPrack, SendAck, SendBye.
+	ProxyAuthEnabled bool
+	AuthNonce        string
+	AuthRealm        string
+	AuthOpaque       string
 }
 
 // WildcardEvent is delivered to wildcard listeners.
@@ -90,6 +101,7 @@ type ExtensionAgent struct {
 	regContactHdr  string
 	regNonce       string
 	regRealm       string
+	regOpaque      string // [FIX-4] echo opaque from 401 challenge
 	regCSeq        int
 }
 
@@ -198,13 +210,14 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 		challenge := sip.Parse401Challenge(raw401)
 		a.regNonce = challenge.Nonce
 		a.regRealm = challenge.Realm
+		a.regOpaque = challenge.Opaque // [FIX-4]
 		if a.regRealm == "" {
 			a.regRealm = a.Config.Domain
 		}
 
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
 
 		a.regCSeq = 2
 		authMsg := sip.CloneSipMessage(msg)
@@ -256,7 +269,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 	if a.regNonce != "" {
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
@@ -279,6 +292,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 	case raw401 := <-ch401:
 		challenge := sip.Parse401Challenge(raw401)
 		a.regNonce = challenge.Nonce
+		a.regOpaque = challenge.Opaque // [FIX-4]
 		if challenge.Realm != "" {
 			a.regRealm = challenge.Realm
 		}
@@ -288,7 +302,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
 		retryMsg.RemoveHeader(sip.HdrAuthorization)
 		retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
 		if err := a.Send(retryMsg, ""); err != nil {
@@ -350,7 +364,7 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 		if realm == "" {
 			realm = a.Config.Domain
 		}
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "REGISTER", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "REGISTER", cnonce, "00000001", "auth", challenge.Opaque)
 		authMsg := sip.CloneSipMessage(msg)
 		authMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
 		authMsg.ReplaceHeader(sip.HdrCSeq, "2 REGISTER")
@@ -410,20 +424,20 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	// use401=true → WWW-Authenticate challenge → Authorization header (SM/401)
 	// use401=false → Proxy-Authenticate challenge → Proxy-Authorization header (SBC/407)
 	sendAuthRetry := func(rawChallenge string, use401 bool) error {
-		var realm, nonce string
+		var realm, nonce, opaque string
 		if use401 {
 			ch := sip.Parse401Challenge(rawChallenge)
-			realm, nonce = ch.Realm, ch.Nonce
+			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
 		} else {
 			ch := sip.Parse407Challenge(rawChallenge)
-			realm, nonce = ch.Realm, ch.Nonce
+			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
 		}
 		if realm == "" {
 			realm = a.Config.Domain
 		}
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth")
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", opaque)
 
 		cseq++
 		retryMsg := sip.CloneSipMessage(msg)
@@ -517,6 +531,22 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	return dialog, nil
 }
 
+// [FIX-2] buildProxyAuth computes a Proxy-Authorization header for proactive
+// in-dialog auth, reusing the nonce/realm stored from the initial 407 challenge.
+// Returns "" when the dialog has no stored credentials (e.g. Kamailio path).
+func (a *ExtensionAgent) buildProxyAuth(dialog *DialogState, method, uri string) string {
+	if !dialog.ProxyAuthEnabled {
+		return ""
+	}
+	cnonce := sip.GenCNonce()
+	return sip.CalcDigestResponse(
+		a.Ext, a.Config.SIPPassword,
+		dialog.AuthRealm, dialog.AuthNonce,
+		uri, method, cnonce, "00000001", "auth",
+		dialog.AuthOpaque,
+	)
+}
+
 // SendPrack sends a PRACK for a reliable provisional response.
 func (a *ExtensionAgent) SendPrack(dialog *DialogState) error {
 	if dialog.ProvMsg == nil {
@@ -544,6 +574,10 @@ func (a *ExtensionAgent) SendPrack(dialog *DialogState) error {
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d PRACK", dialog.CSeq))
 	msg.AddHeader(sip.HdrRAck, rackValue)
+	// [FIX-2] Proactive auth on PRACK — digest uri matches the PRACK Request-URI
+	if authHdr := a.buildProxyAuth(dialog, "PRACK", fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)); authHdr != "" {
+		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	}
 	msg.AddHeader(sip.HdrContentLength, "0")
 
 	return a.Send(msg, "")
@@ -571,6 +605,10 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d ACK", dialog.CSeq))
 	for _, route := range dialog.RouteSet {
 		msg.AddHeader(sip.HdrRoute, route)
+	}
+	// [FIX-2] Proactive auth on ACK — digest uri matches the ACK Request-URI
+	if authHdr := a.buildProxyAuth(dialog, "ACK", target); authHdr != "" {
+		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 	}
 	msg.AddHeader(sip.HdrContentLength, "0")
 
@@ -661,6 +699,10 @@ func (a *ExtensionAgent) SendBye(dialog *DialogState) error {
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d BYE", dialog.CSeq))
 	for _, route := range dialog.RouteSet {
 		msg.AddHeader(sip.HdrRoute, route)
+	}
+	// [FIX-2] Proactive auth on BYE — digest uri matches the BYE Request-URI
+	if authHdr := a.buildProxyAuth(dialog, "BYE", target); authHdr != "" {
+		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 	}
 	msg.AddHeader(sip.HdrContentLength, "0")
 
@@ -923,9 +965,15 @@ func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) erro
 	if realm == "" {
 		realm = a.Config.Domain
 	}
+	// [FIX-2] Update stored auth state with fresh nonce from this 407
+	dialog.ProxyAuthEnabled = true
+	dialog.AuthNonce = challenge.Nonce
+	dialog.AuthRealm = realm
+	dialog.AuthOpaque = challenge.Opaque
+
 	cnonce := sip.GenCNonce()
 	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, "00000001", "auth")
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, "00000001", "auth", challenge.Opaque)
 
 	rackValue := fmt.Sprintf("%d %d INVITE", dialog.RSeq, dialog.CSeq-1)
 	dialog.CSeq++
@@ -962,15 +1010,17 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 	if realm == "" {
 		realm = a.Config.Domain
 	}
-	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "BYE", cnonce, "00000001", "auth")
 
 	dialog.CSeq++
 	target := dialog.RemoteTarget
 	if target == "" {
 		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
 	}
+
+	cnonce := sip.GenCNonce()
+	// [FIX-3] Use target (the BYE Request-URI) as digest uri per RFC 2617
+	// Revert FIX-3: change target back to fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, target, "BYE", cnonce, "00000001", "auth", challenge.Opaque)
 
 	msg := sip.NewSipMessage()
 	msg.SetRequestLine(fmt.Sprintf("BYE %s SIP/2.0", target))
@@ -1002,9 +1052,16 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 	if realm == "" {
 		realm = a.Config.Domain
 	}
+	// [FIX-2] Store auth state so subsequent in-dialog requests include
+	// Proxy-Authorization proactively (mirrors Python seniors' pattern).
+	dialog.ProxyAuthEnabled = true
+	dialog.AuthNonce = challenge.Nonce
+	dialog.AuthRealm = realm
+	dialog.AuthOpaque = challenge.Opaque
+
 	cnonce := sip.GenCNonce()
 	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth")
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth", challenge.Opaque)
 
 	if dialog.InviteMsg != nil {
 		// ACK must be sent BEFORE CSeq is incremented and Via is replaced,
