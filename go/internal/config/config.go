@@ -48,6 +48,7 @@ type VMConfig struct {
 	RegisterRetry        int `yaml:"register_retry" json:"register_retry"`
 	RegisterTimeout      int `yaml:"register_timeout" json:"register_timeout"`
 	SubscribeConcurrency int `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
+	SubscribeExpires     int `yaml:"subscribe_expires" json:"subscribe_expires"`
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
 	LocalHost  string `yaml:"local_host" json:"local_host"`
 	LocalPort  int    `yaml:"local_port" json:"local_port"`
@@ -261,6 +262,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.RegisterExpires == 0 {
 		cfg.RegisterExpires = 3600
+	}
+	if cfg.SubscribeExpires == 0 {
+		cfg.SubscribeExpires = 3600
 	}
 	if cfg.RegisterRetry == 0 {
 		cfg.RegisterRetry = 3

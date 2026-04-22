@@ -334,6 +334,65 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 	return false
 }
 
+// StartSubscribeRefreshLoop starts a background goroutine that re-subscribes
+// all agents at half the subscribe_expires interval, keeping SBC subscription
+// state alive for the duration of the run. The returned stop function must be
+// called (e.g. via defer) to cleanly terminate the loop.
+func StartSubscribeRefreshLoop(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+) func() {
+	expires := cfg.SubscribeExpires
+	if expires <= 0 {
+		expires = 600
+	}
+	interval := time.Duration(expires/2) * time.Second
+
+	stopCh := make(chan struct{})
+	concurrency := cfg.SubscribeConcurrency
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+
+	go func() {
+		slog.Info("Subscribe refresh loop started",
+			"interval_s", interval.Seconds(), "subscribe_expires", expires)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				slog.Info("Subscribe refresh loop stopped")
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				slog.Debug("Subscribe refresh: firing", "agents", len(agents))
+				sem := make(chan struct{}, concurrency)
+				var wg sync.WaitGroup
+				wg.Add(len(agents))
+				for _, ag := range agents {
+					go func(a *agent.ExtensionAgent) {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						rCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout)*time.Second)
+						defer cancel()
+						if err := a.Resubscribe(rCtx); err != nil {
+							slog.Warn("Resubscribe failed", "ext", a.Ext, "err", err)
+						}
+					}(ag)
+				}
+				wg.Wait()
+				slog.Debug("Subscribe refresh: complete", "agents", len(agents))
+			}
+		}
+	}()
+
+	return func() { close(stopCh) }
+}
+
 // FlushStaleRegistrations sends REGISTER(Expires:0) for every extension to
 // clear stale bindings from a previous run. Errors are swallowed.
 func FlushStaleRegistrations(
@@ -377,16 +436,18 @@ func FlushStaleRegistrations(
 //	Phase 1 — Register all extensions
 //	Phase 2 — Subscribe all extensions (skipped if skipSubscribe is true)
 //
-// It returns a PrePhaseResult summarising the outcome. An error is returned
-// if any extension fails to register or subscribe.
+// It returns a PrePhaseResult and a stop function that must be called when the
+// traffic run ends to terminate the background subscription refresh loop.
+// An error is returned if any extension fails to register or subscribe.
 func RunPrePhase(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 	skipSubscribe bool,
-) (*PrePhaseResult, error) {
+) (*PrePhaseResult, func(), error) {
 	total := len(agents)
 	start := time.Now()
+	noopStop := func() {}
 
 	// Phase 0: flush stale registrations
 	FlushStaleRegistrations(ctx, agents, cfg)
@@ -401,13 +462,14 @@ func RunPrePhase(
 	if len(failedReg) > 0 {
 		slog.Error("PRE-PHASE REGISTER failed",
 			"failed_count", len(failedReg), "extensions", failedReg)
-		return nil, fmt.Errorf(
+		return nil, noopStop, fmt.Errorf(
 			"pre-phase REGISTER failed for %d extension(s): %v — aborting, no INVITE will be sent",
 			len(failedReg), failedReg)
 	}
 
 	// Phase 2: SUBSCRIBE
 	var failedSub []string
+	stopRefresh := noopStop
 
 	if skipSubscribe {
 		slog.Info("PRE-PHASE 2/2 — SUBSCRIBE skipped")
@@ -421,10 +483,12 @@ func RunPrePhase(
 		if len(failedSub) > 0 {
 			slog.Error("PRE-PHASE SUBSCRIBE failed",
 				"failed_count", len(failedSub), "extensions", failedSub)
-			return nil, fmt.Errorf(
+			return nil, noopStop, fmt.Errorf(
 				"pre-phase SUBSCRIBE failed for %d extension(s): %v — aborting",
 				len(failedSub), failedSub)
 		}
+
+		stopRefresh = StartSubscribeRefreshLoop(ctx, agents, cfg)
 	}
 
 	elapsed := time.Since(start).Seconds()
@@ -453,5 +517,5 @@ func RunPrePhase(
 		"elapsed_s", fmt.Sprintf("%.1f", elapsed))
 	slog.Info("============================================================")
 
-	return result, nil
+	return result, stopRefresh, nil
 }

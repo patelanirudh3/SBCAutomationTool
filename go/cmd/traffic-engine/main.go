@@ -201,13 +201,14 @@ func runLifecycle(
 
 	// Pre-phase
 	collector.SetPhase("PRE_REGISTER")
-	preResult, err := prephase.RunPrePhase(ctx, agentSlice, cfg, skipSubscribe)
+	preResult, stopSubRefresh, err := prephase.RunPrePhase(ctx, agentSlice, cfg, skipSubscribe)
 	if err != nil {
 		slog.Error("Pre-phase failed", "err", err)
 		shutdownCleanup(ctx, agents, nil, nil, collector, cfg, runID, pairID, noUnregister)
 		collector.SetPhase("DONE")
 		return 1
 	}
+	defer stopSubRefresh()
 	collector.UpdateCounts(0, len(agents), preResult.Registered, preResult.Subscribed)
 
 	if prePhaseOnly {
