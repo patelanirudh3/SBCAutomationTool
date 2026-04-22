@@ -224,6 +224,24 @@ func runLifecycle(
 	collector.SetPhase("TRAFFIC")
 	collector.SetRunning(true)
 
+	// For timed mode, enforce a hard wall-clock deadline from traffic start.
+	// Converting duration_hours to a call count (maxCalls) alone is not
+	// sufficient: when calls time out, slots are held longer than hold_time_s,
+	// the concurrent ceiling backs up, and the run extends well past the
+	// intended duration. The deadline context guarantees the traffic phase
+	// exits on time regardless of call outcome rates or CPS back-pressure.
+	trafficCtx := ctx
+	var trafficCancel context.CancelFunc
+	if cfg.TrafficMode == "timed" && cfg.DurationHours > 0 {
+		deadline := time.Duration(cfg.DurationHours * float64(time.Hour))
+		trafficCtx, trafficCancel = context.WithTimeout(ctx, deadline)
+		defer trafficCancel()
+		slog.Info("Traffic deadline set",
+			"duration_hours", cfg.DurationHours,
+			"deadline", time.Now().Add(deadline).Format(time.RFC3339),
+		)
+	}
+
 	var callEngine *engine.CallEngine
 	var uasEngine *engine.UasAutoAnswer
 
@@ -249,11 +267,11 @@ func runLifecycle(
 
 		engineDone := make(chan error, 1)
 		go func() {
-			engineDone <- callEngine.Run(ctx)
+			engineDone <- callEngine.Run(trafficCtx)
 		}()
 
 		select {
-		case <-ctx.Done():
+		case <-trafficCtx.Done():
 			callEngine.Stop()
 		case err := <-engineDone:
 			if err != nil {

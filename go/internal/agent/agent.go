@@ -103,6 +103,16 @@ type ExtensionAgent struct {
 	regRealm       string
 	regOpaque      string // [FIX-4] echo opaque from 401 challenge
 	regCSeq        int
+	regGrantedExp  int // server-granted Expires from REGISTER 200 OK
+
+	subCallID     string
+	subFromHeader string
+	subToHeader   string
+	subContact    string
+	subNonce      string
+	subRealm      string
+	subOpaque     string
+	subCSeq       int
 }
 
 // NewExtensionAgent creates a new agent for the given extension.
@@ -178,12 +188,16 @@ func (a *ExtensionAgent) syncLocalPort() {
 }
 
 // Register performs the full REGISTER flow: initial -> 401 -> auth -> 200.
+//
+// Both response waits use WaitForSIPEvent so that any 200 OK that arrived
+// between attempts (buffered in earlyResponses) is consumed immediately
+// instead of being silently dropped when no handler was registered.
 func (a *ExtensionAgent) Register(ctx context.Context) error {
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
 
-	msg := sip.BuildInitialRegister(a.Ext, a.Config.Domain, a.Config.SIPTransport, a.localHost, a.localPort, 3600)
+	msg := sip.BuildInitialRegister(a.Ext, a.Config.Domain, a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
 	msg.ReplaceHeader(sip.HdrCallID, callID)
 	fromHdr := fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag)
 	msg.ReplaceHeader(sip.HdrFrom, fromHdr)
@@ -192,6 +206,98 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	a.regFromTag = fromTag
 	a.regFromHeader = fromHdr
 	a.regCSeq = 1
+
+	timeout := time.Duration(a.Config.RegisterTimeout) * time.Second
+
+	if err := a.Send(msg, ""); err != nil {
+		return err
+	}
+
+	// Wait for either 401 (challenge) or 200 (no-auth path).
+	// WaitForSIPEvent scans earlyResponses first, so a 200 that arrived
+	// while no handler was registered (e.g. late response from a previous
+	// attempt) is picked up immediately.
+	raw, err := a.WaitForSIPEvent(ctx, timeout, "401", "200")
+	if err != nil {
+		return err
+	}
+
+	eventCode, _ := sip.ClassifyMessage(raw)
+	if eventCode == "200" {
+		parsed := sip.ParseHeaders(strings.SplitN(raw, "\r\n\r\n", 2)[0])
+		a.regGrantedExp = parsed.GetGrantedExpiry()
+		slog.Info("registered (no auth)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
+		a.registeredOnce.Do(func() { close(a.Registered) })
+		return nil
+	}
+
+	// eventCode == "401": build and send authenticated REGISTER.
+	challenge := sip.Parse401Challenge(raw)
+	a.regNonce = challenge.Nonce
+	a.regRealm = challenge.Realm
+	a.regOpaque = challenge.Opaque // [FIX-4]
+	if a.regRealm == "" {
+		a.regRealm = a.Config.Domain
+	}
+
+	cnonce := sip.GenCNonce()
+	uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+
+	a.regCSeq = 2
+	authMsg := sip.CloneSipMessage(msg)
+	authMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+	authMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
+	authMsg.RemoveHeader(sip.HdrAuthorization)
+	authMsg.AddHeader(sip.HdrAuthorization, authHdr)
+
+	if err := a.Send(authMsg, ""); err != nil {
+		return err
+	}
+
+	// Wait for the final 200 OK after sending the authenticated REGISTER.
+	// Again uses WaitForSIPEvent to catch any already-buffered 200.
+	raw200, err := a.WaitForSIPEvent(ctx, timeout, "200")
+	if err != nil {
+		return err
+	}
+	parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+	a.regGrantedExp = parsed.GetGrantedExpiry()
+	slog.Info("registered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
+	a.registeredOnce.Do(func() { close(a.Registered) })
+	return nil
+}
+
+// GrantedRegisterExpiry returns the server-granted Expires value from the last
+// successful REGISTER 200 OK, or 0 if not yet registered.
+func (a *ExtensionAgent) GrantedRegisterExpiry() int { return a.regGrantedExp }
+
+// Reregister sends a REGISTER refresh using the same Call-ID and From tag as
+// the original registration (in-dialog re-REGISTER per RFC 3261 §10.2.2).
+// It reuses cached credentials so no new 401 round-trip is needed when the
+// nonce is still valid, and falls back to a fresh 401 challenge if required.
+func (a *ExtensionAgent) Reregister(ctx context.Context) error {
+	a.syncLocalPort()
+	if a.regCallID == "" {
+		return fmt.Errorf("ext=%s: no registration state; Register must be called first", a.Ext)
+	}
+
+	a.regCSeq++
+	expiresVal := fmt.Sprintf("%d", a.Config.RegisterExpires)
+
+	msg := sip.BuildInitialRegister(a.Ext, a.Config.Domain, a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg.ReplaceHeader(sip.HdrCallID, a.regCallID)
+	msg.ReplaceHeader(sip.HdrFrom, a.regFromHeader)
+	msg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
+	msg.ReplaceHeader(sip.HdrExpires, expiresVal)
+
+	// Include cached credentials proactively to avoid an extra 401 round-trip.
+	if a.regNonce != "" {
+		cnonce := sip.GenCNonce()
+		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+		msg.AddHeader(sip.HdrAuthorization, authHdr)
+	}
 
 	ch401 := a.waitForEvent("401")
 	ch200 := a.waitForEvent("200")
@@ -209,41 +315,38 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	case raw401 := <-ch401:
 		challenge := sip.Parse401Challenge(raw401)
 		a.regNonce = challenge.Nonce
-		a.regRealm = challenge.Realm
-		a.regOpaque = challenge.Opaque // [FIX-4]
-		if a.regRealm == "" {
-			a.regRealm = a.Config.Domain
+		a.regOpaque = challenge.Opaque
+		if challenge.Realm != "" {
+			a.regRealm = challenge.Realm
 		}
-
+		a.regCSeq++
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
-
-		a.regCSeq = 2
-		authMsg := sip.CloneSipMessage(msg)
-		authMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
-		authMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
-		authMsg.RemoveHeader(sip.HdrAuthorization)
-		authMsg.AddHeader(sip.HdrAuthorization, authHdr)
-
-		if err := a.Send(authMsg, ""); err != nil {
+		retryMsg := sip.CloneSipMessage(msg)
+		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
+		retryMsg.RemoveHeader(sip.HdrAuthorization)
+		retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
+		if err := a.Send(retryMsg, ""); err != nil {
 			return err
 		}
-
+		ch200r := a.waitForEvent("200")
+		defer a.deregisterCh(ch200r, "200")
 		select {
-		case <-ch200:
-			slog.Info("registered", "ext", a.Ext)
-			a.registeredOnce.Do(func() { close(a.Registered) })
+		case raw200 := <-ch200r:
+			parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+			a.regGrantedExp = parsed.GetGrantedExpiry()
+			slog.Debug("reregistered (after 401)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 			return nil
 		case <-tCtx.Done():
 			return tCtx.Err()
 		}
-
-	case <-ch200:
-		slog.Info("registered (no auth)", "ext", a.Ext)
-		a.registeredOnce.Do(func() { close(a.Registered) })
+	case raw200 := <-ch200:
+		parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+		a.regGrantedExp = parsed.GetGrantedExpiry()
+		slog.Debug("reregistered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 		return nil
-
 	case <-tCtx.Done():
 		return tCtx.Err()
 	}
@@ -384,21 +487,27 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 
 // Subscribe performs the SUBSCRIBE flow handling both 407 (Proxy-Auth) and
 // 401 (WWW-Auth) challenges. Avaya Session Manager issues 401 for SUBSCRIBE.
+// On success it saves dialog state so Resubscribe can issue in-dialog refreshes.
 func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
 	cseq := 1
 
+	fromHdr := fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag)
+	toHdr := fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain)
+	contactHdr := fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport)
+	expiresVal := fmt.Sprintf("%d", a.Config.SubscribeExpires)
+
 	msg := sip.NewSipMessage()
 	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
 	msg.AddHeader(sip.HdrCallID, callID)
-	msg.AddHeader(sip.HdrFrom, fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag))
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain))
+	msg.AddHeader(sip.HdrFrom, fromHdr)
+	msg.AddHeader(sip.HdrTo, toHdr)
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport))
+	msg.AddHeader(sip.HdrContact, contactHdr)
 	msg.AddHeader(sip.HdrMaxForwards, "70")
-	msg.AddHeader(sip.HdrExpires, "600")
+	msg.AddHeader(sip.HdrExpires, expiresVal)
 	msg.AddHeader(sip.HdrEvent, "dialog")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", cseq))
 	msg.AddHeader(sip.HdrContentLength, "0")
@@ -435,6 +544,10 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 		if realm == "" {
 			realm = a.Config.Domain
 		}
+		a.subNonce = nonce
+		a.subRealm = realm
+		a.subOpaque = opaque
+
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", opaque)
@@ -480,8 +593,130 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 		return tCtx.Err()
 	}
 
+	// Save dialog state for in-dialog refresh via Resubscribe.
+	a.subCallID = callID
+	a.subFromHeader = fromHdr
+	a.subToHeader = toHdr
+	a.subContact = contactHdr
+	a.subCSeq = cseq
+
 	slog.Info("subscribed", "ext", a.Ext)
 	a.subscribedOnce.Do(func() { close(a.Subscribed) })
+	return nil
+}
+
+// Resubscribe sends an in-dialog SUBSCRIBE refresh using the state saved from
+// the initial Subscribe call. It reuses the same Call-ID and From tag (keeping
+// the subscription dialog alive) and increments CSeq. A fresh auth challenge
+// is handled if the server issues a new 401/407.
+func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
+	a.syncLocalPort()
+	if a.subCallID == "" {
+		return fmt.Errorf("ext=%s: no subscription state; Subscribe must be called first", a.Ext)
+	}
+
+	a.subCSeq++
+	expiresVal := fmt.Sprintf("%d", a.Config.SubscribeExpires)
+
+	msg := sip.NewSipMessage()
+	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
+	msg.AddHeader(sip.HdrCallID, a.subCallID)
+	msg.AddHeader(sip.HdrFrom, a.subFromHeader)
+	msg.AddHeader(sip.HdrTo, a.subToHeader)
+	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+	msg.AddHeader(sip.HdrContact, a.subContact)
+	msg.AddHeader(sip.HdrMaxForwards, "70")
+	msg.AddHeader(sip.HdrExpires, expiresVal)
+	msg.AddHeader(sip.HdrEvent, "dialog")
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", a.subCSeq))
+	msg.AddHeader(sip.HdrContentLength, "0")
+
+	// Include cached credentials proactively if we have them.
+	if a.subNonce != "" {
+		cnonce := sip.GenCNonce()
+		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.subRealm, a.subNonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", a.subOpaque)
+		msg.AddHeader(sip.HdrAuthorization, authHdr)
+	}
+
+	ch401 := a.waitForEvent("401")
+	ch407 := a.waitForEvent("407")
+	ch200 := a.waitForEvent("200")
+	ch202 := a.waitForEvent("202")
+	defer a.deregisterCh(ch401, "401")
+	defer a.deregisterCh(ch407, "407")
+	defer a.deregisterCh(ch200, "200")
+	defer a.deregisterCh(ch202, "202")
+
+	if err := a.Send(msg, ""); err != nil {
+		return err
+	}
+
+	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	defer cancel()
+
+	sendAuthRetry := func(rawChallenge string, use401 bool) error {
+		var realm, nonce, opaque string
+		if use401 {
+			ch := sip.Parse401Challenge(rawChallenge)
+			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
+		} else {
+			ch := sip.Parse407Challenge(rawChallenge)
+			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
+		}
+		if realm == "" {
+			realm = a.Config.Domain
+		}
+		a.subNonce = nonce
+		a.subRealm = realm
+		a.subOpaque = opaque
+
+		cnonce := sip.GenCNonce()
+		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", opaque)
+
+		a.subCSeq++
+		retryMsg := sip.CloneSipMessage(msg)
+		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", a.Config.SIPTransport, a.localHost, sip.CreateBranchID()))
+		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", a.subCSeq))
+		retryMsg.RemoveHeader(sip.HdrAuthorization)
+		retryMsg.RemoveHeader(sip.HdrProxyAuthorization)
+		if use401 {
+			retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
+		} else {
+			retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+		}
+		return a.Send(retryMsg, "")
+	}
+
+	select {
+	case raw401 := <-ch401:
+		if err := sendAuthRetry(raw401, true); err != nil {
+			return err
+		}
+		select {
+		case <-ch200:
+		case <-ch202:
+		case <-tCtx.Done():
+			return tCtx.Err()
+		}
+	case raw407 := <-ch407:
+		if err := sendAuthRetry(raw407, false); err != nil {
+			return err
+		}
+		select {
+		case <-ch200:
+		case <-ch202:
+		case <-tCtx.Done():
+			return tCtx.Err()
+		}
+	case <-ch200:
+	case <-ch202:
+	case <-tCtx.Done():
+		return tCtx.Err()
+	}
+
+	slog.Debug("resubscribed", "ext", a.Ext, "expires", a.Config.SubscribeExpires)
 	return nil
 }
 

@@ -334,6 +334,66 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 	return false
 }
 
+// StartRegisterRefreshLoop starts a background goroutine that re-registers all
+// agents at half the register_expires interval, preventing SBC registration
+// bindings from expiring during long test runs. The returned stop function must
+// be called (e.g. via defer) to cleanly terminate the loop.
+func StartRegisterRefreshLoop(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+) func() {
+	expires := cfg.RegisterExpires
+	if expires <= 0 {
+		expires = 3600
+	}
+	interval := time.Duration(expires/2) * time.Second
+
+	concurrency := cfg.RegisterBatchSize
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+
+	stopCh := make(chan struct{})
+
+	go func() {
+		slog.Info("Register refresh loop started",
+			"interval_s", interval.Seconds(), "register_expires", expires)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				slog.Info("Register refresh loop stopped")
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				slog.Debug("Register refresh: firing", "agents", len(agents))
+				sem := make(chan struct{}, concurrency)
+				var wg sync.WaitGroup
+				wg.Add(len(agents))
+				for _, ag := range agents {
+					go func(a *agent.ExtensionAgent) {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						rCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout)*time.Second)
+						defer cancel()
+						if err := a.Reregister(rCtx); err != nil {
+							slog.Warn("Reregister failed", "ext", a.Ext, "err", err)
+						}
+					}(ag)
+				}
+				wg.Wait()
+				slog.Debug("Register refresh: complete", "agents", len(agents))
+			}
+		}
+	}()
+
+	return func() { close(stopCh) }
+}
+
 // StartSubscribeRefreshLoop starts a background goroutine that re-subscribes
 // all agents at half the subscribe_expires interval, keeping SBC subscription
 // state alive for the duration of the run. The returned stop function must be
@@ -467,9 +527,11 @@ func RunPrePhase(
 			len(failedReg), failedReg)
 	}
 
+	stopRegRefresh := StartRegisterRefreshLoop(ctx, agents, cfg)
+
 	// Phase 2: SUBSCRIBE
 	var failedSub []string
-	stopRefresh := noopStop
+	stopSubRefresh := noopStop
 
 	if skipSubscribe {
 		slog.Info("PRE-PHASE 2/2 — SUBSCRIBE skipped")
@@ -483,12 +545,18 @@ func RunPrePhase(
 		if len(failedSub) > 0 {
 			slog.Error("PRE-PHASE SUBSCRIBE failed",
 				"failed_count", len(failedSub), "extensions", failedSub)
+			stopRegRefresh()
 			return nil, noopStop, fmt.Errorf(
 				"pre-phase SUBSCRIBE failed for %d extension(s): %v — aborting",
 				len(failedSub), failedSub)
 		}
 
-		stopRefresh = StartSubscribeRefreshLoop(ctx, agents, cfg)
+		stopSubRefresh = StartSubscribeRefreshLoop(ctx, agents, cfg)
+	}
+
+	stopRefresh := func() {
+		stopRegRefresh()
+		stopSubRefresh()
 	}
 
 	elapsed := time.Since(start).Seconds()

@@ -320,6 +320,32 @@ func (m *SipMessage) IsHeaderPresent(name string) bool {
 	return len(m.headers[name]) > 0
 }
 
+// GetGrantedExpiry reads the server-granted Expires value from a REGISTER 200
+// OK. It first checks the top-level Expires header, then falls back to the
+// first Contact header's expires parameter. Returns 0 if neither is present.
+func (m *SipMessage) GetGrantedExpiry() int {
+	if vals := m.headers[HdrExpires]; len(vals) > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(vals[0])); err == nil && n > 0 {
+			return n
+		}
+	}
+	if contacts := m.headers[HdrContact]; len(contacts) > 0 {
+		c := contacts[0]
+		lower := strings.ToLower(c)
+		if idx := strings.Index(lower, "expires="); idx >= 0 {
+			rest := c[idx+len("expires="):]
+			end := strings.IndexAny(rest, ";, \t>")
+			if end < 0 {
+				end = len(rest)
+			}
+			if n, err := strconv.Atoi(strings.TrimSpace(rest[:end])); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 // GetEvent returns the first Event header value, or empty string.
 func (m *SipMessage) GetEvent() string {
 	vals := m.headers[HdrEvent]

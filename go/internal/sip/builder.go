@@ -54,6 +54,7 @@ func BuildInitialRegister(fromUser, domain, transport, localIP string, localPort
 	contact += fmt.Sprintf(`+sip.instance="<urn:uuid:%s>";reg-id=1`, InstanceUUID(fromUser))
 	m.AddHeader(HdrContact, contact)
 
+	m.AddHeader(HdrExpires, strconv.Itoa(expires))
 	m.AddHeader(HdrAllow, "INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,MESSAGE,REFER,INFO,PUBLISH,UPDATE")
 	m.AddHeader(HdrSupported, "eventlist,feature-ref,replaces,sdp-anat,tdialog")
 	m.AddHeader(HdrUserAgent, "Avaya J179 IP Phone 4.0.11.0.1 10981904bda0")
