@@ -41,6 +41,9 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 		}
 		if code == "407" {
 			switch method {
+			case "INVITE":
+				slog.Debug("ClassifyMessage", "eventCode", "407_INVITE", "code", code, "method", method)
+				return "407_INVITE", raw
 			case "PRACK":
 				slog.Debug("ClassifyMessage", "eventCode", "407_PRACK", "code", code, "method", method)
 				return "407_PRACK", raw

@@ -431,7 +431,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	var raw200 string
 	got180 := false
 	for !got180 {
-		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407", "200_INVITE")
+		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407_INVITE", "200_INVITE")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
@@ -475,7 +475,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			raw200 = raw
 			got180 = true
 
-		case code == "407":
+		case code == "407_INVITE":
 			emit("AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Invite(dialog, raw, rtpPort); err != nil {
 				result := fail(fmt.Sprintf("407 handling: %v", err))
