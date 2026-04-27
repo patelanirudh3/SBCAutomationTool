@@ -1377,7 +1377,6 @@ func (a *ExtensionAgent) waitForEvent(codes ...string) chan string {
 
 func (a *ExtensionAgent) deregisterCh(ch chan string, codes ...string) {
 	a.handlerMu.Lock()
-	defer a.handlerMu.Unlock()
 	for _, code := range codes {
 		listeners := a.handlers[code]
 		for i, c := range listeners {
@@ -1385,6 +1384,26 @@ func (a *ExtensionAgent) deregisterCh(ch chan string, codes ...string) {
 				a.handlers[code] = append(listeners[:i], listeners[i+1:]...)
 				break
 			}
+		}
+	}
+	// Drain any message that slipped into the channel after WaitForSIPEvent
+	// already returned its result but before this deregister ran.  Without
+	// draining, that message would be lost because nobody reads from ch once
+	// WaitForSIPEvent has returned.  Re-buffer it so the next WaitForSIPEvent
+	// call can pick it up via the earlyResponses scan.
+	for {
+		select {
+		case stale := <-ch:
+			ec, _ := sip.ClassifyMessage(stale)
+			if len(a.earlyResponses) >= maxEarlyResponses {
+				a.earlyResponses = a.earlyResponses[1:]
+			}
+			a.earlyResponses = append(a.earlyResponses, earlyResponse{code: ec, raw: stale})
+			slog.Debug("deregisterCh: drained stale message back to earlyResponse",
+				"ext", a.Ext, "eventCode", ec)
+		default:
+			a.handlerMu.Unlock()
+			return
 		}
 	}
 }
