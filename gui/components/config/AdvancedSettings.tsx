@@ -100,20 +100,18 @@ function useWrapAnalysis(pairIndex: number, advSettings: AdvancedSettingsType): 
     if (!pair) {
       return { poolCount: 0, wrapTime: 0, holdTime: 0, naturalSpacing: true, autoDelay: 0, userMargin: 0, effectiveDelay: 0, minPoolForNatural: 0 }
     }
-    const uacCount = pair.uac.uac_ext_end - pair.uac.uac_ext_start + 1
-    const uasCount = pair.uas.uas_ext_end - pair.uas.uas_ext_start + 1
-    const poolCount = lcm(Math.max(uacCount, 1), Math.max(uasCount, 1))
+    const poolCount = Math.max((pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1, 0)
+    const pairCycles = Math.floor(poolCount / 2)
     const cps = Math.max(pair.uac.cps, 0.001)
-    const wrapTime = poolCount / cps
+    const wrapTime = pairCycles > 0 ? pairCycles / cps : 0
     const holdTime = pair.uac.hold_time_seconds
     const naturalSpacing = wrapTime >= holdTime + SIP_BYE_BUFFER
 
-    const worstCaseElapsed = wrapTime
-    const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - worstCaseElapsed)
+    const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - wrapTime)
 
     const userMargin = advSettings.pool_wrap_delay_seconds ?? 0
     const effectiveDelay = autoDelay + Math.max(0, userMargin)
-    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER))
+    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER)) * 2
 
     return { poolCount, wrapTime, holdTime, naturalSpacing, autoDelay, userMargin, effectiveDelay, minPoolForNatural }
   }, [pair, advSettings.pool_wrap_delay_seconds])

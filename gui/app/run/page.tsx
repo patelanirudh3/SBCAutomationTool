@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2, Home, TableProperties, GitBranch } from 'lucide-react'
+import { WifiOff, Loader2, Home, TableProperties, GitBranch, Users, AlertOctagon, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
@@ -25,7 +25,7 @@ import { DownloadReport } from '@/components/postrun/DownloadReport'
 import { useTrafficStore } from '@/store/traffic'
 import type { CallSpine } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor } from '@/lib/api'
 import {
   MOCK_UAC_METRICS,
   MOCK_UAS_METRICS,
@@ -42,21 +42,16 @@ const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 // Both VM statuses are consulted; UAC drives the primary state
 // ---------------------------------------------------------------------------
 
-function mapBackendPhase(uacPhase: string, uasPhase: string): RunPhase {
-  const phases = [uacPhase, uasPhase].map((p) => (p ?? '').toUpperCase())
-  if (phases.some((p) => p === 'FAILED')) return 'FAILED'
-  if (phases.some((p) => p === 'TRAFFIC')) return 'TRAFFIC'
-  if (
-    phases.some(
-      (p) => p === 'PRE_PHASE' || p === 'PRE_REGISTER' || p === 'PRE_SUBSCRIBE'
-    )
-  )
-    return 'PRE_PHASE'
-  if (
-    phases.some((p) => p === 'DONE' || p === 'STOPPING') &&
-    phases.every((p) => p === 'DONE' || p === 'STOPPING' || p === 'IDLE')
-  )
-    return 'COMPLETE'
+function mapBackendPhase(uacPhase: string, _uasPhase: string): RunPhase {
+  // In the new unified model, UAC is the sole authority for phase
+  const p = (uacPhase ?? '').toUpperCase()
+  if (p === 'FAILED') return 'FAILED'
+  if (p === 'TRAFFIC') return 'TRAFFIC'
+  if (p === 'STOPPING') return 'STOPPING'
+  if (p === 'CLEANUP_READY') return 'CLEANUP_READY'
+  if (p === 'TRAFFIC_READY') return 'TRAFFIC_READY'
+  if (p === 'PRE_PHASE' || p === 'PRE_REGISTER' || p === 'PRE_SUBSCRIBE') return 'PRE_PHASE'
+  if (p === 'DONE') return 'COMPLETE'
   return 'IDLE'
 }
 
@@ -66,14 +61,23 @@ function mapBackendPhase(uacPhase: string, uasPhase: string): RunPhase {
 
 function LiveDashboard({
   stopping,
-  onStop,
+  onGracefulStop,
+  onInterruptStop,
+  onCleanup,
+  cleanupDone,
 }: {
   stopping: boolean
-  onStop: () => void
+  onGracefulStop: () => void
+  onInterruptStop: () => void
+  onCleanup: () => void
+  cleanupDone: boolean
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const uasMetrics = useTrafficStore((s) => s.uasMetrics)
+  const idleCount   = useTrafficStore((s) => s.idleCount)
+  const nonIdleCount= useTrafficStore((s) => s.nonIdleCount)
+  const regOnlyCount= useTrafficStore((s) => s.regOnlyCount)
   const pairs = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
 
@@ -82,11 +86,10 @@ function LiveDashboard({
 
   const extensionCeiling =
     pair
-      ? (pair.uac.uac_ext_end - pair.uac.uac_ext_start + 1) +
-        (pair.uac.uas_ext_end - pair.uac.uas_ext_start + 1)
+      ? ((pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1)
       : 10
 
-  if (!uacMetrics || !uasMetrics) {
+  if (!uacMetrics) {
     return (
       <div className="flex flex-1 items-center justify-center">
         <p className="font-mono text-sm text-muted-foreground animate-pulse">
@@ -96,62 +99,107 @@ function LiveDashboard({
     )
   }
 
-  const showStopBtn = phase === 'TRAFFIC'
+  const isTrafficPhase = phase === 'TRAFFIC'
+  const isCleanupReady = phase === 'CLEANUP_READY'
+  const isStopping     = phase === 'STOPPING'
 
   return (
     <div className="flex flex-col gap-4 p-4 max-w-6xl mx-auto w-full">
-      {/* Row 1 — Hero: ASR + RunTimer + Stop */}
+      {/* Row 1 — Hero: ASR + RunTimer + Stop buttons */}
       <div className="rounded-lg border border-border bg-card p-5 flex items-center gap-6">
         <ASRGauge asr={uacMetrics.asr} className="flex-1 min-w-0" />
         <RunTimer elapsed={uacMetrics.run_elapsed_seconds} />
-        {showStopBtn && (
+
+        {/* Stop controls — shown during active traffic */}
+        {(isTrafficPhase || isStopping) && (
+          <div className="flex shrink-0 flex-col gap-2">
+            {/* Graceful Stop */}
+            <button
+              onClick={onGracefulStop}
+              disabled={stopping || isStopping}
+              className={cn(
+                'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
+                'border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs font-semibold',
+                'hover:bg-amber-500/20 hover:text-amber-200 transition-colors',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              )}
+            >
+              {stopping && !isStopping ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <CheckCircle2 className="size-3" />
+              )}
+              Graceful Stop
+            </button>
+            {/* Force Stop (interrupt) */}
+            <button
+              onClick={onInterruptStop}
+              disabled={stopping}
+              className={cn(
+                'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
+                'border-rose-500/40 bg-rose-500/10 text-rose-300 text-xs font-semibold',
+                'hover:bg-rose-500/20 hover:text-rose-200 transition-colors',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              )}
+            >
+              <AlertOctagon className="size-3" />
+              Force Stop
+            </button>
+          </div>
+        )}
+
+        {/* Cleanup button — shown when traffic is done, cleanup not yet started */}
+        {isCleanupReady && !cleanupDone && (
           <button
-            onClick={onStop}
+            onClick={onCleanup}
             disabled={stopping}
             className={cn(
-              'group relative flex size-20 shrink-0 flex-col items-center justify-center rounded-full',
-              'bg-rose-600 text-white shadow-[0_0_24px_oklch(0.50_0.22_15/0.55)]',
-              'border-4 border-rose-400/40',
-              'transition-all duration-150',
-              'hover:bg-rose-500 hover:shadow-[0_0_32px_oklch(0.55_0.24_15/0.70)] hover:scale-105',
-              'active:scale-95 active:shadow-[0_0_14px_oklch(0.45_0.20_15/0.45)]',
-              'disabled:cursor-not-allowed disabled:opacity-60 disabled:shadow-none disabled:scale-100',
+              'flex items-center gap-1.5 rounded-lg border px-4 py-2',
+              'border-sky-500/40 bg-sky-500/10 text-sky-300 text-sm font-semibold',
+              'hover:bg-sky-500/20 hover:text-sky-200 transition-colors',
+              'disabled:cursor-not-allowed disabled:opacity-50',
             )}
           >
-            {stopping ? (
-              <>
-                <Loader2 className="size-5 animate-spin mb-0.5" />
-                <span className="text-[9px] font-bold uppercase tracking-widest leading-none">
-                  Stopping
-                </span>
-              </>
-            ) : (
-              <>
-                {/* Outer ring pulse */}
-                <span className="absolute inset-0 rounded-full bg-rose-500/30 animate-ping group-hover:hidden" />
-                <span className="relative text-[11px] font-black uppercase tracking-wider leading-tight text-center px-1">
-                  Stop<br />Traffic
-                </span>
-              </>
-            )}
+            {stopping ? <Loader2 className="size-4 animate-spin" /> : <Users className="size-4" />}
+            Unregister / Unsubscribe All
           </button>
         )}
       </div>
 
+      {/* Pool counts row — shown whenever we have non-zero counts */}
+      {(idleCount > 0 || nonIdleCount > 0 || regOnlyCount > 0) && (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3 text-center">
+            <p className="text-2xl font-bold font-mono text-emerald-400">{idleCount}</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">Idle (available)</p>
+          </div>
+          <div className="rounded-lg border border-blue-500/25 bg-blue-500/5 p-3 text-center">
+            <p className="text-2xl font-bold font-mono text-blue-400">{nonIdleCount}</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">Active (in call)</p>
+          </div>
+          <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-center">
+            <p className="text-2xl font-bold font-mono text-amber-400">{regOnlyCount}</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">Reg-only</p>
+          </div>
+        </div>
+      )}
+
       {/* Aggregate totals bar */}
       <AggregatePanel uacMetrics={uacMetrics} />
 
-      {/* Row 2 — VM Metrics Cards */}
+      {/* Row 2 — VM Metrics Card (single, primary VM) */}
       <div className="grid grid-cols-2 gap-4">
         <VMMetricsCard
           role="UAC"
           metrics={uacMetrics}
           configuredCps={configuredCps}
         />
-        <VMMetricsCard
-          role="UAS"
-          metrics={uasMetrics}
-        />
+        {uasMetrics && (
+          <VMMetricsCard
+            role="UAS"
+            metrics={uasMetrics}
+          />
+        )}
       </div>
 
       {/* Row 3 — Charts */}
@@ -354,6 +402,7 @@ export default function RunPage() {
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
+  const [cleanupDone, setCleanupDone] = useState(false)
 
   const mockTickRef = useRef(0)
   const mockUacRef = useRef<TrafficMetrics>(MOCK_UAC_METRICS)
@@ -365,7 +414,7 @@ export default function RunPage() {
   useEffect(() => {
     if (!IS_MOCK) return
 
-    if (phase === 'IDLE' || phase === 'PRE_PHASE') {
+    if (phase === 'IDLE' || phase === 'PRE_PHASE' || phase === 'TRAFFIC_READY') {
       setPhase('TRAFFIC')
     }
 
@@ -425,29 +474,57 @@ export default function RunPage() {
   }, [])
 
   // ------------------------------------------------------------------
-  // Stop Traffic handler
+  // Stop Traffic handlers (new phase-gated model)
   // ------------------------------------------------------------------
-  const handleStop = async () => {
-    setStopping(true)
 
+  const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
+  const vmPort = pair?.uac.metrics_port ?? 8082
+
+  const handleGracefulStop = async () => {
+    setStopping(true)
     if (IS_MOCK) {
       setCallEvents(MOCK_CALL_EVENTS)
-      setAggregate({
-        ...MOCK_AGGREGATE,
-        ended_at: new Date().toISOString(),
-      })
-      setPhase('COMPLETE')
+      setAggregate({ ...MOCK_AGGREGATE, ended_at: new Date().toISOString() })
+      setPhase('CLEANUP_READY')
+      setStopping(false)
       return
     }
-
     try {
-      await fetch(
-        `http://${pair?.uac.vm_ip ?? '127.0.0.1'}:${pair?.uac.metrics_port ?? 8082}/api/test/stop`,
-        { method: 'POST' }
-      )
-    } catch {
+      await gracefulStopFor(vmIp, vmPort)
+      setPhase('STOPPING')
+    } catch { /* backend will still stop, polling detects phase change */ }
+    setStopping(false)
+  }
+
+  const handleInterruptStop = async () => {
+    setStopping(true)
+    if (IS_MOCK) {
+      setCallEvents(MOCK_CALL_EVENTS)
+      setAggregate({ ...MOCK_AGGREGATE, ended_at: new Date().toISOString() })
+      setPhase('CLEANUP_READY')
       setStopping(false)
+      return
     }
+    try {
+      await interruptStopFor(vmIp, vmPort)
+      setPhase('STOPPING')
+    } catch { /* ignore — backend will stop */ }
+    setStopping(false)
+  }
+
+  const handleCleanup = async () => {
+    setStopping(true)
+    if (IS_MOCK) {
+      setPhase('COMPLETE')
+      setCleanupDone(true)
+      setStopping(false)
+      return
+    }
+    try {
+      await startCleanupFor(vmIp, vmPort)
+      setCleanupDone(true)
+    } catch { /* ignore */ }
+    setStopping(false)
   }
 
   // ------------------------------------------------------------------
@@ -556,7 +633,7 @@ export default function RunPage() {
       const storePhase = useTrafficStore.getState().phase
       if (
         consecutiveFailures >= 3 &&
-        (storePhase === 'TRAFFIC' || storePhase === 'PRE_PHASE')
+        (storePhase === 'TRAFFIC' || storePhase === 'PRE_PHASE' || storePhase === 'STOPPING')
       ) {
         await finish('COMPLETE')
       }
@@ -598,12 +675,12 @@ export default function RunPage() {
     !IS_MOCK
   )
 
-  const isTraffic = phase === 'TRAFFIC'
+  const isTraffic = phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'CLEANUP_READY'
   const isPostRun = phase === 'COMPLETE' || phase === 'FAILED'
   const showReconnectBanner =
     !IS_MOCK &&
     isTraffic &&
-    (wsStatus.uac !== 'connected' || wsStatus.uas !== 'connected')
+    wsStatus.uac !== 'connected'
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -639,7 +716,13 @@ export default function RunPage() {
               transition={{ duration: 0.3 }}
               className="flex flex-col items-center"
             >
-              <LiveDashboard stopping={stopping} onStop={handleStop} />
+              <LiveDashboard
+                stopping={stopping}
+                onGracefulStop={handleGracefulStop}
+                onInterruptStop={handleInterruptStop}
+                onCleanup={handleCleanup}
+                cleanupDone={cleanupDone}
+              />
             </motion.div>
           )}
           {isPostRun && (

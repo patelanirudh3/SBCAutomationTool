@@ -281,6 +281,60 @@ export async function stopTestFor(
 }
 
 // ---------------------------------------------------------------------------
+// Phase-gated lifecycle endpoints (new unified-pool model)
+// ---------------------------------------------------------------------------
+
+export async function startPrePhaseFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/prephase/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+export async function startTrafficFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/traffic/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+export async function startCleanupFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/cleanup/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+export async function gracefulStopFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/shutdown/graceful`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+export async function interruptStopFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/shutdown/interrupt`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+// ---------------------------------------------------------------------------
 // Per-VM reset — POST /api/test/reset on a specific VM backend
 // ---------------------------------------------------------------------------
 

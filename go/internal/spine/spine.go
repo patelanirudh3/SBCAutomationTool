@@ -3,10 +3,8 @@ package spine
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
-	"net/http"
 	"strings"
 	"time"
 )
@@ -296,65 +294,6 @@ func BuildCallSpines(uacCalls, uasCalls []map[string]any) []json.RawMessage {
 	return spines
 }
 
-// CollectUASCallResults fetches call results from UAS via HTTP GET /api/call-results.
-// Returns empty slice on any failure — never blocks the run export.
-func CollectUASCallResults(uasBaseURL string, timeoutSeconds float64) []map[string]any {
-	url := strings.TrimRight(uasBaseURL, "/") + "/api/call-results"
-	client := &http.Client{
-		Timeout: time.Duration(timeoutSeconds * float64(time.Second)),
-	}
-
-	resp, err := client.Get(url)
-	if err != nil {
-		slog.Warn("Could not collect UAS CallResults — spine will be UAC-only",
-			"url", url, "error", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		slog.Warn("UAS /api/call-results returned non-200 — spine will be UAC-only",
-			"url", url, "status", resp.StatusCode)
-		return nil
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		slog.Warn("Failed to read UAS call-results response body",
-			"url", url, "error", err)
-		return nil
-	}
-
-	// Parse each result as map[string]json.RawMessage so that the
-	// sip_milestones nested object is kept as raw JSON bytes — when we later
-	// re-marshal the spine's uas_leg the field order from the UAS is preserved.
-	var rawResults []map[string]json.RawMessage
-	if err := json.Unmarshal(body, &rawResults); err != nil {
-		slog.Warn("Failed to decode UAS call-results JSON",
-			"url", url, "error", err)
-		return nil
-	}
-
-	results := make([]map[string]any, 0, len(rawResults))
-	for _, rr := range rawResults {
-		m := make(map[string]any, len(rr))
-		for k, v := range rr {
-			if k == "sip_milestones" {
-				// Keep as json.RawMessage; json.Marshal will embed it as-is.
-				m[k] = v
-				continue
-			}
-			var val any
-			if err := json.Unmarshal(v, &val); err == nil {
-				m[k] = val
-			}
-		}
-		results = append(results, m)
-	}
-
-	slog.Info("Collected UAS CallResults", "count", len(results), "url", url)
-	return results
-}
 
 // ---------------------------------------------------------------------------
 // Correlation strategies

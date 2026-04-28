@@ -33,7 +33,6 @@ export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 
 export const VMConfigSchema = z
   .object({
-    vm_role: VMRoleSchema,
     vm_id: z
       .string()
       .min(1, 'VM ID is required')
@@ -46,10 +45,9 @@ export const VMConfigSchema = z
     ssh_user: z.string().optional(),
     ssh_key_path: z.string().optional(),
 
-    uac_ext_start: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
-    uac_ext_end: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
-    uas_ext_start: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
-    uas_ext_end: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
+    // Unified extension range (single pool)
+    ext_start: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
+    ext_end: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
 
     sbc_host: z
       .string()
@@ -70,70 +68,56 @@ export const VMConfigSchema = z
       .regex(DOMAIN_REGEX, 'Must be a valid domain (e.g. avaya.com)'),
     sip_password: z.string().min(1, 'SIP password is required'),
 
+    register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
+    subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
+
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
     ramp_up_seconds: z.number().nonnegative('Ramp-up must be ≥ 0').max(300, 'Cannot exceed 300s').optional(),
     media_enabled: z.boolean().optional(),
     metrics_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
-    peer_stop_url: z
-      .string()
-      .url('Must be a valid http:// URL')
-      .optional()
-      .or(z.literal('')),
 
     traffic_mode: TrafficModeSchema.optional(),
     call_count: z.number().int().nonnegative().max(1000000, 'Cannot exceed 1,000,000').optional(),
     duration_hours: z.number().positive().max(168, 'Cannot exceed 168h (1 week)').optional(),
   })
   .superRefine((data, ctx) => {
-    if (data.uac_ext_start >= data.uac_ext_end) {
+    if (data.ext_start >= data.ext_end) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['uac_ext_end'],
+        path: ['ext_end'],
         message: 'End must be greater than Start',
       })
     }
 
-    if (data.uas_ext_start >= data.uas_ext_end) {
+    if (data.ext_end - data.ext_start < 1) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['uas_ext_end'],
-        message: 'End must be greater than Start',
+        path: ['ext_end'],
+        message: 'Need at least 2 extensions',
       })
     }
 
-    const uacRange = { start: data.uac_ext_start, end: data.uac_ext_end }
-    const uasRange = { start: data.uas_ext_start, end: data.uas_ext_end }
-    if (uasRange.start <= uacRange.end && uasRange.end >= uacRange.start) {
+    if (data.traffic_mode === 'smoke' && !data.call_count) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['uas_ext_start'],
-        message: 'UAC and UAS extension ranges must not overlap',
+        path: ['call_count'],
+        message: 'call_count required for smoke mode',
       })
     }
-
-    if (data.vm_role === 'UAC') {
-      if (data.traffic_mode === 'smoke' && !data.call_count) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['call_count'],
-          message: 'call_count required for smoke mode',
-        })
-      }
-      if (data.traffic_mode === 'timed' && !data.duration_hours) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['duration_hours'],
-          message: 'duration_hours required for timed mode',
-        })
-      }
+    if (data.traffic_mode === 'timed' && !data.duration_hours) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['duration_hours'],
+        message: 'duration_hours required for timed mode',
+      })
     }
   })
 
 export type VMConfigInput = z.input<typeof VMConfigSchema>
 export type VMConfigOutput = z.output<typeof VMConfigSchema>
 
-// Derives UAC peer_stop_url from UAS vm_ip + metrics_port (per spec)
+/** @deprecated No longer used; left for backward compat with existing callers */
 export function deriveUACPeerStopUrl(uasVmIp: string, uasMetricsPort: number): string {
   if (!uasVmIp || !uasMetricsPort) return ''
   return `http://${uasVmIp}:${uasMetricsPort}/api/test/stop`

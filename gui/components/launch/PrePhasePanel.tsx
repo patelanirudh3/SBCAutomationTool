@@ -2,624 +2,432 @@
 
 import { useEffect, useCallback, useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { motion, AnimatePresence } from 'framer-motion'
-import { AlertTriangle, Play, RotateCcw } from 'lucide-react'
+import { AlertTriangle, Play, ArrowRight, Users, CheckCircle2, XCircle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { ChecklistItem, type ChecklistState } from './ChecklistItem'
-import { LaunchCountdown } from './LaunchCountdown'
+import { Progress } from '@/components/ui/progress'
 import { useTrafficStore } from '@/store/traffic'
-import { getMetricsFor, startTestFor } from '@/lib/api'
+import { getMetricsFor, startPrePhaseFor, startTrafficFor, startTestFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { VMRole } from '@/types'
 
-// ---------------------------------------------------------------------------
-// Transition timing — tuned for demo: snappy but readable
-// ---------------------------------------------------------------------------
-const STEP_CHECKING_MS = 400   // spinner before showing ok
-const STEP_AFTER_OK_MS = 300   // pause after each item before next
-const STEP_BETWEEN_MS = 350    // between items (mock mode)
+// How often to poll metrics during pre-phase
+const POLL_INTERVAL_MS = 2_000
 
-// ---------------------------------------------------------------------------
-// Per-side checklist model
-// ---------------------------------------------------------------------------
-
-interface CheckItem {
-  key: string
-  label: string
-  state: ChecklistState
-  failLog?: string
-}
-
-function makeUASItems(n: number): CheckItem[] {
-  return [
-    { key: 'register',   label: `REGISTER complete: 0/${n} OK, 0 failed`,                 state: 'pending' },
-    { key: 'subscribe',  label: `SUBSCRIBE complete: 0/${n} OK, 0 failed`,                state: 'pending' },
-    { key: 'extensions', label: `ALL EXTENSIONS READY — 0 registered, 0 subscribed`,      state: 'pending' },
-    { key: 'auto_start', label: `UAS auto-answer started for ${n} extensions`,             state: 'pending' },
-    { key: 'auto_active',label: `UAS auto-answer mode active on ${n} extensions`,          state: 'pending' },
-  ]
-}
-
-function makeUACItems(n: number): CheckItem[] {
-  return [
-    { key: 'register',   label: `REGISTER complete: 0/${n} OK, 0 failed`,                 state: 'pending' },
-    { key: 'subscribe',  label: `SUBSCRIBE complete: 0/${n} OK, 0 failed`,                state: 'pending' },
-    { key: 'extensions', label: `ALL EXTENSIONS READY — 0 registered, 0 subscribed`,      state: 'pending' },
-  ]
-}
-
-// GET /metrics response shape — only the fields we care about for pre-phase.
-interface LiveMetrics {
-  phase: string           // backend: "INIT" | "PRE_REGISTER" | "TRAFFIC" | "STOPPING" | "DONE"
-  running: boolean
-  registered_count: number
-  subscribed_count: number
+// Pre-phase live metrics shape from backend
+interface PrePhaseMetrics {
+  phase: string
+  registered_count?: number
+  subscribed_count?: number
+  idle_count?: number
+  non_idle_count?: number
+  reg_only_count?: number
 }
 
 // ---------------------------------------------------------------------------
-// Side panel (UAS or UAC) — now includes per-side Start button
+// PoolCountBadge — shows idle / non-idle / reg-only counts
 // ---------------------------------------------------------------------------
 
-function SidePanel({
-  role,
-  vmId,
-  items,
-  active,
-  onRetry,
-  hasFailed,
-  showStartBtn,
-  onStart,
-  pingError,
+function CountBadge({
+  label,
+  value,
+  color,
 }: {
-  role: VMRole
-  vmId: string
-  items: CheckItem[]
-  active: boolean
-  onRetry?: () => void
-  hasFailed: boolean
-  showStartBtn?: boolean
-  onStart?: () => void
-  pingError?: string | null
+  label: string
+  value: number
+  color: 'emerald' | 'amber' | 'slate' | 'rose'
 }) {
-  const isUAS = role === 'UAS'
+  const cls = {
+    emerald: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
+    amber:   'border-amber-500/30 bg-amber-500/10 text-amber-400',
+    slate:   'border-slate-600/40 bg-slate-700/20 text-slate-300',
+    rose:    'border-rose-500/30 bg-rose-500/10 text-rose-400',
+  }[color]
 
   return (
-    <motion.div
-      animate={{ opacity: active ? 1 : 0.35 }}
-      transition={{ duration: 0.5 }}
-      className="flex flex-1 flex-col"
-    >
-      {/* Side header */}
-      <div className="flex items-center justify-between border-b border-border bg-card/80 px-5 py-3">
-        <div className="flex items-center gap-2">
-          <span
-            className={cn(
-              'rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest',
-              isUAS ? 'bg-violet-500/15 text-violet-400' : 'bg-blue-500/15 text-blue-400'
-            )}
-          >
-            {role}
-          </span>
-          <span className="font-mono text-sm text-foreground">{vmId}</span>
-        </div>
-        {hasFailed && onRetry && (
-          <Button variant="outline" size="sm" onClick={onRetry} className="gap-1.5 text-xs">
-            <RotateCcw className="size-3" />
-            Retry
-          </Button>
-        )}
-      </div>
-
-      {/* Per-side Start button — shown in live mode before monitoring starts for this side */}
-      {showStartBtn && onStart && (
-        <div className="flex flex-col items-center gap-2 border-b border-border/30 py-3">
-          <Button
-            onClick={onStart}
-            variant="outline"
-            size="sm"
-            className={cn(
-              'gap-2',
-              isUAS
-                ? 'border-violet-500/30 bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 hover:text-violet-300'
-                : 'border-blue-500/30 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 hover:text-blue-300'
-            )}
-          >
-            <Play className="size-3" />
-            Start {role}
-          </Button>
-          {pingError && (
-            <p className="max-w-xs text-center text-xs text-rose-400">
-              {pingError}{' '}
-              <button
-                onClick={onStart}
-                className="underline underline-offset-2 hover:text-rose-300"
-              >
-                Retry
-              </button>
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Checklist */}
-      <div className="flex-1 space-y-3 px-5 py-5">
-        {items.map((item) => (
-          <ChecklistItem
-            key={item.key}
-            label={item.label}
-            state={item.state}
-            failLog={item.failLog}
-          />
-        ))}
-      </div>
-    </motion.div>
+    <div className={cn('flex flex-col items-center rounded-lg border px-4 py-3', cls)}>
+      <span className="text-2xl font-bold font-mono">{value}</span>
+      <span className="mt-0.5 text-[11px] font-medium tracking-wide">{label}</span>
+    </div>
   )
 }
 
 // ---------------------------------------------------------------------------
-// Main orchestrator
+// Main PrePhasePanel
 // ---------------------------------------------------------------------------
 
 export function PrePhasePanel() {
   const router = useRouter()
-  const { pairs, activePairIndex, setPhase, setUASPrePhase, setUACPrePhase, setCurrentRunId } = useTrafficStore()
+  const {
+    pairs,
+    activePairIndex,
+    setPhase,
+    setPrePhaseStatus,
+    setCurrentRunId,
+    idleCount,
+    nonIdleCount,
+    regOnlyCount,
+    updateUACMetrics,
+  } = useTrafficStore()
+
   const pair = pairs[activePairIndex]
-  const extCount = pair ? pair.uas.uas_ext_end - pair.uas.uas_ext_start + 1 : 10
+  const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
+  const vmPort = pair?.uac.metrics_port ?? 8082
+  const extCount = pair ? (pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1 : 0
 
-  const [uasItems, setUasItems] = useState<CheckItem[]>(() => makeUASItems(extCount))
-  const [uacItems, setUacItems] = useState<CheckItem[]>(() => makeUACItems(extCount))
-  const [uasActive, setUasActive] = useState(true)
-  const [uacActive, setUacActive] = useState(false)
-  const [showCountdown, setShowCountdown] = useState(false)
-  const [uasComplete, setUasComplete] = useState(false)
-  const [uacComplete, setUacComplete] = useState(false)
+  const [regStarted, setRegStarted] = useState(false)
+  const [regDone, setRegDone] = useState(false)
+  const [regCount, setRegCount] = useState(0)
+  const [subCount, setSubCount] = useState(0)
+  const [localIdleCount, setLocalIdleCount] = useState(0)
+  const [localRegOnlyCount, setLocalRegOnlyCount] = useState(0)
+  const [localNonIdleCount, setLocalNonIdleCount] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  const [isStartingReg, setIsStartingReg] = useState(false)
+  const [isStartingTraffic, setIsStartingTraffic] = useState(false)
 
-  // Per-side monitoring state (live mode only)
-  const [uasMonitoringStarted, setUasMonitoringStarted] = useState(false)
-  const [uacMonitoringStarted, setUacMonitoringStarted] = useState(false)
-  const [uasPingError, setUasPingError] = useState<string | null>(null)
-  const [uacPingError, setUacPingError] = useState<string | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const isMock  = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
-  const isMock = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
-  const hasStartedRef = useRef(false)
-
-  // Live-mode polling and timeout handles
-  const uasPollRef    = useRef<ReturnType<typeof setInterval>  | null>(null)
-  const uacPollRef    = useRef<ReturnType<typeof setInterval>  | null>(null)
-  const uasTimeoutRef = useRef<ReturnType<typeof setTimeout>   | null>(null)
-  const uacTimeoutRef = useRef<ReturnType<typeof setTimeout>   | null>(null)
-
-  // ---------------------------------------------------------------------------
-  // Helpers shared by mock + live
-  // ---------------------------------------------------------------------------
-
-  const advanceItem = useCallback(
-    (
-      setter: React.Dispatch<React.SetStateAction<CheckItem[]>>,
-      key: string,
-      state: ChecklistState,
-      label?: string,
-      failLog?: string
-    ) => {
-      setter((prev) =>
-        prev.map((it) =>
-          it.key === key ? { ...it, state, label: label ?? it.label, failLog } : it
-        )
-      )
-    },
-    []
-  )
-
-  const transitionItem = useCallback(
-    async (
-      setter: React.Dispatch<React.SetStateAction<CheckItem[]>>,
-      key: string,
-      finalState: ChecklistState,
-      label: string
-    ) => {
-      advanceItem(setter, key, 'checking')
-      await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
-      advanceItem(setter, key, finalState, label)
-    },
-    [advanceItem]
-  )
-
-  // Cleanup all live-mode timers on unmount
+  // Sync pool counts from store (populated via WS metrics)
   useEffect(() => {
-    return () => {
-      if (uasPollRef.current)    clearInterval(uasPollRef.current)
-      if (uacPollRef.current)    clearInterval(uacPollRef.current)
-      if (uasTimeoutRef.current) clearTimeout(uasTimeoutRef.current)
-      if (uacTimeoutRef.current) clearTimeout(uacTimeoutRef.current)
+    setLocalIdleCount(idleCount)
+    setLocalNonIdleCount(nonIdleCount)
+    setLocalRegOnlyCount(regOnlyCount)
+  }, [idleCount, nonIdleCount, regOnlyCount])
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
     }
   }, [])
 
+  useEffect(() => () => stopPolling(), [stopPolling])
+
   // ---------------------------------------------------------------------------
-  // MOCK_MODE simulation — unchanged, auto-runs on mount
+  // Polling — checks metrics while pre-phase is running
   // ---------------------------------------------------------------------------
+
+  const startPolling = useCallback(() => {
+    stopPolling()
+    pollRef.current = setInterval(async () => {
+      try {
+        const m = (await getMetricsFor(vmIp, vmPort)) as unknown as PrePhaseMetrics & {
+          idle_count?: number; non_idle_count?: number; reg_only_count?: number
+          registered_count?: number; subscribed_count?: number; phase?: string
+        }
+
+        // Feed into store so pool counts & phase badge stay current
+        updateUACMetrics(m as Parameters<typeof updateUACMetrics>[0])
+
+        setRegCount(m.registered_count ?? 0)
+        setSubCount(m.subscribed_count ?? 0)
+        setLocalIdleCount(m.idle_count ?? 0)
+        setLocalRegOnlyCount(m.reg_only_count ?? 0)
+        setLocalNonIdleCount(m.non_idle_count ?? 0)
+
+        const phase = m.phase ?? ''
+        if (phase === 'TRAFFIC_READY' || phase === 'TRAFFIC' || phase === 'CLEANUP_READY' || phase === 'DONE') {
+          stopPolling()
+          setRegDone(true)
+          setPhase('TRAFFIC_READY')
+          setPrePhaseStatus({
+            vm_id: pair?.uac.vm_id ?? 'traffic-local',
+            register_complete: true,
+            register_count: m.registered_count ?? 0,
+            register_total: extCount,
+            subscribe_complete: true,
+            subscribe_count: m.subscribed_count ?? 0,
+            subscribe_total: extCount,
+            extensions_ready: (m.idle_count ?? 0) >= 2,
+            idle_count: m.idle_count,
+            reg_only_count: m.reg_only_count,
+          })
+        }
+      } catch {
+        // transient error — keep polling
+      }
+    }, POLL_INTERVAL_MS)
+  }, [vmIp, vmPort, pair, extCount, stopPolling, setPhase, setPrePhaseStatus, updateUACMetrics])
+
+  // ---------------------------------------------------------------------------
+  // MOCK mode — auto-simulate pre-phase on mount
+  // ---------------------------------------------------------------------------
+
+  const hasStartedRef = useRef(false)
 
   useEffect(() => {
     if (!isMock || hasStartedRef.current) return
     hasStartedRef.current = true
+    const n = Math.max(extCount, 10)
 
-    setPhase('PRE_PHASE')
-
-    // Generate run-level run_id for this traffic run
-    const pad = (n: number) => String(n).padStart(2, '0')
+    const pad = (x: number) => String(x).padStart(2, '0')
     const now = new Date()
     const runId = `run-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
     setCurrentRunId(runId)
-
-    const run = async () => {
-      const n = extCount
-
-      await transitionItem(setUasItems, 'register',   'ok', `REGISTER complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUasItems, 'subscribe',  'ok', `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUasItems, 'extensions', 'ok', `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUasItems, 'auto_start', 'ok', `UAS auto-answer started for ${n} extensions`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUasItems, 'auto_active','ok', `UAS auto-answer mode active on ${n} extensions`)
-
-      setUasComplete(true)
-      setUASPrePhase({
-        vm_id: pair?.uas.vm_id ?? 'uas-local',
-        role: 'UAS',
-        register_complete: true,
-        register_count: n,
-        register_total: n,
-        subscribe_complete: true,
-        subscribe_count: n,
-        subscribe_total: n,
-        extensions_ready: true,
-        auto_answer_started: true,
-        auto_answer_active: true,
-      })
-
-      setShowCountdown(true)
-    }
-
-    run()
-  }, [isMock, extCount, pair, setPhase, setUASPrePhase, setCurrentRunId, transitionItem])
-
-  // ---------------------------------------------------------------------------
-  // Live mode: UAS polling — started by "Start UAS" button
-  // ---------------------------------------------------------------------------
-
-  const startUASPolling = useCallback(() => {
-    if (!pair) return
-    const n = extCount
-
+    setRegStarted(true)
     setPhase('PRE_PHASE')
 
-    uasTimeoutRef.current = setTimeout(() => {
-      setUasItems((prev) =>
-        prev.map((it) =>
-          it.state === 'checking'
-            ? { ...it, state: 'failed' as ChecklistState, failLog: 'Timeout: no response after 60s' }
-            : it
-        )
-      )
-      if (uasPollRef.current) { clearInterval(uasPollRef.current); uasPollRef.current = null }
-    }, 60_000)
+    const tick = 200
+    let reg = 0
+    let sub = 0
 
-    uasPollRef.current = setInterval(async () => {
-      try {
-        const m = (await getMetricsFor(pair.uas.vm_ip, pair.uas.metrics_port)) as unknown as LiveMetrics
-        const phase = m.phase ?? 'INIT'
-
-        if (phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'DONE') {
-          if (uasPollRef.current) { clearInterval(uasPollRef.current); uasPollRef.current = null }
-          if (uasTimeoutRef.current) { clearTimeout(uasTimeoutRef.current); uasTimeoutRef.current = null }
-
-          const steps: [string, string][] = [
-            ['register',    `REGISTER complete: ${n}/${n} OK, 0 failed`],
-            ['subscribe',   `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`],
-            ['extensions',  `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`],
-            ['auto_start',  `UAS auto-answer started for ${n} extensions`],
-            ['auto_active', `UAS auto-answer mode active on ${n} extensions`],
-          ]
-          for (const [key, label] of steps) {
-            advanceItem(setUasItems, key, 'checking')
-            await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
-            advanceItem(setUasItems, key, 'ok', label)
-            await new Promise((r) => setTimeout(r, STEP_AFTER_OK_MS))
-          }
-
-          setUasComplete(true)
-          setUASPrePhase({
-            vm_id: pair.uas.vm_id,
-            role: 'UAS',
-            register_complete: true,
-            register_count: n,
-            register_total: n,
-            subscribe_complete: true,
-            subscribe_count: n,
-            subscribe_total: n,
-            extensions_ready: true,
-            auto_answer_started: true,
-            auto_answer_active: true,
-          })
-          setShowCountdown(true)
-          return
-        }
-
-        if (phase === 'PRE_REGISTER' || phase === 'INIT') {
-          setUasItems((prev) =>
-            prev.map((it) =>
-              it.key === 'register' && it.state === 'pending'
-                ? { ...it, state: 'checking' }
-                : it
-            )
-          )
-        }
-      } catch {
-        // transient network error — keep polling
+    const iv = setInterval(() => {
+      if (reg < n) {
+        reg = Math.min(reg + 1, n)
+        setRegCount(reg)
       }
-    }, 3_000)
-  }, [pair, extCount, setPhase, setUASPrePhase, advanceItem])
-
-  // ---------------------------------------------------------------------------
-  // Live mode: UAC polling — started by "Start UAC" button (after countdown)
-  // ---------------------------------------------------------------------------
-
-  const startUACPolling = useCallback(() => {
-    if (!pair) return
-    const n = extCount
-
-    uacTimeoutRef.current = setTimeout(() => {
-      setUacItems((prev) =>
-        prev.map((it) =>
-          it.state === 'checking'
-            ? { ...it, state: 'failed' as ChecklistState, failLog: 'Timeout: no response after 60s' }
-            : it
-        )
-      )
-      if (uacPollRef.current) { clearInterval(uacPollRef.current); uacPollRef.current = null }
-    }, 60_000)
-
-    uacPollRef.current = setInterval(async () => {
-      try {
-        const m = (await getMetricsFor(pair.uac.vm_ip, pair.uac.metrics_port)) as unknown as LiveMetrics
-        const phase = m.phase ?? 'INIT'
-
-        if (phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'DONE') {
-          if (uacPollRef.current) { clearInterval(uacPollRef.current); uacPollRef.current = null }
-          if (uacTimeoutRef.current) { clearTimeout(uacTimeoutRef.current); uacTimeoutRef.current = null }
-
-          const steps: [string, string][] = [
-            ['register',   `REGISTER complete: ${n}/${n} OK, 0 failed`],
-            ['subscribe',  `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`],
-            ['extensions', `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`],
-          ]
-          for (const [key, label] of steps) {
-            advanceItem(setUacItems, key, 'checking')
-            await new Promise((r) => setTimeout(r, STEP_CHECKING_MS))
-            advanceItem(setUacItems, key, 'ok', label)
-            await new Promise((r) => setTimeout(r, STEP_AFTER_OK_MS))
-          }
-
-          setUacComplete(true)
-          setUACPrePhase({
-            vm_id: pair.uac.vm_id,
-            role: 'UAC',
-            register_complete: true,
-            register_count: n,
-            register_total: n,
-            subscribe_complete: true,
-            subscribe_count: n,
-            subscribe_total: n,
-            extensions_ready: true,
-            auto_answer_started: false,
-            auto_answer_active: false,
-          })
-          return
-        }
-
-        if (phase === 'PRE_REGISTER' || phase === 'INIT') {
-          setUacItems((prev) =>
-            prev.map((it) =>
-              it.key === 'register' && it.state === 'pending'
-                ? { ...it, state: 'checking' }
-                : it
-            )
-          )
-        }
-      } catch {
-        // transient network error — keep polling
+      if (sub < reg - 1) {
+        sub = Math.min(sub + 1, reg - 1)
+        setSubCount(sub)
+        setLocalIdleCount(sub)
       }
-    }, 3_000)
-  }, [pair, extCount, setUACPrePhase, advanceItem])
+      if (reg >= n && sub >= n) {
+        clearInterval(iv)
+        setRegDone(true)
+        setLocalIdleCount(n)
+        setLocalRegOnlyCount(0)
+        setPhase('TRAFFIC_READY')
+        setPrePhaseStatus({
+          vm_id: pair?.uac.vm_id ?? 'traffic-local',
+          register_complete: true,
+          register_count: n,
+          register_total: n,
+          subscribe_complete: true,
+          subscribe_count: n,
+          subscribe_total: n,
+          extensions_ready: true,
+          idle_count: n,
+          reg_only_count: 0,
+        })
+      }
+    }, tick)
+    return () => clearInterval(iv)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMock])
 
   // ---------------------------------------------------------------------------
-  // Per-side "Start" button handlers — ping only that side's VM
+  // Handlers
   // ---------------------------------------------------------------------------
 
-  const handleStartUAS = useCallback(async () => {
-    if (!pair) return
-    setUasPingError(null)
+  const handleStartRegSub = useCallback(async () => {
+    if (isStartingReg) return
+    setIsStartingReg(true)
+    setError(null)
 
-    // Generate run-level run_id (one per traffic run, shared by all pairs)
-    const pad = (n: number) => String(n).padStart(2, '0')
+    // Generate run_id
+    const pad = (x: number) => String(x).padStart(2, '0')
     const now = new Date()
     const runId = `run-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
     setCurrentRunId(runId)
 
     try {
-      await startTestFor(pair.uas.vm_ip, pair.uas.metrics_port, runId, pair.pair_id)
+      // First, start the traffic engine (test/start) to launch the backend process
+      await startTestFor(vmIp, vmPort, runId, pair?.pair_id ?? 'pair-1')
+      // Then signal prephase/start to begin registration
+      await startPrePhaseFor(vmIp, vmPort)
+      setRegStarted(true)
+      setPhase('PRE_PHASE')
+      startPolling()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to start UAS'
-      setUasPingError(
-        `Could not start UAS at http://${pair.uas.vm_ip}:${pair.uas.metrics_port} — ${msg}`
-      )
-      return
+      const msg = err instanceof Error ? err.message : 'Failed to start registration'
+      setError(`Could not start Reg/Sub at http://${vmIp}:${vmPort} — ${msg}`)
+    } finally {
+      setIsStartingReg(false)
     }
+  }, [isStartingReg, vmIp, vmPort, pair, setCurrentRunId, setPhase, startPolling])
 
-    setUasMonitoringStarted(true)
-    startUASPolling()
-  }, [pair, startUASPolling, setCurrentRunId])
-
-  const handleStartUAC = useCallback(async () => {
-    if (!pair) return
-    setUacPingError(null)
-
-    const runId = useTrafficStore.getState().currentRunId
-    if (!runId) {
-      setUacPingError('Start UAS first to establish run_id')
-      return
-    }
+  const handleStartTraffic = useCallback(async () => {
+    if (isStartingTraffic) return
+    setIsStartingTraffic(true)
+    setError(null)
 
     try {
-      await startTestFor(pair.uac.vm_ip, pair.uac.metrics_port, runId, pair.pair_id)
+      await startTrafficFor(vmIp, vmPort)
+      setPhase('TRAFFIC')
+      router.push('/run')
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to start UAC'
-      setUacPingError(
-        `Could not start UAC at http://${pair.uac.vm_ip}:${pair.uac.metrics_port} — ${msg}`
-      )
-      return
+      const msg = err instanceof Error ? err.message : 'Failed to start traffic'
+      setError(`Could not start traffic at http://${vmIp}:${vmPort} — ${msg}`)
+      setIsStartingTraffic(false)
     }
+  }, [isStartingTraffic, vmIp, vmPort, setPhase, router])
 
-    setUacMonitoringStarted(true)
-    startUACPolling()
-  }, [pair, startUACPolling])
-
-  // Countdown complete → activate UAC panel
-  const handleCountdownDone = useCallback(async () => {
-    setShowCountdown(false)
-    setUacActive(true)
-
-    if (isMock) {
-      const n = extCount
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUacItems, 'register',   'ok', `REGISTER complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUacItems, 'subscribe',  'ok', `SUBSCRIBE complete: ${n}/${n} OK, 0 failed`)
-      await new Promise((r) => setTimeout(r, STEP_BETWEEN_MS))
-      await transitionItem(setUacItems, 'extensions', 'ok', `ALL EXTENSIONS READY — ${n} registered, ${n} subscribed`)
-
-      setUacComplete(true)
-      setUACPrePhase({
-        vm_id: pair?.uac.vm_id ?? 'uac-local',
-        role: 'UAC',
-        register_complete: true,
-        register_count: n,
-        register_total: n,
-        subscribe_complete: true,
-        subscribe_count: n,
-        subscribe_total: n,
-        extensions_ready: true,
-        auto_answer_started: false,
-        auto_answer_active: false,
-      })
-    }
-    // Live mode: UAC "Start UAC" button is now visible — operator starts UAC
-    // process in terminal, then clicks the button. No auto-polling here.
-  }, [isMock, extCount, pair, setUACPrePhase, transitionItem])
-
-  // Auto-navigate when all UAC items are green — 1.5s so user sees the final state
-  useEffect(() => {
-    if (uacComplete) {
-      const timeout = setTimeout(() => {
-        setPhase('TRAFFIC')
-        router.push('/run')
-      }, 1500)
-      return () => clearTimeout(timeout)
-    }
-  }, [uacComplete, setPhase, router])
+  // Mock mode: clicking Start Traffic navigates immediately
+  const handleMockStartTraffic = useCallback(() => {
+    setPhase('TRAFFIC')
+    router.push('/run')
+  }, [setPhase, router])
 
   // ---------------------------------------------------------------------------
-  // Retry handlers (per-side)
+  // Derived display values
   // ---------------------------------------------------------------------------
 
-  const handleRetryUAS = useCallback(() => {
-    if (uasPollRef.current)    { clearInterval(uasPollRef.current);  uasPollRef.current    = null }
-    if (uasTimeoutRef.current) { clearTimeout(uasTimeoutRef.current); uasTimeoutRef.current = null }
-    setUasItems(makeUASItems(extCount))
-    setUasComplete(false)
-    setUasPingError(null)
-    if (isMock) {
-      hasStartedRef.current = false
-    } else {
-      setUasMonitoringStarted(false)
-    }
-  }, [extCount, isMock])
-
-  const handleRetryUAC = useCallback(() => {
-    if (uacPollRef.current)    { clearInterval(uacPollRef.current);  uacPollRef.current    = null }
-    if (uacTimeoutRef.current) { clearTimeout(uacTimeoutRef.current); uacTimeoutRef.current = null }
-    setUacItems(makeUACItems(extCount))
-    setUacComplete(false)
-    setUacPingError(null)
-    if (!isMock) {
-      setUacMonitoringStarted(false)
-    }
-  }, [extCount, isMock])
-
-  const uasFailed = uasItems.some((it) => it.state === 'failed')
-  const uacFailed = uacItems.some((it) => it.state === 'failed')
-
-  // UAS button: shown in live mode before UAS monitoring starts
-  const showUASStartBtn = !isMock && !uasMonitoringStarted
-  // UAC button: shown in live mode after countdown (uacActive), before UAC monitoring starts
-  const showUACStartBtn = !isMock && uacActive && !uacMonitoringStarted
-
-  void uasComplete
+  const displayIdle   = isMock ? localIdleCount   : (idleCount    > 0 ? idleCount    : localIdleCount)
+  const displayRegOnly= isMock ? localRegOnlyCount : (regOnlyCount > 0 ? regOnlyCount : localRegOnlyCount)
+  const displayNonIdle= isMock ? localNonIdleCount : (nonIdleCount > 0 ? nonIdleCount : localNonIdleCount)
+  const canStartTraffic = displayIdle >= 2
+  const total = Math.max(extCount, 1)
+  const regPct = Math.round((regCount / total) * 100)
+  const subPct = Math.round((subCount / total) * 100)
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      {/* Top banner */}
-      <div className="flex items-center gap-2 border-b border-amber-500/20 bg-amber-500/5 px-5 py-2.5">
-        <AlertTriangle className="size-3.5 shrink-0 text-amber-400" />
-        <p className="text-xs text-amber-300">
-          Launching UAS first. UAC will start automatically when UAS is ready.
+
+      {/* ── Info banner ─────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 border-b border-sky-500/20 bg-sky-500/5 px-5 py-2.5">
+        <Users className="size-3.5 shrink-0 text-sky-400" />
+        <p className="text-xs text-sky-300">
+          Phase 1 — Register and subscribe all extensions. Each successful Reg+Sub adds the user to the
+          idle pool. Once <span className="font-bold">≥ 2</span> users are idle, you can start traffic.
         </p>
       </div>
 
-      {/* Two-column layout */}
-      <div className="flex flex-1 overflow-hidden">
-        <SidePanel
-          role="UAS"
-          vmId={pair?.uas.vm_id ?? 'uas-local'}
-          items={uasItems}
-          active={uasActive}
-          onRetry={handleRetryUAS}
-          hasFailed={uasFailed}
-          showStartBtn={showUASStartBtn}
-          onStart={handleStartUAS}
-          pingError={uasPingError}
-        />
+      {/* ── Main content ─────────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-2xl space-y-6 px-6 py-8">
 
-        {/* Divider */}
-        <div className="w-px shrink-0 bg-border/30" />
+          {/* ── Start button row ───────────────────────────────── */}
+          {!regStarted && (
+            <div className="flex flex-col items-center gap-3">
+              <p className="text-sm text-muted-foreground">
+                Click <span className="font-semibold text-foreground">Reg / Sub</span> to register and
+                subscribe all {extCount > 0 ? extCount : '…'} extensions.
+              </p>
+              <Button
+                size="lg"
+                onClick={isMock ? () => { hasStartedRef.current = false; handleStartRegSub() } : handleStartRegSub}
+                disabled={isStartingReg}
+                className="gap-2 bg-emerald-600 hover:bg-emerald-500 text-white"
+              >
+                {isStartingReg ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Starting…
+                  </>
+                ) : (
+                  <>
+                    <Play className="size-4" />
+                    Reg / Sub
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
 
-        <SidePanel
-          role="UAC"
-          vmId={pair?.uac.vm_id ?? 'uac-local'}
-          items={uacItems}
-          active={uacActive}
-          onRetry={handleRetryUAC}
-          hasFailed={uacFailed}
-          showStartBtn={showUACStartBtn}
-          onStart={handleStartUAC}
-          pingError={uacPingError}
-        />
+          {/* ── Progress bars ─────────────────────────────────── */}
+          {regStarted && (
+            <div className="space-y-4 rounded-xl border border-border bg-card p-5">
+              <h3 className="text-sm font-semibold text-foreground">Registration Progress</h3>
+
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>REGISTER</span>
+                  <span className="font-mono">
+                    <span className="font-semibold text-foreground">{regCount}</span> / {extCount}
+                    {regCount >= extCount && (
+                      <CheckCircle2 className="ml-1 inline size-3 text-emerald-400" />
+                    )}
+                  </span>
+                </div>
+                <Progress value={regPct} className="h-2" />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>SUBSCRIBE</span>
+                  <span className="font-mono">
+                    <span className="font-semibold text-foreground">{subCount}</span> / {extCount}
+                    {subCount >= extCount && (
+                      <CheckCircle2 className="ml-1 inline size-3 text-emerald-400" />
+                    )}
+                  </span>
+                </div>
+                <Progress value={subPct} className="h-2" />
+              </div>
+            </div>
+          )}
+
+          {/* ── Pool counts ───────────────────────────────────── */}
+          {regStarted && (
+            <div className="grid grid-cols-3 gap-3">
+              <CountBadge label="Idle (ready)" value={displayIdle}    color="emerald" />
+              <CountBadge label="Reg-only"     value={displayRegOnly} color="amber"   />
+              <CountBadge label="Active calls" value={displayNonIdle} color="slate"   />
+            </div>
+          )}
+
+          {/* ── Completion status ─────────────────────────────── */}
+          {regDone && (
+            <div className={cn(
+              'flex items-start gap-3 rounded-lg border p-4',
+              canStartTraffic
+                ? 'border-emerald-500/30 bg-emerald-500/5'
+                : 'border-amber-500/30 bg-amber-500/5'
+            )}>
+              {canStartTraffic ? (
+                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-400" />
+              ) : (
+                <XCircle className="mt-0.5 size-4 shrink-0 text-amber-400" />
+              )}
+              <div>
+                <p className={cn(
+                  'text-sm font-semibold',
+                  canStartTraffic ? 'text-emerald-300' : 'text-amber-300'
+                )}>
+                  {canStartTraffic
+                    ? `${displayIdle} users in idle pool — ready for traffic`
+                    : `Only ${displayIdle} idle user${displayIdle === 1 ? '' : 's'} — need at least 2 to start traffic`
+                  }
+                </p>
+                {displayRegOnly > 0 && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {displayRegOnly} user{displayRegOnly === 1 ? '' : 's'} registered but not subscribed (reg-only list).
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── Error ─────────────────────────────────────────── */}
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-4">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-rose-400" />
+              <p className="text-sm text-rose-300">{error}</p>
+            </div>
+          )}
+
+          {/* ── Start Traffic button ──────────────────────────── */}
+          {(regDone || (regStarted && displayIdle >= 2)) && (
+            <div className="flex justify-end">
+              <Button
+                size="lg"
+                onClick={isMock ? handleMockStartTraffic : handleStartTraffic}
+                disabled={!canStartTraffic || isStartingTraffic}
+                className={cn(
+                  'gap-2',
+                  canStartTraffic
+                    ? 'bg-blue-600 hover:bg-blue-500 text-white'
+                    : 'opacity-40 cursor-not-allowed'
+                )}
+              >
+                {isStartingTraffic ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Starting…
+                  </>
+                ) : (
+                  <>
+                    Start Traffic
+                    <ArrowRight className="size-4" />
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+
+        </div>
       </div>
 
-      {/* Countdown overlay */}
-      <AnimatePresence>
-        {showCountdown && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm"
-          >
-            <LaunchCountdown seconds={5} onComplete={handleCountdownDone} />
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
   )
 }

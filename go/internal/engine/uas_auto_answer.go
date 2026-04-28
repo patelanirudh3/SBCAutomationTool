@@ -96,8 +96,15 @@ func (u *UasAutoAnswer) stopped() bool {
 }
 
 // uasLoop listens for INVITE events on the agent's wildcard queue and spawns
-// a handleCall goroutine for each one.
+// a handleCall goroutine for each one. It checks AutoAnswerEnabled() before
+// spawning to avoid answering calls when the agent has been selected as a caller.
 func (u *UasAutoAnswer) uasLoop(ctx context.Context, ag *agent.ExtensionAgent) {
+	u.uasLoopWithStop(ctx, ag, nil)
+}
+
+// uasLoopWithStop is the internal loop; stopCh (if non-nil) allows stopping
+// a single agent's loop independently from the global StopEvent.
+func (u *UasAutoAnswer) uasLoopWithStop(ctx context.Context, ag *agent.ExtensionAgent, stopCh <-chan struct{}) {
 	wq := ag.RegisterWildcardListener()
 	defer ag.DeregisterWildcardListener(wq)
 
@@ -112,17 +119,47 @@ func (u *UasAutoAnswer) uasLoop(ctx context.Context, ag *agent.ExtensionAgent) {
 			return
 		default:
 		}
+		if stopCh != nil {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+		}
 
 		code, rawMsg, err := ag.WaitWildcard(ctx, wq, 1*time.Second)
 		if err != nil {
 			continue
 		}
-		if code == "INVITE" {
+		// Double-check: only answer if this agent is still in auto-answer mode.
+		// This guards against the narrow window between NextPair() returning and
+		// the flag being set to false (which should not occur since the flag is
+		// set inside the NextPair lock, but provides defence in depth).
+		if code == "INVITE" && ag.AutoAnswerEnabled() {
 			u.wg.Add(1)
 			go func(raw string) {
 				defer u.wg.Done()
 				u.handleCall(ctx, ag, raw)
 			}(rawMsg)
+		}
+	}
+}
+
+// StartAutoAnswerForAgent starts an independent auto-answer loop for a single
+// agent. Called for every agent that successfully completes Reg+Sub during
+// pre-phase. Returns a stop function that terminates only this agent's loop.
+func (u *UasAutoAnswer) StartAutoAnswerForAgent(ctx context.Context, ag *agent.ExtensionAgent) func() {
+	stopCh := make(chan struct{})
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		u.uasLoopWithStop(ctx, ag, stopCh)
+	}()
+	return func() {
+		select {
+		case <-stopCh:
+		default:
+			close(stopCh)
 		}
 	}
 }
@@ -290,6 +327,11 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	if err := ag.HandleBye(rawBye, dialog); err != nil {
 		slog.Error("UAS handle BYE failed", "ext", ag.Ext, "err", err)
 	}
+	// Register the completed dialog as a zombie for 60s so that any late
+	// duplicate INVITE with this Call-ID is rejected (defence in depth for
+	// TCP/TLS; stale retransmits are theoretically impossible on reliable
+	// transports but this costs nothing).
+	ag.RegisterZombie(dialog, 60*time.Second)
 	milestones.Bye200SentMs = msSince(callStart)
 	if u.metrics != nil {
 		u.metrics.IncrementSIPCounter("bye_200_sent")

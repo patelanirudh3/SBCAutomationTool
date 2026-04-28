@@ -14,34 +14,33 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// VMConfig holds all configuration for one VM's traffic run.
+// VMConfig holds all configuration for a single-pool traffic run.
+// The dual UAC/UAS role model has been replaced with a unified user pool.
 type VMConfig struct {
-	VMRole    string `yaml:"vm_role" json:"vm_role"`
 	VMID      string `yaml:"vm_id" json:"vm_id"`
-	UACExtStart int  `yaml:"uac_ext_start" json:"uac_ext_start"`
-	UACExtEnd   int  `yaml:"uac_ext_end" json:"uac_ext_end"`
-	UASExtStart int  `yaml:"uas_ext_start" json:"uas_ext_start"`
-	UASExtEnd   int  `yaml:"uas_ext_end" json:"uas_ext_end"`
-	SBCHost     string `yaml:"sbc_host" json:"sbc_host"`
-	SBCPort     int    `yaml:"sbc_port" json:"sbc_port"`
+	ExtStart  int    `yaml:"ext_start" json:"ext_start"`
+	ExtEnd    int    `yaml:"ext_end" json:"ext_end"`
+	SBCHost   string `yaml:"sbc_host" json:"sbc_host"`
+	SBCPort   int    `yaml:"sbc_port" json:"sbc_port"`
 	// TODO(failover): SecondaryHost/Port are stored and validated but not yet
 	// wired into the engine. When failover_enabled is true, the forking model
 	// requires: (1) REGISTER on both primary and secondary during pre-phase,
 	// (2) SUBSCRIBE only on primary, (3) on primary failure during traffic run
 	// re-SUBSCRIBE to secondary (no re-REGISTER needed).
-	SecondaryHost string `yaml:"secondary_host" json:"secondary_host"`
-	SecondaryPort int    `yaml:"secondary_port" json:"secondary_port"`
-	FailoverEnabled bool `yaml:"failover_enabled" json:"failover_enabled"`
-	DNSServers   string `yaml:"dns_servers" json:"dns_servers"`
-	SIPTransport string `yaml:"sip_transport" json:"sip_transport"`
-	Domain       string `yaml:"domain" json:"domain"`
-	SIPPassword  string `yaml:"sip_password" json:"sip_password"`
-	CPS              int `yaml:"cps" json:"cps"`
-	HoldTimeSeconds  int `yaml:"hold_time_seconds" json:"hold_time_seconds"`
-	RampUpSeconds    int `yaml:"ramp_up_seconds" json:"ramp_up_seconds"`
-	MetricsInterval  int `yaml:"metrics_interval" json:"metrics_interval"`
-	MetricsPort      int `yaml:"metrics_port" json:"metrics_port"`
-	CoordinatorURL   string `yaml:"coordinator_url" json:"coordinator_url"`
+	SecondaryHost   string `yaml:"secondary_host" json:"secondary_host"`
+	SecondaryPort   int    `yaml:"secondary_port" json:"secondary_port"`
+	FailoverEnabled bool   `yaml:"failover_enabled" json:"failover_enabled"`
+	DNSServers      string `yaml:"dns_servers" json:"dns_servers"`
+	SIPTransport    string `yaml:"sip_transport" json:"sip_transport"`
+	Domain          string `yaml:"domain" json:"domain"`
+	SIPPassword     string `yaml:"sip_password" json:"sip_password"`
+
+	CPS             int `yaml:"cps" json:"cps"`
+	HoldTimeSeconds int `yaml:"hold_time_seconds" json:"hold_time_seconds"`
+	RampUpSeconds   int `yaml:"ramp_up_seconds" json:"ramp_up_seconds"`
+	MetricsInterval int `yaml:"metrics_interval" json:"metrics_interval"`
+	MetricsPort     int `yaml:"metrics_port" json:"metrics_port"`
+
 	RegisterBatchSize    int `yaml:"register_batch_size" json:"register_batch_size"`
 	RegisterBatchDelayMs int `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
 	RegisterExpires      int `yaml:"register_expires" json:"register_expires"`
@@ -49,48 +48,32 @@ type VMConfig struct {
 	RegisterTimeout      int `yaml:"register_timeout" json:"register_timeout"`
 	SubscribeConcurrency int `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
 	SubscribeExpires     int `yaml:"subscribe_expires" json:"subscribe_expires"`
-	MaxConcurrentCalls int `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
-	LocalHost  string `yaml:"local_host" json:"local_host"`
-	LocalPort  int    `yaml:"local_port" json:"local_port"`
-	PeerStopURL string `yaml:"peer_stop_url" json:"peer_stop_url"`
+
+	MaxConcurrentCalls int    `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
+	LocalHost          string `yaml:"local_host" json:"local_host"`
+	LocalPort          int    `yaml:"local_port" json:"local_port"`
+
 	RTPBurstSeconds      int `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
 	RTPBurstPPS          int `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
 	RTPKeepaliveInterval int `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
-	MediaEnabled bool   `yaml:"media_enabled" json:"media_enabled"`
-	RTPMode      string `yaml:"rtp_mode" json:"rtp_mode"`
-	RTPPtime     int    `yaml:"rtp_ptime" json:"rtp_ptime"`
-	RTPPcap      bool   `yaml:"rtp_pcap" json:"rtp_pcap"`
-	PoolWrapDelaySeconds float64 `yaml:"pool_wrap_delay_seconds" json:"pool_wrap_delay_seconds"`
-	TrafficMode string  `yaml:"traffic_mode" json:"traffic_mode"`
-	CallCount   int     `yaml:"call_count" json:"call_count"`
+	MediaEnabled         bool   `yaml:"media_enabled" json:"media_enabled"`
+	RTPMode              string `yaml:"rtp_mode" json:"rtp_mode"`
+	RTPPtime             int    `yaml:"rtp_ptime" json:"rtp_ptime"`
+	RTPPcap              bool   `yaml:"rtp_pcap" json:"rtp_pcap"`
+
+	TrafficMode   string  `yaml:"traffic_mode" json:"traffic_mode"`
+	CallCount     int     `yaml:"call_count" json:"call_count"`
 	DurationHours float64 `yaml:"duration_hours" json:"duration_hours"`
+
 	Scenario                    string  `yaml:"scenario" json:"scenario"`
 	ScenarioHoldDurationSeconds float64 `yaml:"scenario_hold_duration_seconds" json:"scenario_hold_duration_seconds"`
 	ScenarioPreHoldRTPSeconds   float64 `yaml:"scenario_pre_hold_rtp_seconds" json:"scenario_pre_hold_rtp_seconds"`
 	ScenarioPostHoldRTPSeconds  float64 `yaml:"scenario_post_hold_rtp_seconds" json:"scenario_post_hold_rtp_seconds"`
 }
 
-// UACExtCount returns the number of UAC extensions in the configured range.
-func (c *VMConfig) UACExtCount() int {
-	return c.UACExtEnd - c.UACExtStart + 1
-}
-
-// UASExtCount returns the number of UAS extensions in the configured range.
-func (c *VMConfig) UASExtCount() int {
-	return c.UASExtEnd - c.UASExtStart + 1
-}
-
-// PoolWrapCount returns the number of calls per full pool wrap — the LCM of
-// UAC and UAS extension counts. This is purely an extension-geometry question
-// (how many calls until every unique pair has been used once) and is
-// independent of call_count, traffic_mode, or any other run-level setting.
-func (c *VMConfig) PoolWrapCount() int {
-	uac := c.UACExtCount()
-	uas := c.UASExtCount()
-	if uac <= 0 || uas <= 0 {
-		return 0
-	}
-	return lcm(uac, uas)
+// ExtCount returns the total number of extensions in the configured range.
+func (c *VMConfig) ExtCount() int {
+	return c.ExtEnd - c.ExtStart + 1
 }
 
 // EffectiveMaxConcurrent returns MaxConcurrentCalls if explicitly set,
@@ -100,30 +83,6 @@ func (c *VMConfig) EffectiveMaxConcurrent() int {
 		return c.MaxConcurrentCalls
 	}
 	return c.CPS * c.HoldTimeSeconds
-}
-
-func gcd(a, b int) int {
-	for b != 0 {
-		a, b = b, a%b
-	}
-	return a
-}
-
-func lcm(a, b int) int {
-	if a == 0 || b == 0 {
-		return 0
-	}
-	return (a / gcd(a, b)) * b
-}
-
-// IsUAC reports whether the VM is configured as a UAC.
-func (c *VMConfig) IsUAC() bool {
-	return strings.EqualFold(c.VMRole, "UAC")
-}
-
-// IsUAS reports whether the VM is configured as a UAS.
-func (c *VMConfig) IsUAS() bool {
-	return strings.EqualFold(c.VMRole, "UAS")
 }
 
 // BatchDelay returns the inter-batch delay for TCP socket creation and
@@ -302,14 +261,9 @@ func ApplyDefaults(cfg *VMConfig) {
 }
 
 // Validate checks that a VMConfig has all required fields set and that
-// value ranges are sane. It normalises VMRole and SIPTransport to upper case.
+// value ranges are sane. It normalises SIPTransport to upper case.
 func Validate(cfg *VMConfig) error {
 	var errs []string
-
-	role := strings.ToUpper(cfg.VMRole)
-	if role != "UAC" && role != "UAS" {
-		errs = append(errs, fmt.Sprintf("vm_role must be 'UAC' or 'UAS', got %q", cfg.VMRole))
-	}
 
 	transport := strings.ToUpper(cfg.SIPTransport)
 	if transport != "TCP" && transport != "TLS" && transport != "UDP" {
@@ -320,11 +274,11 @@ func Validate(cfg *VMConfig) error {
 		errs = append(errs, "sbc_host is required")
 	}
 
-	if cfg.UACExtStart > cfg.UACExtEnd {
-		errs = append(errs, fmt.Sprintf("uac_ext_start (%d) > uac_ext_end (%d)", cfg.UACExtStart, cfg.UACExtEnd))
+	if cfg.ExtStart > cfg.ExtEnd {
+		errs = append(errs, fmt.Sprintf("ext_start (%d) > ext_end (%d)", cfg.ExtStart, cfg.ExtEnd))
 	}
-	if cfg.UASExtStart > cfg.UASExtEnd {
-		errs = append(errs, fmt.Sprintf("uas_ext_start (%d) > uas_ext_end (%d)", cfg.UASExtStart, cfg.UASExtEnd))
+	if cfg.ExtCount() < 2 {
+		errs = append(errs, fmt.Sprintf("ext range must have at least 2 extensions, got %d", cfg.ExtCount()))
 	}
 
 	if cfg.CPS <= 0 {
@@ -368,11 +322,9 @@ func Validate(cfg *VMConfig) error {
 		return fmt.Errorf("config: validation failed:\n  %s", strings.Join(errs, "\n  "))
 	}
 
-	cfg.VMRole = role
 	cfg.SIPTransport = transport
 
 	slog.Info("VMConfig validated",
-		"role", cfg.VMRole,
 		"vm_id", cfg.VMID,
 		"primary_host", fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort),
 		"failover_enabled", cfg.FailoverEnabled,
@@ -381,8 +333,10 @@ func Validate(cfg *VMConfig) error {
 		"transport", cfg.SIPTransport,
 		"cps", cfg.CPS,
 		"hold_s", cfg.HoldTimeSeconds,
-		"ext_range", fmt.Sprintf("%d-%d", cfg.UACExtStart, cfg.UACExtEnd),
+		"ext_range", fmt.Sprintf("%d-%d (%d)", cfg.ExtStart, cfg.ExtEnd, cfg.ExtCount()),
 		"concurrent_estimate", cfg.EffectiveMaxConcurrent(),
+		"register_expires", cfg.RegisterExpires,
+		"subscribe_expires", cfg.SubscribeExpires,
 		"register_batch_size", cfg.RegisterBatchSize,
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
@@ -410,8 +364,8 @@ func WriteConfigYAML(cfg *VMConfig, path string) (string, error) {
 		return "", fmt.Errorf("config: yaml marshal: %w", err)
 	}
 
-	header := fmt.Sprintf("# Auto-generated by GUI — %s config\n# %s\n\n",
-		cfg.VMRole, time.Now().Format(time.RFC3339))
+	header := fmt.Sprintf("# Auto-generated by GUI\n# %s\n\n",
+		time.Now().Format(time.RFC3339))
 
 	f, err := os.Create(path)
 	if err != nil {
@@ -428,7 +382,7 @@ func WriteConfigYAML(cfg *VMConfig, path string) (string, error) {
 			abs = wd + "/" + path
 		}
 	}
-	slog.Info("Config YAML written", "path", abs, "role", cfg.VMRole, "vm_id", cfg.VMID)
+	slog.Info("Config YAML written", "path", abs, "vm_id", cfg.VMID)
 	return abs, nil
 }
 

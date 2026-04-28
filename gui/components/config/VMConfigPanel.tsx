@@ -16,7 +16,7 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { Link2, Loader2, CheckCircle, XCircle, Signal, ArrowDownToLine, Lock } from 'lucide-react'
+import { Loader2, CheckCircle, XCircle, Signal, ArrowDownToLine, Lock } from 'lucide-react'
 import type { VMRole, TrafficMode, SipTransport, ReachabilityStatus } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -25,13 +25,13 @@ export type RawVMFormValues = {
   vm_ip: string
   ssh_user: string
   ssh_key_path: string
-  uac_ext_start: string
-  uac_ext_end: string
-  uac_ext_count: string
-  uas_ext_start: string
-  uas_ext_end: string
-  uas_ext_count: string
-  uas_override: boolean
+  // Unified extension pool (single range)
+  ext_start: string
+  ext_end: string
+  ext_count: string
+  // Registration / subscription expiry
+  register_expires: string
+  subscribe_expires: string
   sbc_host: string
   sbc_port: string
   secondary_host: string
@@ -46,7 +46,6 @@ export type RawVMFormValues = {
   ramp_up_seconds: string
   media_enabled: boolean
   metrics_port: string
-  peer_stop_url: string
   traffic_mode: TrafficMode
   call_count: string
   duration_hours: string
@@ -62,7 +61,7 @@ export interface VMConfigPanelProps {
   warnings: Record<string, string>
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
-  /** UAC form values — supplied to the UAS card so SIP Server section can mirror them read-only */
+  /** @deprecated No longer used — single-pool model has no peer VM */
   peerRaw?: RawVMFormValues
 }
 
@@ -214,7 +213,6 @@ export function VMConfigPanel({
   warnings,
   reachability,
   onCheckReachability,
-  peerRaw,
 }: VMConfigPanelProps) {
   const isUAC = role === 'UAC'
 
@@ -222,8 +220,7 @@ export function VMConfigPanel({
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
   const t = (field: string) => touched.has(field)
 
-  const uacExtCount = deriveExtCount(parseInt(raw.uac_ext_start), parseInt(raw.uac_ext_end))
-  const uasExtCount = deriveExtCount(parseInt(raw.uas_ext_start), parseInt(raw.uas_ext_end))
+  const extCount = deriveExtCount(parseInt(raw.ext_start), parseInt(raw.ext_end))
 
   // Trigger health check when either vm_ip or metrics_port blurs (if both have values)
   const handleIpBlur = () => {
@@ -466,7 +463,7 @@ export function VMConfigPanel({
               <span className="text-[11px] font-semibold tracking-wide text-slate-300">Auto-synced from UAC</span>
             </div>
             {(() => {
-              const p = peerRaw ?? raw
+              const p = raw
               return (
                 <div className="space-y-2 font-mono text-[12px]">
                   <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1.5">
@@ -504,81 +501,117 @@ export function VMConfigPanel({
 
       {/* ── Extensions ────────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Extensions</SectionHeader>
+        <SectionHeader>Extension Pool</SectionHeader>
 
         {isUAC ? (
-          <>
-            {/* UAC Range — Start + Count → derived End */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold text-slate-200">UAC Range</span>
-                {uacExtCount > 0 && (
-                  <span className="flex items-center gap-1 rounded border border-slate-700/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px]">
-                    <span className="font-bold text-amber-400">{raw.uac_ext_start}</span>
-                    <span className="text-slate-500">→</span>
-                    <span className="font-bold text-amber-400">{raw.uac_ext_end}</span>
-                    <span className="text-slate-500">·</span>
-                    <span className="text-slate-400">{uacExtCount} ext</span>
-                  </span>
-                )}
-              </div>
-              <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
-                <FormField label="Start" error={e('uac_ext_start')}>
-                  <Input
-                    type="number"
-                    value={raw.uac_ext_start}
-                    onChange={(ev) => onChange('uac_ext_start', ev.target.value)}
-                    onBlur={() => onBlur('uac_ext_start')}
-                    placeholder="4001000"
-                    className="font-mono text-xs"
-                    aria-invalid={t('uac_ext_start') && !!errors.uac_ext_start ? true : undefined}
-                  />
-                </FormField>
-                <span className="pb-2 text-base font-bold text-cyan-400/50">+</span>
-                <FormField label="Count">
-                  <Input
-                    type="number"
-                    min={1}
-                    value={raw.uac_ext_count ?? ''}
-                    onChange={(ev) => onChange('uac_ext_count', ev.target.value)}
-                    onBlur={() => onBlur('uac_ext_count')}
-                    placeholder="5"
-                    className="font-mono text-xs"
-                  />
-                </FormField>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold text-slate-200">Unified Range</span>
+              {extCount > 0 && (
+                <span className="flex items-center gap-1 rounded border border-slate-700/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px]">
+                  <span className="font-bold text-amber-400">{raw.ext_start}</span>
+                  <span className="text-slate-500">→</span>
+                  <span className="font-bold text-amber-400">{raw.ext_end}</span>
+                  <span className="text-slate-500">·</span>
+                  <span className="text-slate-400">{extCount} ext</span>
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <FormField label="Start" error={e('ext_start')}>
+                <Input
+                  type="number"
+                  value={raw.ext_start}
+                  onChange={(ev) => onChange('ext_start', ev.target.value)}
+                  onBlur={() => onBlur('ext_start')}
+                  placeholder="4001000"
+                  className="font-mono text-xs"
+                  aria-invalid={t('ext_start') && !!errors.ext_start ? true : undefined}
+                />
+              </FormField>
+              <FormField label="End" error={e('ext_end')}>
+                <Input
+                  type="number"
+                  value={raw.ext_end}
+                  onChange={(ev) => onChange('ext_end', ev.target.value)}
+                  onBlur={() => onBlur('ext_end')}
+                  placeholder="4001009"
+                  className="font-mono text-xs"
+                  aria-invalid={t('ext_end') && !!errors.ext_end ? true : undefined}
+                />
+              </FormField>
+              <div className="space-y-1">
+                <Label className="text-xs font-medium text-foreground/80">Count</Label>
+                <div className="flex h-9 items-center rounded-md border border-input bg-secondary/40 px-3 font-mono text-xs text-muted-foreground">
+                  {extCount > 0 ? extCount : '—'}
+                </div>
               </div>
             </div>
-          </>
+            <FieldHint>All extensions form a single pool — any two may be paired for calls.</FieldHint>
+          </div>
         ) : (
-          /* UAS card: read-only, auto-synced from UAC */
           <div className="rounded-md border border-border/50 bg-secondary/30 px-3 py-2.5 space-y-2">
             <div className="flex items-center gap-1.5">
               <Lock className="size-3 text-slate-400" />
-              <span className="text-[11px] font-semibold tracking-wide text-slate-300">Auto-synced from UAC</span>
+              <span className="text-[11px] font-semibold tracking-wide text-slate-300">Auto-synced from primary config</span>
             </div>
-            <div className="font-mono text-[12px] leading-relaxed space-y-0.5">
+            <div className="font-mono text-[12px] leading-relaxed">
               <div className="flex items-center justify-between">
-                <span className="font-medium text-slate-400">UAC</span>
+                <span className="font-medium text-slate-400">Pool</span>
                 <span className="font-semibold">
-                  <span className="text-amber-400">{raw.uac_ext_start}</span>
+                  <span className="text-amber-400">{raw.ext_start}</span>
                   <span className="text-slate-500"> → </span>
-                  <span className="text-amber-400">{raw.uac_ext_end}</span>
-                  <span className="text-slate-500"> ({uacExtCount} ext)</span>
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="font-medium text-slate-400">UAS</span>
-                <span className="font-semibold">
-                  <span className="text-amber-400">{raw.uas_ext_start}</span>
-                  <span className="text-slate-500"> → </span>
-                  <span className="text-amber-400">{raw.uas_ext_end}</span>
-                  <span className="text-slate-500"> ({uasExtCount} ext)</span>
+                  <span className="text-amber-400">{raw.ext_end}</span>
+                  <span className="text-slate-500"> ({extCount} ext)</span>
                 </span>
               </div>
             </div>
           </div>
         )}
       </div>
+
+      {/* ── Registration ──────────────────────────────────────── */}
+      {isUAC && (
+        <div className="space-y-3">
+          <SectionHeader>Registration</SectionHeader>
+          <div className="grid grid-cols-2 gap-3">
+            <FormField
+              label="REGISTER Expires (s)"
+              error={e('register_expires')}
+              hint="Expiry value sent in REGISTER messages (default: 3600)"
+            >
+              <Input
+                type="number"
+                min={60}
+                step={60}
+                value={raw.register_expires}
+                onChange={(ev) => onChange('register_expires', ev.target.value)}
+                onBlur={() => onBlur('register_expires')}
+                placeholder="3600"
+                className="font-mono"
+                aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
+              />
+            </FormField>
+            <FormField
+              label="SUBSCRIBE Expires (s)"
+              error={e('subscribe_expires')}
+              hint="Expiry value sent in SUBSCRIBE messages (default: 3600)"
+            >
+              <Input
+                type="number"
+                min={60}
+                step={60}
+                value={raw.subscribe_expires}
+                onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
+                onBlur={() => onBlur('subscribe_expires')}
+                placeholder="3600"
+                className="font-mono"
+                aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+              />
+            </FormField>
+          </div>
+        </div>
+      )}
 
       {/* ── Traffic ───────────────────────────────────────────── */}
       <div className="space-y-3">
@@ -691,51 +724,33 @@ export function VMConfigPanel({
         )}
       </div>
 
-      {/* ── UAC-only: Run Control + Peer Stop URL ────────────── */}
+      {/* ── Run Control ───────────────────────────────────────── */}
       {isUAC && (
-        <>
-          <div className="space-y-3">
-            <SectionHeader>Run Control</SectionHeader>
-            <TrafficModeSelector
-              value={raw.traffic_mode as TrafficMode}
-              onChange={(m) => onChange('traffic_mode', m)}
-              callCount={raw.call_count}
-              onCallCountChange={(v) => onChange('call_count', v)}
-              durationHours={raw.duration_hours}
-              onDurationHoursChange={(v) => onChange('duration_hours', v)}
-              cps={raw.cps}
-              errors={{
-                call_count: t('call_count') ? errors.call_count : undefined,
-                duration_hours: t('duration_hours') ? errors.duration_hours : undefined,
-              }}
-              warnings={{
-                call_count: t('call_count') ? warnings.call_count : undefined,
-                duration_hours: t('duration_hours') ? warnings.duration_hours : undefined,
-              }}
-              touched={{
-                call_count: t('call_count'),
-                duration_hours: t('duration_hours'),
-              }}
-              onBlur={(field) => onBlur(field)}
-            />
-          </div>
-
-          <div className="space-y-3">
-            <SectionHeader>Coordination</SectionHeader>
-            <div className="space-y-1">
-              <div className="flex items-center gap-1.5">
-                <Label className="text-xs font-medium text-slate-200">Peer Stop URL</Label>
-                <Link2 className="size-3 text-sky-400/70" />
-              </div>
-              <div className="rounded-md border border-zinc-600/40 bg-zinc-800/40 px-3 py-2">
-                <span className="font-mono text-xs text-sky-400 underline decoration-sky-400/30 underline-offset-2 select-all">
-                  {raw.peer_stop_url || '—'}
-                </span>
-              </div>
-              <FieldHint>Auto-derived from UAS VM IP + metrics port</FieldHint>
-            </div>
-          </div>
-        </>
+        <div className="space-y-3">
+          <SectionHeader>Run Control</SectionHeader>
+          <TrafficModeSelector
+            value={raw.traffic_mode as TrafficMode}
+            onChange={(m) => onChange('traffic_mode', m)}
+            callCount={raw.call_count}
+            onCallCountChange={(v) => onChange('call_count', v)}
+            durationHours={raw.duration_hours}
+            onDurationHoursChange={(v) => onChange('duration_hours', v)}
+            cps={raw.cps}
+            errors={{
+              call_count: t('call_count') ? errors.call_count : undefined,
+              duration_hours: t('duration_hours') ? errors.duration_hours : undefined,
+            }}
+            warnings={{
+              call_count: t('call_count') ? warnings.call_count : undefined,
+              duration_hours: t('duration_hours') ? warnings.duration_hours : undefined,
+            }}
+            touched={{
+              call_count: t('call_count'),
+              duration_hours: t('duration_hours'),
+            }}
+            onBlur={(field) => onBlur(field)}
+          />
+        </div>
       )}
 
     </div>

@@ -46,56 +46,38 @@ interface MetricsHistoryPoint {
   failed: number
 }
 
+function makeDefaultConfig(vmId: string, metricsPort: number) {
+  return {
+    vm_id: vmId,
+    vm_ip: '127.0.0.1',
+    ext_start: 4001000,
+    ext_end: 4001009,
+    register_expires: 3600,
+    subscribe_expires: 3600,
+    sbc_host: '10.133.63.117',
+    sbc_port: 5060,
+    secondary_host: '',
+    secondary_port: 5060,
+    failover_enabled: false,
+    dns_servers: '',
+    sip_transport: 'TCP' as const,
+    domain: 'avaya.com',
+    sip_password: '123456',
+    cps: 1,
+    hold_time_seconds: 5,
+    metrics_port: metricsPort,
+    traffic_mode: 'smoke' as const,
+    call_count: 10,
+  }
+}
+
 function makePair(index: number): VMPair {
   const pairId = `pair-${index + 1}`
   return {
     pair_id: pairId,
     pair_label: `Pair ${index + 1}`,
-    uac: {
-      vm_role: 'UAC',
-      vm_id: 'uac-local',
-      vm_ip: '127.0.0.1',
-      uac_ext_start: 4001000,
-      uac_ext_end: 4001004,
-      uas_ext_start: 4001005,
-      uas_ext_end: 4001009,
-      sbc_host: '10.133.63.117',
-      sbc_port: 5060,
-      secondary_host: '',
-      secondary_port: 5060,
-      failover_enabled: false,
-      dns_servers: '',
-      sip_transport: 'TCP',
-      domain: 'avaya.com',
-      sip_password: '123456',
-      cps: 1,
-      hold_time_seconds: 5,
-      metrics_port: 8082,
-      peer_stop_url: 'http://127.0.0.1:8081/api/test/stop',
-      traffic_mode: 'smoke',
-      call_count: 10,
-    },
-    uas: {
-      vm_role: 'UAS',
-      vm_id: 'uas-local',
-      vm_ip: '127.0.0.1',
-      uac_ext_start: 4001000,
-      uac_ext_end: 4001004,
-      uas_ext_start: 4001005,
-      uas_ext_end: 4001009,
-      sbc_host: '10.133.63.117',
-      sbc_port: 5060,
-      secondary_host: '',
-      secondary_port: 5060,
-      failover_enabled: false,
-      dns_servers: '',
-      sip_transport: 'TCP',
-      domain: 'avaya.com',
-      sip_password: '123456',
-      cps: 1,
-      hold_time_seconds: 5,
-      metrics_port: 8081,
-    },
+    uac: makeDefaultConfig('traffic-local', 8082),
+    uas: makeDefaultConfig('traffic-uas', 8081),
     advancedSettings: { ...DEFAULT_ADVANCED_SETTINGS },
     validated: false,
     saved: false,
@@ -123,11 +105,19 @@ interface TrafficStore {
   phase: RunPhase
   setPhase: (p: RunPhase) => void
 
-  // Pre-phase
+  // Pre-phase (unified pool)
+  prePhaseStatus: PrePhaseStatus | null
+  setPrePhaseStatus: (s: PrePhaseStatus) => void
+  // Legacy aliases (kept for components not yet updated)
   uasPrePhase: PrePhaseStatus | null
   uacPrePhase: PrePhaseStatus | null
   setUASPrePhase: (s: PrePhaseStatus) => void
   setUACPrePhase: (s: PrePhaseStatus) => void
+
+  // Pool counts (from live metrics)
+  idleCount: number
+  nonIdleCount: number
+  regOnlyCount: number
 
   // Live metrics
   uacMetrics: TrafficMetrics | null
@@ -169,8 +159,12 @@ const initialState = {
   activePairIndex: 0,
   reachability: {} as Record<string, ReachabilityStatus>,
   phase: 'IDLE' as RunPhase,
+  prePhaseStatus: null,
   uasPrePhase: null,
   uacPrePhase: null,
+  idleCount: 0,
+  nonIdleCount: 0,
+  regOnlyCount: 0,
   uacMetrics: null,
   uasMetrics: null,
   metricsHistory: [] as MetricsHistoryPoint[],
@@ -218,12 +212,17 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
 
   setPhase: (p) => set({ phase: p }),
 
+  setPrePhaseStatus: (s) => set({ prePhaseStatus: s }),
   setUASPrePhase: (s) => set({ uasPrePhase: s }),
   setUACPrePhase: (s) => set({ uacPrePhase: s }),
 
   updateUACMetrics: (m) =>
     set((state) => ({
       uacMetrics: m,
+      phase: m.phase ?? state.phase,
+      idleCount: m.idle_count ?? state.idleCount,
+      nonIdleCount: m.non_idle_count ?? state.nonIdleCount,
+      regOnlyCount: m.reg_only_count ?? state.regOnlyCount,
       metricsHistory: [
         ...state.metricsHistory.slice(-59),
         {

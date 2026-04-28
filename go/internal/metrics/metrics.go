@@ -45,6 +45,10 @@ type TrafficMetrics struct {
 	RunElapsedSec    float64            `json:"run_elapsed_seconds"`
 	Running          bool               `json:"running"`
 	RTPHealth        map[string]int     `json:"rtp_health"`
+	// Single-pool agent counts (new model)
+	IdleCount    int `json:"idle_count"`
+	NonIdleCount int `json:"non_idle_count"`
+	RegOnlyCount int `json:"reg_only_count"`
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +123,7 @@ type MetricsCollector struct {
 	rawEvents          []map[string]any
 	callSpines         []json.RawMessage
 	concurrentProvider func() int
+	poolCountsProvider func() (idle, nonIdle, regOnly int)
 
 	rtpHealthCounts map[string]int
 
@@ -228,6 +233,15 @@ func (c *MetricsCollector) UpdateCounts(concurrent, sockets, registered, subscri
 func (c *MetricsCollector) SetConcurrentProvider(fn func() int) {
 	c.mu.Lock()
 	c.concurrentProvider = fn
+	c.mu.Unlock()
+}
+
+// SetPoolCountsProvider sets a callable that returns the current pool counts
+// (idle, non-idle, reg-only). Called from buildSnapshotLocked to populate the
+// idle_count / non_idle_count / reg_only_count fields in TrafficMetrics.
+func (c *MetricsCollector) SetPoolCountsProvider(fn func() (idle, nonIdle, regOnly int)) {
+	c.mu.Lock()
+	c.poolCountsProvider = fn
 	c.mu.Unlock()
 }
 
@@ -559,6 +573,11 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		runElapsed = math.Round(now.Sub(c.runStart).Seconds()*10) / 10
 	}
 
+	var idleCount, nonIdleCount, regOnlyCount int
+	if c.poolCountsProvider != nil {
+		idleCount, nonIdleCount, regOnlyCount = c.poolCountsProvider()
+	}
+
 	snap := TrafficMetrics{
 		Timestamp:       float64(time.Now().UnixMilli()) / 1000.0,
 		VMID:            c.vmID,
@@ -584,6 +603,9 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 			"WARNING":  c.rtpHealthCounts["WARNING"],
 			"CRITICAL": c.rtpHealthCounts["CRITICAL"],
 		},
+		IdleCount:    idleCount,
+		NonIdleCount: nonIdleCount,
+		RegOnlyCount: regOnlyCount,
 	}
 	c.latest = snap
 	return snap
@@ -712,21 +734,35 @@ type ProcessContext struct {
 	StartFunc   func()
 	Mu          sync.Mutex
 
+	// Phase-gate channels for the single-pool state machine.
+	// Closed by the corresponding API endpoint to unblock the lifecycle goroutine.
+	PrePhaseStartCh  chan struct{} // POST /api/prephase/start
+	TrafficStartCh   chan struct{} // POST /api/traffic/start
+	CleanupStartCh   chan struct{} // POST /api/cleanup/start
+	GracefulStopCh   chan struct{} // POST /api/shutdown/graceful
+	InterruptStopCh  chan struct{} // POST /api/shutdown/interrupt
+
 	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
 	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
 	// Injected by main.go to avoid importing the config package from metrics.
 	OnConfigReceived func(body map[string]any) (vmID, role, yamlPath string, parsedCfg any, err error)
 }
 
-// NewProcessContext creates a ProcessContext in IDLE state.
+// NewProcessContext creates a ProcessContext in IDLE state with all phase-gate
+// channels initialised.
 func NewProcessContext(collector *MetricsCollector, port int) *ProcessContext {
 	return &ProcessContext{
-		Collector:   collector,
-		StopEvent:   make(chan struct{}, 1),
-		ProcessExit: make(chan struct{}, 1),
-		Port:        port,
-		State:       "IDLE",
-		LogLevel:    "INFO",
+		Collector:       collector,
+		StopEvent:       make(chan struct{}, 1),
+		ProcessExit:     make(chan struct{}, 1),
+		Port:            port,
+		State:           "IDLE",
+		LogLevel:        "INFO",
+		PrePhaseStartCh: make(chan struct{}, 1),
+		TrafficStartCh:  make(chan struct{}, 1),
+		CleanupStartCh:  make(chan struct{}, 1),
+		GracefulStopCh:  make(chan struct{}, 1),
+		InterruptStopCh: make(chan struct{}, 1),
 	}
 }
 
@@ -1348,6 +1384,83 @@ func BuildMux(
 				"asr":        snap.ASR,
 			},
 		})
+	})
+
+	// ---------------------------------------------------------------------------
+	// Single-pool phase-gate endpoints
+	// ---------------------------------------------------------------------------
+
+	// POST /api/prephase/start — unblock the lifecycle to start Reg/Sub
+	mux.HandleFunc("POST /api/prephase/start", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		select {
+		case processCtx.PrePhaseStartCh <- struct{}{}:
+			slog.Info("PrePhase start signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "prephase_starting"})
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "pre-phase already started or not ready"})
+		}
+	})
+
+	// POST /api/traffic/start — unblock the lifecycle to start traffic
+	mux.HandleFunc("POST /api/traffic/start", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		select {
+		case processCtx.TrafficStartCh <- struct{}{}:
+			slog.Info("Traffic start signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "traffic_starting"})
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "traffic already started or not ready"})
+		}
+	})
+
+	// POST /api/cleanup/start — unblock the lifecycle to run cleanup (unsubscribe/unregister)
+	mux.HandleFunc("POST /api/cleanup/start", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		select {
+		case processCtx.CleanupStartCh <- struct{}{}:
+			slog.Info("Cleanup start signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "cleanup_starting"})
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "cleanup already started or not ready"})
+		}
+	})
+
+	// POST /api/shutdown/graceful — drain in-flight calls then cleanup + exit
+	mux.HandleFunc("POST /api/shutdown/graceful", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		slog.Info("Graceful shutdown requested via API")
+		select {
+		case processCtx.GracefulStopCh <- struct{}{}:
+		default:
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "graceful_stop_signalled"})
+	})
+
+	// POST /api/shutdown/interrupt — cancel in-flight calls (CANCEL/BYE), then cleanup + exit
+	mux.HandleFunc("POST /api/shutdown/interrupt", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		slog.Info("Interrupted shutdown requested via API")
+		select {
+		case processCtx.InterruptStopCh <- struct{}{}:
+		default:
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "interrupt_stop_signalled"})
 	})
 
 	return mux

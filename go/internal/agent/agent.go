@@ -95,6 +95,12 @@ type ExtensionAgent struct {
 
 	closed atomic.Bool
 
+	// autoAnswerEnabled controls whether this agent's uasLoop will answer
+	// incoming INVITEs. All agents start with auto-answer enabled.
+	// Disabled atomically by PoolEngine.NextPair() when the agent is selected
+	// as a caller, re-enabled after the call completes (BYE/200).
+	autoAnswerEnabled atomic.Bool
+
 	regCallID      string
 	regFromTag     string
 	regFromHeader  string
@@ -116,8 +122,9 @@ type ExtensionAgent struct {
 }
 
 // NewExtensionAgent creates a new agent for the given extension.
+// Auto-answer starts enabled — all agents can act as callees by default.
 func NewExtensionAgent(ext string, cfg *config.VMConfig) *ExtensionAgent {
-	return &ExtensionAgent{
+	a := &ExtensionAgent{
 		Ext:           ext,
 		Config:        cfg,
 		ActiveDialogs: make(map[string]*DialogState),
@@ -126,6 +133,21 @@ func NewExtensionAgent(ext string, cfg *config.VMConfig) *ExtensionAgent {
 		Registered:    make(chan struct{}),
 		Subscribed:    make(chan struct{}),
 	}
+	a.autoAnswerEnabled.Store(true)
+	return a
+}
+
+// SetAutoAnswer enables or disables automatic INVITE answering for this agent.
+// Set to false atomically (inside PoolEngine.NextPair lock) when the agent is
+// selected as a caller; set back to true after BYE/200 completes.
+func (a *ExtensionAgent) SetAutoAnswer(enabled bool) {
+	a.autoAnswerEnabled.Store(enabled)
+}
+
+// AutoAnswerEnabled reports whether this agent will automatically answer
+// incoming INVITEs. Checked by uasLoop before spawning handleCall.
+func (a *ExtensionAgent) AutoAnswerEnabled() bool {
+	return a.autoAnswerEnabled.Load()
 }
 
 // Start creates the SIP transport, connects, and starts the dispatch goroutine.

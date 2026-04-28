@@ -7,24 +7,39 @@ import type { TrafficMetrics, VMRole, RunPhase } from '@/types'
 const PHASE_LABEL: Record<RunPhase, string> = {
   IDLE: 'IDLE',
   PRE_PHASE: 'PRE-PHASE',
+  PRE_REGISTER: 'REGISTERING',
+  TRAFFIC_READY: 'TRAFFIC READY',
   TRAFFIC: 'TRAFFIC',
+  STOPPING: 'STOPPING',
+  CLEANUP_READY: 'CLEANUP READY',
   COMPLETE: 'COMPLETE',
+  DONE: 'DONE',
   FAILED: 'FAILED',
 }
 
 const PHASE_COLOR: Record<RunPhase, string> = {
   IDLE: 'text-muted-foreground',
   PRE_PHASE: 'text-amber-400',
+  PRE_REGISTER: 'text-amber-400',
+  TRAFFIC_READY: 'text-sky-400',
   TRAFFIC: 'text-emerald-400',
+  STOPPING: 'text-amber-400',
+  CLEANUP_READY: 'text-sky-400',
   COMPLETE: 'text-emerald-400',
+  DONE: 'text-emerald-400',
   FAILED: 'text-rose-500',
 }
 
 const PHASE_DOT: Record<RunPhase, string> = {
   IDLE: 'bg-muted-foreground',
   PRE_PHASE: 'bg-amber-400',
+  PRE_REGISTER: 'bg-amber-400',
+  TRAFFIC_READY: 'bg-sky-400',
   TRAFFIC: 'bg-emerald-400',
+  STOPPING: 'bg-amber-400',
+  CLEANUP_READY: 'bg-sky-400',
   COMPLETE: 'bg-emerald-400',
+  DONE: 'bg-emerald-400',
   FAILED: 'bg-rose-500',
 }
 

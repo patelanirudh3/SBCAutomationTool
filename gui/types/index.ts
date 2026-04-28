@@ -1,7 +1,17 @@
 export type VMRole = 'UAC' | 'UAS'
 export type TrafficMode = 'smoke' | 'timed' | 'unlimited'
 export type SipTransport = 'TCP' | 'TLS' | 'UDP'
-export type RunPhase = 'IDLE' | 'PRE_PHASE' | 'TRAFFIC' | 'COMPLETE' | 'FAILED'
+export type RunPhase =
+  | 'IDLE'
+  | 'PRE_PHASE'
+  | 'PRE_REGISTER'
+  | 'TRAFFIC_READY'
+  | 'TRAFFIC'
+  | 'STOPPING'
+  | 'CLEANUP_READY'
+  | 'COMPLETE'
+  | 'DONE'
+  | 'FAILED'
 export type RunMode = 'local' | 'multi-vm'
 
 export type RtpMode = '3phase' | 'continuous'
@@ -41,7 +51,7 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
 
 export interface VMConfig {
   // Identity
-  vm_role: VMRole
+  vm_role?: VMRole  // deprecated — not used in unified pool model
   vm_id: string
 
   // VM Connection
@@ -49,11 +59,15 @@ export interface VMConfig {
   ssh_user?: string
   ssh_key_path?: string
 
-  // Extensions
-  uac_ext_start: number
-  uac_ext_end: number
-  uas_ext_start: number
-  uas_ext_end: number
+  // Extensions (unified pool)
+  ext_start: number
+  ext_end: number
+
+  // Legacy dual-range fields (kept for backward compat, no longer used by backend)
+  uac_ext_start?: number
+  uac_ext_end?: number
+  uas_ext_start?: number
+  uas_ext_end?: number
 
   // SIP Connection (Primary)
   sbc_host: string
@@ -68,13 +82,17 @@ export interface VMConfig {
   failover_enabled?: boolean
   dns_servers?: string
 
+  // Registration / Subscription
+  register_expires?: number   // default: 3600 (seconds)
+  subscribe_expires?: number  // default: 3600 (seconds)
+
   // Traffic
   cps: number
   hold_time_seconds: number
-  ramp_up_seconds?: number    // UAC only — default: 5
-  media_enabled?: boolean     // UAC only — default: true; false = signaling-only
+  ramp_up_seconds?: number
+  media_enabled?: boolean
   metrics_port: number
-  peer_stop_url?: string      // UAC only — auto-derived from UAS vm_ip + metrics_port
+  peer_stop_url?: string
 
   // Run Control (UAC only)
   traffic_mode?: TrafficMode
@@ -83,8 +101,8 @@ export interface VMConfig {
 }
 
 export interface VMPair {
-  pair_id: string             // e.g. 'pair-1'
-  pair_label: string          // e.g. 'Pair 1'
+  pair_id: string
+  pair_label: string
   uac: VMConfig
   uas: VMConfig
   advancedSettings: AdvancedSettings
@@ -110,11 +128,15 @@ export interface TrafficMetrics {
   socket_count: number
   registered_count: number
   run_elapsed_seconds: number
+  // Unified pool counts
+  idle_count?: number
+  non_idle_count?: number
+  reg_only_count?: number
 }
 
 export interface PrePhaseStatus {
   vm_id: string
-  role: VMRole
+  role?: VMRole
   register_complete: boolean
   register_count: number
   register_total: number
@@ -122,8 +144,10 @@ export interface PrePhaseStatus {
   subscribe_count: number
   subscribe_total: number
   extensions_ready: boolean
-  auto_answer_started: boolean  // UAS only — never shown on UAC panel
-  auto_answer_active: boolean   // UAS only — never shown on UAC panel
+  // Unified pool result counts
+  idle_count?: number
+  reg_only_count?: number
+  failed_count?: number
 }
 
 export interface CallEvent {

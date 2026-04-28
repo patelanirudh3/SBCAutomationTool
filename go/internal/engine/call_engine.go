@@ -17,10 +17,6 @@ import (
 
 const sipTimeout = 20 * time.Second
 
-// sipByeBuffer is the constant BYE RTT + SBC dialog cleanup allowance
-// used in the pool wrap delay formula.  Internal, not user-configurable.
-const sipByeBuffer = 2.0
-
 // callFailed is a sentinel error used inside executeCall to signal a cleanly
 // rejected call (4xx/5xx/6xx final response).
 type callFailed struct{ reason string }
@@ -28,37 +24,39 @@ type callFailed struct{ reason string }
 func (e *callFailed) Error() string { return e.reason }
 
 // ---------------------------------------------------------------------------
-// CallEngine — UAC-side CPS-controlled call orchestrator
+// CallEngine — single-pool CPS-controlled call orchestrator
 // ---------------------------------------------------------------------------
 
 // CallEngine fires INVITEs at a configured CPS rate, manages concurrent call
-// limits, pool-wrap delays, linear ramp-up, and drives each call through the
-// full SIP+RTP sequence.
+// limits, and drives each call through the full SIP+RTP sequence. Caller/callee
+// pairs are drawn from a PoolEngine; users are returned to the pool after
+// each call so they can be reused without re-registering.
 type CallEngine struct {
-	agents     map[string]*agent.ExtensionAgent
+	pool       *PoolEngine
 	config     *config.VMConfig
 	onComplete func(CallResult)
 	onAttempt  func()
 	maxCalls   int
-	index      int
 
 	StopEvent chan struct{}
 
-	activeCalls   sync.Map // set of call_id → struct{}
-	busyExts      sync.Map // set of caller_ext (int) → struct{}; prevents overlapping INVITEs
-	activeCount   atomic.Int32
+	activeCalls    sync.Map // call_id → struct{}
+	activeCount    atomic.Int32
 	callsAttempted atomic.Int32
 	callsCompleted atomic.Int32
 	callsFailed    atomic.Int32
 	peakActiveCalls int32
-
-	currentWrapStartTime atomic.Int64 // nanosecond monotonic timestamp
 
 	metrics MetricsRecorder
 }
 
 // CallEngineOption configures optional CallEngine parameters.
 type CallEngineOption func(*CallEngine)
+
+// WithPool attaches the PoolEngine for idle/non-idle pair management.
+func WithPool(p *PoolEngine) CallEngineOption {
+	return func(e *CallEngine) { e.pool = p }
+}
 
 // WithOnComplete sets the callback invoked when a call finishes.
 func WithOnComplete(fn func(CallResult)) CallEngineOption {
@@ -80,10 +78,10 @@ func WithMetrics(m MetricsRecorder) CallEngineOption {
 	return func(e *CallEngine) { e.metrics = m }
 }
 
-// NewCallEngine creates a UAC call engine.
-func NewCallEngine(agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, opts ...CallEngineOption) *CallEngine {
+// NewCallEngine creates a single-pool call engine.
+func NewCallEngine(pool *PoolEngine, cfg *config.VMConfig, opts ...CallEngineOption) *CallEngine {
 	e := &CallEngine{
-		agents:    agents,
+		pool:      pool,
 		config:    cfg,
 		StopEvent: make(chan struct{}),
 	}
@@ -126,9 +124,10 @@ func (e *CallEngine) stopped() bool {
 	}
 }
 
-// Run is the main UAC loop.  It fires calls at the configured CPS with
-// linear ramp-up, respects the max concurrent ceiling, and applies pool wrap
-// delays.  It blocks until the engine is stopped or the context is cancelled.
+// Run is the main call loop. It fires calls at the configured CPS with
+// linear ramp-up, respects the max concurrent ceiling, and draws pairs
+// from the PoolEngine. It blocks until the engine is stopped or the
+// context is cancelled.
 func (e *CallEngine) Run(ctx context.Context) error {
 	cfg := e.config
 	fullInterval := time.Duration(float64(time.Second) / float64(cfg.CPS))
@@ -170,9 +169,7 @@ func (e *CallEngine) Run(ctx context.Context) error {
 			for e.activeCount.Load() > 0 {
 				select {
 				case <-deadline:
-					slog.Warn("max_calls drain timed out",
-						"active", e.activeCount.Load(),
-					)
+					slog.Warn("max_calls drain timed out", "active", e.activeCount.Load())
 					break drain
 				case <-time.After(200 * time.Millisecond):
 				}
@@ -190,39 +187,6 @@ func (e *CallEngine) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Pool wrap delay
-		poolCount := cfg.PoolWrapCount()
-		if poolCount > 0 && attempted > 0 && attempted%poolCount == 0 {
-			wrapTime := float64(poolCount) / math.Max(float64(cfg.CPS), 0.001)
-			holdTime := float64(cfg.HoldTimeSeconds)
-			extraMargin := float64(cfg.PoolWrapDelaySeconds)
-
-			wrapStartNano := e.currentWrapStartTime.Load()
-			elapsed := float64(time.Since(time.Unix(0, wrapStartNano)).Nanoseconds()) / 1e9
-			sleepFor := math.Max(0, holdTime+sipByeBuffer+extraMargin-elapsed)
-
-			natural := wrapTime >= holdTime+sipByeBuffer
-
-			if sleepFor > 0 {
-				slog.Info("Pool wrap delay: sleeping",
-					"sleep_s", sleepFor,
-					"wrap", attempted/poolCount+1,
-					"wrap_time_s", wrapTime,
-					"hold_s", holdTime,
-					"natural", natural,
-				)
-				time.Sleep(time.Duration(sleepFor * float64(time.Second)))
-			} else if !natural {
-				slog.Debug("Pool wrap boundary: no sleep needed",
-					"wrap", attempted/poolCount+1,
-					"elapsed_s", elapsed,
-					"hold_s", holdTime,
-					"buffer_s", sipByeBuffer,
-				)
-			}
-			e.currentWrapStartTime.Store(time.Now().UnixNano())
-		}
-
 		// Linear ramp-up: interval decreases from fullInterval×10 → fullInterval
 		var interval time.Duration
 		if step < rampSteps {
@@ -233,81 +197,52 @@ func (e *CallEngine) Run(ctx context.Context) error {
 			interval = fullInterval
 		}
 
-		caller, callee, free := e.nextFreePair()
-		if !free {
-			slog.Warn("All extensions busy — waiting for free pair",
-				"pool_size", cfg.UACExtCount(),
-				"active_calls", e.activeCount.Load(),
-			)
+		// Pick a pair from the pool
+		caller, callee, ok, stalled := e.pool.NextPair()
+		if stalled {
+			slog.Warn("PoolEngine permanently stalled — stopping traffic engine")
+			e.Stop()
+			wg.Wait()
+			return nil
+		}
+		if !ok {
+			// Back-pressure: fewer than 2 idle users; wait for returning pairs
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		ag, ok := e.agents[fmt.Sprintf("%d", caller)]
-		if !ok {
-			slog.Error("No agent for extension", "ext", caller)
-			time.Sleep(interval)
-			continue
-		}
 
-		if attempted == 0 {
-			e.currentWrapStartTime.Store(time.Now().UnixNano())
-		}
 		e.callsAttempted.Add(1)
 		if e.onAttempt != nil {
 			e.onAttempt()
 		}
 
-		wrapIdx := 0
-		if poolCount := cfg.PoolWrapCount(); poolCount > 0 {
-			wrapIdx = (int(e.callsAttempted.Load()) - 1) / poolCount
-		}
-
 		wg.Add(1)
-		go func(ag *agent.ExtensionAgent, callee string, wrapIdx int) {
+		go func(ag *agent.ExtensionAgent, calleeAg *agent.ExtensionAgent) {
 			defer wg.Done()
-			e.executeCall(ctx, ag, callee, wrapIdx)
-		}(ag, fmt.Sprintf("%d", callee), wrapIdx)
+			e.executeCall(ctx, ag, calleeAg)
+		}(caller, callee)
 
 		time.Sleep(interval)
 	}
 }
 
-// nextFreePair returns the next (caller_ext, callee_ext) pair whose caller is
-// not currently busy.  It advances the pool index past any busy extensions so
-// that pool wrap semantics are preserved.  When every extension is busy it
-// returns ok=false so the caller can apply back-pressure.
-func (e *CallEngine) nextFreePair() (caller, callee int, ok bool) {
-	cfg := e.config
-	poolSize := cfg.UACExtCount()
-	for attempts := 0; attempts < poolSize; attempts++ {
-		caller = cfg.UACExtStart + (e.index % poolSize)
-		callee = cfg.UASExtStart + (e.index % cfg.UASExtCount())
-		e.index++
-		if _, busy := e.busyExts.Load(caller); !busy {
-			return caller, callee, true
-		}
-	}
-	return 0, 0, false
-}
-
-// executeCall runs a single UAC call through the full SIP+RTP sequence:
+// executeCall runs a single call through the full SIP+RTP sequence:
 //
 //	INVITE → 100 → 180 → PRACK → 200 PRACK → 200 INVITE → ACK
 //	→ RTP (hold_time) → BYE → 200 BYE
 //
-// It handles 407 re-INVITE with auth, final failure codes (4xx/5xx/6xx → ACK + fail),
-// timeouts (→ CANCEL), and RTP allocation failures (degrade to port 9).
-func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, callee string, poolWrapIndex int) {
+// On completion (success or failure) the pair is returned to the PoolEngine.
+func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, calleeAg *agent.ExtensionAgent) {
 	ag.ClearEarlyResponses()
 
 	callStart := time.Now()
 	callID := "pending"
+	callee := calleeAg.Ext
 	var rtpEP *rtp.RtpEndpoint
 	milestones := SipMilestones{}
 	inviteTsUTC := ""
 	cfg := e.config
-	added := false // tracks whether activeCount was incremented
-	callerExt := atoi(ag.Ext)
+	added := false
 
 	defer func() {
 		if rtpEP != nil {
@@ -317,26 +252,21 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.activeCalls.Delete(callID)
 			e.activeCount.Add(-1)
 		}
-		e.busyExts.Delete(callerExt)
 		ag.RemoveDialog(callID)
+		// Return the pair to the pool so both users can be reused.
+		e.pool.ReturnPair(ag, calleeAg)
 	}()
 
 	emit := func(event string, sipCode int, ms float64, extra map[string]any) {
 		emitCallEvent(e.metrics, callID, ag.Ext, event, "uac", callee, sipCode, ms, extra)
 	}
 
-	// Pre-declared so the fail closure can read dialog.RTPRemoteIP/Port even on
-	// failure paths that occur after the 200 OK has been parsed (e.g. BYE
-	// timeout).  The `:=` assignment below re-assigns this variable.
 	var dialog *agent.DialogState
 
 	fail := func(reason string) CallResult {
 		e.callsFailed.Add(1)
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
 
-		// Collect RTP stats even on failure so the call table shows correct
-		// packet counts when the call was torn down mid-flight (e.g. BYE 407
-		// timeout after RTP has been running for the full hold time).
 		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv int
 		var mediaOK bool
 		if rtpEP != nil {
@@ -375,7 +305,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			SBCRTPRelayIP:    sbcRelayIP,
 			SBCRTPRelayPort:  sbcRelayPort,
 			RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
-			PoolWrapIndex:    poolWrapIndex,
 			PeerExt:          callee,
 			TsUTC:            inviteTsUTC,
 			Direction:        "uac",
@@ -388,8 +317,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		var err error
 		rtpEP, err = rtp.NewRtpEndpoint(ag.LocalHost(), cfg.RTPPtime)
 		if err != nil {
-			slog.Warn("RTP socket alloc failed — using port 9",
-				"ext", ag.Ext, "err", err)
+			slog.Warn("RTP socket alloc failed — using port 9", "ext", ag.Ext, "err", err)
 		}
 	}
 	rtpPort := 9
@@ -410,7 +338,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	callID = dialog.CallID
 	e.activeCalls.Store(callID, struct{}{})
-	e.busyExts.Store(callerExt, struct{}{})
 	e.activeCount.Add(1)
 	added = true
 	if peak := e.activeCount.Load(); peak > e.peakActiveCalls {
@@ -425,9 +352,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee})
 
 	// ── Wait for provisional / 407 / final fail ────────────────────
-	// The earlyResponse buffer in the agent guarantees that a 200_INVITE
-	// arriving between loop iterations (or between loop exit and the explicit
-	// WaitForSIPEvent below) is never silently dropped.
 	var raw200 string
 	got180 := false
 	for !got180 {
@@ -447,7 +371,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				Success: false, FailureReason: "timeout",
 				TotalMs:       msSince(callStart),
 				RTPLocalPort:  rtpLocalPort(rtpEP),
-				PoolWrapIndex: poolWrapIndex,
 				PeerExt: callee, TsUTC: inviteTsUTC, Direction: "uac",
 				SipMilestones: milestones,
 			}
@@ -541,10 +464,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
-	// If the 200 arrived inside the provisional loop (direct answer without
-	// 180), raw200 is already populated.  Otherwise, wait for it now — the
-	// earlyResponse buffer guarantees we pick it up even if it arrived
-	// between loop exit and this call.
 	if raw200 == "" {
 		var err error
 		raw200, err = ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE")
@@ -648,7 +567,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("BYE_200", 200, milestones.Bye200Ms, nil)
 
-	// Allow tail-end RTP packets to arrive after BYE completes.
 	if rtpEP != nil {
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -712,7 +630,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		RTPRxPkts:        rtpRx,
 		MediaVerified:    mediaOK,
 		RTPLocalPort:     rtpLocalPort(rtpEP),
-		PoolWrapIndex:    poolWrapIndex,
 		PeerExt:          callee,
 		TsUTC:            inviteTsUTC,
 		Direction:        "uac",
@@ -730,10 +647,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 }
 
 // DrainActiveCalls sends BYE to every currently established dialog across all
-// agents.  Called during SIGTERM / graceful shutdown.
-func (e *CallEngine) DrainActiveCalls(ctx context.Context, timeout time.Duration) error {
+// agents in the pool. Called during graceful/interrupted shutdown.
+func (e *CallEngine) DrainActiveCalls(ctx context.Context, timeout time.Duration, allAgents map[string]*agent.ExtensionAgent) error {
 	var wg sync.WaitGroup
-	for _, ag := range e.agents {
+	for _, ag := range allAgents {
 		for _, d := range ag.ActiveDialogsSnapshot() {
 			if d.State == "ESTABLISHED" {
 				wg.Add(1)

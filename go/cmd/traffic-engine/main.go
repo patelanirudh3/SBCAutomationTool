@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,8 +88,7 @@ func main() {
 	// Dry run
 	if *dryRun {
 		slog.Info("Dry run — config valid, exiting",
-			"uac_ext", fmt.Sprintf("%d–%d (%d)", cfg.UACExtStart, cfg.UACExtEnd, cfg.UACExtCount()),
-			"uas_ext", fmt.Sprintf("%d–%d (%d)", cfg.UASExtStart, cfg.UASExtEnd, cfg.UASExtCount()),
+			"ext_range", fmt.Sprintf("%d-%d (%d)", cfg.ExtStart, cfg.ExtEnd, cfg.ExtCount()),
 			"cps", cfg.CPS, "hold", cfg.HoldTimeSeconds,
 			"concurrent", cfg.EffectiveMaxConcurrent(),
 		)
@@ -99,7 +97,7 @@ func main() {
 
 	// Derive max_calls
 	maxCalls := *maxCallsFlag
-	if maxCalls == 0 && cfg.IsUAC() {
+	if maxCalls == 0 {
 		switch cfg.TrafficMode {
 		case "smoke":
 			maxCalls = cfg.CallCount
@@ -107,39 +105,44 @@ func main() {
 			maxCalls = int(float64(cfg.CPS) * cfg.DurationHours * 3600)
 		}
 	}
-	if maxCalls > 0 && cfg.PoolWrapCount() > 0 {
-		poolWraps := int(math.Ceil(float64(maxCalls) / float64(cfg.PoolWrapCount())))
-		slog.Info("Traffic mode resolved",
-			"mode", cfg.TrafficMode, "max_calls", maxCalls,
-			"pool_wrap_count", cfg.PoolWrapCount(), "pool_wraps", poolWraps,
-		)
-	} else if maxCalls == 0 {
+	if maxCalls == 0 {
 		slog.Info("Traffic mode: unlimited (run until stopped)", "mode", cfg.TrafficMode)
+	} else {
+		slog.Info("Traffic mode resolved", "mode", cfg.TrafficMode, "max_calls", maxCalls)
 	}
 
-	// Run the full lifecycle
-	exitCode := runLifecycle(cfg, *skipSubscribe, maxCalls, *prePhaseOnly, *noUnregister, *apiOnly, *guiDrainSeconds, runID, pairID, *logDir, nil, nil)
+	exitCode := runLifecycle(cfg, *skipSubscribe, maxCalls, *prePhaseOnly, *noUnregister, *guiDrainSeconds, runID, pairID, *logDir, nil, nil, nil, nil)
 	slog.Info("Process exiting", "pid", os.Getpid(), "code", exitCode)
 	os.Exit(exitCode)
 }
 
+// runLifecycle runs the full single-pool traffic lifecycle.
+//
+// Phase state machine (GUI mode):
+//
+//	CONFIGURED → PRE_REGISTER → TRAFFIC_READY → TRAFFIC → CLEANUP_READY → DONE
+//
+// In CLI mode (pctx == nil), every phase gate is skipped and the pipeline runs
+// straight through.
+//
+// pctx, if non-nil, provides phase-gate channels (TrafficStartCh,
+// CleanupStartCh, GracefulStopCh, InterruptStopCh).
+// stopNew, if non-nil, is set to true by interrupted shutdown to halt
+// RegisterAll/SubscribeAll from starting new batches.
 func runLifecycle(
 	cfg *config.VMConfig,
 	skipSubscribe bool,
 	maxCalls int,
 	prePhaseOnly bool,
 	noUnregister bool,
-	apiOnly bool,
 	guiDrainSeconds int,
 	runID, pairID, logDir string,
 	extCollector *metrics.MetricsCollector,
 	extCtx context.Context,
+	pctx *metrics.ProcessContext,
+	stopNew *atomic.Bool,
 ) int {
 	overallStart := time.Now()
-
-	// GUI mode: reuse the shared collector and derive context from the caller
-	// (cancelled by StopEvent / POST /api/shutdown).
-	// CLI mode: create own collector, signal handler, and metrics server.
 	guiMode := extCollector != nil
 
 	var collector *metrics.MetricsCollector
@@ -155,7 +158,7 @@ func runLifecycle(
 		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 		go func() {
 			sig := <-sigCh
-			slog.Info("Received signal, initiating graceful shutdown", "signal", sig)
+			slog.Info("Signal received — initiating shutdown", "signal", sig)
 			cancel()
 		}()
 		collector = metrics.NewMetricsCollector(cfg.VMID, cfg.MetricsInterval)
@@ -164,11 +167,11 @@ func runLifecycle(
 
 	collector.SetPhase("INIT")
 
-	// Start metrics HTTP server only in CLI mode
+	// Start metrics HTTP server (CLI mode only — in GUI mode the shared server is already running)
 	var stopCh chan struct{}
 	if !guiMode {
 		stopCh = make(chan struct{})
-		actualPort, err := metrics.StartServer(collector, cfg.VMID, cfg.VMRole, cfg.MetricsPort, stopCh, nil)
+		actualPort, err := metrics.StartServer(collector, cfg.VMID, "", cfg.MetricsPort, stopCh, nil)
 		if err != nil {
 			slog.Warn("Could not start metrics server", "err", err)
 		} else {
@@ -181,14 +184,7 @@ func runLifecycle(
 		}
 	}()
 
-	// API-only mode with config
-	if apiOnly {
-		slog.Info("API-ONLY mode — server running", "port", cfg.MetricsPort, "role", cfg.VMRole)
-		<-ctx.Done()
-		return 0
-	}
-
-	// Create agents
+	// Create and connect agents
 	agents := createAgents(cfg)
 	agentSlice := agentsToSlice(agents)
 	slog.Info("Connecting transports", "count", len(agents))
@@ -199,118 +195,215 @@ func runLifecycle(
 	}
 	collector.UpdateCounts(0, len(agents), 0, 0)
 
-	// Pre-phase
-	collector.SetPhase("PRE_REGISTER")
-	preResult, stopSubRefresh, err := prephase.RunPrePhase(ctx, agentSlice, cfg, skipSubscribe)
-	if err != nil {
-		slog.Error("Pre-phase failed", "err", err)
-		shutdownCleanup(ctx, agents, nil, nil, collector, cfg, runID, pairID, noUnregister)
-		collector.SetPhase("DONE")
-		return 1
+	// Create pool engine and wire pool counts provider into the metrics collector
+	pool := engine.NewPoolEngine()
+	collector.SetPoolCountsProvider(func() (idle, nonIdle, regOnly int) {
+		return pool.Counts()
+	})
+
+	// Create the UAS auto-answer engine (used for all agents in the new single-pool model)
+	uasEngine := engine.NewUasAutoAnswer(
+		agents, cfg,
+		engine.WithUasOnComplete(func(r engine.CallResult) {
+			collector.RecordCall(callResultToMetrics(r))
+		}),
+		engine.WithUasMetrics(collector),
+	)
+
+	// Start a per-agent auto-answer loop for every agent added to the idle pool.
+	// The loop checks ag.AutoAnswerEnabled() before answering, so callers
+	// (agents selected by PoolEngine.NextPair) won't pick up their own INVITE.
+	agentAutoAnswerStops := make(map[string]func())
+
+	onIdle := func(ag *agent.ExtensionAgent) {
+		pool.AddToIdle(ag)
+		stop := uasEngine.StartAutoAnswerForAgent(ctx, ag)
+		agentAutoAnswerStops[ag.Ext] = stop
+		slog.Debug("Agent added to idle pool", "ext", ag.Ext)
 	}
-	defer stopSubRefresh()
+
+	onRegOnly := func(ag *agent.ExtensionAgent) {
+		pool.AddToRegOnly(ag)
+		slog.Debug("Agent added to reg-only pool (sub failed)", "ext", ag.Ext)
+	}
+
+	// ── Pre-phase ────────────────────────────────────────────────────────────
+	collector.SetPhase("PRE_REGISTER")
+	slog.Info("Starting pre-phase (Register + Subscribe)")
+
+	if stopNew == nil {
+		var sn atomic.Bool
+		stopNew = &sn
+	}
+
+	preResult, stopRefresh := prephase.RunPrePhase(
+		ctx, agentSlice, cfg, skipSubscribe,
+		onIdle, onRegOnly, stopNew,
+	)
+	defer stopRefresh()
+
 	collector.UpdateCounts(0, len(agents), preResult.Registered, preResult.Subscribed)
 
+	slog.Info("Pre-phase complete",
+		"total", preResult.Total,
+		"registered", preResult.Registered,
+		"subscribed", preResult.Subscribed,
+		"idle", preResult.IdleCount,
+		"reg_only", preResult.RegOnlyCount,
+		"failed_reg", len(preResult.FailedRegister),
+		"failed_sub", len(preResult.FailedSubscribe),
+	)
+
 	if prePhaseOnly {
-		slog.Info("PRE-PHASE-ONLY mode — extensions registered. Waiting for signal to exit.")
+		slog.Info("PRE-PHASE-ONLY mode — waiting for signal to exit")
 		collector.SetPhase("READY_PRE_PHASE_ONLY")
 		<-ctx.Done()
-		shutdownCleanup(ctx, agents, nil, nil, collector, cfg, runID, pairID, noUnregister)
+		shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
 		collector.SetPhase("DONE")
 		return 0
 	}
 
-	// Traffic phase
+	// ── Wait for "Start Traffic" gate (GUI mode) ─────────────────────────────
+	collector.SetPhase("TRAFFIC_READY")
+	idle, _, _ := pool.Counts()
+	slog.Info("TRAFFIC_READY — waiting for Start Traffic signal", "idle_agents", idle)
+
+	if pctx != nil {
+		// GUI mode: block until either traffic is started or a stop is requested
+		select {
+		case <-pctx.TrafficStartCh:
+			slog.Info("Start Traffic signal received via API")
+		case <-pctx.GracefulStopCh:
+			slog.Info("Graceful stop received before traffic started")
+			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			collector.SetPhase("DONE")
+			return 0
+		case <-pctx.InterruptStopCh:
+			slog.Info("Interrupted stop received before traffic started")
+			stopNew.Store(true)
+			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			collector.SetPhase("DONE")
+			return 0
+		case <-ctx.Done():
+			return 0
+		}
+	}
+	// In CLI mode: proceed immediately to traffic
+
+	// ── Traffic phase ─────────────────────────────────────────────────────────
 	collector.SetPhase("TRAFFIC")
 	collector.SetRunning(true)
 
-	// For timed mode, enforce a hard wall-clock deadline from traffic start.
-	// Converting duration_hours to a call count (maxCalls) alone is not
-	// sufficient: when calls time out, slots are held longer than hold_time_s,
-	// the concurrent ceiling backs up, and the run extends well past the
-	// intended duration. The deadline context guarantees the traffic phase
-	// exits on time regardless of call outcome rates or CPS back-pressure.
+	// Timed-mode hard deadline
 	trafficCtx := ctx
-	var trafficCancel context.CancelFunc
+	var trafficCancel context.CancelFunc = func() {}
 	if cfg.TrafficMode == "timed" && cfg.DurationHours > 0 {
 		deadline := time.Duration(cfg.DurationHours * float64(time.Hour))
 		trafficCtx, trafficCancel = context.WithTimeout(ctx, deadline)
-		defer trafficCancel()
 		slog.Info("Traffic deadline set",
 			"duration_hours", cfg.DurationHours,
 			"deadline", time.Now().Add(deadline).Format(time.RFC3339),
 		)
 	}
 
-	var callEngine *engine.CallEngine
-	var uasEngine *engine.UasAutoAnswer
+	callEngine := engine.NewCallEngine(
+		pool, cfg,
+		engine.WithOnComplete(func(r engine.CallResult) {
+			collector.RecordCall(callResultToMetrics(r))
+		}),
+		engine.WithOnAttempt(func() {
+			collector.RecordAttempt()
+		}),
+		engine.WithMaxCalls(maxCalls),
+		engine.WithMetrics(collector),
+	)
+	collector.SetConcurrentProvider(func() int { return callEngine.ActiveCallCount() })
 
-	if cfg.IsUAC() {
-		callEngine = engine.NewCallEngine(
-			agents, cfg,
-			engine.WithOnComplete(func(r engine.CallResult) {
-				collector.RecordCall(callResultToMetrics(r))
-			}),
-			engine.WithOnAttempt(func() {
-				collector.RecordAttempt()
-			}),
-			engine.WithMaxCalls(maxCalls),
-			engine.WithMetrics(collector),
-		)
-		collector.SetConcurrentProvider(func() int { return callEngine.ActiveCallCount() })
+	slog.Info("Traffic starting",
+		"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
+		"max_concurrent", cfg.EffectiveMaxConcurrent(),
+		"ramp_s", cfg.RampUpSeconds, "max_calls", maxCalls,
+		"idle_agents", idle,
+	)
 
-		slog.Info("UAC traffic starting",
-			"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
-			"max_concurrent", cfg.EffectiveMaxConcurrent(),
-			"ramp_s", cfg.RampUpSeconds, "max_calls", maxCalls,
-		)
+	engineDone := make(chan error, 1)
+	go func() {
+		engineDone <- callEngine.Run(trafficCtx)
+	}()
 
-		engineDone := make(chan error, 1)
-		go func() {
-			engineDone <- callEngine.Run(trafficCtx)
-		}()
+	// Monitor phase-gate channels during traffic
+	if pctx != nil {
+		for {
+			select {
+			case <-trafficCtx.Done():
+				// Timed-mode deadline or parent cancellation
+				callEngine.Stop()
+				<-engineDone
+				goto trafficDone
 
+			case err := <-engineDone:
+				if err != nil {
+					slog.Warn("Call engine stopped with error", "err", err)
+				}
+				goto trafficDone
+
+			case <-pctx.GracefulStopCh:
+				slog.Info("Graceful stop received — draining in-flight calls")
+				callEngine.Stop()
+				<-engineDone
+				goto trafficDone
+
+			case <-pctx.InterruptStopCh:
+				slog.Info("Interrupted stop received — cancelling in-flight calls")
+				trafficCancel()
+				callEngine.Stop()
+				<-engineDone
+				goto trafficDone
+			}
+		}
+	} else {
+		// CLI mode: wait for engine or context cancellation
 		select {
 		case <-trafficCtx.Done():
 			callEngine.Stop()
+			<-engineDone
 		case err := <-engineDone:
 			if err != nil {
 				slog.Warn("Call engine stopped with error", "err", err)
 			}
 		}
-	} else {
-		uasEngine = engine.NewUasAutoAnswer(
-			agents, cfg,
-			engine.WithUasOnComplete(func(r engine.CallResult) {
-				collector.RecordCall(callResultToMetrics(r))
-			}),
-			engine.WithUasMetrics(collector),
-		)
-		if err := uasEngine.Start(ctx); err != nil {
-			slog.Error("UAS start failed", "err", err)
-			return 1
-		}
-		slog.Info("UAS auto-answer active", "extensions", len(agents))
-		<-ctx.Done()
 	}
 
-	// Graceful shutdown — this signals the UAS peer to stop and drains all
-	// active calls before returning.  Spine correlation is intentionally
-	// performed AFTER shutdown so that the UAS has had time to finalize and
-	// record its last completed call legs before the UAC fetches them.
+trafficDone:
+	trafficCancel()
 	collector.SetPhase("STOPPING")
 	collector.SetRunning(false)
-	slog.Info("Initiating graceful shutdown")
+	slog.Info("Traffic phase complete")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// ── Wait for "Cleanup" gate (GUI mode) ────────────────────────────────────
+	collector.SetPhase("CLEANUP_READY")
+	slog.Info("CLEANUP_READY — waiting for Cleanup signal")
+
+	if pctx != nil {
+		select {
+		case <-pctx.CleanupStartCh:
+			slog.Info("Cleanup signal received via API")
+		case <-ctx.Done():
+		}
+	}
+	// In CLI mode: proceed immediately to cleanup
+
+	// Build call spines (using local results split by direction — no remote peer fetch)
+	buildAndStoreSpines(collector)
+
+	// ── Cleanup ───────────────────────────────────────────────────────────────
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer shutdownCancel()
-	shutdownCleanup(shutdownCtx, agents, callEngine, uasEngine, collector, cfg, runID, pairID, noUnregister)
+	shutdownCleanup(shutdownCtx, agents, pool, callEngine, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
 
-	// Call spine correlation AFTER shutdown — UAS peer has been signaled to
-	// stop and all active call BYEs have been drained, so its results are
-	// fully flushed before we fetch them for correlation.
-	if cfg.IsUAC() {
-		buildAndStoreSpines(cfg, collector)
+	// Stop all per-agent auto-answer loops
+	for _, stop := range agentAutoAnswerStops {
+		stop()
 	}
 
 	elapsed := time.Since(overallStart).Seconds()
@@ -325,15 +418,11 @@ func runLifecycle(
 	)
 	slog.Info("============================================================")
 
-	// Write run-*.json
 	writeRunJSON(collector, cfg, runID, pairID, logDir)
 
-	// All post-run data (spines, run JSON, summaries) is now materialized.
-	// Only NOW advertise DONE so the GUI never fetches stale/empty data.
 	collector.SetPhase("DONE")
-	slog.Info("Phase set to DONE — all post-run data ready for GUI")
+	slog.Info("Phase set to DONE — all post-run data ready")
 
-	// GUI drain
 	if guiDrainSeconds > 0 {
 		slog.Info("GUI drain: keeping metrics server alive", "seconds", guiDrainSeconds)
 		select {
@@ -345,64 +434,62 @@ func runLifecycle(
 	return 0
 }
 
-func buildAndStoreSpines(cfg *config.VMConfig, collector *metrics.MetricsCollector) {
-	peerURL := cfg.PeerStopURL
-	uasBaseURL := ""
-	if peerURL != "" {
-		if parsed, err := url.Parse(peerURL); err == nil {
-			uasBaseURL = fmt.Sprintf("%s://%s:%s", parsed.Scheme, parsed.Hostname(), parsed.Port())
+// buildAndStoreSpines builds correlated call spines from locally collected
+// call results. In the single-pool model both caller (UAC) and callee (UAS)
+// legs are recorded locally; the direction field distinguishes them.
+func buildAndStoreSpines(collector *metrics.MetricsCollector) {
+	allCalls := collector.GetCallResultsAsDicts()
+
+	var uacCalls, uasCalls []map[string]any
+	for _, r := range allCalls {
+		dir, _ := r["direction"].(string)
+		if dir == "uas" {
+			uasCalls = append(uasCalls, r)
+		} else {
+			uacCalls = append(uacCalls, r)
 		}
 	}
 
-	var uasCalls []map[string]any
-	if uasBaseURL != "" {
-		uasCalls = spine.CollectUASCallResults(uasBaseURL, 8.0)
-	} else {
-		slog.Warn("No peer_stop_url — skipping UAS event collection for spine correlation")
-	}
-
-	uacCalls := collector.GetCallResultsAsDicts()
 	callSpines := spine.BuildCallSpines(uacCalls, uasCalls)
 	collector.StoreCallSpines(callSpines)
 
 	correlated := 0
 	for _, raw := range callSpines {
-		// Quick scan for "unmatched" without full unmarshal — sufficient for the log counter.
 		if !strings.Contains(string(raw), `"unmatched"`) {
 			correlated++
 		}
 	}
-	slog.Info("Built call spines", "total", len(callSpines), "correlated", correlated)
+	slog.Info("Built call spines",
+		"total", len(callSpines), "correlated", correlated,
+		"uac_legs", len(uacCalls), "uas_legs", len(uasCalls),
+	)
 }
 
+// shutdownCleanup stops the call engine and UAS auto-answer, then
+// unregisters/unsubscribes all users and closes transports.
 func shutdownCleanup(
 	ctx context.Context,
 	agents map[string]*agent.ExtensionAgent,
+	pool *engine.PoolEngine,
 	eng *engine.CallEngine,
 	uas *engine.UasAutoAnswer,
 	collector *metrics.MetricsCollector,
 	cfg *config.VMConfig,
-	runID, pairID string,
+	runID, pairID, logDir string,
 	noUnregister bool,
 ) {
-	// Signal UAS peer to stop
-	if cfg.IsUAC() && cfg.PeerStopURL != "" {
-		postPeerStop(cfg.PeerStopURL)
-	}
-
-	// Stop call engine
+	// Stop call engine (no-op if already stopped)
 	if eng != nil {
 		eng.Stop()
 		slog.Info("Draining active calls (BYE)")
-		eng.DrainActiveCalls(ctx, 10*time.Second)
+		eng.DrainActiveCalls(ctx, 15*time.Second, agents)
 	}
 
-	// Stop UAS
+	// Stop UAS auto-answer engine
 	if uas != nil {
 		uas.Stop()
 	}
 
-	// Unregister with semaphore-limited concurrency (scales to 1k-5k extensions)
 	if !noUnregister {
 		concurrency := cfg.SubscribeConcurrency
 		if concurrency <= 0 {
@@ -412,8 +499,16 @@ func shutdownCleanup(
 		waves := (len(agents) + concurrency - 1) / concurrency
 		outerTimeout := time.Duration(waves)*perExtTimeout + 10*time.Second
 
+		// Use all agents from pool for cleanup (idle + non-idle + reg-only)
+		var cleanupAgents []*agent.ExtensionAgent
+		if pool != nil {
+			cleanupAgents = pool.AllForCleanup()
+		} else {
+			cleanupAgents = agentsToSlice(agents)
+		}
+
 		slog.Info("Unregistering extensions",
-			"count", len(agents),
+			"count", len(cleanupAgents),
 			"concurrency", concurrency,
 			"waves", waves,
 			"outer_timeout_s", outerTimeout.Seconds(),
@@ -423,7 +518,7 @@ func shutdownCleanup(
 
 		sem := make(chan struct{}, concurrency)
 		var wg sync.WaitGroup
-		for _, ag := range agents {
+		for _, ag := range cleanupAgents {
 			wg.Add(1)
 			go func(a *agent.ExtensionAgent) {
 				defer wg.Done()
@@ -439,70 +534,21 @@ func shutdownCleanup(
 		slog.Info("--no-unregister: skipping unregistration")
 	}
 
-	// Close transports
 	slog.Info("Closing transports")
 	for _, ag := range agents {
 		ag.Close()
 	}
 
-	// Final metrics flush + log (matches Python step 6)
 	snap := collector.Latest()
 	snapJSON, _ := json.Marshal(snap)
 	slog.Info("Final metrics: " + string(snapJSON))
 
-	// Write traffic_summary_*.log (matches Python write_traffic_summary)
-	writeTrafficSummary(collector, cfg, "logs", runID, pairID, eng, agents)
-
+	writeTrafficSummary(collector, cfg, logDir, runID, pairID, eng, agents)
 	slog.Info("SIP cleanup complete — metrics server still serving")
-}
-
-func postPeerStop(peerURL string) {
-	parsed, err := url.Parse(peerURL)
-	if err != nil {
-		return
-	}
-	hostname := parsed.Hostname()
-	if hostname == "" {
-		hostname = "localhost"
-	}
-	portStr := parsed.Port()
-	port := 8081
-	if portStr != "" {
-		if p, err := strconv.Atoi(portStr); err == nil {
-			port = p
-		}
-	}
-	portsToTry := []int{port}
-	for _, p := range []int{8081, 8082, 8083} {
-		found := false
-		for _, existing := range portsToTry {
-			if existing == p {
-				found = true
-				break
-			}
-		}
-		if !found {
-			portsToTry = append(portsToTry, p)
-		}
-	}
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	for _, p := range portsToTry {
-		u := fmt.Sprintf("%s://%s:%d%s?source=uac", parsed.Scheme, hostname, p, parsed.Path)
-		slog.Info("Signaling UAS shutdown", "url", u)
-		resp, err := client.Post(u, "application/json", nil)
-		if err == nil {
-			resp.Body.Close()
-			return
-		}
-		slog.Debug("POST peer_stop failed", "url", u, "err", err)
-	}
-	slog.Warn("POST to peer_stop_url failed on all ports")
 }
 
 func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, runID, pairID, logDir string) {
 	os.MkdirAll(logDir, 0755)
-	// File is named <runID>_<pairID>_<vmID>.json — no "run-" prefix duplication.
 	path := fmt.Sprintf("%s/%s_%s_%s.json", logDir, runID, pairID, cfg.VMID)
 
 	snap := collector.Latest()
@@ -532,37 +578,34 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		"aggregate_asr":   asr,
 	}
 
-	// Build config snapshot for the report
 	cfgMap := map[string]any{
-		"vm_role":            cfg.VMRole,
-		"vm_id":             cfg.VMID,
-		"uac_ext_start":     cfg.UACExtStart,
-		"uac_ext_end":       cfg.UACExtEnd,
-		"uas_ext_start":     cfg.UASExtStart,
-		"uas_ext_end":       cfg.UASExtEnd,
-		"sbc_host":          cfg.SBCHost,
-		"sbc_port":          cfg.SBCPort,
-		"sip_transport":     cfg.SIPTransport,
-		"domain":            cfg.Domain,
-		"cps":               cfg.CPS,
-		"hold_time_seconds": cfg.HoldTimeSeconds,
-		"ramp_up_seconds":   cfg.RampUpSeconds,
-		"media_enabled":     cfg.MediaEnabled,
-		"metrics_port":      cfg.MetricsPort,
-		"traffic_mode":      cfg.TrafficMode,
+		"vm_id":              cfg.VMID,
+		"ext_start":          cfg.ExtStart,
+		"ext_end":            cfg.ExtEnd,
+		"sbc_host":           cfg.SBCHost,
+		"sbc_port":           cfg.SBCPort,
+		"sip_transport":      cfg.SIPTransport,
+		"domain":             cfg.Domain,
+		"cps":                cfg.CPS,
+		"hold_time_seconds":  cfg.HoldTimeSeconds,
+		"ramp_up_seconds":    cfg.RampUpSeconds,
+		"register_expires":   cfg.RegisterExpires,
+		"subscribe_expires":  cfg.SubscribeExpires,
+		"media_enabled":      cfg.MediaEnabled,
+		"metrics_port":       cfg.MetricsPort,
+		"traffic_mode":       cfg.TrafficMode,
 	}
 
 	output := map[string]any{
-		"generated_at":   time.Now().UTC().Format(time.RFC3339Nano),
-		"run_id":         runID,
-		"pair_id":        pairID,
-		"vm_id":          cfg.VMID,
-		"vm_role":        cfg.VMRole,
-		"aggregate":      aggregate,
-		"final_metrics":  snap,
-		"config":         cfgMap,
-		"call_events":    callEvents,
-		"call_spines":    callSpines,
+		"generated_at":  time.Now().UTC().Format(time.RFC3339Nano),
+		"run_id":        runID,
+		"pair_id":       pairID,
+		"vm_id":         cfg.VMID,
+		"aggregate":     aggregate,
+		"final_metrics": snap,
+		"config":        cfgMap,
+		"call_events":   callEvents,
+		"call_spines":   callSpines,
 	}
 
 	data, err := json.MarshalIndent(output, "", "  ")
@@ -577,8 +620,6 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 	slog.Info("Run JSON written", "path", path)
 }
 
-// writeTrafficSummary writes a human-readable summary log matching the Python
-// write_traffic_summary format: traffic_summary_<runID>_<pairID>_<vmID>.log
 func writeTrafficSummary(
 	collector *metrics.MetricsCollector,
 	cfg *config.VMConfig,
@@ -595,20 +636,14 @@ func writeTrafficSummary(
 	snap := collector.Latest()
 	sipC := collector.GetSIPCounters()
 
-	// SIP ephemeral ports
 	sipPortsByExt := make(map[string]int)
 	for ext, ag := range agents {
-		port := ag.LocalPort()
-		if port != 0 {
+		if port := ag.LocalPort(); port != 0 {
 			sipPortsByExt[ext] = port
 		}
 	}
 
-	// RTP UDP ports
-	type rtpEntry struct {
-		caller, callee string
-		port           int
-	}
+	type rtpEntry struct{ caller, callee string; port int }
 	var rtpPorts []rtpEntry
 	for _, r := range results {
 		if r.RTPLocalPort > 0 && r.RTPLocalPort != 9 {
@@ -616,7 +651,6 @@ func writeTrafficSummary(
 		}
 	}
 
-	// Media verification
 	var mediaVerified, mediaTotal int
 	for _, r := range results {
 		if r.Success {
@@ -627,23 +661,14 @@ func writeTrafficSummary(
 		}
 	}
 
-	// Peak concurrent (UAC only)
 	peakConcurrent := 0
 	if eng != nil {
 		peakConcurrent = eng.PeakActiveCalls()
 	}
 
-	// Pool wrap pairings
-	pairingsByWrap := make(map[int][]struct{ caller, callee string })
-	for _, r := range results {
-		if r.Caller != "remote" {
-			pairingsByWrap[r.PoolWrapIndex] = append(pairingsByWrap[r.PoolWrapIndex], struct{ caller, callee string }{r.Caller, r.Callee})
-		}
-	}
-
 	var lines []string
 	lines = append(lines, strings.Repeat("=", 70))
-	lines = append(lines, fmt.Sprintf("TRAFFIC RUN SUMMARY — %s — %s", vmID, cfg.VMRole))
+	lines = append(lines, fmt.Sprintf("TRAFFIC RUN SUMMARY — %s", vmID))
 	lines = append(lines, fmt.Sprintf("Timestamp: %s", time.Now().Format("2006-01-02T15:04:05.000000")))
 	lines = append(lines, strings.Repeat("=", 70))
 	lines = append(lines, "")
@@ -659,42 +684,32 @@ func writeTrafficSummary(
 		lines = append(lines, fmt.Sprintf("  peak_concurrent:  %d", peakConcurrent))
 	}
 	lines = append(lines, "")
-
-	if cfg.IsUAC() {
-		lines = append(lines, "--- SIP message counters (UAC) ---")
-		lines = append(lines, fmt.Sprintf("  invites_sent:       %d", sipC.InvitesSent))
-		lines = append(lines, fmt.Sprintf("  acks_sent:          %d", sipC.AcksSent))
-		lines = append(lines, fmt.Sprintf("  byes_sent:          %d", sipC.ByesSent))
-		lines = append(lines, fmt.Sprintf("  bye_200_received:   %d", sipC.Bye200Received))
-	} else {
-		lines = append(lines, "--- SIP message counters (UAS) ---")
-		lines = append(lines, fmt.Sprintf("  invites_received:   %d", sipC.InvitesReceived))
-		lines = append(lines, fmt.Sprintf("  acks_received:      %d", sipC.AcksReceived))
-		lines = append(lines, fmt.Sprintf("  byes_received:      %d", sipC.ByesReceived))
-		lines = append(lines, fmt.Sprintf("  bye_200_sent:       %d", sipC.Bye200Sent))
-	}
+	lines = append(lines, "--- SIP message counters ---")
+	lines = append(lines, fmt.Sprintf("  invites_sent:       %d", sipC.InvitesSent))
+	lines = append(lines, fmt.Sprintf("  acks_sent:          %d", sipC.AcksSent))
+	lines = append(lines, fmt.Sprintf("  byes_sent:          %d", sipC.ByesSent))
+	lines = append(lines, fmt.Sprintf("  bye_200_received:   %d", sipC.Bye200Received))
+	lines = append(lines, fmt.Sprintf("  invites_received:   %d", sipC.InvitesReceived))
+	lines = append(lines, fmt.Sprintf("  acks_received:      %d", sipC.AcksReceived))
+	lines = append(lines, fmt.Sprintf("  byes_received:      %d", sipC.ByesReceived))
+	lines = append(lines, fmt.Sprintf("  bye_200_sent:       %d", sipC.Bye200Sent))
 	lines = append(lines, "")
-
 	lines = append(lines, "--- RTP media verification ---")
 	lines = append(lines, fmt.Sprintf("  MEDIA_VERIFIED:   %d / %d successful calls", mediaVerified, mediaTotal))
-	mediaFailed := mediaTotal - mediaVerified
-	if mediaFailed > 0 {
+	if mediaFailed := mediaTotal - mediaVerified; mediaFailed > 0 {
 		lines = append(lines, fmt.Sprintf("  MEDIA_FAILED:     %d", mediaFailed))
 	}
 	lines = append(lines, "")
-
-	lines = append(lines, "--- Ephemeral SIP ports (used and closed by extensions) ---")
+	lines = append(lines, "--- Ephemeral SIP ports ---")
 	if len(sipPortsByExt) > 0 {
-		sortedExts := sortedKeys(sipPortsByExt)
-		for _, ext := range sortedExts {
+		for _, ext := range sortedKeys(sipPortsByExt) {
 			lines = append(lines, fmt.Sprintf("  ext %s: port %d", ext, sipPortsByExt[ext]))
 		}
 	} else {
 		lines = append(lines, "  (none recorded)")
 	}
 	lines = append(lines, "")
-
-	lines = append(lines, "--- UDP RTP ports (created and closed per call) ---")
+	lines = append(lines, "--- UDP RTP ports ---")
 	if len(rtpPorts) > 0 {
 		limit := 50
 		for i, rp := range rtpPorts {
@@ -710,23 +725,10 @@ func writeTrafficSummary(
 		lines = append(lines, "  (none recorded)")
 	}
 	lines = append(lines, "")
-
-	if len(pairingsByWrap) > 0 {
-		lines = append(lines, "--- UAC-to-UAS call pairings by pool wrap ---")
-		sortedWraps := sortedIntKeys(pairingsByWrap)
-		for _, wrap := range sortedWraps {
-			lines = append(lines, fmt.Sprintf("  Wrap %d:", wrap+1))
-			for _, pair := range pairingsByWrap[wrap] {
-				lines = append(lines, fmt.Sprintf("    %s -> %s", pair.caller, pair.callee))
-			}
-		}
-	}
-	lines = append(lines, "")
-
 	lines = append(lines, "--- Config ---")
 	lines = append(lines, fmt.Sprintf("  cps: %d  hold_time_seconds: %d", cfg.CPS, cfg.HoldTimeSeconds))
-	lines = append(lines, fmt.Sprintf("  uac_ext: %d-%d", cfg.UACExtStart, cfg.UACExtEnd))
-	lines = append(lines, fmt.Sprintf("  uas_ext: %d-%d", cfg.UASExtStart, cfg.UASExtEnd))
+	lines = append(lines, fmt.Sprintf("  ext_range: %d-%d (%d)", cfg.ExtStart, cfg.ExtEnd, cfg.ExtCount()))
+	lines = append(lines, fmt.Sprintf("  register_expires: %d  subscribe_expires: %d", cfg.RegisterExpires, cfg.SubscribeExpires))
 	lines = append(lines, strings.Repeat("=", 70))
 
 	content := strings.Join(lines, "\n")
@@ -742,7 +744,6 @@ func sortedKeys(m map[string]int) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	// Sort numerically by converting to int, fall back to string sort
 	sort.Slice(keys, func(i, j int) bool {
 		ni, ei := strconv.Atoi(keys[i])
 		nj, ej := strconv.Atoi(keys[j])
@@ -754,27 +755,13 @@ func sortedKeys(m map[string]int) []string {
 	return keys
 }
 
-func sortedIntKeys[V any](m map[int]V) []int {
-	keys := make([]int, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-	return keys
-}
-
 func createAgents(cfg *config.VMConfig) map[string]*agent.ExtensionAgent {
 	agents := make(map[string]*agent.ExtensionAgent)
-	var extStart, extEnd int
-	if cfg.IsUAC() {
-		extStart = cfg.UACExtStart
-		extEnd = cfg.UACExtEnd
-	} else {
-		extStart = cfg.UASExtStart
-		extEnd = cfg.UASExtEnd
-	}
-	slog.Info("Creating agents", "start", extStart, "end", extEnd, "count", extEnd-extStart+1)
-	for ext := extStart; ext <= extEnd; ext++ {
+	slog.Info("Creating agents",
+		"ext_start", cfg.ExtStart, "ext_end", cfg.ExtEnd,
+		"count", cfg.ExtCount(),
+	)
+	for ext := cfg.ExtStart; ext <= cfg.ExtEnd; ext++ {
 		extStr := strconv.Itoa(ext)
 		agents[extStr] = agent.NewExtensionAgent(extStr, cfg)
 	}
@@ -786,7 +773,6 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	for _, a := range agents {
 		out = append(out, a)
 	}
-	// Sort by extension number so batch from/to log lines always show the correct min→max range.
 	sort.Slice(out, func(i, j int) bool {
 		ni, _ := strconv.Atoi(out[i].Ext)
 		nj, _ := strconv.Atoi(out[j].Ext)
@@ -820,7 +806,7 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 
 		slog.Info("Transport batch connecting",
 			"batch", batchNum, "count", len(batch),
-			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext, // slice is sorted, so [0]=min [last]=max
+			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext,
 		)
 
 		var wg sync.WaitGroup
@@ -861,7 +847,6 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 
 	processExitCh := make(chan struct{}, 1)
 
-	// Second Ctrl+C triggers immediate exit (interruptible GUI drain)
 	secondSigCh := make(chan struct{}, 1)
 	sigCount := 0
 	var sigMu sync.Mutex
@@ -899,25 +884,26 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	pctx.ProcessExit = processExitCh
 	pctx.LogLevel = logLevel
 
-	// Channel signalled when lifecycle goroutine finishes
 	lifecycleDone := make(chan struct{}, 1)
 	var lifecycleRunning sync.Mutex
 
-	// Wire the config validation callback — called by PUT /api/config.
+	// Wire config validation callback
 	pctx.OnConfigReceived = func(body map[string]any) (string, string, string, any, error) {
 		cfg, err := config.ConfigFromDict(body)
 		if err != nil {
 			return "", "", "", nil, err
 		}
-		yamlFilename := strings.ToLower(cfg.VMRole) + ".yaml"
+		yamlFilename := fmt.Sprintf("config_%s.yaml", cfg.VMID)
 		yamlPath, err := config.WriteConfigYAML(cfg, yamlFilename)
 		if err != nil {
 			return "", "", "", nil, fmt.Errorf("failed to write YAML: %w", err)
 		}
-		return cfg.VMID, cfg.VMRole, yamlPath, cfg, nil
+		return cfg.VMID, "", yamlPath, cfg, nil
 	}
 
-	// Wire the lifecycle start callback — called by POST /api/test/start.
+	// Wire the lifecycle start callback — triggered by POST /api/test/start
+	// In the new model, this starts the goroutine which runs pre-phase immediately
+	// (the operator gating is: pre-phase starts, then waits for TrafficStartCh)
 	pctx.StartFunc = func() {
 		pctx.Mu.Lock()
 		cfg, ok := pctx.Config.(*config.VMConfig)
@@ -936,26 +922,25 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		}
 
 		maxCalls := 0
-		if cfg.IsUAC() {
-			switch cfg.TrafficMode {
-			case "smoke":
-				maxCalls = cfg.CallCount
-			case "timed":
-				maxCalls = int(float64(cfg.CPS) * cfg.DurationHours * 3600)
-			}
+		switch cfg.TrafficMode {
+		case "smoke":
+			maxCalls = cfg.CallCount
+		case "timed":
+			maxCalls = int(float64(cfg.CPS) * cfg.DurationHours * 3600)
 		}
 
 		logFile := autoLogFile(runID, pairID, cfg.VMID, "logs")
 		setupFileLogging(logLevel, logFile)
 
 		slog.Info("Traffic lifecycle starting via API",
-			"vm_id", cfg.VMID, "role", cfg.VMRole,
+			"vm_id", cfg.VMID,
 			"run_id", runID, "pair_id", pairID,
 			"max_calls", maxCalls,
 		)
 
-		// Create a context cancelled by StopEvent (POST /api/shutdown,
-		// POST /api/test/stop) or by runAPIOnly's parent context (Ctrl+C).
+		var stopNew atomic.Bool
+
+		// Create context cancelled by StopEvent, GracefulStopCh, or InterruptStopCh
 		stopCtx, stopCancel := context.WithCancel(ctx)
 		go func() {
 			select {
@@ -966,10 +951,10 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		}()
 
 		lifecycleRunning.Lock()
-		exitCode := runLifecycle(cfg, false, maxCalls, false, false, false, 0, runID, pairID, "logs", collector, stopCtx)
+		exitCode := runLifecycle(cfg, false, maxCalls, false, false, 0, runID, pairID, "logs", collector, stopCtx, pctx, &stopNew)
 		lifecycleRunning.Unlock()
 
-		stopCancel() // clean up the StopEvent goroutine
+		stopCancel()
 
 		pctx.Mu.Lock()
 		if exitCode == 0 {
@@ -989,7 +974,7 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	}
 
 	stopCh := make(chan struct{})
-	actualPort, err := metrics.StartServer(collector, "unconfigured", "unconfigured", port, stopCh, pctx)
+	actualPort, err := metrics.StartServer(collector, "unconfigured", "", port, stopCh, pctx)
 	if err != nil {
 		slog.Error("Could not start API server", "err", err)
 		return 1
@@ -1000,7 +985,11 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	slog.Info("GUI-DRIVEN mode — server running", "port", actualPort, "pid", os.Getpid())
 	slog.Info("------------------------------------------------------------")
 	slog.Info("  PUT  /api/config            — push VM configuration")
-	slog.Info("  POST /api/test/start        — start traffic lifecycle")
+	slog.Info("  POST /api/test/start        — start pre-phase (Reg/Sub) lifecycle")
+	slog.Info("  POST /api/traffic/start     — start traffic (after pre-phase)")
+	slog.Info("  POST /api/cleanup/start     — run cleanup (unsubscribe + unregister)")
+	slog.Info("  POST /api/shutdown/graceful — drain in-flight calls and cleanup")
+	slog.Info("  POST /api/shutdown/interrupt — cancel in-flight calls and cleanup")
 	slog.Info("  POST /api/test/stop         — stop traffic")
 	slog.Info("  POST /api/test/reset        — reset state to IDLE")
 	slog.Info("  POST /api/shutdown          — graceful process shutdown")
@@ -1016,14 +1005,11 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	slog.Info("Press Ctrl+C to initiate graceful shutdown")
 	slog.Info("============================================================")
 
-	// Wait for process exit (Ctrl+C, SIGTERM, or POST /api/shutdown)
 	select {
 	case <-ctx.Done():
 	case <-processExitCh:
 	}
 
-	// If lifecycle is still running, wait for it to complete (up to 60s)
-	// This matches Python: await asyncio.wait_for(ctx._lifecycle_task, timeout=60.0)
 	if lifecycleRunning.TryLock() {
 		lifecycleRunning.Unlock()
 	} else {
@@ -1040,13 +1026,8 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		}
 	}
 
-	// Brief drain so GUI can fetch last data before process dies
-	// Interruptible by second Ctrl+C (matches Python asyncio.CancelledError)
 	if guiDrainSeconds > 0 {
-		slog.Info("GUI drain: keeping server alive",
-			"seconds", guiDrainSeconds,
-			"phase", "DONE, all endpoints serving final data",
-		)
+		slog.Info("GUI drain: keeping server alive", "seconds", guiDrainSeconds)
 		select {
 		case <-time.After(time.Duration(guiDrainSeconds) * time.Second):
 		case <-secondSigCh:
@@ -1087,15 +1068,15 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		MarkersReceived:  r.MarkersReceived,
 		Scenario:         r.Scenario,
 	}
-	// Serialize SipMilestones struct directly to json.RawMessage so the struct
-	// field order (UAC keys then UAS keys) is preserved in all JSON outputs.
 	if raw, err := json.Marshal(r.SipMilestones); err == nil {
 		d.SipMilestones = raw
 	}
 	return d
 }
 
-// Logging setup
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
 
 func parseLogLevel(level string) slog.Level {
 	switch strings.ToUpper(level) {
@@ -1115,9 +1096,6 @@ func setupLogging(level string) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})))
 }
 
-// setupFileLogging creates a dual-output logger: console (stdout) at the
-// requested level + file at DEBUG. This mirrors the Python behaviour where
-// StreamHandler and RotatingFileHandler coexist.
 func setupFileLogging(level, path string) {
 	dir := ""
 	if idx := strings.LastIndex(path, "/"); idx >= 0 {
@@ -1134,18 +1112,13 @@ func setupFileLogging(level, path string) {
 	}
 
 	consoleLvl := parseLogLevel(level)
-
 	consoleHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: consoleLvl})
 	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
-
 	slog.SetDefault(slog.New(newMultiHandler(consoleHandler, fileHandler)))
 	slog.Info("Log file opened (dual: console+file)", "path", path, "console_level", level, "file_level", "DEBUG")
 }
 
-// multiHandler fans out log records to multiple slog.Handlers.
-type multiHandler struct {
-	handlers []slog.Handler
-}
+type multiHandler struct{ handlers []slog.Handler }
 
 func newMultiHandler(handlers ...slog.Handler) *multiHandler {
 	return &multiHandler{handlers: handlers}
@@ -1191,7 +1164,9 @@ func autoLogFile(runID, pairID, vmID, logDir string) string {
 	return fmt.Sprintf("%s/traffic_%s_%s_%s.log", logDir, runID, pairID, vmID)
 }
 
+// ---------------------------------------------------------------------------
 // Env helpers
+// ---------------------------------------------------------------------------
 
 func envStr(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {

@@ -1,13 +1,21 @@
 // Package prephase implements bulk REGISTER + SUBSCRIBE for all extensions
-// before any INVITE is fired. It is a direct port of the Python pre_phase.py
-// module.
+// before any INVITE is fired.
+//
+// New behaviour (single-pool model):
+//
+//   - Partial registration or subscription failures no longer abort the run.
+//   - Per-agent callbacks are invoked as each user completes:
+//     Reg OK + Sub OK  → onIdle(ag)       — added to the idle pool
+//     Reg OK + Sub fail → onRegOnly(ag)    — added to reg-only list
+//     Reg fail           — counted only in PrePhaseResult.FailedRegister
+//   - stopNew *atomic.Bool: if set to true mid-run, no new batches/requests
+//     are started (used during interrupted shutdown).
 //
 // Sequencing:
 //
 //	Phase 0 — Flush stale registrations (REGISTER Expires:0)
 //	Phase 1 — Register all extensions in sequential batches
-//	Phase 2 — Subscribe all extensions (optional)
-//	Log "ALL EXTENSIONS READY"
+//	Phase 2 — Subscribe successfully registered extensions
 package prephase
 
 import (
@@ -23,6 +31,7 @@ import (
 	"github.com/cci/traffic-engine/internal/agent"
 	"github.com/cci/traffic-engine/internal/config"
 )
+
 
 // batchMinExt returns the numerically smallest extension in the batch.
 func batchMinExt(batch []*agent.ExtensionAgent) string {
@@ -50,12 +59,13 @@ func batchMaxExt(batch []*agent.ExtensionAgent) string {
 	return maxExt
 }
 
-
 // PrePhaseResult holds success/failure counts from the pre-phase pipeline.
 type PrePhaseResult struct {
 	Total           int
 	Registered      int
 	Subscribed      int
+	IdleCount       int // reg + sub OK
+	RegOnlyCount    int // reg OK, sub failed
 	FailedRegister  []string
 	FailedSubscribe []string
 	DurationSeconds float64
@@ -77,36 +87,32 @@ func (r *PrePhaseResult) AllReady() bool {
 }
 
 // RegisterAll registers extensions in sequential batches of cfg.RegisterBatchSize.
-// Each batch fires concurrently and must complete before the next batch starts.
-// A configurable pause (RegisterBatchDelayMs) separates batches to stay
-// within SBC DATAIFPROTECT limits.
-// Returns the list of extension numbers that failed to register.
+// Each batch fires concurrently; batches are separated by RegisterBatchDelayMs.
 //
-// TODO(failover): When failover_enabled is true, extensions should register
-// on BOTH the primary and secondary hosts (forking model). Only SUBSCRIBE
-// should target the primary. During a traffic-run failover event, extensions
-// that fail to re-register on the primary should move their subscription
-// (re-SUBSCRIBE) to the secondary — they do NOT re-register on secondary
-// because the forking model already keeps them registered there.
-// This requires a separate registration flow and is not yet implemented.
+// agentCb is called for each agent after its registration attempt:
+//
+//	agentCb(ag, true)  — registration succeeded
+//	agentCb(ag, false) — registration failed
+//
+// If stopNew is non-nil and becomes true, no further batches are started.
+// Returns the list of extensions that failed to register.
 func RegisterAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
-	progressCb func(done, total int),
+	agentCb func(ag *agent.ExtensionAgent, succeeded bool),
+	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
 	batchSize := cfg.RegisterBatchSize
 	if batchSize <= 0 {
 		batchSize = 10
 	}
-
 	batchDelay := cfg.BatchDelay()
 
 	var (
 		mu     sync.Mutex
 		failed []string
-		done   int64
 	)
 
 	slog.Info("Pre-phase: registering extensions",
@@ -116,6 +122,12 @@ func RegisterAll(
 	start := time.Now()
 
 	for batchStart := 0; batchStart < total; batchStart += batchSize {
+		if stopNew != nil && stopNew.Load() {
+			slog.Info("RegisterAll: stopNew requested — halting new batches",
+				"completed", batchStart, "total", total)
+			break
+		}
+
 		batchEnd := batchStart + batchSize
 		if batchEnd > total {
 			batchEnd = total
@@ -134,46 +146,44 @@ func RegisterAll(
 		for _, a := range batch {
 			go func(ag *agent.ExtensionAgent) {
 				defer wg.Done()
-				if !registerOne(ctx, ag, cfg) {
+				ok := registerOne(ctx, ag, cfg)
+				if !ok {
 					mu.Lock()
 					failed = append(failed, ag.Ext)
 					mu.Unlock()
-					return
 				}
-				cur := atomic.AddInt64(&done, 1)
-				if progressCb != nil {
-					progressCb(int(cur), total)
+				if agentCb != nil {
+					agentCb(ag, ok)
 				}
 			}(a)
 		}
 
 		wg.Wait()
 
-		succeeded := len(batch)
 		mu.Lock()
-		batchFailed := 0
+		batchFailCount := 0
 		for _, ext := range failed {
 			for _, a := range batch {
 				if a.Ext == ext {
-					batchFailed++
+					batchFailCount++
 				}
 			}
 		}
 		mu.Unlock()
-		succeeded -= batchFailed
 
 		slog.Info("REGISTER batch complete",
-			"batch", batchNum, "ok", succeeded, "total", len(batch))
+			"batch", batchNum, "ok", len(batch)-batchFailCount, "total", len(batch))
 
 		if batchEnd < total {
 			select {
 			case <-ctx.Done():
-				break
+				goto done
 			case <-time.After(batchDelay):
 			}
 		}
 	}
 
+done:
 	elapsed := time.Since(start).Seconds()
 	mu.Lock()
 	failedCopy := make([]string, len(failed))
@@ -227,19 +237,22 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 	return false
 }
 
-// SubscribeAll subscribes all extensions with a semaphore limiting concurrency
-// to cfg.SubscribeConcurrency. Returns the list of extension numbers that failed.
+// SubscribeAll subscribes a list of extensions with a semaphore limiting
+// concurrency to cfg.SubscribeConcurrency.
 //
-// TODO(failover): SUBSCRIBE should only target the primary host. During a
-// failover event (triggered during traffic run), extensions that lose their
-// primary registration should re-SUBSCRIBE to the secondary host. The
-// re-SUBSCRIBE flow is separate from re-REGISTER and will be implemented
-// as part of the failover engine.
+// agentCb is called for each agent after its subscription attempt:
+//
+//	agentCb(ag, true)  — subscription succeeded
+//	agentCb(ag, false) — subscription failed
+//
+// If stopNew is non-nil and becomes true, no further subscriptions are started.
+// Returns the list of extensions that failed to subscribe.
 func SubscribeAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
-	progressCb func(done, total int),
+	agentCb func(ag *agent.ExtensionAgent, succeeded bool),
+	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
 	concurrency := cfg.SubscribeConcurrency
@@ -250,7 +263,6 @@ func SubscribeAll(
 	var (
 		mu     sync.Mutex
 		failed []string
-		done   int64
 	)
 
 	slog.Info("Pre-phase: subscribing extensions", "total", total)
@@ -258,23 +270,26 @@ func SubscribeAll(
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	wg.Add(total)
 
 	for _, a := range agents {
+		if stopNew != nil && stopNew.Load() {
+			slog.Info("SubscribeAll: stopNew requested — halting new subscriptions")
+			break
+		}
+		wg.Add(1)
 		go func(ag *agent.ExtensionAgent) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			if !subscribeOne(ctx, ag, cfg) {
+			ok := subscribeOne(ctx, ag, cfg)
+			if !ok {
 				mu.Lock()
 				failed = append(failed, ag.Ext)
 				mu.Unlock()
-				return
 			}
-			cur := atomic.AddInt64(&done, 1)
-			if progressCb != nil {
-				progressCb(int(cur), total)
+			if agentCb != nil {
+				agentCb(ag, ok)
 			}
 		}(a)
 	}
@@ -405,7 +420,7 @@ func StartSubscribeRefreshLoop(
 ) func() {
 	expires := cfg.SubscribeExpires
 	if expires <= 0 {
-		expires = 600
+		expires = 3600
 	}
 	interval := time.Duration(expires/2) * time.Second
 
@@ -490,21 +505,29 @@ func FlushStaleRegistrations(
 	slog.Info("Flush complete — all extensions cleared from server")
 }
 
-// RunPrePhase executes the full pre-phase pipeline:
+// RunPrePhase executes the full pre-phase pipeline with per-agent callbacks:
 //
 //	Phase 0 — Flush stale registrations
-//	Phase 1 — Register all extensions
-//	Phase 2 — Subscribe all extensions (skipped if skipSubscribe is true)
+//	Phase 1 — Register all extensions (partial failures are tolerated)
+//	Phase 2 — Subscribe successfully registered extensions
+//	           onIdle(ag)    called when reg+sub both succeed → idle_list
+//	           onRegOnly(ag) called when reg OK but sub failed → reg_only_list
 //
-// It returns a PrePhaseResult and a stop function that must be called when the
-// traffic run ends to terminate the background subscription refresh loop.
-// An error is returned if any extension fails to register or subscribe.
+// stopNew, if non-nil, causes new batches/subscriptions to halt when set to
+// true (used by interrupted shutdown before cleaning up in-flight work).
+//
+// Always returns a result; never returns an error for partial failures.
+// Background refresh loops are started after their respective phases; the
+// returned stop function must be called to terminate them.
 func RunPrePhase(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 	skipSubscribe bool,
-) (*PrePhaseResult, func(), error) {
+	onIdle func(ag *agent.ExtensionAgent),
+	onRegOnly func(ag *agent.ExtensionAgent),
+	stopNew *atomic.Bool,
+) (*PrePhaseResult, func()) {
 	total := len(agents)
 	start := time.Now()
 	noopStop := func() {}
@@ -517,41 +540,71 @@ func RunPrePhase(
 	slog.Info("PRE-PHASE 1/2 — REGISTER", "count", total)
 	slog.Info("============================================================")
 
-	failedReg := RegisterAll(ctx, agents, cfg, nil)
+	// Track which agents registered successfully so we can subscribe only those.
+	var (
+		regMu        sync.Mutex
+		registeredAg []*agent.ExtensionAgent
+	)
+
+	failedReg := RegisterAll(ctx, agents, cfg, func(ag *agent.ExtensionAgent, ok bool) {
+		if ok {
+			regMu.Lock()
+			registeredAg = append(registeredAg, ag)
+			regMu.Unlock()
+		}
+	}, stopNew)
 
 	if len(failedReg) > 0 {
-		slog.Error("PRE-PHASE REGISTER failed",
+		slog.Warn("PRE-PHASE REGISTER partial failure",
 			"failed_count", len(failedReg), "extensions", failedReg)
-		return nil, noopStop, fmt.Errorf(
-			"pre-phase REGISTER failed for %d extension(s): %v — aborting, no INVITE will be sent",
-			len(failedReg), failedReg)
+	}
+	if len(registeredAg) == 0 {
+		slog.Error("PRE-PHASE: no extensions registered — skipping SUBSCRIBE")
+		elapsed := time.Since(start).Seconds()
+		return &PrePhaseResult{
+			Total: total, Registered: 0, Subscribed: 0,
+			FailedRegister: failedReg, FailedSubscribe: []string{},
+			DurationSeconds: elapsed,
+		}, noopStop
 	}
 
-	stopRegRefresh := StartRegisterRefreshLoop(ctx, agents, cfg)
+	stopRegRefresh := StartRegisterRefreshLoop(ctx, registeredAg, cfg)
 
-	// Phase 2: SUBSCRIBE
+	// Phase 2: SUBSCRIBE (only for successfully registered agents)
 	var failedSub []string
 	stopSubRefresh := noopStop
 
 	if skipSubscribe {
 		slog.Info("PRE-PHASE 2/2 — SUBSCRIBE skipped")
+		// All registered agents go to reg_only
+		if onRegOnly != nil {
+			for _, ag := range registeredAg {
+				onRegOnly(ag)
+			}
+		}
 	} else {
 		slog.Info("============================================================")
-		slog.Info("PRE-PHASE 2/2 — SUBSCRIBE", "count", total)
+		slog.Info("PRE-PHASE 2/2 — SUBSCRIBE", "count", len(registeredAg))
 		slog.Info("============================================================")
 
-		failedSub = SubscribeAll(ctx, agents, cfg, nil)
+		failedSub = SubscribeAll(ctx, registeredAg, cfg, func(ag *agent.ExtensionAgent, ok bool) {
+			if ok {
+				if onIdle != nil {
+					onIdle(ag)
+				}
+			} else {
+				if onRegOnly != nil {
+					onRegOnly(ag)
+				}
+			}
+		}, stopNew)
 
 		if len(failedSub) > 0 {
-			slog.Error("PRE-PHASE SUBSCRIBE failed",
+			slog.Warn("PRE-PHASE SUBSCRIBE partial failure",
 				"failed_count", len(failedSub), "extensions", failedSub)
-			stopRegRefresh()
-			return nil, noopStop, fmt.Errorf(
-				"pre-phase SUBSCRIBE failed for %d extension(s): %v — aborting",
-				len(failedSub), failedSub)
 		}
 
-		stopSubRefresh = StartSubscribeRefreshLoop(ctx, agents, cfg)
+		stopSubRefresh = StartSubscribeRefreshLoop(ctx, registeredAg, cfg)
 	}
 
 	stopRefresh := func() {
@@ -560,8 +613,14 @@ func RunPrePhase(
 	}
 
 	elapsed := time.Since(start).Seconds()
-	registered := total - len(failedReg)
-	subscribed := total - len(failedSub)
+	registered := len(registeredAg)
+	subscribed := registered - len(failedSub)
+	idleCount := subscribed
+	regOnlyCount := len(failedSub)
+	if skipSubscribe {
+		idleCount = 0
+		regOnlyCount = registered
+	}
 
 	if failedReg == nil {
 		failedReg = []string{}
@@ -574,16 +633,20 @@ func RunPrePhase(
 		Total:           total,
 		Registered:      registered,
 		Subscribed:      subscribed,
+		IdleCount:       idleCount,
+		RegOnlyCount:    regOnlyCount,
 		FailedRegister:  failedReg,
 		FailedSubscribe: failedSub,
 		DurationSeconds: elapsed,
 	}
 
 	slog.Info("============================================================")
-	slog.Info("ALL EXTENSIONS READY",
+	slog.Info("PRE-PHASE COMPLETE",
 		"registered", registered, "subscribed", subscribed,
+		"idle", idleCount, "reg_only", regOnlyCount,
+		"failed_reg", len(failedReg), "failed_sub", len(failedSub),
 		"elapsed_s", fmt.Sprintf("%.1f", elapsed))
 	slog.Info("============================================================")
 
-	return result, stopRefresh, nil
+	return result, stopRefresh
 }

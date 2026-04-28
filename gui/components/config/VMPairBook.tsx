@@ -27,18 +27,16 @@ const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 // Defaults from real yaml files
 // ---------------------------------------------------------------------------
 
-const UAC_DEFAULTS: RawVMFormValues = {
-  vm_id: 'uac-local',
+const DEFAULTS: RawVMFormValues = {
+  vm_id: 'traffic-local',
   vm_ip: '127.0.0.1',
   ssh_user: '',
   ssh_key_path: '',
-  uac_ext_start: '4001000',
-  uac_ext_end: '4001004',
-  uac_ext_count: '5',
-  uas_ext_start: '4001005',
-  uas_ext_end: '4001009',
-  uas_ext_count: '5',
-  uas_override: false,
+  ext_start: '4001000',
+  ext_end: '4001009',
+  ext_count: '10',
+  register_expires: '3600',
+  subscribe_expires: '3600',
   sbc_host: '10.133.63.117',
   sbc_port: '5060',
   secondary_host: '',
@@ -53,54 +51,29 @@ const UAC_DEFAULTS: RawVMFormValues = {
   ramp_up_seconds: '5',
   media_enabled: true,
   metrics_port: '8082',
-  peer_stop_url: 'http://127.0.0.1:8081/api/test/stop',
   traffic_mode: 'smoke',
   call_count: '10',
   duration_hours: '1',
 }
 
+// Legacy UAS defaults kept only for the secondary-VM connection card
 const UAS_DEFAULTS: RawVMFormValues = {
-  vm_id: 'uas-local',
-  vm_ip: '127.0.0.1',
-  ssh_user: '',
-  ssh_key_path: '',
-  uac_ext_start: '4001000',
-  uac_ext_end: '4001004',
-  uac_ext_count: '5',
-  uas_ext_start: '4001005',
-  uas_ext_end: '4001009',
-  uas_ext_count: '5',
-  uas_override: false,
-  sbc_host: '10.133.63.117',
-  sbc_port: '5060',
-  secondary_host: '',
-  secondary_port: '5060',
-  failover_enabled: false,
-  dns_servers: '',
-  sip_transport: 'TCP',
-  domain: 'avaya.com',
-  sip_password: '123456',
-  cps: '1',
-  hold_time_seconds: '5',
-  ramp_up_seconds: '0',
-  media_enabled: true,
+  ...DEFAULTS,
+  vm_id: 'traffic-uas',
   metrics_port: '8081',
-  peer_stop_url: '',
-  traffic_mode: 'smoke',
-  call_count: '10',
-  duration_hours: '1',
+  ramp_up_seconds: '0',
 }
+
+const UAC_DEFAULTS = DEFAULTS
 
 // All fields to touch on full validation
 const UAC_FIELDS = [
-  'vm_id', 'vm_ip', 'uac_ext_start', 'uac_ext_end', 'uas_ext_start', 'uas_ext_end',
+  'vm_id', 'vm_ip', 'ext_start', 'ext_end',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
   'cps', 'hold_time_seconds', 'ramp_up_seconds', 'metrics_port', 'traffic_mode', 'call_count',
   'duration_hours',
 ]
-const UAS_FIELDS = UAC_FIELDS.filter(
-  (f) => !['traffic_mode', 'call_count', 'duration_hours'].includes(f)
-)
+const UAS_FIELDS = ['vm_id', 'vm_ip', 'metrics_port']
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -108,15 +81,12 @@ const UAS_FIELDS = UAC_FIELDS.filter(
 
 function parseRaw(raw: RawVMFormValues, role: 'UAC' | 'UAS'): unknown {
   return {
-    vm_role: role,
     vm_id: raw.vm_id,
     vm_ip: raw.vm_ip,
     ssh_user: raw.ssh_user || undefined,
     ssh_key_path: raw.ssh_key_path || undefined,
-    uac_ext_start: parseInt(raw.uac_ext_start) || 0,
-    uac_ext_end: parseInt(raw.uac_ext_end) || 0,
-    uas_ext_start: parseInt(raw.uas_ext_start) || 0,
-    uas_ext_end: parseInt(raw.uas_ext_end) || 0,
+    ext_start: parseInt(raw.ext_start) || 0,
+    ext_end: parseInt(raw.ext_end) || 0,
     sbc_host: raw.sbc_host,
     sbc_port: parseInt(raw.sbc_port) || 0,
     secondary_host: raw.failover_enabled ? (raw.secondary_host || undefined) : undefined,
@@ -126,21 +96,22 @@ function parseRaw(raw: RawVMFormValues, role: 'UAC' | 'UAS'): unknown {
     sip_transport: raw.sip_transport,
     domain: raw.domain,
     sip_password: raw.sip_password,
+    register_expires: raw.register_expires ? parseInt(raw.register_expires) : undefined,
+    subscribe_expires: raw.subscribe_expires ? parseInt(raw.subscribe_expires) : undefined,
     cps: parseFloat(raw.cps) || 0,
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
     ramp_up_seconds: role === 'UAC' && raw.ramp_up_seconds !== '' ? parseFloat(raw.ramp_up_seconds) : undefined,
     media_enabled: raw.media_enabled,
     metrics_port: parseInt(raw.metrics_port) || 0,
-    peer_stop_url: raw.peer_stop_url || undefined,
     traffic_mode: role === 'UAC' ? raw.traffic_mode || undefined : undefined,
-    call_count:
-      role === 'UAC' && raw.call_count ? parseInt(raw.call_count) : undefined,
-    duration_hours:
-      role === 'UAC' && raw.duration_hours ? parseFloat(raw.duration_hours) : undefined,
+    call_count: role === 'UAC' && raw.call_count ? parseInt(raw.call_count) : undefined,
+    duration_hours: role === 'UAC' && raw.duration_hours ? parseFloat(raw.duration_hours) : undefined,
   }
 }
 
 function getErrors(raw: RawVMFormValues, role: 'UAC' | 'UAS'): Record<string, string> {
+  // UAS card only validates identity/connection — skip full schema validation
+  if (role === 'UAS') return {}
   const result = VMConfigSchema.safeParse(parseRaw(raw, role))
   if (result.success) return {}
   const flat = result.error.flatten().fieldErrors
@@ -196,25 +167,19 @@ function _lcm(a: number, b: number): number { return a && b ? (a * b) / _gcd(a, 
 
 function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
   const [howItWorksOpen, setHowItWorksOpen] = useState(false)
+  const extStart = parseInt(uacRaw.ext_start) || 0
+  const extEnd = parseInt(uacRaw.ext_end) || 0
+  const poolCount = Math.max(extEnd - extStart + 1, 0)
 
-  const uacStart = parseInt(uacRaw.uac_ext_start) || 0
-  const uacEnd = parseInt(uacRaw.uac_ext_end) || 0
-  const uasStart = parseInt(uacRaw.uas_ext_start) || 0
-  const uasEnd = parseInt(uacRaw.uas_ext_end) || 0
-  const uacCount = Math.max(uacEnd - uacStart + 1, 0)
-  const uasCount = Math.max(uasEnd - uasStart + 1, 0)
-
-  const poolCount = _lcm(Math.max(uacCount, 1), Math.max(uasCount, 1))
   const cps = Math.max(parseFloat(uacRaw.cps) || 0, 0.001)
   const holdTime = parseFloat(uacRaw.hold_time_seconds) || 0
-  const wrapTime = poolCount / cps
+  // Pairs cycle: N/2 unique pairs; time to cycle all = (N/2) / CPS
+  const pairCycles = Math.floor(poolCount / 2)
+  const wrapTime = pairCycles > 0 ? pairCycles / cps : 0
   const naturalSpacing = wrapTime >= holdTime + SIP_BYE_BUFFER
-  const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - wrapTime)
-  const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER))
+  const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER)) * 2
 
-  if (uacCount <= 0 || uasCount <= 0) return null
-
-  const accent = naturalSpacing ? 'emerald' : 'amber'
+  if (poolCount < 2) return null
 
   return (
     <div className="space-y-3">
@@ -243,31 +208,26 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
 
         <div className="space-y-1.5 font-mono text-[12px] leading-relaxed">
           <div className="flex justify-between">
-            <span className="text-slate-300">pool_count</span>
+            <span className="text-slate-300">pool_size</span>
             <span className="font-medium text-slate-100">{poolCount}</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-slate-300">wrap_time</span>
+            <span className="text-slate-300">pair_cycles</span>
+            <span className="font-medium text-slate-100">{pairCycles}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-300">cycle_time</span>
             <span className="font-medium text-slate-100">{wrapTime.toFixed(1)}s</span>
           </div>
           <div className="flex justify-between">
             <span className="text-slate-300">hold_time</span>
             <span className="font-medium text-slate-100">{holdTime}s</span>
           </div>
-          {!naturalSpacing && (
-            <>
-              <div className="my-1 border-t border-white/10" />
-              <div className="flex justify-between">
-                <span className="text-slate-300">auto delay</span>
-                <span className="font-semibold text-amber-300">{autoDelay.toFixed(1)}s</span>
-              </div>
-            </>
-          )}
         </div>
 
         {!naturalSpacing && (
           <p className="text-[11px] leading-relaxed text-slate-200">
-            Need <span className="font-mono font-bold text-emerald-400">{minPoolForNatural}</span> pool_count for natural spacing
+            Add <span className="font-mono font-bold text-amber-400">{Math.max(0, minPoolForNatural - poolCount)}</span> more ext for natural spacing
           </p>
         )}
       </div>
@@ -293,18 +253,18 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
         {howItWorksOpen && (
           <div className="mt-2.5 space-y-1.5 font-mono text-[11px] leading-relaxed text-slate-200">
             <div>
-              <span className="text-slate-300">pool_count</span> = LCM({uacCount}, {uasCount}) ={' '}
-              <span className="font-bold text-emerald-400">{poolCount}</span>
+              <span className="text-slate-300">pair_cycles</span> = ⌊{poolCount} / 2⌋ ={' '}
+              <span className="font-bold text-emerald-400">{pairCycles}</span>
             </div>
             <div>
-              <span className="text-slate-300">wrap_time</span> = {poolCount} / {cps.toFixed(1)} ={' '}
+              <span className="text-slate-300">cycle_time</span> = {pairCycles} / {cps.toFixed(1)} ={' '}
               <span className="font-bold text-emerald-400">{wrapTime.toFixed(1)}s</span>
             </div>
             <div>
-              <span className="text-slate-300">natural</span> = wrap_time {'>='} hold + {SIP_BYE_BUFFER}s
+              <span className="text-slate-300">natural</span> = cycle_time {'>='} hold + {SIP_BYE_BUFFER}s
             </div>
             <div>
-              <span className="text-slate-300">min_pool</span> = ⌈CPS × (hold + {SIP_BYE_BUFFER})⌉ ={' '}
+              <span className="text-slate-300">min_ext</span> = 2 × ⌈CPS × (hold + {SIP_BYE_BUFFER})⌉ ={' '}
               <span className="font-bold text-emerald-400">{minPoolForNatural}</span>
             </div>
           </div>
@@ -327,12 +287,16 @@ function WrapSidebar({ uacRaw }: { uacRaw: RawVMFormValues }) {
             <span className="font-mono text-slate-100">{uacRaw.hold_time_seconds}s</span>
           </div>
           <div className="flex justify-between text-slate-300">
-            <span>UAC Ext</span>
-            <span className="font-mono text-slate-100">{uacCount}</span>
+            <span>Pool Size</span>
+            <span className="font-mono text-slate-100">{poolCount}</span>
           </div>
           <div className="flex justify-between text-slate-300">
-            <span>UAS Ext</span>
-            <span className="font-mono text-slate-100">{uasCount}</span>
+            <span>Reg Expires</span>
+            <span className="font-mono text-slate-100">{uacRaw.register_expires || '3600'}s</span>
+          </div>
+          <div className="flex justify-between text-slate-300">
+            <span>Sub Expires</span>
+            <span className="font-mono text-slate-100">{uacRaw.subscribe_expires || '3600'}s</span>
           </div>
           <div className="flex justify-between text-slate-300">
             <span>Media</span>
@@ -389,21 +353,16 @@ export function VMPairBook() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairs[activePairIndex]?.uac.vm_ip, pairs[activePairIndex]?.uas.vm_ip])
 
-  // Auto-derive UAC peer_stop_url from UAS vm_ip + metrics_port (per spec)
+  // Derive ext_count from ext_start + ext_end
   useEffect(() => {
-    const url = deriveUACPeerStopUrl(uasRaw.vm_ip, parseInt(uasRaw.metrics_port) || 0)
-    setUacRaw((prev) => ({ ...prev, peer_stop_url: url }))
-  }, [uasRaw.vm_ip, uasRaw.metrics_port])
+    const start = parseInt(uacRaw.ext_start) || 0
+    const end = parseInt(uacRaw.ext_end) || 0
+    const count = end >= start && start > 0 ? end - start + 1 : 0
+    setUacRaw((prev) => ({ ...prev, ext_count: count > 0 ? String(count) : '' }))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uacRaw.ext_start, uacRaw.ext_end])
 
-  // Mirror UAC hold_time_seconds to UAS so the UAS BYE-wait timeout stays in
-  // sync. UAS uses hold_time_seconds + 60s as a safety timeout — it must be at
-  // least as large as the UAC value to avoid false timeouts on the UAS side.
-  useEffect(() => {
-    setUasRaw((prev) => ({ ...prev, hold_time_seconds: uacRaw.hold_time_seconds }))
-  }, [uacRaw.hold_time_seconds])
-
-  // Mirror SIP Server fields from UAC → UAS so the config pushed to the UAS
-  // backend always matches what is shown in the read-only UAS SIP Server card.
+  // Mirror SIP Server fields from UAC → UAS for co-located secondary VM (if used)
   useEffect(() => {
     setUasRaw((prev) => ({
       ...prev,
@@ -416,6 +375,12 @@ export function VMPairBook() {
       failover_enabled: uacRaw.failover_enabled,
       secondary_host:  uacRaw.secondary_host,
       secondary_port:  uacRaw.secondary_port,
+      hold_time_seconds: uacRaw.hold_time_seconds,
+      ext_start:       uacRaw.ext_start,
+      ext_end:         uacRaw.ext_end,
+      ext_count:       uacRaw.ext_count,
+      register_expires: uacRaw.register_expires,
+      subscribe_expires: uacRaw.subscribe_expires,
     }))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -428,39 +393,12 @@ export function VMPairBook() {
     uacRaw.failover_enabled,
     uacRaw.secondary_host,
     uacRaw.secondary_port,
+    uacRaw.hold_time_seconds,
+    uacRaw.ext_start,
+    uacRaw.ext_end,
+    uacRaw.register_expires,
+    uacRaw.subscribe_expires,
   ])
-
-  // Derive all extension ranges from UAC Start + Count.
-  // UAC End = Start + Count - 1; UAS Start = UAC End + 1; UAS End = UAS Start + Count - 1.
-  // Both UAC and UAS raw values stay in sync automatically.
-  useEffect(() => {
-    const start = parseInt(uacRaw.uac_ext_start) || 0
-    const count = parseInt(uacRaw.uac_ext_count) || 0
-    if (start <= 0 || count <= 0) return
-
-    const uacEnd = start + count - 1
-    const uasStart = uacEnd + 1
-    const uasEnd = uasStart + count - 1
-
-    setUacRaw((prev) => ({
-      ...prev,
-      uac_ext_end: String(uacEnd),
-      uas_ext_start: String(uasStart),
-      uas_ext_end: String(uasEnd),
-      uas_ext_count: String(count),
-    }))
-
-    setUasRaw((prev) => ({
-      ...prev,
-      uac_ext_start: uacRaw.uac_ext_start,
-      uac_ext_end: String(uacEnd),
-      uac_ext_count: uacRaw.uac_ext_count,
-      uas_ext_start: String(uasStart),
-      uas_ext_end: String(uasEnd),
-      uas_ext_count: String(count),
-    }))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uacRaw.uac_ext_start, uacRaw.uac_ext_count])
 
   // Keep the store's pair connection info (ip, port, vm_id) in sync with the
   // live form values so SessionMenu always shows the current typed-in values —
@@ -504,46 +442,35 @@ export function VMPairBook() {
   }, [uacRaw, uasRaw])
 
   const liveAnalysis: WrapAnalysis = useMemo(() => {
-    const uacStart = parseInt(uacRaw.uac_ext_start) || 0
-    const uacEnd = parseInt(uacRaw.uac_ext_end) || 0
-    const uasStart = parseInt(uacRaw.uas_ext_start) || 0
-    const uasEnd = parseInt(uacRaw.uas_ext_end) || 0
-    const uacCount = Math.max(uacEnd - uacStart + 1, 0)
-    const uasCount = Math.max(uasEnd - uasStart + 1, 0)
-    const poolCount = _lcm(Math.max(uacCount, 1), Math.max(uasCount, 1))
+    const extStart = parseInt(uacRaw.ext_start) || 0
+    const extEnd = parseInt(uacRaw.ext_end) || 0
+    const poolCount = Math.max(extEnd - extStart + 1, 0)
+    const pairCycles = Math.floor(poolCount / 2)
     const cps = Math.max(parseFloat(uacRaw.cps) || 0, 0.001)
     const holdTime = parseFloat(uacRaw.hold_time_seconds) || 0
-    const wrapTime = poolCount / cps
+    const wrapTime = pairCycles > 0 ? pairCycles / cps : 0
     const naturalSpacing = wrapTime >= holdTime + SIP_BYE_BUFFER
     const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - wrapTime)
     const adv = pairs[activePairIndex]?.advancedSettings
     const userMargin = adv?.pool_wrap_delay_seconds ?? 0
     const effectiveDelay = autoDelay + Math.max(0, userMargin)
-    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER))
+    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER)) * 2
     return { poolCount, wrapTime, holdTime, naturalSpacing, autoDelay, userMargin, effectiveDelay, minPoolForNatural }
-  }, [uacRaw.uac_ext_start, uacRaw.uac_ext_end, uacRaw.uas_ext_start, uacRaw.uas_ext_end, uacRaw.cps, uacRaw.hold_time_seconds, pairs, activePairIndex])
+  }, [uacRaw.ext_start, uacRaw.ext_end, uacRaw.cps, uacRaw.hold_time_seconds, pairs, activePairIndex])
 
   const uacErrors = useMemo(() => getErrors(uacRaw, 'UAC'), [uacRaw])
-  const uasErrors = useMemo(() => getErrors(uasRaw, 'UAS'), [uasRaw])
+  const uasErrors = useMemo(() => getErrors(uasRaw, 'UAS'), [uasRaw]) // always empty in new model
 
-  const uacWarnings = useMemo(() => {
-    const w = getFieldWarnings(uacRaw)
-    if (uacRaw.metrics_port && uasRaw.metrics_port && uacRaw.metrics_port === uasRaw.metrics_port) {
-      w.metrics_port = 'Same port as UAS — must be different for co-located VMs'
-    }
-    return w
-  }, [uacRaw, uasRaw])
-
+  const uacWarnings = useMemo(() => getFieldWarnings(uacRaw), [uacRaw])
   const uasWarnings = useMemo(() => {
     const w = getFieldWarnings(uasRaw)
     if (uacRaw.metrics_port && uasRaw.metrics_port && uacRaw.metrics_port === uasRaw.metrics_port) {
-      w.metrics_port = 'Same port as UAC — must be different for co-located VMs'
+      w.metrics_port = 'Same port as primary — must be different for co-located VMs'
     }
     return w
   }, [uacRaw, uasRaw])
 
-  const isValid =
-    Object.keys(uacErrors).length === 0 && Object.keys(uasErrors).length === 0
+  const isValid = Object.keys(uacErrors).length === 0
 
   // ── Reachability checks ─────────────────────────────────────────────────
 
@@ -637,10 +564,13 @@ export function VMPairBook() {
     if (IS_MOCK) {
       await new Promise((r) => setTimeout(r, 600))
     } else {
-      // Push config to both backends via PUT /api/config
+      // Push config to primary backend via PUT /api/config
       try {
-        await putConfigFor(uas.vm_ip, uas.metrics_port, uasPayload)
         await putConfigFor(uac.vm_ip, uac.metrics_port, uacPayload)
+        // Push to secondary VM only if it has a different IP or port
+        if (uas.vm_ip !== uac.vm_ip || uas.metrics_port !== uac.metrics_port) {
+          await putConfigFor(uas.vm_ip, uas.metrics_port, uasPayload)
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Failed to push config'
         setConfigPushError(msg)

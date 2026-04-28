@@ -279,7 +279,7 @@ export function SessionMenu() {
         uas: {
           ip: pair.uas.vm_ip,
           port: pair.uas.metrics_port,
-          role: uasRes.role ?? pair.uas.vm_role,
+          role: uasRes.role ?? pair.uas.vm_role ?? 'UAS',
           vm_id: uasRes.vm_id ?? pair.uas.vm_id,
           reachable: uasRes.reachable ?? false,
           state: uasRes.state ?? 'offline',
@@ -288,7 +288,7 @@ export function SessionMenu() {
         uac: {
           ip: pair.uac.vm_ip,
           port: pair.uac.metrics_port,
-          role: uacRes.role ?? pair.uac.vm_role,
+          role: uacRes.role ?? pair.uac.vm_role ?? 'UAC',
           vm_id: uacRes.vm_id ?? pair.uac.vm_id,
           reachable: uacRes.reachable ?? false,
           state: uacRes.state ?? 'offline',
