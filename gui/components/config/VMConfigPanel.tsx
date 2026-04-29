@@ -33,6 +33,9 @@ export type RawVMFormValues = {
   register_expires: string
   subscribe_expires: string
   register_rate_cps: string
+  // RFC 3261 INVITE client-transaction timers (UAC). Empty -> backend uses RFC defaults.
+  t1_ms: string
+  timer_b_seconds: string
   // SIP server
   sbc_host: string
   sbc_port: string
@@ -86,7 +89,7 @@ const SECTION_FIELDS = {
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
                    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
-  registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
@@ -740,6 +743,39 @@ export function VMConfigPanel({
             aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
           />
         </FormField>
+
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label="T1 (ms)" error={e('t1_ms')}
+            hint="RFC 3261 INVITE retransmit interval (UDP only). Default 500 ms.">
+            <Input
+              type="number"
+              min={100}
+              max={5000}
+              step={50}
+              value={raw.t1_ms}
+              onChange={(ev) => onChange('t1_ms', ev.target.value)}
+              onBlur={() => onBlur('t1_ms')}
+              placeholder="500"
+              className="font-mono"
+              aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
+            />
+          </FormField>
+          <FormField label="Timer B (s)" error={e('timer_b_seconds')}
+            hint="RFC 3261 INVITE transaction timeout (default 64*T1 = 32 s).">
+            <Input
+              type="number"
+              min={1}
+              max={300}
+              step={1}
+              value={raw.timer_b_seconds}
+              onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
+              onBlur={() => onBlur('timer_b_seconds')}
+              placeholder="32"
+              className="font-mono"
+              aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
+            />
+          </FormField>
+        </div>
       </div>
 
       {/* ── Call Traffic ──────────────────────────────────────── */}

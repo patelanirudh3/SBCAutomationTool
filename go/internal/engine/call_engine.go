@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,50 @@ import (
 )
 
 const sipTimeout = 20 * time.Second
+
+// startTimerA implements RFC 3261 §17.1.1.2 INVITE-client retransmission.
+// On UDP, it spawns a goroutine that fires the retransmit callback at T1,
+// doubling the interval each subsequent fire (no cap for INVITE), until
+// either:
+//   - the returned stop function is called (response received), or
+//   - the parent context is cancelled, or
+//   - the Timer B deadline passes (transaction will be timed out by the
+//     concurrent WaitForSIPEvent call).
+//
+// On TCP/TLS the helper is a no-op — RFC 3261 §17.1.1.2 specifies that
+// reliable transports rely on the transport's own retransmission and Timer A
+// is not started.
+//
+// The returned stop function is safe to call multiple times.
+func startTimerA(ctx context.Context, transport string, t1 time.Duration,
+	timerBDeadline time.Time, retransmit func() error) func() {
+	if !strings.EqualFold(transport, "UDP") {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	var once sync.Once
+	go func() {
+		interval := t1
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+				if time.Now().After(timerBDeadline) {
+					return
+				}
+				if err := retransmit(); err != nil {
+					slog.Debug("Timer A retransmit failed", "err", err)
+					return
+				}
+				interval *= 2
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(stop) }) }
+}
 
 // callFailed is a sentinel error used inside executeCall to signal a cleanly
 // rejected call (4xx/5xx/6xx final response).
@@ -393,11 +438,34 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee})
 
+	// ── RFC 3261 §17.1.1 INVITE client transaction timers ──────────
+	// Timer B: overall transaction timeout (default 64*T1 = 32s) covering
+	// every wait until the transaction terminates (ACK sent for 2xx, or
+	// ACK sent for 3xx/4xx/5xx/6xx). PRACK / BYE waits remain on the
+	// existing flat sipTimeout (out of scope per minimal RFC enablement).
+	t1 := time.Duration(cfg.T1Ms) * time.Millisecond
+	timerB := time.Duration(cfg.TimerBSeconds) * time.Second
+	timerBDeadline := time.Now().Add(timerB)
+	remainingTimerB := func() time.Duration {
+		if rem := time.Until(timerBDeadline); rem > 0 {
+			return rem
+		}
+		return 0
+	}
+	// Timer A: UDP-only INVITE retransmit. No-op on TCP/TLS.
+	stopTimerA := startTimerA(ctx, cfg.SIPTransport, t1, timerBDeadline, func() error {
+		if e.metrics != nil {
+			e.metrics.IncrementSIPCounter("invite_retransmits")
+		}
+		return ag.RetransmitInvite(dialog)
+	})
+	defer stopTimerA()
+
 	// ── Wait for provisional / 407 / final fail ────────────────────
 	var raw200 string
 	got180 := false
 	for !got180 {
-		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
+		raw, err := ag.WaitForSIPEvent(ctx, remainingTimerB(), "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
@@ -413,6 +481,9 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.complete(result)
 			return
 		}
+
+		// RFC 3261 §17.1.1.2: stop Timer A on first response (1xx or final).
+		stopTimerA()
 
 		code, _ := sip.ClassifyMessage(raw)
 
@@ -506,7 +577,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
 	if raw200 == "" {
 		var err error
-		raw200, err = ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE", "_FINAL_FAIL")
+		raw200, err = ag.WaitForSIPEvent(ctx, remainingTimerB(), "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
 			sendCleanupOnTimeout()
 			result := fail("200_invite timeout")

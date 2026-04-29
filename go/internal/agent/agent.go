@@ -36,6 +36,10 @@ type DialogState struct {
 	ByeSentMs     float64
 	IsReliable    bool
 	InviteMsg     *sip.SipMessage
+	// InviteSDP is the SDP body sent with the original INVITE; needed so
+	// Timer A retransmissions (RFC 3261 §17.1.1.2, UDP only) can re-send
+	// the exact same payload without rebuilding it.
+	InviteSDP     string
 	ProvMsg       *sip.SipMessage
 	RTPRemoteIP   string
 	RTPRemotePort int
@@ -785,6 +789,7 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 		State:        "INVITE_SENT",
 		InviteSentMs: float64(time.Now().UnixMilli()),
 		InviteMsg:    msg,
+		InviteSDP:    sdpBody,
 		IsReliable:   true,
 	}
 
@@ -796,6 +801,17 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 		return nil, err
 	}
 	return dialog, nil
+}
+
+// RetransmitInvite resends the original INVITE byte-for-byte. Used by Timer A
+// (RFC 3261 §17.1.1.2) on UDP transports when no provisional/final response
+// has arrived within the current retransmit interval. Returns an error if the
+// dialog has no stored INVITE message (defensive — should never happen).
+func (a *ExtensionAgent) RetransmitInvite(dialog *DialogState) error {
+	if dialog == nil || dialog.InviteMsg == nil {
+		return fmt.Errorf("retransmit_invite: no stored INVITE message")
+	}
+	return a.Send(dialog.InviteMsg, dialog.InviteSDP)
 }
 
 // [FIX-2] buildProxyAuth computes a Proxy-Authorization header for proactive

@@ -63,6 +63,13 @@ type VMConfig struct {
 	SubscribeConcurrency int `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
 	SubscribeExpires     int `yaml:"subscribe_expires" json:"subscribe_expires"`
 
+	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
+	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
+	// retransmit interval, doubles each fire). TimerBSeconds is the overall
+	// INVITE transaction timeout (RFC default = 64*T1 = 32s).
+	T1Ms          int `yaml:"t1_ms" json:"t1_ms"`
+	TimerBSeconds int `yaml:"timer_b_seconds" json:"timer_b_seconds"`
+
 	MaxConcurrentCalls int    `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
 	LocalHost          string `yaml:"local_host" json:"local_host"`
 	LocalPort          int    `yaml:"local_port" json:"local_port"`
@@ -245,6 +252,12 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RegisterTimeout == 0 {
 		cfg.RegisterTimeout = 5
 	}
+	if cfg.T1Ms <= 0 {
+		cfg.T1Ms = 500
+	}
+	if cfg.TimerBSeconds <= 0 {
+		cfg.TimerBSeconds = 32
+	}
 	if cfg.RTPBurstSeconds == 0 {
 		cfg.RTPBurstSeconds = 2
 	}
@@ -342,6 +355,13 @@ func Validate(cfg *VMConfig) error {
 	}
 	if cfg.SBCPort <= 0 || cfg.SBCPort > 65535 {
 		errs = append(errs, fmt.Sprintf("sbc_port out of range: %d", cfg.SBCPort))
+	}
+
+	if cfg.T1Ms < 100 || cfg.T1Ms > 5000 {
+		errs = append(errs, fmt.Sprintf("t1_ms must be 100..5000 ms, got %d", cfg.T1Ms))
+	}
+	if cfg.TimerBSeconds < 1 || cfg.TimerBSeconds > 300 {
+		errs = append(errs, fmt.Sprintf("timer_b_seconds must be 1..300 s, got %d", cfg.TimerBSeconds))
 	}
 
 	if cfg.RTPBurstSeconds < 0 {

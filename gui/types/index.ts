@@ -91,6 +91,11 @@ export interface VMConfig {
   subscribe_expires?: number       // default: 3600 (seconds)
   register_rate_cps?: number       // default: 10 — REGISTERs per second
 
+  // SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
+  // Both optional — backend uses RFC defaults when unset.
+  t1_ms?: number                   // RFC default 500 — Timer A retransmit interval (UDP only)
+  timer_b_seconds?: number         // RFC default 32 (= 64*T1) — INVITE transaction timeout
+
   // Traffic
   cps: number
   hold_time_seconds: number

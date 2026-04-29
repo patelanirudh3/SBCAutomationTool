@@ -51,6 +51,8 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     register_expires: 3600,
     subscribe_expires: 3600,
     register_rate_cps: 10,
+    t1_ms: 500,
+    timer_b_seconds: 32,
     sbc_host: '10.133.63.117',
     sbc_port: 5060,
     secondary_host: '',

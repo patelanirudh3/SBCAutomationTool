@@ -50,6 +50,9 @@ type TrafficMetrics struct {
 	IdleCount    int `json:"idle_count"`
 	NonIdleCount int `json:"non_idle_count"`
 	RegOnlyCount int `json:"reg_only_count"`
+	// InviteRetransmits counts UDP INVITE retransmissions triggered by
+	// RFC 3261 Timer A. Useful for diagnosing UDP packet loss / SBC stress.
+	InviteRetransmits int `json:"invite_retransmits"`
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +139,11 @@ type MetricsCollector struct {
 	rtpHealthCounts map[string]int
 
 	// SIP message counters — UAC side
-	invitesSent    int
-	acksSent       int
-	byesSent       int
-	bye200Received int
+	invitesSent       int
+	inviteRetransmits int
+	acksSent          int
+	byesSent          int
+	bye200Received    int
 	// SIP message counters — UAS side
 	invitesReceived int
 	acksReceived    int
@@ -178,6 +182,8 @@ func (c *MetricsCollector) IncrementSIPCounter(name string) {
 	switch name {
 	case "invites_sent":
 		c.invitesSent++
+	case "invite_retransmits":
+		c.inviteRetransmits++
 	case "acks_sent":
 		c.acksSent++
 	case "byes_sent":
@@ -530,6 +536,7 @@ func (c *MetricsCollector) Reset() {
 	c.concurrentProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
 	c.invitesSent = 0
+	c.inviteRetransmits = 0
 	c.acksSent = 0
 	c.byesSent = 0
 	c.bye200Received = 0
@@ -619,9 +626,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 			"WARNING":  c.rtpHealthCounts["WARNING"],
 			"CRITICAL": c.rtpHealthCounts["CRITICAL"],
 		},
-		IdleCount:    idleCount,
-		NonIdleCount: nonIdleCount,
-		RegOnlyCount: regOnlyCount,
+		IdleCount:         idleCount,
+		NonIdleCount:      nonIdleCount,
+		RegOnlyCount:      regOnlyCount,
+		InviteRetransmits: c.inviteRetransmits,
 	}
 	c.latest = snap
 	return snap

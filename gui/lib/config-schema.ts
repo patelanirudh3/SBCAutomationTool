@@ -81,6 +81,8 @@ export const VMConfigSchema = z
     register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     register_rate_cps: z.number().positive('Rate must be positive').max(500, 'Cannot exceed 500 reg/s').optional(),
+    t1_ms: z.number().int().min(100, 'Minimum 100 ms').max(5000, 'Maximum 5000 ms').optional(),
+    timer_b_seconds: z.number().int().min(1, 'Minimum 1 s').max(300, 'Maximum 300 s').optional(),
 
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
