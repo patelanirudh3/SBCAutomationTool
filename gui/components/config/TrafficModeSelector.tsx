@@ -17,6 +17,8 @@ interface TrafficModeSelectorProps {
   durationHours: string
   onDurationHoursChange: (v: string) => void
   cps: string
+  startTimeIso?: string
+  onStartTimeIsoChange?: (v: string) => void
   errors: { call_count?: string; duration_hours?: string }
   warnings: { call_count?: string; duration_hours?: string }
   touched: { call_count?: boolean; duration_hours?: boolean }
@@ -62,6 +64,8 @@ export function TrafficModeSelector({
   durationHours,
   onDurationHoursChange,
   cps,
+  startTimeIso = '',
+  onStartTimeIsoChange,
   errors,
   warnings,
   touched,
@@ -140,7 +144,7 @@ export function TrafficModeSelector({
       {/* Smoke: call_count */}
       {value === 'smoke' && (
         <div className="space-y-1">
-          <Label className="text-xs font-medium text-foreground/80">Call Count</Label>
+          <Label className="text-xs font-medium text-foreground/80">Smoke Call Count</Label>
           <Input
             type="number"
             min={1}
@@ -153,6 +157,9 @@ export function TrafficModeSelector({
           />
           {touched.call_count && <FieldError error={errors.call_count} />}
           {touched.call_count && !errors.call_count && <FieldSoftWarning warning={warnings.call_count} />}
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            e.g. 20 = 20 callers call 20 others, selected from the full registered pool. Only INVITE calls are made.
+          </p>
         </div>
       )}
 
@@ -251,6 +258,30 @@ export function TrafficModeSelector({
           Runs until coordinator{' '}
           <code className="font-mono text-foreground">POST /api/test/stop</code>
         </p>
+      )}
+
+      {/* Scheduled start time — shown for timed + unlimited */}
+      {(value === 'timed' || value === 'unlimited') && onStartTimeIsoChange && (
+        <div className="space-y-1 border-t border-slate-700/40 pt-3">
+          <Label className="text-xs font-medium text-foreground/80">Scheduled Start Time (optional)</Label>
+          <input
+            type="datetime-local"
+            value={startTimeIso ? startTimeIso.slice(0, 16) : ''}
+            onChange={(e) => {
+              const v = e.target.value
+              onStartTimeIsoChange(v ? new Date(v).toISOString() : '')
+            }}
+            className={cn(
+              'w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+            )}
+          />
+          <p className="text-[11px] text-slate-400">
+            {startTimeIso
+              ? `Traffic will start at ${new Date(startTimeIso).toLocaleString()} (local time)`
+              : 'Leave empty to start traffic immediately after pre-phase completes.'}
+          </p>
+        </div>
       )}
     </div>
   )

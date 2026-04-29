@@ -3,8 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2, Home, TableProperties, GitBranch, Users, AlertOctagon, CheckCircle2 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { WifiOff, Loader2, Home, Users, AlertOctagon, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 import { Navbar } from '@/components/layout/Navbar'
@@ -16,14 +15,14 @@ import { VMMetricsCard } from '@/components/dashboard/VMMetricsCard'
 import { LiveChart } from '@/components/dashboard/LiveChart'
 import { ConcurrentCallsBar } from '@/components/dashboard/ConcurrentCallsBar'
 import { AggregatePanel } from '@/components/dashboard/AggregatePanel'
-import { SummaryCard } from '@/components/postrun/SummaryCard'
-import { CallTable } from '@/components/postrun/CallTable'
-import { CallSpineCard } from '@/components/postrun/CallSpineCard'
-import { FailureAnalysis } from '@/components/postrun/FailureAnalysis'
-import { DownloadReport } from '@/components/postrun/DownloadReport'
+import { PrePhaseReport } from '@/components/dashboard/PrePhaseReport'
+import { PrePhaseSummaryModal } from '@/components/dashboard/PrePhaseSummaryModal'
+import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
+import { MediaQosPanel } from '@/components/dashboard/MediaQosPanel'
+import { FinalReport } from '@/components/postrun/FinalReport'
 
 import { useTrafficStore } from '@/store/traffic'
-import type { CallSpine } from '@/types'
+import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
 import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor } from '@/lib/api'
 import {
@@ -78,6 +77,7 @@ function LiveDashboard({
   const idleCount   = useTrafficStore((s) => s.idleCount)
   const nonIdleCount= useTrafficStore((s) => s.nonIdleCount)
   const regOnlyCount= useTrafficStore((s) => s.regOnlyCount)
+  const callEvents  = useTrafficStore((s) => s.callEvents) as CallEvent[]
   const pairs = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
 
@@ -212,88 +212,38 @@ function LiveDashboard({
           />
         </div>
       </div>
+
+      {/* Row 4 — Live call stats: successful / completed / failed */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="rounded-lg border border-sky-500/25 bg-sky-500/5 p-3 text-center">
+          <p className="text-2xl font-bold font-mono text-sky-400">
+            {uacMetrics.concurrent_calls.toLocaleString()}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">In-Call (INV/200/ACK)</p>
+        </div>
+        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3 text-center">
+          <p className="text-2xl font-bold font-mono text-emerald-400">
+            {uacMetrics.calls_completed.toLocaleString()}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">Completed (BYE/200)</p>
+        </div>
+        <div className="rounded-lg border border-rose-500/25 bg-rose-500/5 p-3 text-center">
+          <p className="text-2xl font-bold font-mono text-rose-400">
+            {uacMetrics.calls_failed.toLocaleString()}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">Failed</p>
+        </div>
+      </div>
+
+      {/* Row 5 — Failed calls table */}
+      <FailedCallsTable events={callEvents} />
+
+      {/* Row 6 — Media / QoS placeholder */}
+      <MediaQosPanel />
     </div>
   )
 }
 
-// ---------------------------------------------------------------------------
-// Post-Run — Screen 4
-// ---------------------------------------------------------------------------
-
-function PostRunSummary() {
-  const phase = useTrafficStore((s) => s.phase)
-  const callSpines = useTrafficStore((s) => s.callSpines) as unknown as CallSpine[]
-  const pairs = useTrafficStore((s) => s.pairs)
-  const activePairIndex = useTrafficStore((s) => s.activePairIndex)
-  const trafficMode = pairs[activePairIndex]?.uac.traffic_mode ?? 'smoke'
-
-  const isSmoke = trafficMode === 'smoke'
-  const showSpineView = isSmoke && callSpines.length > 0
-  const [view, setView] = useState<'spine' | 'table'>(showSpineView ? 'spine' : 'table')
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 16 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4 }}
-      className="flex flex-col gap-4 p-4 max-w-5xl mx-auto w-full"
-    >
-      <SummaryCard />
-
-      {phase === 'FAILED' && <FailureAnalysis />}
-
-      {/* View toggle — only shown for smoke / scenario tests */}
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-widest text-foreground/70">
-          Call Analysis
-        </span>
-        {showSpineView && (
-          <div className="flex items-center rounded-lg border border-border bg-secondary/40 p-0.5">
-            <button
-              type="button"
-              onClick={() => setView('spine')}
-              className={cn(
-                'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[10px] font-semibold transition-all',
-                view === 'spine'
-                  ? 'bg-card text-emerald-400 shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              )}
-            >
-              <GitBranch className="size-3" />
-              Spine View
-            </button>
-            <button
-              type="button"
-              onClick={() => setView('table')}
-              className={cn(
-                'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[10px] font-semibold transition-all',
-                view === 'table'
-                  ? 'bg-card text-emerald-400 shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              )}
-            >
-              <TableProperties className="size-3" />
-              Table View
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Call spines (smoke/scenario only) or table */}
-      {showSpineView && view === 'spine' ? (
-        <div className="flex flex-col gap-3">
-          {callSpines.map((spine, i) => (
-            <CallSpineCard key={spine.spine_id ?? i} spine={spine} index={i} />
-          ))}
-        </div>
-      ) : (
-        <CallTable />
-      )}
-
-      <DownloadReport />
-    </motion.div>
-  )
-}
 
 // ---------------------------------------------------------------------------
 // Reconnect banner
@@ -675,12 +625,28 @@ export default function RunPage() {
     !IS_MOCK
   )
 
-  const isTraffic = phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'CLEANUP_READY'
-  const isPostRun = phase === 'COMPLETE' || phase === 'FAILED'
+  const isPrePhase     = phase === 'PRE_PHASE'
+  const isTrafficReady = phase === 'TRAFFIC_READY'
+  const isTraffic      = phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'CLEANUP_READY'
+  const isPostRun      = phase === 'COMPLETE' || phase === 'FAILED'
   const showReconnectBanner =
     !IS_MOCK &&
     isTraffic &&
     wsStatus.uac !== 'connected'
+
+  // Track elapsed seconds since pre-phase started (for the summary modal)
+  const [prePhaseElapsed, setPrePhaseElapsed] = useState(0)
+  const prePhaseTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  useEffect(() => {
+    if (isPrePhase) {
+      setPrePhaseElapsed(0)
+      prePhaseTimerRef.current = setInterval(() => setPrePhaseElapsed((e) => e + 1), 1000)
+    } else {
+      if (prePhaseTimerRef.current) clearInterval(prePhaseTimerRef.current)
+    }
+    return () => { if (prePhaseTimerRef.current) clearInterval(prePhaseTimerRef.current) }
+  }, [isPrePhase])
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -707,6 +673,44 @@ export default function RunPage() {
       </div>
       <main className="flex-1 overflow-y-auto py-2">
         <AnimatePresence mode="wait">
+
+          {/* Pre-phase: registration + subscription progress */}
+          {isPrePhase && (
+            <motion.div
+              key="prephase"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.3 }}
+              className="flex flex-col items-center"
+            >
+              <PrePhaseReport />
+            </motion.div>
+          )}
+
+          {/* Traffic ready: show pre-phase summary + Start Traffic button */}
+          {isTrafficReady && (
+            <motion.div
+              key="traffic-ready"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.3 }}
+              className="flex flex-col items-center"
+            >
+              {/* Background: frozen pre-phase report */}
+              <PrePhaseReport />
+              {/* Overlay: summary modal */}
+              <PrePhaseSummaryModal
+                elapsedSeconds={prePhaseElapsed}
+                onAbort={() => {
+                  setPhase('IDLE')
+                }}
+              />
+            </motion.div>
+          )}
+
+          {/* Traffic in progress */}
           {isTraffic && (
             <motion.div
               key="live"
@@ -725,6 +729,8 @@ export default function RunPage() {
               />
             </motion.div>
           )}
+
+          {/* Post-run / complete: final report */}
           {isPostRun && (
             <motion.div
               key="postrun"
@@ -734,10 +740,12 @@ export default function RunPage() {
               transition={{ duration: 0.3 }}
               className="flex flex-col items-center"
             >
-              <PostRunSummary />
+              <FinalReport />
             </motion.div>
           )}
-          {!isTraffic && !isPostRun && (
+
+          {/* Idle / unknown */}
+          {!isPrePhase && !isTrafficReady && !isTraffic && !isPostRun && (
             <motion.div
               key="idle"
               initial={{ opacity: 0 }}
@@ -745,7 +753,7 @@ export default function RunPage() {
               className="flex flex-1 items-center justify-center py-20"
             >
               <p className="font-mono text-sm text-muted-foreground">
-                Waiting for traffic phase to start…
+                Waiting for pre-phase to start…
               </p>
             </motion.div>
           )}

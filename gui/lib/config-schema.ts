@@ -30,6 +30,8 @@ function isValidIpOrHostname(val: string): boolean {
 export const VMRoleSchema = z.enum(['UAC', 'UAS'])
 export const TrafficModeSchema = z.enum(['smoke', 'timed', 'unlimited'])
 export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
+export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
+export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
 
 export const VMConfigSchema = z
   .object({
@@ -51,7 +53,7 @@ export const VMConfigSchema = z
 
     sbc_host: z
       .string()
-      .min(1, 'Primary host is required')
+      .min(1, 'Remote SIP server host is required')
       .refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
     sbc_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
     secondary_host: z
@@ -62,6 +64,7 @@ export const VMConfigSchema = z
     failover_enabled: z.boolean().optional(),
     dns_servers: z.string().optional(),
     sip_transport: SipTransportSchema,
+    sip_scheme: SipSchemeSchema.optional(),
     domain: z
       .string()
       .min(1, 'Domain is required')
@@ -70,16 +73,19 @@ export const VMConfigSchema = z
 
     register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
+    register_rate_cps: z.number().positive('Rate must be positive').max(500, 'Cannot exceed 500 reg/s').optional(),
 
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
-    ramp_up_seconds: z.number().nonnegative('Ramp-up must be ≥ 0').max(300, 'Cannot exceed 300s').optional(),
     media_enabled: z.boolean().optional(),
+    rtp_codec: RtpCodecSchema.optional(),
+    rtp_ptime: z.number().int().min(10).max(80).optional(),
     metrics_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
 
     traffic_mode: TrafficModeSchema.optional(),
     call_count: z.number().int().nonnegative().max(1000000, 'Cannot exceed 1,000,000').optional(),
     duration_hours: z.number().positive().max(168, 'Cannot exceed 168h (1 week)').optional(),
+    start_time_iso: z.string().optional(),
   })
   .superRefine((data, ctx) => {
     if (data.ext_start >= data.ext_end) {
@@ -141,6 +147,7 @@ export function getFieldWarnings(raw: {
   call_count: string
   duration_hours: string
   traffic_mode: string
+  register_rate_cps?: string
 }): FieldWarnings {
   const w: FieldWarnings = {}
 

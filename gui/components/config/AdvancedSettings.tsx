@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Settings2, Pencil, Check, ChevronDown, Info } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -9,12 +9,12 @@ import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTrafficStore } from '@/store/traffic'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
-import type { AdvancedSettings as AdvancedSettingsType, RtpMode, RtpPtime } from '@/types'
+import type { AdvancedSettings as AdvancedSettingsType, RtpMode } from '@/types'
 import { cn } from '@/lib/utils'
 import { FieldError, FieldHint } from './ConfigValidator'
 
 // ---------------------------------------------------------------------------
-// Field definition helpers
+// Field helper
 // ---------------------------------------------------------------------------
 
 function AdvancedField({
@@ -75,58 +75,10 @@ function AdvancedField({
 }
 
 // ---------------------------------------------------------------------------
-// Wrap analysis helpers (derived, read-only)
+// Token row (collapsed read-only summary)
 // ---------------------------------------------------------------------------
 
-const SIP_BYE_BUFFER = 2
-
-function gcd(a: number, b: number): number { return b === 0 ? a : gcd(b, a % b) }
-function lcm(a: number, b: number): number { return (a * b) / gcd(a, b) }
-
-export interface WrapAnalysis {
-  poolCount: number
-  wrapTime: number
-  holdTime: number
-  naturalSpacing: boolean
-  autoDelay: number
-  userMargin: number
-  effectiveDelay: number
-  minPoolForNatural: number
-}
-
-function useWrapAnalysis(pairIndex: number, advSettings: AdvancedSettingsType): WrapAnalysis {
-  const pair = useTrafficStore((s) => s.pairs[pairIndex])
-  return useMemo(() => {
-    if (!pair) {
-      return { poolCount: 0, wrapTime: 0, holdTime: 0, naturalSpacing: true, autoDelay: 0, userMargin: 0, effectiveDelay: 0, minPoolForNatural: 0 }
-    }
-    const poolCount = Math.max((pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1, 0)
-    const pairCycles = Math.floor(poolCount / 2)
-    const cps = Math.max(pair.uac.cps, 0.001)
-    const wrapTime = pairCycles > 0 ? pairCycles / cps : 0
-    const holdTime = pair.uac.hold_time_seconds
-    const naturalSpacing = wrapTime >= holdTime + SIP_BYE_BUFFER
-
-    const autoDelay = Math.max(0, holdTime + SIP_BYE_BUFFER - wrapTime)
-
-    const userMargin = advSettings.pool_wrap_delay_seconds ?? 0
-    const effectiveDelay = autoDelay + Math.max(0, userMargin)
-    const minPoolForNatural = Math.ceil(cps * (holdTime + SIP_BYE_BUFFER)) * 2
-
-    return { poolCount, wrapTime, holdTime, naturalSpacing, autoDelay, userMargin, effectiveDelay, minPoolForNatural }
-  }, [pair, advSettings.pool_wrap_delay_seconds])
-}
-
-// ---------------------------------------------------------------------------
-// Token row (collapsed read-only display)
-// ---------------------------------------------------------------------------
-
-function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnalysis }) {
-  const wrapLabel = analysis.naturalSpacing
-    ? 'natural'
-    : `auto ${analysis.autoDelay.toFixed(0)}s + ${Math.max(0, analysis.userMargin)}s`
-
-  const pps = 1000 / (s.rtp_ptime || 20)
+function TokenRow({ s }: { s: AdvancedSettingsType }) {
   const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
 
   const tokens = [
@@ -135,12 +87,10 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
     `subscribe: ${s.subscribe_concurrency}`,
-    `rtp: ${modeLabel} ${s.rtp_ptime || 20}ms/${pps}pps`,
+    `rtp: ${modeLabel}`,
     `burst: ${s.rtp_burst_seconds}s`,
     `keepalive: ${s.rtp_keepalive_interval}s`,
-    `pool_wrap_delay: ${s.pool_wrap_delay_seconds}s`,
-    `metrics: ${s.metrics_interval}s`,
-    `wrap: ${wrapLabel}`,
+    `refresh: ${s.metrics_interval}s`,
     ...(s.rtp_pcap ? ['pcap: on'] : []),
   ]
 
@@ -148,17 +98,8 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       {tokens.map((tok, i) => (
         <span key={i} className="flex items-center gap-2">
-          <span className={cn(
-            'font-mono text-[11px] font-medium',
-            tok.startsWith('wrap:')
-              ? analysis.naturalSpacing ? 'text-emerald-400' : 'text-amber-400'
-              : 'text-slate-300'
-          )}>
-            {tok}
-          </span>
-          {i < tokens.length - 1 && (
-            <span className="text-slate-600">·</span>
-          )}
+          <span className="font-mono text-[11px] font-medium text-slate-300">{tok}</span>
+          {i < tokens.length - 1 && <span className="text-slate-600">·</span>}
         </span>
       ))}
     </div>
@@ -169,13 +110,10 @@ function TokenRow({ s, analysis }: { s: AdvancedSettingsType; analysis: WrapAnal
 // Main component
 // ---------------------------------------------------------------------------
 
-export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: number; liveAnalysis?: WrapAnalysis }) {
+export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
   const { pairs, updateAdvancedSettings } = useTrafficStore()
   const saved: AdvancedSettingsType =
     pairs[pairIndex]?.advancedSettings ?? { ...DEFAULT_ADVANCED_SETTINGS }
-
-  const storeAnalysis = useWrapAnalysis(pairIndex, saved)
-  const analysis = liveAnalysis ?? storeAnalysis
 
   const [isOpen, setIsOpen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -183,29 +121,22 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
   const [errors, setErrors] = useState<Partial<Record<keyof AdvancedSettingsType, string>>>({})
   const panelRef = useRef<HTMLDivElement>(null)
 
-  // Sync draft when saved changes externally (e.g. store reset)
   useEffect(() => {
     if (!isEditing) setDraft({ ...saved })
   }, [saved, isEditing])
 
-  // Escape key: cancel edit
   useEffect(() => {
     if (!isEditing) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') handleCancel()
-    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') handleCancel() }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEditing])
 
-  // Click-away: cancel edit
   useEffect(() => {
     if (!isEditing) return
     const onClick = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-        handleCancel()
-      }
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) handleCancel()
     }
     document.addEventListener('mousedown', onClick)
     return () => document.removeEventListener('mousedown', onClick)
@@ -226,11 +157,11 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
   }
 
   const handleSave = () => {
-    const ALLOW_ZERO: Set<string> = new Set(['pool_wrap_delay_seconds', 'register_batch_delay_ms'])
-    const SKIP_NUMERIC: Set<string> = new Set(['rtp_mode', 'rtp_ptime', 'rtp_pcap'])
+    const ALLOW_ZERO: Set<string> = new Set(['register_batch_delay_ms'])
+    const SKIP: Set<string> = new Set(['rtp_mode', 'rtp_pcap'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
-      if (SKIP_NUMERIC.has(key)) continue
+      if (SKIP.has(key)) continue
       const v = val as number
       if (!Number.isFinite(v)) {
         newErrors[key as keyof AdvancedSettingsType] = 'Must be a number'
@@ -239,10 +170,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
           ALLOW_ZERO.has(key) ? 'Must be ≥ 0' : 'Must be a positive number'
       }
     }
-    if (Object.keys(newErrors).length > 0) {
-      setErrors(newErrors)
-      return
-    }
+    if (Object.keys(newErrors).length > 0) { setErrors(newErrors); return }
     setErrors({})
     updateAdvancedSettings(pairIndex, draft)
     setIsEditing(false)
@@ -262,7 +190,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
         'shadow-lg shadow-indigo-950/30',
       )}
     >
-      {/* ── Header row ──────────────────────────────────────────── */}
+      {/* Header */}
       <div className="flex items-center justify-between px-5 py-2.5">
         <button
           type="button"
@@ -273,9 +201,6 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
           <span className="text-[11px] font-bold uppercase tracking-widest text-slate-100">
             Advanced Settings — Registration &amp; RTP
           </span>
-          <span className="rounded border border-indigo-400/25 bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-200">
-            shared for this VM Pair
-          </span>
           <ChevronDown
             className={cn(
               'ml-0.5 size-3.5 shrink-0 text-slate-400 transition-transform duration-200',
@@ -285,12 +210,6 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
         </button>
 
         <div className="flex shrink-0 items-center gap-3">
-          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
-            <span className="inline-block size-1.5 rounded-full bg-blue-400" />
-            <span className="inline-block size-1.5 rounded-full bg-indigo-400" />
-            Affects both UAC and UAS
-          </span>
-
           {!isEditing ? (
             <button
               type="button"
@@ -305,11 +224,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
               Edit
             </button>
           ) : (
-            <Button
-              size="sm"
-              onClick={handleSave}
-              className="h-6 gap-1 px-2.5 text-[11px]"
-            >
+            <Button size="sm" onClick={handleSave} className="h-6 gap-1 px-2.5 text-[11px]">
               <Check className="size-3" />
               Save
             </Button>
@@ -317,14 +232,14 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
         </div>
       </div>
 
-      {/* ── Token row (collapsed, always visible below header) ─── */}
+      {/* Token row (collapsed) */}
       {!isOpen && (
         <div className="border-t border-slate-700/40 px-5 py-2">
-          <TokenRow s={saved} analysis={analysis} />
+          <TokenRow s={saved} />
         </div>
       )}
 
-      {/* ── Expanded body ──────────────────────────────────────── */}
+      {/* Expanded body */}
       <AnimatePresence initial={false}>
         {isOpen && (
           <motion.div
@@ -336,10 +251,9 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
             className="overflow-hidden"
           >
             <div className="border-t border-slate-700/40 px-5 py-4 space-y-4">
-
-              {/* 2-column grid */}
               <div className="grid grid-cols-2 gap-x-8 gap-y-3">
-                {/* Left column — Pre-Phase Settings */}
+
+                {/* Left — Pre-Phase / Registration */}
                 <div className="space-y-3">
                   <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
@@ -365,7 +279,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     disabled={disabled}
                     min={0}
                     error={errors.register_batch_delay_ms}
-                    tooltip="Delay in milliseconds between TCP socket creation and REGISTER batches. Prevents overwhelming the SBC connection rate limits."
+                    tooltip="Delay in milliseconds between TCP socket creation and REGISTER batches."
                     onChange={set('register_batch_delay_ms')}
                   />
                   <AdvancedField
@@ -373,7 +287,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     value={draft.register_timeout}
                     disabled={disabled}
                     error={errors.register_timeout}
-                    tooltip="Max wait per REGISTER or SUBSCRIBE response. Applies to both pre-phase operations."
+                    tooltip="Max wait per REGISTER or SUBSCRIBE response."
                     onChange={set('register_timeout')}
                   />
                   <AdvancedField
@@ -382,7 +296,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     min={0}
                     disabled={disabled}
                     error={errors.register_retry}
-                    tooltip="Number of retries on no-response for both REGISTER and SUBSCRIBE."
+                    tooltip="Number of retries on no-response for REGISTER and SUBSCRIBE."
                     onChange={set('register_retry')}
                   />
                   <AdvancedField
@@ -390,12 +304,12 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     value={draft.subscribe_concurrency}
                     disabled={disabled}
                     error={errors.subscribe_concurrency}
-                    tooltip="Max concurrent SUBSCRIBE operations. Controls how many extensions subscribe simultaneously (independent of REGISTER batch size)."
+                    tooltip="Max concurrent SUBSCRIBE operations."
                     onChange={set('subscribe_concurrency')}
                   />
                 </div>
 
-                {/* Right column — RTP */}
+                {/* Right — RTP */}
                 <div className="space-y-3">
                   <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-indigo-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-indigo-400" />
@@ -403,7 +317,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     <span className="h-px flex-1 bg-indigo-400/30" />
                   </h3>
 
-                  {/* RTP Mode toggle */}
+                  {/* RTP Mode */}
                   <div className="space-y-1">
                     <Label className="text-xs font-semibold text-slate-200/90">RTP Mode</Label>
                     <div className="flex gap-2">
@@ -427,56 +341,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     </div>
                   </div>
 
-                  {/* Codec ptime dropdown */}
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-1.5">
-                      <Label className="text-xs font-semibold text-slate-200/90">Codec ptime</Label>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
-                            <Info className="size-3" />
-                          </button>
-                        </TooltipTrigger>
-                        <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
-                          G.711 PCMU packetization time. Determines packets per second: PPS = 1000 ÷ ptime
-                        </TooltipContent>
-                      </Tooltip>
-                    </div>
-                    <select
-                      disabled={disabled}
-                      value={draft.rtp_ptime}
-                      onChange={(e) => {
-                        const pt = Number(e.target.value) as RtpPtime
-                        setDraft((prev) => ({
-                          ...prev,
-                          rtp_ptime: pt,
-                          rtp_burst_pps: 1000 / pt,
-                        }))
-                      }}
-                      className={cn(
-                        'w-full rounded-md border px-3 py-2 font-mono text-sm',
-                        'border-slate-600/50 bg-slate-800/80 text-slate-100',
-                        'focus:border-indigo-400/60 focus:ring-1 focus:ring-indigo-400/30 focus:outline-none',
-                        disabled && 'cursor-default opacity-75',
-                      )}
-                    >
-                      <option value={20} className="bg-slate-800 text-slate-100">20 ms (50 PPS)</option>
-                      <option value={40} className="bg-slate-800 text-slate-100">40 ms (25 PPS)</option>
-                    </select>
-                    <p className="font-mono text-[11px] text-slate-300">
-                      Formula: PPS = 1000 ÷ {draft.rtp_ptime} = <span className="font-bold text-emerald-400">{1000 / (draft.rtp_ptime || 20)} PPS</span>
-                    </p>
-                  </div>
-
-                  {/* Payload (read-only) */}
-                  <div className="space-y-1">
-                    <Label className="text-xs font-semibold text-slate-200/90">Payload</Label>
-                    <div className="rounded-md border border-slate-600/40 bg-slate-800/60 px-3 py-2 font-mono text-sm font-medium text-emerald-400">
-                      1 kHz Tone (PCMU)
-                    </div>
-                  </div>
-
-                  {/* PCAP capture toggle */}
+                  {/* PCAP capture */}
                   <div className="space-y-1">
                     <div className="flex items-center gap-1.5">
                       <Label className="text-xs font-semibold text-slate-200/90">PCAP Capture</Label>
@@ -487,7 +352,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                           </button>
                         </TooltipTrigger>
                         <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
-                          Save RTP packets to .pcap files in logs/. Open in Wireshark to verify the 1 kHz tone payload and RTP flow. Best for smoke tests.
+                          Save RTP packets to .pcap files in logs/. Open in Wireshark to verify payload and RTP flow.
                         </TooltipContent>
                       </Tooltip>
                     </div>
@@ -505,9 +370,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                     >
                       <span className={cn(
                         'inline-block size-3 rounded-sm border-2 transition-colors',
-                        draft.rtp_pcap
-                          ? 'border-emerald-400 bg-emerald-400'
-                          : 'border-zinc-400 bg-transparent'
+                        draft.rtp_pcap ? 'border-emerald-400 bg-emerald-400' : 'border-zinc-400 bg-transparent'
                       )} />
                       {draft.rtp_pcap ? 'Enabled — pcap files saved to logs/' : 'Disabled'}
                     </button>
@@ -529,7 +392,7 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                         value={draft.rtp_keepalive_interval}
                         disabled={disabled}
                         error={errors.rtp_keepalive_interval}
-                        tooltip="Interval between keepalive packets during the mid-call period (between start and end bursts)."
+                        tooltip="Interval between keepalive packets during the mid-call period."
                         onChange={set('rtp_keepalive_interval')}
                       />
                     </>
@@ -537,38 +400,23 @@ export function AdvancedSettings({ pairIndex, liveAnalysis }: { pairIndex: numbe
                 </div>
               </div>
 
-              {/* Full-width — Pool Wrap Delay */}
+              {/* Full-width — Reporting Refresh Interval */}
               <div className="border-t border-slate-700/30 pt-3">
                 <AdvancedField
-                  label="Pool Wrap Delay — Extra Margin (s)"
-                  value={draft.pool_wrap_delay_seconds}
-                  disabled={disabled}
-                  min={0}
-                  error={errors.pool_wrap_delay_seconds}
-                  hint="Extra safety margin beyond the auto-computed delay. Default 0. Only needed if SBC is slow to release dialogs (e.g. 503s at wrap boundaries)."
-                  tooltip="The engine auto-computes a wrap delay from hold_time + SIP_BYE_BUFFER (2s). This field adds extra seconds on top of that. Set to 0 unless your SBC needs more time to clean up dialogs."
-                  onChange={set('pool_wrap_delay_seconds')}
-                />
-              </div>
-
-              {/* Full-width — Metrics Interval */}
-              <div className="border-t border-slate-700/30 pt-3">
-                <AdvancedField
-                  label="Metrics Interval (s)"
+                  label="Reporting Refresh Interval (s)"
                   value={draft.metrics_interval}
                   disabled={disabled}
                   min={1}
                   error={errors.metrics_interval}
-                  hint="How often the backend pushes a fresh metrics snapshot over WebSocket to the Live Dashboard"
-                  tooltip="Controls the WS /metrics/stream push cadence. Lower = more responsive Live Dashboard; higher = less CPU. Default 3s gives smooth updates without noticeable overhead."
+                  hint="How frequently the backend pushes a metrics snapshot to the live reporting view. Lower = more responsive; higher = less CPU load."
+                  tooltip="Controls the WebSocket /metrics/stream push cadence. Default 3s gives smooth live updates."
                   onChange={set('metrics_interval')}
                 />
               </div>
 
-              {/* Current token row (read-only summary while expanded) */}
               {!isEditing && (
                 <div className="border-t border-slate-700/30 pt-2">
-                  <TokenRow s={saved} analysis={analysis} />
+                  <TokenRow s={saved} />
                 </div>
               )}
             </div>

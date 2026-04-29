@@ -1,6 +1,8 @@
 export type VMRole = 'UAC' | 'UAS'
 export type TrafficMode = 'smoke' | 'timed' | 'unlimited'
 export type SipTransport = 'TCP' | 'TLS' | 'UDP'
+export type SipScheme = 'SIP' | 'SIPS'
+export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
 export type RunPhase =
   | 'IDLE'
   | 'PRE_PHASE'
@@ -15,7 +17,6 @@ export type RunPhase =
 export type RunMode = 'local' | 'multi-vm'
 
 export type RtpMode = '3phase' | 'continuous'
-export type RtpPtime = 20 | 40
 
 export interface AdvancedSettings {
   register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
@@ -24,12 +25,9 @@ export interface AdvancedSettings {
   register_retry: number               // default: 3 — retry attempts for REGISTER and SUBSCRIBE
   subscribe_concurrency: number        // default: 10 — max concurrent SUBSCRIBE operations
   rtp_mode: RtpMode                    // default: '3phase'
-  rtp_ptime: RtpPtime                  // default: 20 (ms) → 50 PPS
   rtp_burst_seconds: number            // default: 2
-  rtp_burst_pps: number                // default: 50
   rtp_keepalive_interval: number       // default: 3
-  pool_wrap_delay_seconds: number      // default: 0 — extra margin beyond auto-computed delay
-  metrics_interval: number             // default: 3  — WS push cadence (seconds)
+  metrics_interval: number             // default: 3 — reporting refresh cadence (seconds)
   rtp_pcap: boolean                    // default: false — capture RTP to pcap files
 }
 
@@ -40,11 +38,8 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   register_retry: 3,
   subscribe_concurrency: 10,
   rtp_mode: '3phase',
-  rtp_ptime: 20,
   rtp_burst_seconds: 2,
-  rtp_burst_pps: 50,
   rtp_keepalive_interval: 3,
-  pool_wrap_delay_seconds: 0,
   metrics_interval: 3,
   rtp_pcap: false,
 }
@@ -73,6 +68,7 @@ export interface VMConfig {
   sbc_host: string
   sbc_port: number
   sip_transport: SipTransport
+  sip_scheme?: SipScheme         // default: 'SIP'
   domain: string
   sip_password: string
 
@@ -83,21 +79,26 @@ export interface VMConfig {
   dns_servers?: string
 
   // Registration / Subscription
-  register_expires?: number   // default: 3600 (seconds)
-  subscribe_expires?: number  // default: 3600 (seconds)
+  register_expires?: number        // default: 3600 (seconds)
+  subscribe_expires?: number       // default: 3600 (seconds)
+  register_rate_cps?: number       // default: 10 — REGISTERs per second
 
   // Traffic
   cps: number
   hold_time_seconds: number
-  ramp_up_seconds?: number
   media_enabled?: boolean
   metrics_port: number
   peer_stop_url?: string
 
-  // Run Control (UAC only)
+  // Media
+  rtp_codec?: RtpCodec             // default: 'G711_ULAW'
+  rtp_ptime?: number               // default: 20 ms
+
+  // Run Control
   traffic_mode?: TrafficMode
   call_count?: number
   duration_hours?: number
+  start_time_iso?: string          // optional scheduled start (ISO 8601 UTC)
 }
 
 export interface VMPair {
