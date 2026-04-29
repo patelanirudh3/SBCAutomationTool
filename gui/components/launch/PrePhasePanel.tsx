@@ -6,7 +6,7 @@ import { AlertTriangle, Play, ArrowRight, Users, CheckCircle2, XCircle, Loader2 
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import { useTrafficStore } from '@/store/traffic'
-import { getMetricsFor, startPrePhaseFor, startTrafficFor, startTestFor } from '@/lib/api'
+import { getMetricsFor, startPrePhaseFor, startTrafficFor, startTestFor, resetTestFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 // How often to poll metrics during pre-phase
@@ -84,6 +84,11 @@ export function PrePhasePanel() {
   const [isStartingReg, setIsStartingReg] = useState(false)
   const [isStartingTraffic, setIsStartingTraffic] = useState(false)
 
+  // Pre-run engine state check
+  const [enginePhase, setEnginePhase] = useState<string | null>(null)
+  const [engineCheckDone, setEngineCheckDone] = useState(false)
+  const [isResetting, setIsResetting] = useState(false)
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const isMock  = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
@@ -148,6 +153,45 @@ export function PrePhasePanel() {
       }
     }, POLL_INTERVAL_MS)
   }, [vmIp, vmPort, pair, extCount, stopPolling, setPhase, setPrePhaseStatus, updateUACMetrics])
+
+  // ---------------------------------------------------------------------------
+  // Pre-run engine state check — runs once on mount (live mode only)
+  // Ensures the backend is IDLE before the admin can start Reg/Sub
+  // ---------------------------------------------------------------------------
+
+  const checkEngineReady = useCallback(async () => {
+    if (isMock) {
+      setEngineCheckDone(true)
+      setEnginePhase('IDLE')
+      return
+    }
+    try {
+      const m = await getMetricsFor(vmIp, vmPort) as unknown as { phase?: string }
+      setEnginePhase((m.phase ?? 'IDLE').toUpperCase())
+    } catch {
+      // Cannot reach engine — treat as IDLE so the user gets the normal
+      // startTestFor error feedback when they click Reg/Sub
+      setEnginePhase('IDLE')
+    } finally {
+      setEngineCheckDone(true)
+    }
+  }, [isMock, vmIp, vmPort])
+
+  useEffect(() => {
+    checkEngineReady()
+  }, [checkEngineReady])
+
+  const handleResetEngine = useCallback(async () => {
+    setIsResetting(true)
+    setError(null)
+    try {
+      await resetTestFor(vmIp, vmPort)
+    } catch { /* ignore — engine may already be idle */ }
+    await checkEngineReady()
+    setIsResetting(false)
+  }, [vmIp, vmPort, checkEngineReady])
+
+  const engineIsReady = !engineCheckDone || enginePhase === 'IDLE' || enginePhase === null
 
   // ---------------------------------------------------------------------------
   // MOCK mode — auto-simulate pre-phase on mount
@@ -286,6 +330,45 @@ export function PrePhasePanel() {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl space-y-6 px-6 py-8">
 
+          {/* ── Engine state warning — shown when backend is not IDLE ─ */}
+          {!regStarted && engineCheckDone && !engineIsReady && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-400" />
+                <div>
+                  <p className="text-sm font-semibold text-amber-300">
+                    Engine not in a clean state
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    The traffic engine at{' '}
+                    <span className="font-mono text-amber-200">{vmIp}:{vmPort}</span> is currently
+                    in <span className="font-mono font-semibold text-amber-300">{enginePhase}</span>{' '}
+                    state. Reset it before starting a new run, or previous SIP registrations may
+                    conflict.
+                  </p>
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={isResetting}
+                  onClick={handleResetEngine}
+                  className="gap-2 border-amber-500/40 text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+                >
+                  {isResetting ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" />
+                      Resetting…
+                    </>
+                  ) : (
+                    'Reset Engine'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
           {/* ── Start button row ───────────────────────────────── */}
           {!regStarted && (
             <div className="flex flex-col items-center gap-3">
@@ -296,13 +379,18 @@ export function PrePhasePanel() {
               <Button
                 size="lg"
                 onClick={isMock ? () => { hasStartedRef.current = false; handleStartRegSub() } : handleStartRegSub}
-                disabled={isStartingReg}
-                className="gap-2 bg-emerald-600 hover:bg-emerald-500 text-white"
+                disabled={isStartingReg || !engineIsReady || isResetting}
+                className="gap-2 bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50"
               >
                 {isStartingReg ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
                     Starting…
+                  </>
+                ) : !engineCheckDone ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Checking engine…
                   </>
                 ) : (
                   <>

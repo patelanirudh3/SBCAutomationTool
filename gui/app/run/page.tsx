@@ -1,14 +1,14 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2, Home, AlertOctagon, CheckCircle2 } from 'lucide-react'
+import { WifiOff, Loader2, AlertOctagon, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 import { Navbar } from '@/components/layout/Navbar'
 import { StepIndicator } from '@/components/layout/StepIndicator'
+import { HomeGuardButton } from '@/components/shared/HomeGuardButton'
 import { ChatPanel } from '@/components/agent/ChatPanel'
 import { ASRGauge } from '@/components/dashboard/ASRGauge'
 import { RunTimer } from '@/components/dashboard/RunTimer'
@@ -547,7 +547,12 @@ export default function RunPage() {
       const storePhase = useTrafficStore.getState().phase
       if (
         consecutiveFailures >= 3 &&
-        (storePhase === 'TRAFFIC' || storePhase === 'PRE_PHASE' || storePhase === 'STOPPING')
+        (
+          storePhase === 'TRAFFIC' ||
+          storePhase === 'PRE_PHASE' ||
+          storePhase === 'STOPPING' ||
+          storePhase === 'CLEANUP_READY'
+        )
       ) {
         await finish('COMPLETE')
       }
@@ -611,19 +616,7 @@ export default function RunPage() {
       <ReconnectBanner visible={showReconnectBanner} />
       <div className="relative flex items-center justify-center border-b border-border px-6 py-4">
         <div className="absolute left-6">
-          <Link
-            href="/config"
-            className={[
-              'flex items-center gap-2 rounded-md border px-3 py-1.5',
-              'border-sky-500/50 text-sky-400',
-              'text-sm font-semibold tracking-wide',
-              'hover:border-sky-400 hover:bg-sky-500/15 hover:text-sky-300',
-              'transition-all duration-200',
-            ].join(' ')}
-          >
-            <Home className="size-4" strokeWidth={2.5} />
-            <span>Home</span>
-          </Link>
+          <HomeGuardButton href="/config" />
         </div>
         <StepIndicator />
       </div>
