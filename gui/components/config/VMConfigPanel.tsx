@@ -69,8 +69,6 @@ export interface VMConfigPanelProps {
   warnings: Record<string, string>
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
-  /** Secondary engine: shows only connection fields (ip + port) */
-  secondaryOnly?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +288,6 @@ export function VMConfigPanel({
   warnings,
   reachability,
   onCheckReachability,
-  secondaryOnly = false,
 }: VMConfigPanelProps) {
   const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
@@ -311,56 +308,6 @@ export function VMConfigPanel({
   const ptimeNum = parseInt(raw.rtp_ptime, 10) || 20
   const ppsDisplay = Math.round(1000 / ptimeNum)
 
-  // ── Secondary-only: just connection fields ──────────────────────
-  if (secondaryOnly) {
-    return (
-      <div className="space-y-4 px-4 py-4">
-        <SectionHeader>Secondary Engine Connection</SectionHeader>
-        <FormField label="VM ID" error={e('vm_id')}>
-          <Input
-            value={raw.vm_id}
-            onChange={(ev) => onChange('vm_id', ev.target.value)}
-            onBlur={() => onBlur('vm_id')}
-            placeholder="traffic-uas"
-          />
-        </FormField>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="IP Address" error={e('vm_ip')}>
-            <Input
-              value={raw.vm_ip}
-              onChange={(ev) => onChange('vm_ip', ev.target.value)}
-              onBlur={handleIpBlur}
-              placeholder="127.0.0.1"
-              className="font-mono"
-            />
-          </FormField>
-          <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
-            <div className="flex gap-2">
-              <Input
-                type="number"
-                value={raw.metrics_port}
-                onChange={(ev) => onChange('metrics_port', ev.target.value)}
-                onBlur={handleMetricsPortBlur}
-                placeholder="8081"
-                className="font-mono"
-              />
-              <TestReachabilityButton
-                vmIp={raw.vm_ip}
-                metricsPort={raw.metrics_port}
-                reachability={reachability}
-                onTest={onCheckReachability}
-              />
-            </div>
-          </FormField>
-        </div>
-        {reachability && <div className="pt-0.5"><ReachabilityIndicator status={reachability} /></div>}
-        <FieldHint>
-          SIP settings, extensions, and traffic config are auto-synced from the primary UA.
-        </FieldHint>
-      </div>
-    )
-  }
-
   return (
     <div className="space-y-6 px-4 py-5">
 
@@ -378,9 +325,9 @@ export function VMConfigPanel({
         </FormField>
       </div>
 
-      {/* ── Engine Connection ─────────────────────────────────── */}
+      {/* ── Traffic Agent Host ───────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Engine Connection</SectionHeader>
+        <SectionHeader>Traffic Agent Host</SectionHeader>
         <div className="grid grid-cols-2 gap-3">
           <FormField label="IP Address" error={e('vm_ip')}>
             <Input
@@ -420,7 +367,7 @@ export function VMConfigPanel({
             </span>
           </p>
           <FieldWarning>
-            The traffic engine must be running on this port before the GUI can connect.
+            The traffic agent must be running on this port before the GUI can connect.
           </FieldWarning>
           {reachability && <div className="pt-0.5"><ReachabilityIndicator status={reachability} /></div>}
         </div>

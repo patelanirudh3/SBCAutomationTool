@@ -18,7 +18,7 @@ import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const VM_IPS_KEY = 'cci-studio-vm-ips'
 
-interface SavedVmIps { uac: string; uas: string }
+interface SavedVmIps { uac: string }
 
 function _loadVmIps(): SavedVmIps[] {
   if (typeof window === 'undefined') return []
@@ -33,7 +33,6 @@ function _saveVmIps(pairs: VMPair[]): void {
   try {
     const data: SavedVmIps[] = pairs.map(p => ({
       uac: p.uac.vm_ip,
-      uas: p.uas.vm_ip,
     }))
     window.localStorage.setItem(VM_IPS_KEY, JSON.stringify(data))
   } catch { /* localStorage unavailable */ }
@@ -82,7 +81,6 @@ function makePair(index: number): VMPair {
     pair_id: pairId,
     pair_label: `Pair ${index + 1}`,
     uac: makeDefaultConfig('traffic-local', 8082),
-    uas: makeDefaultConfig('traffic-uas', 8081),
     advancedSettings: { ...DEFAULT_ADVANCED_SETTINGS },
     validated: false,
     saved: false,
@@ -113,11 +111,6 @@ interface TrafficStore {
   // Pre-phase (unified pool)
   prePhaseStatus: PrePhaseStatus | null
   setPrePhaseStatus: (s: PrePhaseStatus) => void
-  // Legacy aliases (kept for components not yet updated)
-  uasPrePhase: PrePhaseStatus | null
-  uacPrePhase: PrePhaseStatus | null
-  setUASPrePhase: (s: PrePhaseStatus) => void
-  setUACPrePhase: (s: PrePhaseStatus) => void
 
   // Pool counts (from live metrics)
   idleCount: number
@@ -126,14 +119,12 @@ interface TrafficStore {
 
   // Live metrics
   uacMetrics: TrafficMetrics | null
-  uasMetrics: TrafficMetrics | null
   metricsHistory: MetricsHistoryPoint[]
   updateUACMetrics: (m: TrafficMetrics) => void
-  updateUASMetrics: (m: TrafficMetrics) => void
 
-  // WebSocket connection status — one entry per VM role
-  wsStatus: { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' }
-  setWsStatus: (role: 'uac' | 'uas', s: 'connected' | 'reconnecting' | 'disconnected') => void
+  // WebSocket connection status
+  wsStatus: { uac: 'connected' | 'reconnecting' | 'disconnected' }
+  setWsStatus: (role: 'uac', s: 'connected' | 'reconnecting' | 'disconnected') => void
 
   // Post-run
   callEvents: CallEvent[]
@@ -165,15 +156,12 @@ const initialState = {
   reachability: {} as Record<string, ReachabilityStatus>,
   phase: 'IDLE' as RunPhase,
   prePhaseStatus: null,
-  uasPrePhase: null,
-  uacPrePhase: null,
   idleCount: 0,
   nonIdleCount: 0,
   regOnlyCount: 0,
   uacMetrics: null,
-  uasMetrics: null,
   metricsHistory: [] as MetricsHistoryPoint[],
-  wsStatus: { uac: 'disconnected', uas: 'disconnected' } as { uac: 'connected' | 'reconnecting' | 'disconnected'; uas: 'connected' | 'reconnecting' | 'disconnected' },
+  wsStatus: { uac: 'disconnected' } as { uac: 'connected' | 'reconnecting' | 'disconnected' },
   callEvents: [] as CallEvent[],
   callSpines: [] as Record<string, unknown>[],
   aggregate: null,
@@ -218,8 +206,6 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
   setPhase: (p) => set({ phase: p }),
 
   setPrePhaseStatus: (s) => set({ prePhaseStatus: s }),
-  setUASPrePhase: (s) => set({ uasPrePhase: s }),
-  setUACPrePhase: (s) => set({ uacPrePhase: s }),
 
   updateUACMetrics: (m) =>
     set((state) => ({
@@ -238,8 +224,6 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
         },
       ],
     })),
-
-  updateUASMetrics: (m) => set({ uasMetrics: m }),
 
   setWsStatus: (role, s) =>
     set((state) => ({
@@ -261,11 +245,10 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     const pairs = current.map((p, i) => {
       const ips = saved[i]
       if (!ips) return p
-      if (p.uac.vm_ip === ips.uac && p.uas.vm_ip === ips.uas) return p
+      if (p.uac.vm_ip === ips.uac) return p
       return {
         ...p,
         uac: { ...p.uac, vm_ip: ips.uac },
-        uas: { ...p.uas, vm_ip: ips.uas },
       }
     })
     set({ pairs })

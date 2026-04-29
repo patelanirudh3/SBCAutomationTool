@@ -53,8 +53,7 @@ export function SummaryCard({ className }: SummaryCardProps) {
     ? (Date.parse(aggregate.ended_at) - Date.parse(aggregate.started_at)) / 1000
     : null
 
-  const uacVmId = pair?.uac.vm_id ?? 'uac-local'
-  const uasVmId = pair?.uas.vm_id ?? 'uas-local'
+  const uacVmId = pair?.uac.vm_id ?? 'traffic-local'
   const pairId = pair?.pair_id ?? 'pair-1'
   const runId = aggregate.run_id
 
@@ -133,8 +132,6 @@ export function SummaryCard({ className }: SummaryCardProps) {
         {[
           `traffic_${runId}_${pairId}_${uacVmId}.log`,
           `traffic_summary_${runId}_${pairId}_${uacVmId}.log`,
-          `traffic_${runId}_${pairId}_${uasVmId}.log`,
-          `traffic_summary_${runId}_${pairId}_${uasVmId}.log`,
         ].map((f) => (
           <div key={f} className="flex items-center gap-2">
             <FileText className="size-3 text-foreground/50 shrink-0" />

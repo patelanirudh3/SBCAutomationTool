@@ -57,14 +57,12 @@ sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
 Start the traffic engine in API-only mode — no YAML files needed. The GUI pushes
 config as JSON via `PUT /api/config` and controls the full lifecycle over HTTP.
 
-**UAC VM (port 8082):**
+The engine uses a **single-pool model**: every registered extension can both originate
+calls (caller/UAC role) and answer incoming calls (callee/UAS role) within the same
+process. Only **one instance** is needed per test VM.
+
 ```bash
 ./traffic-engine --api-only --port 8082
-```
-
-**UAS VM (port 8081):**
-```bash
-./traffic-engine --api-only --port 8081
 ```
 
 The GUI workflow:
@@ -76,15 +74,10 @@ The GUI workflow:
 
 ### CLI Mode (with YAML config)
 
-For headless/CI/dev use without the GUI. Each VM role needs its own YAML file
-(just like Python's `uac.yaml` / `uas.yaml`):
+For headless/CI/dev use without the GUI. A single YAML config file is required:
 
 ```bash
-# UAC VM
-./traffic-engine --config uac.yaml --log-level INFO
-
-# UAS VM (separate terminal / host)
-./traffic-engine --config uas.yaml --log-level INFO
+./traffic-engine --config config.yaml --log-level INFO
 ```
 
 ### Smoke Test (2 calls)
@@ -161,7 +154,7 @@ internal/
   rtp/         RTP endpoint (G.711 PCMU), codec, PCAP writer
   agent/       ExtensionAgent — one per SIP extension
   prephase/    Batched REGISTER + SUBSCRIBE
-  engine/      CallEngine (UAC) + UasAutoAnswer (UAS)
+  engine/      CallEngine (caller) + UasAutoAnswer (callee, same process)
   metrics/     MetricsCollector + HTTP/WS server (15 endpoints)
   spine/       Call spine correlation (GSID + ext_time strategies)
 ```

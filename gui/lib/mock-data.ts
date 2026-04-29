@@ -29,21 +29,6 @@ export const MOCK_UAC_CONFIG: VMConfig = {
   call_count: 20,
 }
 
-export const MOCK_UAS_CONFIG: VMConfig = {
-  vm_id: 'traffic-uas',
-  vm_ip: '127.0.0.1',
-  ext_start: 4001000,
-  ext_end: 4001019,
-  sbc_host: '10.133.63.117',
-  sbc_port: 5060,
-  sip_transport: 'TCP',
-  domain: 'avaya.com',
-  sip_password: '123456',
-  cps: 2,
-  hold_time_seconds: 10,
-  metrics_port: 8081,
-}
-
 // ---------------------------------------------------------------------------
 // Mock pre-phase status
 // ---------------------------------------------------------------------------
@@ -83,25 +68,6 @@ export const MOCK_UAC_METRICS: TrafficMetrics = {
   min_pdd_ms: 98,
   max_pdd_ms: 212,
   avg_hold_ms: 10020,
-  socket_count: 10,
-  registered_count: 10,
-  run_elapsed_seconds: 45,
-}
-
-export const MOCK_UAS_METRICS: TrafficMetrics = {
-  vm_id: 'uas-local',
-  phase: 'TRAFFIC',
-  running: true,
-  cps_actual: 1.97,
-  concurrent_calls: 8,
-  calls_attempted: 18,
-  calls_completed: 18,
-  calls_failed: 0,
-  asr: 100.0,
-  avg_pdd_ms: 141,
-  min_pdd_ms: 96,
-  max_pdd_ms: 210,
-  avg_hold_ms: 10015,
   socket_count: 10,
   registered_count: 10,
   run_elapsed_seconds: 45,

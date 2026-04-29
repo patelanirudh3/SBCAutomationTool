@@ -27,7 +27,6 @@ import { useMetricsStream } from '@/lib/ws'
 import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor } from '@/lib/api'
 import {
   MOCK_UAC_METRICS,
-  MOCK_UAS_METRICS,
   MOCK_CALL_EVENTS,
   MOCK_AGGREGATE,
   simulateMetricsTick,
@@ -41,8 +40,8 @@ const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 // Both VM statuses are consulted; UAC drives the primary state
 // ---------------------------------------------------------------------------
 
-function mapBackendPhase(uacPhase: string, _uasPhase: string): RunPhase {
-  // In the new unified model, UAC is the sole authority for phase
+function mapBackendPhase(uacPhase: string): RunPhase {
+  // In the single-pool model, UAC is the sole authority for phase
   const p = (uacPhase ?? '').toUpperCase()
   if (p === 'FAILED') return 'FAILED'
   if (p === 'TRAFFIC') return 'TRAFFIC'
@@ -73,7 +72,6 @@ function LiveDashboard({
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
-  const uasMetrics = useTrafficStore((s) => s.uasMetrics)
   const idleCount   = useTrafficStore((s) => s.idleCount)
   const nonIdleCount= useTrafficStore((s) => s.nonIdleCount)
   const regOnlyCount= useTrafficStore((s) => s.regOnlyCount)
@@ -187,19 +185,13 @@ function LiveDashboard({
       {/* Aggregate totals bar */}
       <AggregatePanel uacMetrics={uacMetrics} />
 
-      {/* Row 2 — VM Metrics Card (single, primary VM) */}
-      <div className="grid grid-cols-2 gap-4">
+      {/* Row 2 — VM Metrics Card (single engine) */}
+      <div className="grid grid-cols-1 gap-4">
         <VMMetricsCard
           role="UAC"
           metrics={uacMetrics}
           configuredCps={configuredCps}
         />
-        {uasMetrics && (
-          <VMMetricsCard
-            role="UAS"
-            metrics={uasMetrics}
-          />
-        )}
       </div>
 
       {/* Row 3 — Charts */}
@@ -305,15 +297,12 @@ function buildAggregateFromStore(): void {
 // ---------------------------------------------------------------------------
 
 async function fetchAndStoreCallEvents(
-  livePair: { uac: { vm_ip: string; metrics_port: number; vm_id?: string }; uas: { vm_ip: string; metrics_port: number } },
+  livePair: { uac: { vm_ip: string; metrics_port: number; vm_id?: string } },
   isFinal = false
 ): Promise<boolean> {
-  const [uacCalls, uasCalls] = await Promise.all([
-    getCallsFor(livePair.uac.vm_ip, livePair.uac.metrics_port),
-    getCallsFor(livePair.uas.vm_ip, livePair.uas.metrics_port),
-  ])
+  const uacCalls = await getCallsFor(livePair.uac.vm_ip, livePair.uac.metrics_port)
 
-  const allEvents = [...uacCalls, ...uasCalls]
+  const allEvents = [...uacCalls]
   allEvents.sort((a, b) =>
     new Date(a.ts_utc ?? a.timestamp ?? 0).getTime() -
     new Date(b.ts_utc ?? b.timestamp ?? 0).getTime()
@@ -330,9 +319,9 @@ async function fetchAndStoreCallEvents(
       ? new Date(Date.now() - uacMetrics.run_elapsed_seconds * 1000).toISOString()
       : new Date().toISOString()
 
-    setAggregate(buildAggregate(uacCalls, uasCalls, runId, startedAt))
+    setAggregate(buildAggregate(uacCalls, [], runId, startedAt))
 
-    // Fetch correlated call spines from UAC backend
+    // Fetch correlated call spines from engine backend
     const spines = await getCallSpinesFor(livePair.uac.vm_ip, livePair.uac.metrics_port)
     setCallSpines(spines)
   }
@@ -348,7 +337,7 @@ export default function RunPage() {
   const phase = useTrafficStore((s) => s.phase)
   const wsStatus = useTrafficStore((s) => s.wsStatus)
   const pair = useTrafficStore((s) => s.pairs[s.activePairIndex])
-  const { setPhase, updateUACMetrics, updateUASMetrics, setWsStatus, setCallEvents, setAggregate } =
+  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate } =
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
@@ -356,7 +345,6 @@ export default function RunPage() {
 
   const mockTickRef = useRef(0)
   const mockUacRef = useRef<TrafficMetrics>(MOCK_UAC_METRICS)
-  const mockUasRef = useRef<TrafficMetrics>(MOCK_UAS_METRICS)
 
   // ------------------------------------------------------------------
   // MOCK_MODE: simulate live metrics + auto-transition to COMPLETE
@@ -369,10 +357,8 @@ export default function RunPage() {
     }
 
     setWsStatus('uac', 'connected')
-    setWsStatus('uas', 'connected')
 
     updateUACMetrics(mockUacRef.current)
-    updateUASMetrics(mockUasRef.current)
 
     const interval = setInterval(() => {
       mockTickRef.current += 1
@@ -387,15 +373,8 @@ export default function RunPage() {
         totalCompleted,
         totalFailed
       )
-      mockUasRef.current = simulateMetricsTick(
-        mockUasRef.current,
-        totalCompleted,
-        totalCompleted,
-        0
-      )
 
       updateUACMetrics(mockUacRef.current)
-      updateUASMetrics(mockUasRef.current)
 
       if (tick >= 20) {
         clearInterval(interval)
@@ -525,34 +504,14 @@ export default function RunPage() {
     const poll = async () => {
       if (completed) return
 
-      let uacReachable = false
-      let uasReachable = false
-      let uacPhase = ''
-      let uasPhase = ''
-
-      const [uacResult, uasResult] = await Promise.all([
-        getMetricsFor(livePair.uac.vm_ip, livePair.uac.metrics_port).catch(() => null),
-        getMetricsFor(livePair.uas.vm_ip, livePair.uas.metrics_port).catch(() => null),
-      ])
+      const uacResult = await getMetricsFor(livePair.uac.vm_ip, livePair.uac.metrics_port).catch(() => null)
 
       if (uacResult) {
-        uacReachable = true
-        updateUACMetrics(uacResult)
-        uacPhase = (uacResult as unknown as { phase: string }).phase ?? ''
-      }
-      if (uasResult) {
-        uasReachable = true
-        updateUASMetrics(uasResult)
-        uasPhase = (uasResult as unknown as { phase: string }).phase ?? ''
-      }
-
-      // At least one backend is alive — attempt phase detection + call fetch
-      if (uacReachable || uasReachable) {
         consecutiveFailures = 0
+        updateUACMetrics(uacResult)
+        const uacPhase = (uacResult as unknown as { phase: string }).phase ?? ''
 
-        // Continuously fetch call events while backends are alive so we
-        // always have the latest snapshot — the backends may exit before
-        // we get another chance.
+        // Continuously fetch call events while backend is alive
         const currentPhase = useTrafficStore.getState().phase
         if (
           !callsFetched &&
@@ -561,14 +520,10 @@ export default function RunPage() {
           callsFetched = await fetchAndStoreCallEvents(livePair)
         }
 
-        if (uacPhase || uasPhase) {
-          const livePhase = mapBackendPhase(
-            uacPhase || 'IDLE',
-            uasPhase || 'IDLE'
-          )
+        if (uacPhase) {
+          const livePhase = mapBackendPhase(uacPhase)
 
           if (livePhase === 'COMPLETE' || livePhase === 'FAILED') {
-            // Backends reporting DONE — finish will handle final call fetch
             await finish(livePhase)
             return
           }
@@ -578,7 +533,7 @@ export default function RunPage() {
         return
       }
 
-      // Both unreachable — backends likely exited
+      // Backend unreachable — likely exited
       consecutiveFailures++
       const storePhase = useTrafficStore.getState().phase
       if (
@@ -609,18 +564,6 @@ export default function RunPage() {
         if (m) updateUACMetrics(m)
       },
       onStatusChange: (status) => setWsStatus('uac', status),
-    },
-    !IS_MOCK
-  )
-
-  useMetricsStream(
-    vmWsUrl(pair?.uas.vm_ip ?? '127.0.0.1', pair?.uas.metrics_port ?? 8081),
-    {
-      onMetrics: (metrics) => {
-        const m = metrics.find((m) => m.vm_id === pair?.uas.vm_id) ?? metrics[0]
-        if (m) updateUASMetrics(m)
-      },
-      onStatusChange: (status) => setWsStatus('uas', status),
     },
     !IS_MOCK
   )

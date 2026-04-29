@@ -29,7 +29,6 @@ interface VMBackendInfo {
 interface PairInfo {
   pairLabel: string
   pairId: string
-  uas: VMBackendInfo
   uac: VMBackendInfo
 }
 
@@ -70,7 +69,6 @@ function VMRow({
   onReset: () => void
   onShutdown: () => void
 }) {
-  const isUAS = vm.role === 'UAS'
   const canReset =
     vm.reachable && ['COMPLETE', 'FAILED', 'CONFIGURED'].includes(vm.state)
   const canShutdown = vm.reachable
@@ -99,12 +97,7 @@ function VMRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span
-            className={cn(
-              'rounded px-1.5 py-px text-[9px] font-bold leading-none tracking-widest',
-              isUAS
-                ? 'bg-violet-500/20 text-violet-300'
-                : 'bg-blue-500/20 text-blue-300',
-            )}
+            className="rounded px-1.5 py-px text-[9px] font-bold leading-none tracking-widest bg-emerald-500/20 text-emerald-300"
           >
             {vm.role}
           </span>
@@ -174,7 +167,7 @@ function VMRow({
 }
 
 // ---------------------------------------------------------------------------
-// VM Pair block (UAS + UAC grouped under a pair header)
+// VM Pair block (single UA per pair)
 // ---------------------------------------------------------------------------
 
 function PairBlock({
@@ -194,20 +187,8 @@ function PairBlock({
         </span>
       </div>
 
-      {/* UAS row */}
-      <div className="px-1 pt-1">
-        <VMRow
-          vm={pair.uas}
-          onReset={() => onAction(pair.uas.ip, pair.uas.port, 'reset')}
-          onShutdown={() => onAction(pair.uas.ip, pair.uas.port, 'shutdown')}
-        />
-      </div>
-
-      {/* Divider */}
-      <div className="mx-3 border-t border-border/40" />
-
-      {/* UAC row */}
-      <div className="px-1 pb-1">
+      {/* UA row */}
+      <div className="px-1 py-1">
         <VMRow
           vm={pair.uac}
           onReset={() => onAction(pair.uac.ip, pair.uac.port, 'reset')}
@@ -268,27 +249,15 @@ export function SessionMenu() {
     const result: PairInfo[] = []
 
     for (const pair of pairs) {
-      const [uasRes, uacRes] = await Promise.all([
-        pingVM(pair.uas.vm_ip, pair.uas.metrics_port),
-        pingVM(pair.uac.vm_ip, pair.uac.metrics_port),
-      ])
+      const uacRes = await pingVM(pair.uac.vm_ip, pair.uac.metrics_port)
 
       result.push({
         pairLabel: pair.pair_label,
         pairId: pair.pair_id,
-        uas: {
-          ip: pair.uas.vm_ip,
-          port: pair.uas.metrics_port,
-          role: uasRes.role ?? pair.uas.vm_role ?? 'UAS',
-          vm_id: uasRes.vm_id ?? pair.uas.vm_id,
-          reachable: uasRes.reachable ?? false,
-          state: uasRes.state ?? 'offline',
-          loading: false,
-        },
         uac: {
           ip: pair.uac.vm_ip,
           port: pair.uac.metrics_port,
-          role: uacRes.role ?? pair.uac.vm_role ?? 'UAC',
+          role: uacRes.role ?? pair.uac.vm_role ?? 'UA',
           vm_id: uacRes.vm_id ?? pair.uac.vm_id,
           reachable: uacRes.reachable ?? false,
           state: uacRes.state ?? 'offline',
@@ -307,7 +276,6 @@ export function SessionMenu() {
     setPairData((prev) =>
       prev.map((p) => ({
         ...p,
-        uas: p.uas.ip === ip && p.uas.port === port ? { ...p.uas, loading: val } : p.uas,
         uac: p.uac.ip === ip && p.uac.port === port ? { ...p.uac, loading: val } : p.uac,
       })),
     )
@@ -322,7 +290,7 @@ export function SessionMenu() {
     setTimeout(fetchStates, action === 'shutdown' ? 1500 : 600)
   }
 
-  const allVMs = pairData.flatMap((p) => [p.uas, p.uac])
+  const allVMs = pairData.map((p) => p.uac)
   const hasReachable = allVMs.some((v) => v.reachable)
   const hasResettable = allVMs.some(
     (v) => v.reachable && ['COMPLETE', 'FAILED', 'CONFIGURED'].includes(v.state),

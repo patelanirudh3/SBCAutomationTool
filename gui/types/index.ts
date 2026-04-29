@@ -105,7 +105,6 @@ export interface VMPair {
   pair_id: string
   pair_label: string
   uac: VMConfig
-  uas: VMConfig
   advancedSettings: AdvancedSettings
   validated: boolean
   saved: boolean

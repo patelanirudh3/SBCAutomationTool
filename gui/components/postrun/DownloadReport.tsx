@@ -15,7 +15,6 @@ export function DownloadReport({ className }: DownloadReportProps) {
   const callEvents = useTrafficStore((s) => s.callEvents)
   const callSpines = useTrafficStore((s) => s.callSpines)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
-  const uasMetrics = useTrafficStore((s) => s.uasMetrics)
   const pairs = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
 
@@ -24,8 +23,7 @@ export function DownloadReport({ className }: DownloadReportProps) {
       generated_at: new Date().toISOString(),
       run_id: aggregate?.run_id ?? 'unknown',
       aggregate,
-      final_uac_metrics: uacMetrics,
-      final_uas_metrics: uasMetrics,
+      final_metrics: uacMetrics,
       config: pairs[activePairIndex],
       call_events: callEvents,
       call_spines: callSpines,

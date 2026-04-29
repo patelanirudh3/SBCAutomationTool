@@ -58,13 +58,7 @@ const DEFAULTS: RawVMFormValues = {
   start_time_iso: '',
 }
 
-const SECONDARY_DEFAULTS: RawVMFormValues = {
-  ...DEFAULTS,
-  vm_id: 'traffic-uas',
-  metrics_port: '8081',
-}
-
-// Fields validated for the primary UA form
+// Fields validated for the UA form
 const UA_FIELDS = [
   'vm_id', 'vm_ip', 'ext_start', 'ext_end',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
@@ -166,10 +160,8 @@ export function VMPairBook() {
 
   const pair = pairs[activePairIndex]
   const [raw, setRaw] = useState<RawVMFormValues>(DEFAULTS)
-  const [secondaryRaw, setSecondaryRaw] = useState<RawVMFormValues>(SECONDARY_DEFAULTS)
   const [touched, setTouched] = useState<Set<string>>(new Set())
-  const [primaryReachability, setPrimaryReachability] = useState<ReachabilityStatus | null>(null)
-  const [secondaryReachability, setSecondaryReachability] = useState<ReachabilityStatus | null>(null)
+  const [reachability, setReachability] = useState<ReachabilityStatus | null>(null)
   const [validationPassed, setValidationPassed] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
@@ -177,16 +169,14 @@ export function VMPairBook() {
 
   useEffect(() => { hydrateVmIps() }, [hydrateVmIps])
 
-  // Restore persisted VM IPs from store
+  // Restore persisted VM IP from store
   useEffect(() => {
     const p = pairs[activePairIndex]
     if (!p) return
     if (p.uac.vm_ip !== DEFAULTS.vm_ip)
       setRaw(prev => prev.vm_ip === p.uac.vm_ip ? prev : { ...prev, vm_ip: p.uac.vm_ip })
-    if (p.uas.vm_ip !== SECONDARY_DEFAULTS.vm_ip)
-      setSecondaryRaw(prev => prev.vm_ip === p.uas.vm_ip ? prev : { ...prev, vm_ip: p.uas.vm_ip })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairs[activePairIndex]?.uac.vm_ip, pairs[activePairIndex]?.uas.vm_ip])
+  }, [pairs[activePairIndex]?.uac.vm_ip])
 
   // Keep ext_count derived
   useEffect(() => {
@@ -197,70 +187,24 @@ export function VMPairBook() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [raw.ext_start, raw.ext_end])
 
-  // Mirror SIP/ext settings from primary → secondary
-  useEffect(() => {
-    setSecondaryRaw((prev) => ({
-      ...prev,
-      sbc_host: raw.sbc_host,
-      sbc_port: raw.sbc_port,
-      sip_transport: raw.sip_transport,
-      sip_scheme: raw.sip_scheme,
-      domain: raw.domain,
-      sip_password: raw.sip_password,
-      dns_servers: raw.dns_servers,
-      failover_enabled: raw.failover_enabled,
-      secondary_host: raw.secondary_host,
-      secondary_port: raw.secondary_port,
-      hold_time_seconds: raw.hold_time_seconds,
-      ext_start: raw.ext_start,
-      ext_end: raw.ext_end,
-      ext_count: raw.ext_count,
-      register_expires: raw.register_expires,
-      subscribe_expires: raw.subscribe_expires,
-      register_rate_cps: raw.register_rate_cps,
-      media_enabled: raw.media_enabled,
-      rtp_codec: raw.rtp_codec,
-      rtp_ptime: raw.rtp_ptime,
-      cps: raw.cps,
-      traffic_mode: raw.traffic_mode,
-      call_count: raw.call_count,
-      duration_hours: raw.duration_hours,
-      start_time_iso: raw.start_time_iso,
-    }))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    raw.sbc_host, raw.sbc_port, raw.sip_transport, raw.sip_scheme,
-    raw.domain, raw.sip_password, raw.dns_servers,
-    raw.failover_enabled, raw.secondary_host, raw.secondary_port,
-    raw.hold_time_seconds, raw.ext_start, raw.ext_end,
-    raw.register_expires, raw.subscribe_expires, raw.register_rate_cps,
-    raw.media_enabled, raw.rtp_codec, raw.rtp_ptime,
-    raw.cps, raw.traffic_mode, raw.call_count, raw.duration_hours, raw.start_time_iso,
-  ])
-
   // Keep store connection info in sync with live form
   useEffect(() => {
     const p = pairs[activePairIndex]
     if (!p) return
-    const primaryPort = parseInt(raw.metrics_port) || p.uac.metrics_port
-    const secondaryPort = parseInt(secondaryRaw.metrics_port) || p.uas.metrics_port
+    const port = parseInt(raw.metrics_port) || p.uac.metrics_port
     if (
       p.uac.vm_ip === raw.vm_ip &&
-      p.uac.metrics_port === primaryPort &&
-      p.uac.vm_id === raw.vm_id &&
-      p.uas.vm_ip === secondaryRaw.vm_ip &&
-      p.uas.metrics_port === secondaryPort &&
-      p.uas.vm_id === secondaryRaw.vm_id
+      p.uac.metrics_port === port &&
+      p.uac.vm_id === raw.vm_id
     ) return
     updatePair(activePairIndex, {
       ...p,
-      uac: { ...p.uac, vm_ip: raw.vm_ip, metrics_port: primaryPort, vm_id: raw.vm_id },
-      uas: { ...p.uas, vm_ip: secondaryRaw.vm_ip, metrics_port: secondaryPort, vm_id: secondaryRaw.vm_id },
+      uac: { ...p.uac, vm_ip: raw.vm_ip, metrics_port: port, vm_id: raw.vm_id },
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [raw.vm_ip, raw.metrics_port, raw.vm_id, secondaryRaw.vm_ip, secondaryRaw.metrics_port, secondaryRaw.vm_id])
+  }, [raw.vm_ip, raw.metrics_port, raw.vm_id])
 
-  useEffect(() => { setValidationPassed(false) }, [raw, secondaryRaw])
+  useEffect(() => { setValidationPassed(false) }, [raw])
 
   const errors = useMemo(() => getErrors(raw), [raw])
   const warnings = useMemo(() => getFieldWarnings(raw), [raw])
@@ -269,37 +213,30 @@ export function VMPairBook() {
 
   // Reachability
   const checkReachability = useCallback(
-    async (role: 'primary' | 'secondary', vmIp: string, metricsPort: number) => {
-      const setter = role === 'primary' ? setPrimaryReachability : setSecondaryReachability
-      const vmId = role === 'primary' ? raw.vm_id : secondaryRaw.vm_id
+    async (vmIp: string, metricsPort: number) => {
+      const vmId = raw.vm_id
       if (!vmIp || !metricsPort) return
-      setter({ vm_id: vmId, reachable: false, checking: true })
+      setReachability({ vm_id: vmId, reachable: false, checking: true })
       if (IS_MOCK) {
         await new Promise((r) => setTimeout(r, 800))
-        setter({ vm_id: vmId, reachable: true, checking: false })
+        setReachability({ vm_id: vmId, reachable: true, checking: false })
         return
       }
       const result = await checkHealth(vmIp, metricsPort)
-      setter({ vm_id: vmId, reachable: result.reachable, checking: false, error: result.reachable ? undefined : (result.error ?? 'Connection refused') })
+      setReachability({ vm_id: vmId, reachable: result.reachable, checking: false, error: result.reachable ? undefined : (result.error ?? 'Connection refused') })
     },
-    [raw.vm_id, secondaryRaw.vm_id]
+    [raw.vm_id]
   )
 
   useEffect(() => {
     if (!IS_MOCK || reachabilityTriggeredRef.current) return
     reachabilityTriggeredRef.current = true
-    checkReachability('primary', DEFAULTS.vm_ip, parseInt(DEFAULTS.metrics_port))
-    checkReachability('secondary', SECONDARY_DEFAULTS.vm_ip, parseInt(SECONDARY_DEFAULTS.metrics_port))
+    checkReachability(DEFAULTS.vm_ip, parseInt(DEFAULTS.metrics_port))
   }, [checkReachability])
 
   const handleChange = useCallback(
     (field: keyof RawVMFormValues, value: string | boolean) =>
       setRaw((prev) => ({ ...prev, [field]: value })),
-    []
-  )
-  const handleSecondaryChange = useCallback(
-    (field: keyof RawVMFormValues, value: string | boolean) =>
-      setSecondaryRaw((prev) => ({ ...prev, [field]: value })),
     []
   )
   const handleBlur = useCallback(
@@ -318,16 +255,13 @@ export function VMPairBook() {
     setConfigPushError(null)
 
     const uac = parseRaw(raw) as VMConfig
-    const uas = parseRaw(secondaryRaw) as VMConfig
     const adv = pairs[activePairIndex]?.advancedSettings ?? DEFAULT_ADVANCED_SETTINGS
-    const uacPayload = { ...uac, ...adv }
-    const uasPayload = { ...uas, ...adv }
+    const payload = { ...uac, ...adv }
 
     const currentPair: VMPair = pairs[activePairIndex] ?? {
       pair_id: 'pair-1',
       pair_label: 'Pair 1',
       uac,
-      uas,
       advancedSettings: adv,
       validated: true,
       saved: true,
@@ -337,10 +271,7 @@ export function VMPairBook() {
       await new Promise((r) => setTimeout(r, 600))
     } else {
       try {
-        await putConfigFor(uac.vm_ip, uac.metrics_port, uacPayload)
-        if (uas.vm_ip !== uac.vm_ip || uas.metrics_port !== uac.metrics_port) {
-          await putConfigFor(uas.vm_ip, uas.metrics_port, uasPayload)
-        }
+        await putConfigFor(uac.vm_ip, uac.metrics_port, payload)
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Failed to push config'
         setConfigPushError(msg)
@@ -349,7 +280,7 @@ export function VMPairBook() {
       }
     }
 
-    updatePair(activePairIndex, { ...currentPair, uac, uas, advancedSettings: adv, validated: true, saved: true })
+    updatePair(activePairIndex, { ...currentPair, uac, advancedSettings: adv, validated: true, saved: true })
     setIsSaving(false)
     router.push('/launch')
   }
@@ -366,7 +297,7 @@ export function VMPairBook() {
             {/* Main column */}
             <div className="space-y-5">
 
-              {/* Primary UA card */}
+              {/* UA card */}
               <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
                 <div className="flex items-center border-b border-border px-4 py-2.5">
                   <div className="flex flex-1 items-center gap-2 px-2">
@@ -388,42 +319,10 @@ export function VMPairBook() {
                   onBlur={handleBlur}
                   errors={errors}
                   warnings={warnings}
-                  reachability={primaryReachability}
+                  reachability={reachability}
                   onCheckReachability={() =>
-                    checkReachability('primary', raw.vm_ip, parseInt(raw.metrics_port) || 0)
+                    checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)
                   }
-                />
-              </div>
-
-              {/* Secondary engine connection card */}
-              <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
-                <div className="flex items-center border-b border-border px-4 py-2.5">
-                  <div className="flex flex-1 items-center gap-2 px-2">
-                    <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-slate-500/15 text-slate-400">
-                      2nd
-                    </span>
-                    <span className="font-mono text-sm text-foreground">{secondaryRaw.vm_id || 'Secondary Engine'}</span>
-                    <span className="ml-auto text-[10px] text-slate-500">
-                      SIP settings auto-synced from primary
-                    </span>
-                  </div>
-                </div>
-                <VMConfigPanel
-                  raw={secondaryRaw}
-                  onChange={handleSecondaryChange}
-                  touched={new Set(['vm_id', 'vm_ip', 'metrics_port'])}
-                  onBlur={() => {}}
-                  errors={{}}
-                  warnings={{
-                    ...(raw.metrics_port && secondaryRaw.metrics_port && raw.metrics_port === secondaryRaw.metrics_port
-                      ? { metrics_port: 'Same port as primary — must be different for co-located engines' }
-                      : {}),
-                  }}
-                  reachability={secondaryReachability}
-                  onCheckReachability={() =>
-                    checkReachability('secondary', secondaryRaw.vm_ip, parseInt(secondaryRaw.metrics_port) || 0)
-                  }
-                  secondaryOnly
                 />
               </div>
 

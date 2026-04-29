@@ -37,10 +37,8 @@ const PHASE_COLOR: Record<RunPhase, string> = {
 
 type WsDisplayStatus = 'connected' | 'reconnecting' | 'disconnected'
 
-function deriveWsStatus(ws: { uac: WsDisplayStatus; uas: WsDisplayStatus }): WsDisplayStatus {
-  if (ws.uac === 'disconnected' || ws.uas === 'disconnected') return 'disconnected'
-  if (ws.uac === 'reconnecting' || ws.uas === 'reconnecting') return 'reconnecting'
-  return 'connected'
+function deriveWsStatus(ws: { uac: WsDisplayStatus }): WsDisplayStatus {
+  return ws.uac
 }
 
 export function Navbar() {
@@ -160,7 +158,7 @@ export function Navbar() {
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          UAC: {wsStatusRaw.uac} · UAS: {wsStatusRaw.uas}
+          Engine: {wsStatusRaw.uac}
         </TooltipContent>
       </Tooltip>
     </header>
