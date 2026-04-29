@@ -31,6 +31,7 @@ export const VMRoleSchema = z.enum(['UAC', 'UAS'])
 export const TrafficModeSchema = z.enum(['smoke', 'timed', 'unlimited'])
 export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
+export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
 export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
 
 export const VMConfigSchema = z
@@ -70,6 +71,12 @@ export const VMConfigSchema = z
       .min(1, 'Domain is required')
       .regex(DOMAIN_REGEX, 'Must be a valid domain (e.g. avaya.com)'),
     sip_password: z.string().min(1, 'SIP password is required'),
+
+    tls_mode: TLSModeSchema.optional(),
+    tls_ca_path: z.string().optional(),
+    tls_cert_path: z.string().optional(),
+    tls_key_path: z.string().optional(),
+    tls_server_name: z.string().optional(),
 
     register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
@@ -117,6 +124,33 @@ export const VMConfigSchema = z
         path: ['duration_hours'],
         message: 'duration_hours required for timed mode',
       })
+    }
+
+    if (data.sip_transport === 'TLS') {
+      const mode = data.tls_mode ?? 'insecure'
+      if ((mode === 'server_ca' || mode === 'mutual') && !data.tls_ca_path) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['tls_ca_path'],
+          message: 'CA certificate path is required for this TLS mode',
+        })
+      }
+      if (mode === 'client_cert' || mode === 'mutual') {
+        if (!data.tls_cert_path) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['tls_cert_path'],
+            message: 'Client certificate path is required for this TLS mode',
+          })
+        }
+        if (!data.tls_key_path) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['tls_key_path'],
+            message: 'Client private key path is required for this TLS mode',
+          })
+        }
+      }
     }
   })
 

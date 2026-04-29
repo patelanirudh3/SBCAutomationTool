@@ -164,7 +164,12 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		}
 	}
 
-	t, err := sip.CreateTransport(a.Config.SIPTransport, a.localHost, a.Config.SBCHost, a.Config.SBCPort, a.Config.BuildResolver())
+	tlsCfg, err := config.BuildTLSConfig(a.Config)
+	if err != nil {
+		return fmt.Errorf("ext=%s build tls: %w", a.Ext, err)
+	}
+
+	t, err := sip.CreateTransportWithTLS(a.Config.SIPTransport, a.localHost, a.Config.SBCHost, a.Config.SBCPort, a.Config.BuildResolver(), tlsCfg)
 	if err != nil {
 		return fmt.Errorf("ext=%s create transport: %w", a.Ext, err)
 	}
@@ -175,7 +180,12 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 	a.localPort = t.LocalPort()
 
 	go a.dispatchLoop()
-	slog.Debug("agent started", "ext", a.Ext, "port", a.localPort)
+	slog.Debug("agent started",
+		"ext", a.Ext,
+		"port", a.localPort,
+		"transport", a.Config.SIPTransport,
+		"tls_mode", a.Config.TLSMode,
+	)
 	return nil
 }
 

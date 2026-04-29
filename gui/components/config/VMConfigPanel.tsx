@@ -17,7 +17,7 @@ import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw } from 'lucide-react'
-import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus } from '@/types'
+import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
 export type RawVMFormValues = {
@@ -44,6 +44,12 @@ export type RawVMFormValues = {
   sip_scheme: SipScheme
   domain: string
   sip_password: string
+  // TLS — only meaningful when sip_transport === 'TLS'
+  tls_mode: TLSMode
+  tls_ca_path: string
+  tls_cert_path: string
+  tls_key_path: string
+  tls_server_name: string
   // Traffic
   cps: string
   hold_time_seconds: string
@@ -77,7 +83,8 @@ const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
   agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-                   'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers'] as (keyof RawVMFormValues)[],
+                   'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
+                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
@@ -470,6 +477,99 @@ export function VMConfigPanel({
             </Select>
           </FormField>
         </div>
+
+        {raw.sip_transport === 'TLS' && (
+          <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+            <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-amber-300">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+              TLS Settings
+            </div>
+            <FormField
+              label="TLS Mode"
+              error={e('tls_mode')}
+              hint="Choose how the SBC certificate is validated and whether to present a client cert."
+            >
+              <Select
+                value={raw.tls_mode || 'insecure'}
+                onValueChange={(v) => { onChange('tls_mode', v as TLSMode); onBlur('tls_mode') }}
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="insecure">Insecure (skip verify) — lab/testing only</SelectItem>
+                  <SelectItem value="server_ca">Server CA verification (one-way TLS)</SelectItem>
+                  <SelectItem value="client_cert">Client certificate only</SelectItem>
+                  <SelectItem value="mutual">Mutual TLS (CA + client cert)</SelectItem>
+                </SelectContent>
+              </Select>
+            </FormField>
+
+            {(raw.tls_mode === 'server_ca' || raw.tls_mode === 'mutual') && (
+              <FormField
+                label="CA Certificate Path"
+                error={e('tls_ca_path')}
+                hint="PEM file on the engine VM, e.g. /etc/ssl/certs/sbc-ca.pem"
+              >
+                <Input
+                  value={raw.tls_ca_path}
+                  onChange={(ev) => onChange('tls_ca_path', ev.target.value)}
+                  onBlur={() => onBlur('tls_ca_path')}
+                  placeholder="/path/to/ca.pem"
+                  className="font-mono text-xs"
+                  aria-invalid={t('tls_ca_path') && !!errors.tls_ca_path ? true : undefined}
+                />
+              </FormField>
+            )}
+
+            {(raw.tls_mode === 'client_cert' || raw.tls_mode === 'mutual') && (
+              <div className="grid grid-cols-1 gap-3">
+                <FormField
+                  label="Client Certificate Path"
+                  error={e('tls_cert_path')}
+                  hint="PEM containing the tool's identity certificate."
+                >
+                  <Input
+                    value={raw.tls_cert_path}
+                    onChange={(ev) => onChange('tls_cert_path', ev.target.value)}
+                    onBlur={() => onBlur('tls_cert_path')}
+                    placeholder="/path/to/client.crt"
+                    className="font-mono text-xs"
+                    aria-invalid={t('tls_cert_path') && !!errors.tls_cert_path ? true : undefined}
+                  />
+                </FormField>
+                <FormField
+                  label="Client Private Key Path"
+                  error={e('tls_key_path')}
+                  hint="Private key (chmod 600 on the VM). Must match the certificate above."
+                >
+                  <Input
+                    value={raw.tls_key_path}
+                    onChange={(ev) => onChange('tls_key_path', ev.target.value)}
+                    onBlur={() => onBlur('tls_key_path')}
+                    placeholder="/path/to/client.key"
+                    className="font-mono text-xs"
+                    aria-invalid={t('tls_key_path') && !!errors.tls_key_path ? true : undefined}
+                  />
+                </FormField>
+              </div>
+            )}
+
+            {raw.tls_mode && raw.tls_mode !== 'insecure' && (
+              <FormField
+                label="TLS Server Name (SNI)"
+                error={e('tls_server_name')}
+                hint="Override only if the SBC certificate CN/SAN differs from the host above."
+              >
+                <Input
+                  value={raw.tls_server_name}
+                  onChange={(ev) => onChange('tls_server_name', ev.target.value)}
+                  onBlur={() => onBlur('tls_server_name')}
+                  placeholder="sbc.example.com"
+                  className="font-mono text-xs"
+                />
+              </FormField>
+            )}
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Domain" error={e('domain')}>

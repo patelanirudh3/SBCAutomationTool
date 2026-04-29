@@ -2,6 +2,7 @@ export type VMRole = 'UAC' | 'UAS'
 export type TrafficMode = 'smoke' | 'timed' | 'unlimited'
 export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type SipScheme = 'SIP' | 'SIPS'
+export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
 export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
 export type RunPhase =
   | 'IDLE'
@@ -71,6 +72,13 @@ export interface VMConfig {
   sip_scheme?: SipScheme         // default: 'SIP'
   domain: string
   sip_password: string
+
+  // TLS — only consulted when sip_transport === 'TLS'
+  tls_mode?: TLSMode               // default: 'insecure'
+  tls_ca_path?: string             // PEM file with trusted CA(s)
+  tls_cert_path?: string           // PEM file with client certificate
+  tls_key_path?: string            // PEM file with client private key
+  tls_server_name?: string         // SNI / cert verification hostname
 
   // SIP Connection (Secondary / Failover)
   secondary_host?: string

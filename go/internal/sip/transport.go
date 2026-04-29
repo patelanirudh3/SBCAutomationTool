@@ -443,11 +443,20 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 
 // CreateTransport creates the appropriate Transport for the given type string
 // ("TCP", "UDP", or "TLS"). The returned transport is unconnected; call
-// Connect before use.
-// CreateTransport builds the appropriate Transport for the given type.
+// Connect before use. For TLS, the configuration falls back to the legacy
+// InsecureSkipVerify=true behaviour. Callers that need certificate
+// verification should use CreateTransportWithTLS.
+//
 // The resolver parameter is optional — when non-nil it is used for FQDN
 // resolution of remoteHost (custom DNS servers); nil falls back to system DNS.
 func CreateTransport(transportType, localHost, remoteHost string, remotePort int, resolver *net.Resolver) (Transport, error) {
+	return CreateTransportWithTLS(transportType, localHost, remoteHost, remotePort, resolver, nil)
+}
+
+// CreateTransportWithTLS is the TLS-aware variant of CreateTransport. The
+// tlsCfg argument is used only when transportType is "TLS"; pass nil to fall
+// back to the legacy InsecureSkipVerify behaviour.
+func CreateTransportWithTLS(transportType, localHost, remoteHost string, remotePort int, resolver *net.Resolver, tlsCfg *tls.Config) (Transport, error) {
 	switch strings.ToUpper(transportType) {
 	case "UDP":
 		return NewUDPTransport(localHost, remoteHost, remotePort), nil
@@ -456,7 +465,7 @@ func CreateTransport(transportType, localHost, remoteHost string, remotePort int
 		t.resolver = resolver
 		return t, nil
 	case "TLS":
-		t := NewTCPTransport(localHost, remoteHost, remotePort, true, nil)
+		t := NewTCPTransport(localHost, remoteHost, remotePort, true, tlsCfg)
 		t.resolver = resolver
 		return t, nil
 	default:

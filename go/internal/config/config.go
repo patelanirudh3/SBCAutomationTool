@@ -35,6 +35,20 @@ type VMConfig struct {
 	Domain          string `yaml:"domain" json:"domain"`
 	SIPPassword     string `yaml:"sip_password" json:"sip_password"`
 
+	// TLS settings — only consulted when SIPTransport == "TLS".
+	// TLSMode controls verification policy and which other fields are required:
+	//   "insecure"    → InsecureSkipVerify (lab/testing only)
+	//   "server_ca"   → verify SBC cert against TLSCAPath (one-way TLS)
+	//   "client_cert" → present client cert+key; verify SBC against system roots
+	//   "mutual"      → both: TLSCAPath for server, cert+key for client (mTLS)
+	// TLSServerName overrides the SNI / hostname-verification name; leave empty
+	// to use SBCHost.
+	TLSMode       string `yaml:"tls_mode" json:"tls_mode"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+
 	CPS             int `yaml:"cps" json:"cps"`
 	HoldTimeSeconds int `yaml:"hold_time_seconds" json:"hold_time_seconds"`
 	RampUpSeconds   int `yaml:"ramp_up_seconds" json:"ramp_up_seconds"`
@@ -252,6 +266,11 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.SIPTransport == "" {
 		cfg.SIPTransport = "TCP"
 	}
+	// When TLS is selected without an explicit mode, default to insecure to
+	// preserve backward compatibility with configs that just say sip_transport: TLS.
+	if strings.EqualFold(cfg.SIPTransport, "TLS") && cfg.TLSMode == "" {
+		cfg.TLSMode = "insecure"
+	}
 	if cfg.SBCPort == 0 {
 		cfg.SBCPort = 5060
 	}
@@ -268,6 +287,40 @@ func Validate(cfg *VMConfig) error {
 	transport := strings.ToUpper(cfg.SIPTransport)
 	if transport != "TCP" && transport != "TLS" && transport != "UDP" {
 		errs = append(errs, fmt.Sprintf("sip_transport must be TCP/TLS/UDP, got %q", cfg.SIPTransport))
+	}
+
+	if transport == "TLS" {
+		mode := strings.ToLower(cfg.TLSMode)
+		switch mode {
+		case "", "insecure":
+		case "server_ca":
+			if cfg.TLSCAPath == "" {
+				errs = append(errs, "tls_ca_path is required when tls_mode=server_ca")
+			}
+		case "client_cert":
+			if cfg.TLSCertPath == "" || cfg.TLSKeyPath == "" {
+				errs = append(errs, "tls_cert_path and tls_key_path are required when tls_mode=client_cert")
+			}
+		case "mutual":
+			if cfg.TLSCAPath == "" || cfg.TLSCertPath == "" || cfg.TLSKeyPath == "" {
+				errs = append(errs, "tls_ca_path, tls_cert_path and tls_key_path are all required when tls_mode=mutual")
+			}
+		default:
+			errs = append(errs, fmt.Sprintf("tls_mode must be insecure|server_ca|client_cert|mutual, got %q", cfg.TLSMode))
+		}
+		// File-existence check for any path that was provided
+		for _, pathField := range []struct{ name, value string }{
+			{"tls_ca_path", cfg.TLSCAPath},
+			{"tls_cert_path", cfg.TLSCertPath},
+			{"tls_key_path", cfg.TLSKeyPath},
+		} {
+			if pathField.value == "" {
+				continue
+			}
+			if _, err := os.Stat(pathField.value); err != nil {
+				errs = append(errs, fmt.Sprintf("%s %q: %v", pathField.name, pathField.value, err))
+			}
+		}
 	}
 
 	if cfg.SBCHost == "" {

@@ -17,7 +17,7 @@ import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth, putConfigFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec } from '@/types'
+import type { VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
@@ -47,6 +47,11 @@ const DEFAULTS: RawVMFormValues = {
   sip_scheme: 'SIP',
   domain: 'avaya.com',
   sip_password: '123456',
+  tls_mode: 'insecure',
+  tls_ca_path: '',
+  tls_cert_path: '',
+  tls_key_path: '',
+  tls_server_name: '',
   cps: '1',
   hold_time_seconds: '5',
   media_enabled: true,
@@ -96,6 +101,11 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     sip_scheme:         (u.sip_scheme      ?? 'SIP') as SipScheme,
     domain:             u.domain           ?? DEFAULTS.domain,
     sip_password:       u.sip_password     ?? DEFAULTS.sip_password,
+    tls_mode:           (u.tls_mode        ?? DEFAULTS.tls_mode) as TLSMode,
+    tls_ca_path:        u.tls_ca_path      ?? '',
+    tls_cert_path:      u.tls_cert_path    ?? '',
+    tls_key_path:       u.tls_key_path     ?? '',
+    tls_server_name:    u.tls_server_name  ?? '',
     cps:                String(u.cps               ?? parseFloat(DEFAULTS.cps)),
     hold_time_seconds:  String(u.hold_time_seconds ?? parseFloat(DEFAULTS.hold_time_seconds)),
     media_enabled:      u.media_enabled    ?? true,
@@ -131,6 +141,11 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     sip_scheme: raw.sip_scheme as SipScheme,
     domain: raw.domain,
     sip_password: raw.sip_password,
+    tls_mode: raw.sip_transport === 'TLS' ? (raw.tls_mode as TLSMode) : undefined,
+    tls_ca_path: raw.sip_transport === 'TLS' ? (raw.tls_ca_path || undefined) : undefined,
+    tls_cert_path: raw.sip_transport === 'TLS' ? (raw.tls_cert_path || undefined) : undefined,
+    tls_key_path: raw.sip_transport === 'TLS' ? (raw.tls_key_path || undefined) : undefined,
+    tls_server_name: raw.sip_transport === 'TLS' ? (raw.tls_server_name || undefined) : undefined,
     register_expires: raw.register_expires ? parseInt(raw.register_expires) : undefined,
     subscribe_expires: raw.subscribe_expires ? parseInt(raw.subscribe_expires) : undefined,
     register_rate_cps: raw.register_rate_cps ? parseFloat(raw.register_rate_cps) : undefined,
