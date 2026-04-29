@@ -1,7 +1,7 @@
 'use client'
 
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, Clock, Zap, Loader2, Users, RotateCcw } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Clock, Zap, Loader2, Users, RotateCcw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
@@ -113,6 +113,12 @@ export function FinalReport({
 
   // Call traffic summary
   const attempted  = aggregate?.total_attempted  ?? uacMetrics?.calls_attempted  ?? 0
+  // Prefer aggregate.total_answered, fall back to live metric, then derive
+  // from event list as a last resort (handles legacy backends without the
+  // calls_answered counter).
+  const answered   = aggregate?.total_answered
+                  ?? uacMetrics?.calls_answered
+                  ?? callEvents.filter((e) => e.answered === true).length
   const completed  = aggregate?.total_completed  ?? uacMetrics?.calls_completed  ?? 0
   const failed     = aggregate?.total_failed     ?? uacMetrics?.calls_failed     ?? 0
   const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
@@ -212,15 +218,16 @@ export function FinalReport({
       <div className="space-y-3">
         <SectionLabel>Call Traffic</SectionLabel>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard icon={Phone}      label="Attempted"    value={attempted.toLocaleString()}  color="info" />
-          <StatCard icon={CheckCircle2} label="Completed (BYE/200)" value={completed.toLocaleString()} color="success" />
-          <StatCard icon={PhoneMissed} label="Failed"      value={failed.toLocaleString()}     color={failed > 0 ? 'danger' : 'default'} />
-          <StatCard icon={Zap}        label="ASR"          value={`${asr.toFixed(1)}%`}         color={asr >= 95 ? 'success' : asr >= 80 ? 'warning' : 'danger'} />
+          <StatCard icon={Phone}          label="Attempted"            value={attempted.toLocaleString()}  color="info" />
+          <StatCard icon={PhoneIncoming}  label="Answered (INV/200/ACK)" value={answered.toLocaleString()}   color={answered > 0 ? 'success' : 'default'} />
+          <StatCard icon={CheckCircle2}   label="Completed (BYE/200)"  value={completed.toLocaleString()}  color="success" />
+          <StatCard icon={PhoneMissed}    label="Failed"               value={failed.toLocaleString()}     color={failed > 0 ? 'danger' : 'default'} />
         </div>
-        <div className="grid grid-cols-3 gap-3">
-          <StatCard icon={Clock}     label="Avg PDD"       value={avgPdd != null ? `${avgPdd.toFixed(0)} ms` : '—'}  color="default" />
-          <StatCard icon={PhoneOff}  label="Avg Hold"      value={avgHold != null ? `${(avgHold / 1000).toFixed(1)} s` : '—'} color="default" />
-          <StatCard icon={Clock}     label="Total Duration" value={durationLabel} color="default" />
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard icon={Zap}        label="ASR"            value={`${asr.toFixed(1)}%`}         color={asr >= 95 ? 'success' : asr >= 80 ? 'warning' : 'danger'} />
+          <StatCard icon={Clock}      label="Avg PDD"        value={avgPdd != null ? `${avgPdd.toFixed(0)} ms` : '—'}  color="default" />
+          <StatCard icon={PhoneOff}   label="Avg Hold"       value={avgHold != null ? `${(avgHold / 1000).toFixed(1)} s` : '—'} color="default" />
+          <StatCard icon={Clock}      label="Total Duration" value={durationLabel} color="default" />
         </div>
       </div>
 

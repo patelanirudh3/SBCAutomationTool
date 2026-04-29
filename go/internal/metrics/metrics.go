@@ -31,6 +31,7 @@ type TrafficMetrics struct {
 	CPSActual        float64            `json:"cps_actual"`
 	ConcurrentCalls  int                `json:"concurrent_calls"`
 	CallsAttempted   int                `json:"calls_attempted"`
+	CallsAnswered    int                `json:"calls_answered"`
 	CallsCompleted   int                `json:"calls_completed"`
 	CallsFailed      int                `json:"calls_failed"`
 	ASR              float64            `json:"asr"`
@@ -61,7 +62,13 @@ type CallResultData struct {
 	Caller           string
 	Callee           string
 	Success          bool
-	FailureReason    string
+	// Answered indicates the full INV/200/ACK three-way handshake completed:
+	// for UAC legs, ACK was sent after receiving 200 OK; for UAS legs, ACK
+	// was received from the caller. A call can be Answered=true and
+	// Success=false if the call was answered but media or BYE handshake
+	// failed afterwards.
+	Answered      bool
+	FailureReason string
 	PDDMs            float64
 	HoldMs           float64
 	TotalMs          float64
@@ -98,6 +105,7 @@ type MetricsCollector struct {
 	interval time.Duration
 
 	callsAttempted int
+	callsAnswered  int
 	callsCompleted int
 	callsFailed    int
 
@@ -257,6 +265,10 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 	c.callResults = append(c.callResults, result)
 	c.callsAttempted++
 
+	if result.Answered {
+		c.callsAnswered++
+	}
+
 	if result.Success {
 		c.callsCompleted++
 		if result.PDDMs > 0 {
@@ -302,6 +314,7 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"caller":              r.Caller,
 			"callee":              r.Callee,
 			"success":             r.Success,
+			"answered":            r.Answered,
 			"failure_reason":      r.FailureReason,
 			"pdd_ms":             r.PDDMs,
 			"hold_ms":            r.HoldMs,
@@ -376,6 +389,7 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"peer_ext":            cr.PeerExt,
 			"direction":           direction,
 			"result":              ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+			"answered":           cr.Answered,
 			"failure_reason":      nilIfEmpty(cr.FailureReason),
 			"pdd_ms":             cr.PDDMs,
 			"hold_ms":            cr.HoldMs,
@@ -494,6 +508,7 @@ func (c *MetricsCollector) Reset() {
 	defer c.mu.Unlock()
 
 	c.callsAttempted = 0
+	c.callsAnswered = 0
 	c.callsCompleted = 0
 	c.callsFailed = 0
 	c.pddSamples = nil
@@ -585,6 +600,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CPSActual:       math.Round(cpsActual*1000) / 1000,
 		ConcurrentCalls: concurrent,
 		CallsAttempted:  c.callsAttempted,
+		CallsAnswered:   c.callsAnswered,
 		CallsCompleted:  c.callsCompleted,
 		CallsFailed:     c.callsFailed,
 		ASR:             math.Round(asr*100) / 100,
@@ -1294,6 +1310,7 @@ func BuildMux(
 				"peer_ext":            cr.PeerExt,
 				"direction":           direction,
 				"result":              ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+				"answered":           cr.Answered,
 				"failure_reason":      nilIfEmpty(cr.FailureReason),
 				"pdd_ms":             cr.PDDMs,
 				"hold_ms":            cr.HoldMs,

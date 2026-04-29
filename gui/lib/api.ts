@@ -211,6 +211,7 @@ export function buildAggregate(
   startedAt: string
 ): import('@/types').AggregateMetrics {
   const attempted = uacEvents.length
+  const answered = uacEvents.filter((e) => e.answered === true).length
   const completed = uacEvents.filter((e) => e.result === 'COMPLETED').length
   const failed = attempted - completed
   return {
@@ -218,6 +219,7 @@ export function buildAggregate(
     started_at: startedAt,
     ended_at: new Date().toISOString(),
     total_attempted: attempted,
+    total_answered: answered,
     total_completed: completed,
     total_failed: failed,
     aggregate_asr: attempted > 0 ? Math.round((completed / attempted) * 1000) / 10 : 0,

@@ -1046,7 +1046,12 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		Caller:           r.Caller,
 		Callee:           r.Callee,
 		Success:          r.Success,
-		FailureReason:    r.FailureReason,
+		// Answered = full INV/200/ACK three-way handshake completed.
+		// UAC leg: ACK was sent after receiving 200 OK (AckSentMs > 0).
+		// UAS leg: ACK was received from the caller (AckReceivedMs > 0).
+		// Either side indicates the call was answered by the called party.
+		Answered:      r.SipMilestones.AckSentMs > 0 || r.SipMilestones.AckReceivedMs > 0,
+		FailureReason: r.FailureReason,
 		PDDMs:            r.PDDMs,
 		HoldMs:           r.HoldMs,
 		TotalMs:          r.TotalMs,

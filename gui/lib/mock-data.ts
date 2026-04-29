@@ -61,6 +61,7 @@ export const MOCK_UAC_METRICS: TrafficMetrics = {
   cps_actual: 1.98,
   concurrent_calls: 8,
   calls_attempted: 20,
+  calls_answered: 19,
   calls_completed: 18,
   calls_failed: 2,
   asr: 90.0,
@@ -79,6 +80,7 @@ export const MOCK_UAC_METRICS: TrafficMetrics = {
 
 export const MOCK_AGGREGATE: AggregateMetrics = {
   total_attempted: 20,
+  total_answered: 19,
   total_completed: 18,
   total_failed: 2,
   aggregate_asr: 90.0,
@@ -105,6 +107,7 @@ function makeCall(
     uac_ext: uacExt,
     uas_ext: uasExt,
     result,
+    answered: result === 'COMPLETED' || failureReason !== '408 Request Timeout',
     failure_reason: failureReason,
     pdd_ms: 120 + Math.floor(Math.abs(Math.sin(idx) * 100)),
     hold_ms: result === 'COMPLETED' ? 10000 + idx * 50 : 0,

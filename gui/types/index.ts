@@ -126,6 +126,9 @@ export interface TrafficMetrics {
   cps_actual: number
   concurrent_calls: number
   calls_attempted: number
+  // calls_answered: count of calls that completed the INV/200/ACK three-way
+  // handshake (UAC sent ACK, or UAS received ACK). Always ≥ calls_completed.
+  calls_answered?: number
   calls_completed: number
   calls_failed: number
   asr: number
@@ -166,6 +169,10 @@ export interface CallEvent {
   peer_ext?: string
   direction?: 'uac' | 'uas'
   result: 'COMPLETED' | 'FAILED'
+  // answered: true if the INV/200/ACK three-way handshake completed
+  // (orthogonal to result — a call can be answered=true, result=FAILED if
+  // media or BYE handshake failed afterwards).
+  answered?: boolean
   failure_reason?: string
   pdd_ms: number
   hold_ms: number
@@ -186,6 +193,7 @@ export interface CallEvent {
 
 export interface AggregateMetrics {
   total_attempted: number
+  total_answered?: number
   total_completed: number
   total_failed: number
   aggregate_asr: number

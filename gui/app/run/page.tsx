@@ -259,6 +259,7 @@ function buildAggregateFromStore(): void {
 
   setAggregate({
     total_attempted: uacMetrics.calls_attempted,
+    total_answered: uacMetrics.calls_answered,
     total_completed: uacMetrics.calls_completed,
     total_failed: uacMetrics.calls_failed,
     aggregate_asr: uacMetrics.asr,
@@ -287,26 +288,60 @@ async function fetchAndStoreCallEvents(
     new Date(a.ts_utc ?? a.timestamp ?? 0).getTime() -
     new Date(b.ts_utc ?? b.timestamp ?? 0).getTime()
   )
-  if (allEvents.length === 0) return false
 
-  const { setCallEvents, setAggregate, uacMetrics } = useTrafficStore.getState()
-  setCallEvents(allEvents)
+  const { setCallEvents, setAggregate, uacMetrics, callEvents: existing } =
+    useTrafficStore.getState()
+
+  // Only update the store when the backend returned at least as many events
+  // as we already have. This prevents a transient empty/short response (e.g.
+  // engine restart, brief network blip) from clobbering a previously-fetched
+  // list — which used to leave `callEvents` stale relative to the metric
+  // counters and FailedCallsTable.
+  if (allEvents.length >= existing.length) {
+    setCallEvents(allEvents)
+  }
 
   if (isFinal) {
-    const { currentRunId, setCallSpines } = useTrafficStore.getState()
+    const { currentRunId, setCallSpines, callEvents: latest } =
+      useTrafficStore.getState()
     const runId = currentRunId || `run-${livePair.uac.vm_id ?? 'local'}-${Date.now()}`
     const startedAt = uacMetrics?.run_elapsed_seconds
       ? new Date(Date.now() - uacMetrics.run_elapsed_seconds * 1000).toISOString()
       : new Date().toISOString()
 
-    setAggregate(buildAggregate(uacCalls, [], runId, startedAt))
+    if (latest.length > 0) {
+      setAggregate(buildAggregate(latest, [], runId, startedAt))
+    }
 
-    // Fetch correlated call spines from engine backend
     const spines = await getCallSpinesFor(livePair.uac.vm_ip, livePair.uac.metrics_port)
     setCallSpines(spines)
   }
 
-  return true
+  return allEvents.length > 0
+}
+
+// Final-fetch wrapper with retries: when the engine has finished but the
+// /api/calls list looks short relative to calls_attempted, retry a few
+// times with a small delay so we don't fall back to metric counters
+// just because the engine is briefly slow to flush results.
+async function finalFetchCallEventsWithRetry(
+  livePair: { uac: { vm_ip: string; metrics_port: number; vm_id?: string } },
+  retries = 4,
+  delayMs = 750
+): Promise<boolean> {
+  let gotEvents = false
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    gotEvents = await fetchAndStoreCallEvents(livePair, true)
+    const { callEvents, uacMetrics } = useTrafficStore.getState()
+    const expected = uacMetrics?.calls_attempted ?? 0
+    // Done if we have at least as many events as the engine reported
+    // attempts, or we hit the retry budget.
+    if (callEvents.length >= expected || attempt === retries) {
+      return gotEvents
+    }
+    await new Promise((r) => setTimeout(r, delayMs))
+  }
+  return gotEvents
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +404,7 @@ export default function RunPage() {
           ...MOCK_AGGREGATE,
           run_id: runId,
           total_attempted: totalAttempted,
+          total_answered: MOCK_CALL_EVENTS.filter((e) => e.answered === true).length,
           total_completed: totalCompleted,
           total_failed: totalFailed,
           aggregate_asr:
@@ -491,19 +527,23 @@ export default function RunPage() {
     let intervalId: ReturnType<typeof setInterval> | null = null
     let consecutiveFailures = 0
     let completed = false
-    let callsFetched = false
 
     const finish = async (targetPhase: RunPhase) => {
       if (completed) return
       completed = true
       if (intervalId !== null) clearInterval(intervalId)
 
-      // Fetch call events one last time (isFinal=true builds aggregate from events)
-      const gotEvents = await fetchAndStoreCallEvents(livePair, true)
+      // Fetch call events one last time (isFinal=true builds aggregate from
+      // events); retry a few times so we don't fall back to metric counters
+      // just because the engine briefly returned a short list.
+      const gotEvents = await finalFetchCallEventsWithRetry(livePair)
 
-      // Fallback: if we couldn't reach backends for call events, build
-      // aggregate from the last-known metrics snapshot
-      if (!gotEvents) {
+      // Fallback: if we couldn't reach the backend for call events at all,
+      // build aggregate from the last-known metrics snapshot. This keeps
+      // the report populated even when the engine is unreachable, but the
+      // FailedCallsTable may be empty in that case.
+      const { callEvents } = useTrafficStore.getState()
+      if (!gotEvents && callEvents.length === 0) {
         buildAggregateFromStore()
       }
 
@@ -520,13 +560,16 @@ export default function RunPage() {
         updateUACMetrics(uacResult)
         const uacPhase = (uacResult as unknown as { phase: string }).phase ?? ''
 
-        // Continuously fetch call events while backend is alive
+        // Refresh call events on every poll while traffic is alive so the
+        // FailedCallsTable, Answered/Completed counts, and Failed counts
+        // all stay in sync with the engine. The fetcher tolerates empty
+        // responses without dropping a previously-fetched list.
         const currentPhase = useTrafficStore.getState().phase
         if (
-          !callsFetched &&
-          (currentPhase === 'TRAFFIC' || uacPhase === 'TRAFFIC' || uacPhase === 'STOPPING' || uacPhase === 'DONE')
+          currentPhase === 'TRAFFIC' || uacPhase === 'TRAFFIC' ||
+          uacPhase === 'STOPPING' || uacPhase === 'DONE'
         ) {
-          callsFetched = await fetchAndStoreCallEvents(livePair)
+          await fetchAndStoreCallEvents(livePair)
         }
 
         if (uacPhase) {
