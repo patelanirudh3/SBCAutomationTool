@@ -4,13 +4,12 @@ import { useEffect, useCallback, useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { AlertTriangle, Play, ArrowRight, Users, CheckCircle2, XCircle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Progress } from '@/components/ui/progress'
 import { useTrafficStore } from '@/store/traffic'
 import { getMetricsFor, startPrePhaseFor, startTrafficFor, startTestFor, resetTestFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 // How often to poll metrics during pre-phase
-const POLL_INTERVAL_MS = 2_000
+const POLL_INTERVAL_MS = 1_000
 
 // Pre-phase live metrics shape from backend
 interface PrePhaseMetrics {
@@ -23,17 +22,53 @@ interface PrePhaseMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// PoolCountBadge — shows idle / non-idle / reg-only counts
+// LayeredBar — dual-tone progress bar (green completed + amber partial)
+// ---------------------------------------------------------------------------
+
+function LayeredBar({
+  completed,
+  partial = 0,
+  className,
+}: {
+  completed: number   // 0-100 green (fully done)
+  partial?: number    // 0-100 amber (partial / reg-only)
+  className?: string
+}) {
+  return (
+    <div className={cn('relative h-2 w-full overflow-hidden rounded-full bg-slate-700', className)}>
+      {/* green segment */}
+      <div
+        className="absolute inset-y-0 left-0 bg-emerald-500 transition-all duration-500 ease-out"
+        style={{ width: `${Math.min(completed, 100)}%` }}
+      />
+      {/* amber segment (starts where green ends) */}
+      {partial > 0 && (
+        <div
+          className="absolute inset-y-0 bg-amber-500/80 transition-all duration-500 ease-out"
+          style={{
+            left:  `${Math.min(completed, 100)}%`,
+            width: `${Math.min(partial, 100 - completed)}%`,
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// CountBadge — shows a single pool-count metric
 // ---------------------------------------------------------------------------
 
 function CountBadge({
   label,
   value,
   color,
+  pulsing = false,
 }: {
   label: string
   value: number
   color: 'emerald' | 'amber' | 'slate' | 'rose'
+  pulsing?: boolean
 }) {
   const cls = {
     emerald: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
@@ -43,11 +78,25 @@ function CountBadge({
   }[color]
 
   return (
-    <div className={cn('flex flex-col items-center rounded-lg border px-4 py-3', cls)}>
+    <div className={cn(
+      'flex flex-col items-center rounded-lg border px-4 py-3 transition-shadow',
+      cls,
+      pulsing && value > 0 && 'ring-1 ring-current/40 animate-pulse',
+    )}>
       <span className="text-2xl font-bold font-mono">{value}</span>
       <span className="mt-0.5 text-[11px] font-medium tracking-wide">{label}</span>
     </div>
   )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function formatElapsed(secs: number) {
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +112,6 @@ export function PrePhasePanel() {
     setPrePhaseStatus,
     setCurrentRunId,
     idleCount,
-    nonIdleCount,
     regOnlyCount,
     updateUACMetrics,
   } = useTrafficStore()
@@ -79,7 +127,6 @@ export function PrePhasePanel() {
   const [subCount, setSubCount] = useState(0)
   const [localIdleCount, setLocalIdleCount] = useState(0)
   const [localRegOnlyCount, setLocalRegOnlyCount] = useState(0)
-  const [localNonIdleCount, setLocalNonIdleCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [isStartingReg, setIsStartingReg] = useState(false)
   const [isStartingTraffic, setIsStartingTraffic] = useState(false)
@@ -89,15 +136,28 @@ export function PrePhasePanel() {
   const [engineCheckDone, setEngineCheckDone] = useState(false)
   const [isResetting, setIsResetting] = useState(false)
 
+  // Elapsed timer (counts up while reg/sub is in progress)
+  const [elapsed, setElapsed] = useState(0)
+
+  // Live reg/s rate
+  const [regRate, setRegRate] = useState(0)
+  const prevRegCountRef = useRef(0)
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const isMock  = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
-  // Sync pool counts from store (populated via WS metrics)
+  // Sync idle / reg-only counts from store (populated via WS metrics)
   useEffect(() => {
     setLocalIdleCount(idleCount)
-    setLocalNonIdleCount(nonIdleCount)
     setLocalRegOnlyCount(regOnlyCount)
-  }, [idleCount, nonIdleCount, regOnlyCount])
+  }, [idleCount, regOnlyCount])
+
+  // Elapsed timer — counts up while reg is in progress, freezes when done
+  useEffect(() => {
+    if (!regStarted || regDone) return
+    const id = setInterval(() => setElapsed(e => e + 1), 1000)
+    return () => clearInterval(id)
+  }, [regStarted, regDone])
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -124,16 +184,22 @@ export function PrePhasePanel() {
         // Feed into store so pool counts & phase badge stay current
         updateUACMetrics(m as Parameters<typeof updateUACMetrics>[0])
 
-        setRegCount(m.registered_count ?? 0)
+        const newReg = m.registered_count ?? 0
+        const delta = newReg - prevRegCountRef.current
+        const rate  = delta / (POLL_INTERVAL_MS / 1000)
+        prevRegCountRef.current = newReg
+        if (rate > 0) setRegRate(Math.round(rate * 10) / 10)
+
+        setRegCount(newReg)
         setSubCount(m.subscribed_count ?? 0)
         setLocalIdleCount(m.idle_count ?? 0)
         setLocalRegOnlyCount(m.reg_only_count ?? 0)
-        setLocalNonIdleCount(m.non_idle_count ?? 0)
 
         const phase = m.phase ?? ''
         if (phase === 'TRAFFIC_READY' || phase === 'TRAFFIC' || phase === 'CLEANUP_READY' || phase === 'DONE') {
           stopPolling()
           setRegDone(true)
+          setRegRate(0)
           setPhase('TRAFFIC_READY')
           setPrePhaseStatus({
             vm_id: pair?.uac.vm_id ?? 'traffic-local',
@@ -156,7 +222,6 @@ export function PrePhasePanel() {
 
   // ---------------------------------------------------------------------------
   // Pre-run engine state check — runs once on mount (live mode only)
-  // Ensures the backend is IDLE before the admin can start Reg/Sub
   // ---------------------------------------------------------------------------
 
   const checkEngineReady = useCallback(async () => {
@@ -169,8 +234,6 @@ export function PrePhasePanel() {
       const m = await getMetricsFor(vmIp, vmPort) as unknown as { phase?: string }
       setEnginePhase((m.phase ?? 'IDLE').toUpperCase())
     } catch {
-      // Cannot reach engine — treat as IDLE so the user gets the normal
-      // startTestFor error feedback when they click Reg/Sub
       setEnginePhase('IDLE')
     } finally {
       setEngineCheckDone(true)
@@ -228,6 +291,7 @@ export function PrePhasePanel() {
       if (reg >= n && sub >= n) {
         clearInterval(iv)
         setRegDone(true)
+        setRegRate(0)
         setLocalIdleCount(n)
         setLocalRegOnlyCount(0)
         setPhase('TRAFFIC_READY')
@@ -258,16 +322,13 @@ export function PrePhasePanel() {
     setIsStartingReg(true)
     setError(null)
 
-    // Generate run_id
     const pad = (x: number) => String(x).padStart(2, '0')
     const now = new Date()
     const runId = `run-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
     setCurrentRunId(runId)
 
     try {
-      // First, start the traffic engine (test/start) to launch the backend process
       await startTestFor(vmIp, vmPort, runId, pair?.pair_id ?? 'pair-1')
-      // Then signal prephase/start to begin registration
       await startPrePhaseFor(vmIp, vmPort)
       setRegStarted(true)
       setPhase('PRE_PHASE')
@@ -296,7 +357,6 @@ export function PrePhasePanel() {
     }
   }, [isStartingTraffic, vmIp, vmPort, setPhase, router])
 
-  // Mock mode: clicking Start Traffic navigates immediately
   const handleMockStartTraffic = useCallback(() => {
     setPhase('TRAFFIC')
     router.push('/run')
@@ -306,13 +366,22 @@ export function PrePhasePanel() {
   // Derived display values
   // ---------------------------------------------------------------------------
 
-  const displayIdle   = isMock ? localIdleCount   : (idleCount    > 0 ? idleCount    : localIdleCount)
-  const displayRegOnly= isMock ? localRegOnlyCount : (regOnlyCount > 0 ? regOnlyCount : localRegOnlyCount)
-  const displayNonIdle= isMock ? localNonIdleCount : (nonIdleCount > 0 ? nonIdleCount : localNonIdleCount)
+  const displayIdle    = isMock ? localIdleCount    : (idleCount    > 0 ? idleCount    : localIdleCount)
+  const displayRegOnly = isMock ? localRegOnlyCount : (regOnlyCount > 0 ? regOnlyCount : localRegOnlyCount)
+  const total          = Math.max(extCount, 1)
+
+  // "Pending" = extensions not yet registered (still queued or failed)
+  const displayPending = Math.max(0, total - regCount)
+
   const canStartTraffic = displayIdle >= 2
-  const total = Math.max(extCount, 1)
   const regPct = Math.round((regCount / total) * 100)
   const subPct = Math.round((subCount / total) * 100)
+
+  // Amber segment on the subscribe bar = reg-only (registered but not subscribed)
+  const subAmberPct = Math.round((displayRegOnly / total) * 100)
+
+  // Post-completion failed count (extensions that never made it to either pool)
+  const failedCount = regDone ? Math.max(0, total - regCount) : 0
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -330,7 +399,7 @@ export function PrePhasePanel() {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl space-y-6 px-6 py-8">
 
-          {/* ── Engine state warning — shown when backend is not IDLE ─ */}
+          {/* ── Engine state warning ───────────────────────────── */}
           {!regStarted && engineCheckDone && !engineIsReady && (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
               <div className="flex items-start gap-3">
@@ -402,11 +471,31 @@ export function PrePhasePanel() {
             </div>
           )}
 
-          {/* ── Progress bars ─────────────────────────────────── */}
+          {/* ── Registration Status card ──────────────────────── */}
           {regStarted && (
             <div className="space-y-4 rounded-xl border border-border bg-card p-5">
-              <h3 className="text-sm font-semibold text-foreground">Registration Progress</h3>
 
+              {/* card heading + elapsed timer + rate badge */}
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-foreground">Registration Status</h3>
+                <div className="flex items-center gap-2">
+                  {/* reg/s rate badge — only shown while in-progress */}
+                  {!regDone && regRate > 0 && (
+                    <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+                      {regRate} reg/s
+                    </span>
+                  )}
+                  {/* elapsed timer */}
+                  <span className={cn(
+                    'font-mono text-xs font-semibold tabular-nums',
+                    regDone ? 'text-emerald-400' : 'text-foreground/70',
+                  )}>
+                    {formatElapsed(elapsed)}
+                  </span>
+                </div>
+              </div>
+
+              {/* REGISTER row */}
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-muted-foreground">
                   <span>REGISTER</span>
@@ -417,9 +506,10 @@ export function PrePhasePanel() {
                     )}
                   </span>
                 </div>
-                <Progress value={regPct} className="h-2" />
+                <LayeredBar completed={regPct} />
               </div>
 
+              {/* SUBSCRIBE row */}
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-muted-foreground">
                   <span>SUBSCRIBE</span>
@@ -430,49 +520,77 @@ export function PrePhasePanel() {
                     )}
                   </span>
                 </div>
-                <Progress value={subPct} className="h-2" />
+                <LayeredBar completed={subPct} partial={subAmberPct} />
               </div>
+
             </div>
           )}
 
-          {/* ── Pool counts ───────────────────────────────────── */}
+          {/* ── Pool count badges ─────────────────────────────── */}
           {regStarted && (
             <div className="grid grid-cols-3 gap-3">
-              <CountBadge label="Idle (ready)" value={displayIdle}    color="emerald" />
-              <CountBadge label="Reg-only"     value={displayRegOnly} color="amber"   />
-              <CountBadge label="Active calls" value={displayNonIdle} color="slate"   />
+              <CountBadge
+                label="Ready for Traffic"
+                value={displayIdle}
+                color="emerald"
+                pulsing={!regDone}
+              />
+              <CountBadge
+                label="Reg w/o Sub"
+                value={displayRegOnly}
+                color="amber"
+                pulsing={!regDone}
+              />
+              <CountBadge
+                label="Pending"
+                value={displayPending}
+                color="slate"
+                pulsing={!regDone}
+              />
             </div>
           )}
 
           {/* ── Completion status ─────────────────────────────── */}
           {regDone && (
-            <div className={cn(
-              'flex items-start gap-3 rounded-lg border p-4',
-              canStartTraffic
-                ? 'border-emerald-500/30 bg-emerald-500/5'
-                : 'border-amber-500/30 bg-amber-500/5'
-            )}>
-              {canStartTraffic ? (
-                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-400" />
-              ) : (
-                <XCircle className="mt-0.5 size-4 shrink-0 text-amber-400" />
-              )}
-              <div>
-                <p className={cn(
-                  'text-sm font-semibold',
-                  canStartTraffic ? 'text-emerald-300' : 'text-amber-300'
-                )}>
-                  {canStartTraffic
-                    ? `${displayIdle} users in idle pool — ready for traffic`
-                    : `Only ${displayIdle} idle user${displayIdle === 1 ? '' : 's'} — need at least 2 to start traffic`
-                  }
-                </p>
-                {displayRegOnly > 0 && (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {displayRegOnly} user{displayRegOnly === 1 ? '' : 's'} registered but not subscribed (reg-only list).
-                  </p>
+            <div className="space-y-2">
+              <div className={cn(
+                'flex items-start gap-3 rounded-lg border p-4',
+                canStartTraffic
+                  ? 'border-emerald-500/30 bg-emerald-500/5'
+                  : 'border-amber-500/30 bg-amber-500/5'
+              )}>
+                {canStartTraffic ? (
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-400" />
+                ) : (
+                  <XCircle className="mt-0.5 size-4 shrink-0 text-amber-400" />
                 )}
+                <div>
+                  <p className={cn(
+                    'text-sm font-semibold',
+                    canStartTraffic ? 'text-emerald-300' : 'text-amber-300'
+                  )}>
+                    {canStartTraffic
+                      ? `${displayIdle} users in idle pool — ready for traffic`
+                      : `Only ${displayIdle} idle user${displayIdle === 1 ? '' : 's'} — need at least 2 to start traffic`
+                    }
+                  </p>
+                  {displayRegOnly > 0 && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {displayRegOnly} user{displayRegOnly === 1 ? '' : 's'} registered but not subscribed (reg w/o sub list).
+                    </p>
+                  )}
+                </div>
               </div>
+
+              {/* Failed count badge — only shown if some extensions never registered */}
+              {failedCount > 0 && (
+                <div className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 px-4 py-2.5">
+                  <XCircle className="size-3.5 shrink-0 text-rose-400" />
+                  <p className="text-xs text-rose-300">
+                    <span className="font-semibold">{failedCount}</span> extension{failedCount === 1 ? '' : 's'} failed to register.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
