@@ -1424,6 +1424,13 @@ func (a *ExtensionAgent) dispatchLoop() {
 			a.handlerMu.Lock()
 			queues := make([]chan string, len(a.handlers[eventCode]))
 			copy(queues, a.handlers[eventCode])
+			// Fan out to "_FINAL_FAIL" listeners for any 4xx/5xx/6xx
+			// (excluding 401/407 which have dedicated codes). This lets the
+			// CallEngine react to unsolicited final failures via a single
+			// wildcard handler instead of enumerating every possible code.
+			if sip.IsFinalFailureCode(eventCode) {
+				queues = append(queues, a.handlers["_FINAL_FAIL"]...)
+			}
 			if len(queues) == 0 {
 				if len(a.earlyResponses) >= maxEarlyResponses {
 					a.earlyResponses = a.earlyResponses[1:]
@@ -1590,7 +1597,11 @@ func (a *ExtensionAgent) WaitForSIPEvent(ctx context.Context, timeout time.Durat
 	a.handlerMu.Lock()
 	for i, msg := range a.earlyResponses {
 		for _, code := range codes {
-			if msg.code == code {
+			// Match either the exact bare code or the synthetic
+			// "_FINAL_FAIL" wildcard against any buffered 4xx/5xx/6xx
+			// (excluding 401/407 which use dedicated codes).
+			if msg.code == code ||
+				(code == "_FINAL_FAIL" && sip.IsFinalFailureCode(msg.code)) {
 				a.earlyResponses = append(a.earlyResponses[:i], a.earlyResponses[i+1:]...)
 				a.handlerMu.Unlock()
 				return msg.raw, nil

@@ -75,6 +75,29 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 	return method, raw
 }
 
+// IsFinalFailureCode returns true for a 3-digit SIP status code that is a
+// non-success final response not covered by an explicit handler — i.e. any
+// 4xx, 5xx, or 6xx response other than 401 and 407, which carry their own
+// dedicated event codes (e.g. "407_INVITE", "407_PRACK", "407_BYE").
+//
+// The CallEngine uses this together with the synthetic "_FINAL_FAIL"
+// wildcard event so that final-failure responses are processed via the
+// SendAckForFailure path (RFC 3261 §17.1.1.3) instead of timing out and
+// triggering an incorrect CANCEL.
+func IsFinalFailureCode(code string) bool {
+	if len(code) != 3 {
+		return false
+	}
+	if code == "401" || code == "407" {
+		return false
+	}
+	switch code[0] {
+	case '4', '5', '6':
+		return true
+	}
+	return false
+}
+
 func truncHead(s string, n int) string {
 	if len(s) <= n {
 		return s

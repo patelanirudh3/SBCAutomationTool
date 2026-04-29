@@ -263,6 +263,48 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 	var dialog *agent.DialogState
 
+	// sendCleanupOnTimeout sends the correct cleanup signal when an INVITE
+	// transaction times out without a final response.
+	//   - If a To-tag is present (180/183 received → early dialog established)
+	//     RFC 3261 says the dialog must be torn down with BYE.
+	//   - Otherwise (no provisional, or only 100) CANCEL is correct.
+	// CANCEL must NEVER be sent in response to a final failure (4xx/5xx/6xx)
+	// — those are handled by the dedicated final-failure paths via ACK.
+	sendCleanupOnTimeout := func() {
+		if dialog == nil {
+			return
+		}
+		if dialog.RemoteTag != "" && dialog.State != "INVITE_SENT" {
+			if err := ag.SendBye(dialog); err != nil {
+				slog.Warn("BYE send failed", "ext", ag.Ext, "call_id", callID, "err", err)
+			} else if e.metrics != nil {
+				e.metrics.IncrementSIPCounter("byes_sent")
+			}
+			return
+		}
+		if dialog.State == "INVITE_SENT" || dialog.State == "RINGING" || dialog.State == "PROVRESP_RCVD" {
+			if err := ag.SendCancel(dialog); err != nil {
+				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", err)
+			} else if e.metrics != nil {
+				e.metrics.IncrementSIPCounter("cancels_sent")
+			}
+		}
+	}
+
+	// tryHandleFinalFailure ACKs a final-failure response (4xx/5xx/6xx)
+	// per RFC 3261 §17.1.1.3 and returns true when the response was a
+	// non-401/407 final failure. The caller is then expected to fail the
+	// call cleanly without sending CANCEL.
+	tryHandleFinalFailure := func(raw string) (string, bool) {
+		code, _ := sip.ClassifyMessage(raw)
+		if !sip.IsFinalFailureCode(code) {
+			return code, false
+		}
+		ag.SendAckForFailure(dialog, raw)
+		emit("CALL_FAILED", atoi(code), 0, map[string]any{"reason": "final failure"})
+		return code, true
+	}
+
 	fail := func(reason string) CallResult {
 		e.callsFailed.Add(1)
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
@@ -355,17 +397,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	var raw200 string
 	got180 := false
 	for !got180 {
-		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407_INVITE", "200_INVITE")
+		raw, err := ag.WaitForSIPEvent(ctx, sipTimeout, "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
-			if dialog.State == "INVITE_SENT" || dialog.State == "RINGING" || dialog.State == "PROVRESP_RCVD" {
-				if err := ag.SendCancel(dialog); err != nil {
-					slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", err)
-				} else if e.metrics != nil {
-					e.metrics.IncrementSIPCounter("cancels_sent")
-				}
-			}
+			sendCleanupOnTimeout()
 			result := CallResult{
 				CallID: callID, Caller: ag.Ext, Callee: callee,
 				Success: false, FailureReason: "timeout",
@@ -427,19 +463,21 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		milestones.PrackSentMs = msSince(callStart)
 		emit("PRACK_SENT", 0, milestones.PrackSentMs, nil)
 
-		rawPrackResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "407_PRACK")
+		rawPrackResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "407_PRACK", "_FINAL_FAIL")
 		if err != nil {
-			if cerr := ag.SendCancel(dialog); cerr != nil {
-				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
-			} else if e.metrics != nil {
-				e.metrics.IncrementSIPCounter("cancels_sent")
-			}
+			sendCleanupOnTimeout()
 			result := fail("prack_200 timeout")
 			e.complete(result)
 			return
 		}
 
 		prackCode, _ := sip.ClassifyMessage(rawPrackResp)
+		if sip.IsFinalFailureCode(prackCode) {
+			tryHandleFinalFailure(rawPrackResp)
+			result := fail(fmt.Sprintf("Rejected with %s during PRACK", prackCode))
+			e.complete(result)
+			return
+		}
 		if prackCode == "407_PRACK" {
 			emit("PRACK_AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Prack(dialog, rawPrackResp); err != nil {
@@ -447,13 +485,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				e.complete(result)
 				return
 			}
-			if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK"); err != nil {
-				if cerr := ag.SendCancel(dialog); cerr != nil {
-					slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
-				} else if e.metrics != nil {
-					e.metrics.IncrementSIPCounter("cancels_sent")
-				}
+			rawPrackAuth, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "_FINAL_FAIL")
+			if err != nil {
+				sendCleanupOnTimeout()
 				result := fail("prack_200 timeout after auth")
+				e.complete(result)
+				return
+			}
+			if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
+				result := fail(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code))
 				e.complete(result)
 				return
 			}
@@ -466,14 +506,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
 	if raw200 == "" {
 		var err error
-		raw200, err = ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE")
+		raw200, err = ag.WaitForSIPEvent(ctx, sipTimeout, "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
-			if cerr := ag.SendCancel(dialog); cerr != nil {
-				slog.Warn("CANCEL send failed", "ext", ag.Ext, "call_id", callID, "err", cerr)
-			} else if e.metrics != nil {
-				e.metrics.IncrementSIPCounter("cancels_sent")
-			}
+			sendCleanupOnTimeout()
 			result := fail("200_invite timeout")
+			e.complete(result)
+			return
+		}
+		if code, handled := tryHandleFinalFailure(raw200); handled {
+			result := fail(fmt.Sprintf("Rejected with %s while awaiting 200 INVITE", code))
 			e.complete(result)
 			return
 		}
