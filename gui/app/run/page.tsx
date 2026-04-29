@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
-import { WifiOff, Loader2, Home, Users, AlertOctagon, CheckCircle2 } from 'lucide-react'
+import { WifiOff, Loader2, Home, AlertOctagon, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 import { Navbar } from '@/components/layout/Navbar'
@@ -24,7 +25,7 @@ import { FinalReport } from '@/components/postrun/FinalReport'
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor, resetTestFor } from '@/lib/api'
 import {
   MOCK_UAC_METRICS,
   MOCK_CALL_EVENTS,
@@ -61,14 +62,10 @@ function LiveDashboard({
   stopping,
   onGracefulStop,
   onInterruptStop,
-  onCleanup,
-  cleanupDone,
 }: {
   stopping: boolean
   onGracefulStop: () => void
   onInterruptStop: () => void
-  onCleanup: () => void
-  cleanupDone: boolean
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
@@ -98,7 +95,6 @@ function LiveDashboard({
   }
 
   const isTrafficPhase = phase === 'TRAFFIC'
-  const isCleanupReady = phase === 'CLEANUP_READY'
   const isStopping     = phase === 'STOPPING'
 
   return (
@@ -146,22 +142,6 @@ function LiveDashboard({
           </div>
         )}
 
-        {/* Cleanup button — shown when traffic is done, cleanup not yet started */}
-        {isCleanupReady && !cleanupDone && (
-          <button
-            onClick={onCleanup}
-            disabled={stopping}
-            className={cn(
-              'flex items-center gap-1.5 rounded-lg border px-4 py-2',
-              'border-sky-500/40 bg-sky-500/10 text-sky-300 text-sm font-semibold',
-              'hover:bg-sky-500/20 hover:text-sky-200 transition-colors',
-              'disabled:cursor-not-allowed disabled:opacity-50',
-            )}
-          >
-            {stopping ? <Loader2 className="size-4 animate-spin" /> : <Users className="size-4" />}
-            Unregister / Unsubscribe All
-          </button>
-        )}
       </div>
 
       {/* Pool counts row — shown whenever we have non-zero counts */}
@@ -334,14 +314,19 @@ async function fetchAndStoreCallEvents(
 // ---------------------------------------------------------------------------
 
 export default function RunPage() {
+  const router = useRouter()
   const phase = useTrafficStore((s) => s.phase)
   const wsStatus = useTrafficStore((s) => s.wsStatus)
   const pair = useTrafficStore((s) => s.pairs[s.activePairIndex])
-  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate } =
+  const uacMetrics = useTrafficStore((s) => s.uacMetrics)
+  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate, reset } =
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
   const [cleanupDone, setCleanupDone] = useState(false)
+  const [reRunning, setReRunning] = useState(false)
+  // Elapsed seconds frozen at the moment traffic stops (set once, never overwritten)
+  const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null)
 
   const mockTickRef = useRef(0)
   const mockUacRef = useRef<TrafficMetrics>(MOCK_UAC_METRICS)
@@ -406,8 +391,32 @@ export default function RunPage() {
   // Stop Traffic handlers (new phase-gated model)
   // ------------------------------------------------------------------
 
+  // Capture the elapsed time once traffic stops; never overwrite so it stays accurate
+  const prevPhaseRef = useRef<string>('')
+  useEffect(() => {
+    const prev = prevPhaseRef.current
+    prevPhaseRef.current = phase
+    const trafficPhases = new Set(['TRAFFIC', 'STOPPING'])
+    const postTrafficPhases = new Set(['CLEANUP_READY', 'COMPLETE', 'FAILED'])
+    if (trafficPhases.has(prev) && postTrafficPhases.has(phase) && frozenElapsed === null) {
+      const secs = uacMetrics?.run_elapsed_seconds ?? null
+      setFrozenElapsed(secs)
+    }
+  }, [phase, uacMetrics, frozenElapsed])
+
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
+
+  const handleReRun = async () => {
+    setReRunning(true)
+    try {
+      await resetTestFor(vmIp, vmPort)
+    } catch { /* ignore — backend may already be idle */ }
+    reset()
+    setFrozenElapsed(null)
+    setCleanupDone(false)
+    router.push('/launch')
+  }
 
   const handleGracefulStop = async () => {
     setStopping(true)
@@ -570,8 +579,12 @@ export default function RunPage() {
 
   const isPrePhase     = phase === 'PRE_PHASE'
   const isTrafficReady = phase === 'TRAFFIC_READY'
-  const isTraffic      = phase === 'TRAFFIC' || phase === 'STOPPING' || phase === 'CLEANUP_READY'
-  const isPostRun      = phase === 'COMPLETE' || phase === 'FAILED'
+  // LiveDashboard shows only during active traffic / stopping phase.
+  // CLEANUP_READY transitions immediately to the FinalReport.
+  const isTraffic      = phase === 'TRAFFIC' || phase === 'STOPPING'
+  // FinalReport surfaces as soon as traffic calls finish (CLEANUP_READY),
+  // and remains for COMPLETE and FAILED.
+  const isPostRun      = phase === 'CLEANUP_READY' || phase === 'COMPLETE' || phase === 'FAILED'
   const showReconnectBanner =
     !IS_MOCK &&
     isTraffic &&
@@ -667,8 +680,6 @@ export default function RunPage() {
                 stopping={stopping}
                 onGracefulStop={handleGracefulStop}
                 onInterruptStop={handleInterruptStop}
-                onCleanup={handleCleanup}
-                cleanupDone={cleanupDone}
               />
             </motion.div>
           )}
@@ -683,7 +694,14 @@ export default function RunPage() {
               transition={{ duration: 0.3 }}
               className="flex flex-col items-center"
             >
-              <FinalReport />
+              <FinalReport
+                frozenElapsed={frozenElapsed}
+                onUnregister={handleCleanup}
+                unregisterDone={cleanupDone}
+                unregistering={stopping}
+                onReRun={handleReRun}
+                reRunning={reRunning}
+              />
             </motion.div>
           )}
 

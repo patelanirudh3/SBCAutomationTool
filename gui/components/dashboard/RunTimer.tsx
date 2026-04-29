@@ -11,18 +11,28 @@ function formatElapsed(totalSeconds: number): string {
 
 interface RunTimerProps {
   elapsed: number
+  /** When true the timer shows a stopped/final indicator instead of live colour */
+  frozen?: boolean
   className?: string
 }
 
-export function RunTimer({ elapsed, className }: RunTimerProps) {
+export function RunTimer({ elapsed, frozen = false, className }: RunTimerProps) {
   return (
     <div className={cn('flex flex-col items-end gap-0.5 shrink-0', className)}>
       <span className="text-xs font-semibold tracking-widest uppercase text-foreground/70">
-        Run Time
+        {frozen ? 'Final Time' : 'Run Time'}
       </span>
-      <span className="font-mono text-3xl font-semibold tabular-nums text-foreground leading-none">
+      <span className={cn(
+        'font-mono text-3xl font-semibold tabular-nums leading-none',
+        frozen ? 'text-emerald-400' : 'text-foreground'
+      )}>
         {formatElapsed(elapsed)}
       </span>
+      {frozen && (
+        <span className="text-[10px] font-medium tracking-wide text-emerald-500/70 uppercase">
+          traffic complete
+        </span>
+      )}
     </div>
   )
 }

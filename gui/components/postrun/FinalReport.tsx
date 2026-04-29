@@ -1,7 +1,7 @@
 'use client'
 
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, Clock, Zap } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, Clock, Zap, Loader2, Users, RotateCcw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
@@ -70,7 +70,29 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 // FinalReport
 // ---------------------------------------------------------------------------
 
-export function FinalReport() {
+interface FinalReportProps {
+  /** Elapsed seconds captured at the moment traffic stopped — shown as Total Run Time */
+  frozenElapsed?: number | null
+  /** Called when user clicks Unregister / Unsubscribe */
+  onUnregister?: () => void
+  /** True once cleanup / unregister has completed */
+  unregisterDone?: boolean
+  /** True while an unregister/cleanup is in flight */
+  unregistering?: boolean
+  /** Called when user clicks Re-Run */
+  onReRun?: () => void
+  /** True while a re-run navigation is in progress */
+  reRunning?: boolean
+}
+
+export function FinalReport({
+  frozenElapsed,
+  onUnregister,
+  unregisterDone = false,
+  unregistering = false,
+  onReRun,
+  reRunning = false,
+}: FinalReportProps) {
   const phase         = useTrafficStore((s) => s.phase)
   const aggregate     = useTrafficStore((s) => s.aggregate)
   const callEvents    = useTrafficStore((s) => s.callEvents) as CallEvent[]
@@ -96,11 +118,14 @@ export function FinalReport() {
   const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
   const avgPdd     = uacMetrics?.avg_pdd_ms      ?? null
   const avgHold    = uacMetrics?.avg_hold_ms     ?? null
-  const elapsed    = uacMetrics?.run_elapsed_seconds ?? null
 
+  // Use the frozen snapshot; fall back to live metrics
+  const elapsed = frozenElapsed ?? uacMetrics?.run_elapsed_seconds ?? null
   const durationLabel = elapsed != null
     ? `${Math.floor(elapsed / 60)}m ${Math.floor(elapsed % 60)}s`
     : '—'
+
+  const isFailed = phase === 'FAILED'
 
   return (
     <motion.div
@@ -109,16 +134,67 @@ export function FinalReport() {
       transition={{ duration: 0.4 }}
       className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6"
     >
-      {/* Title */}
-      <div className="flex items-center gap-3">
-        {phase === 'FAILED' ? (
-          <XCircle className="size-6 text-rose-400" />
-        ) : (
-          <CheckCircle2 className="size-6 text-emerald-400" />
-        )}
-        <h1 className="text-xl font-bold text-slate-100">
-          {phase === 'FAILED' ? 'Run Failed' : 'Run Complete — Final Report'}
-        </h1>
+      {/* Title + action buttons row */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex items-center gap-3">
+          {isFailed ? (
+            <XCircle className="size-6 text-rose-400" />
+          ) : (
+            <CheckCircle2 className="size-6 text-emerald-400" />
+          )}
+          <h1 className="text-xl font-bold text-slate-100">
+            {isFailed ? 'Run Failed' : 'Run Complete — Final Report'}
+          </h1>
+        </div>
+
+        {/* Quick-action buttons */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Re-Run: restart traffic with existing registered extensions */}
+          {onReRun && (
+            <button
+              onClick={onReRun}
+              disabled={reRunning || unregistering}
+              className={cn(
+                'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
+                'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
+                'hover:bg-emerald-500/20 hover:text-emerald-200',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              )}
+            >
+              {reRunning
+                ? <Loader2 className="size-4 animate-spin" />
+                : <RotateCcw className="size-4" />}
+              Re-Run
+            </button>
+          )}
+
+          {/* Unregister: clean up registered extensions */}
+          {onUnregister && !unregisterDone && (
+            <button
+              onClick={onUnregister}
+              disabled={unregistering || reRunning}
+              className={cn(
+                'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
+                'border-sky-500/40 bg-sky-500/10 text-sky-300',
+                'hover:bg-sky-500/20 hover:text-sky-200',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              )}
+            >
+              {unregistering
+                ? <Loader2 className="size-4 animate-spin" />
+                : <Users className="size-4" />}
+              Unregister / Unsubscribe
+            </button>
+          )}
+
+          {/* Confirmed unregistered badge */}
+          {unregisterDone && (
+            <span className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-400">
+              <CheckCircle2 className="size-3.5" />
+              Unregistered
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Registration summary */}
