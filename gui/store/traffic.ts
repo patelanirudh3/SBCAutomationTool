@@ -13,28 +13,25 @@ import type {
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 // ---------------------------------------------------------------------------
-// Persist VM IPs across page reloads (localStorage — only vm_ip per side)
+// Persist full VM pair config across page reloads (localStorage)
 // ---------------------------------------------------------------------------
 
-const VM_IPS_KEY = 'cci-studio-vm-ips'
+const CONFIG_KEY = 'cci-studio-config'
 
-interface SavedVmIps { uac: string }
-
-function _loadVmIps(): SavedVmIps[] {
-  if (typeof window === 'undefined') return []
+function _loadConfig(): VMPair[] | null {
+  if (typeof window === 'undefined') return null
   try {
-    const raw = window.localStorage.getItem(VM_IPS_KEY)
-    return raw ? JSON.parse(raw) : []
-  } catch { return [] }
+    const raw = window.localStorage.getItem(CONFIG_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as VMPair[]) : null
+  } catch { return null }
 }
 
-function _saveVmIps(pairs: VMPair[]): void {
+function _saveConfig(pairs: VMPair[]): void {
   if (typeof window === 'undefined') return
   try {
-    const data: SavedVmIps[] = pairs.map(p => ({
-      uac: p.uac.vm_ip,
-    }))
-    window.localStorage.setItem(VM_IPS_KEY, JSON.stringify(data))
+    window.localStorage.setItem(CONFIG_KEY, JSON.stringify(pairs))
   } catch { /* localStorage unavailable */ }
 }
 
@@ -142,8 +139,8 @@ interface TrafficStore {
   chatPanelOpen: boolean
   setChatPanelOpen: (open: boolean) => void
 
-  // Hydrate persisted VM IPs from localStorage (call after mount to avoid SSR mismatch)
-  hydrateVmIps: () => void
+  // Hydrate persisted config from localStorage (call after mount to avoid SSR mismatch)
+  hydrateConfig: () => void
 
   // Reset
   reset: () => void
@@ -183,7 +180,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     set((state) => {
       const pairs = [...state.pairs]
       pairs[index] = pair
-      _saveVmIps(pairs)
+      _saveConfig(pairs)
       return { pairs }
     }),
 
@@ -238,20 +235,17 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
 
   setChatPanelOpen: (open) => set({ chatPanelOpen: open }),
 
-  hydrateVmIps: () => {
-    const saved = _loadVmIps()
-    if (!saved.length) return
-    const current = get().pairs
-    const pairs = current.map((p, i) => {
-      const ips = saved[i]
-      if (!ips) return p
-      if (p.uac.vm_ip === ips.uac) return p
-      return {
-        ...p,
-        uac: { ...p.uac, vm_ip: ips.uac },
-      }
-    })
-    set({ pairs })
+  hydrateConfig: () => {
+    const saved = _loadConfig()
+    if (!saved?.length) return
+    // Merge saved pairs with defaults to handle any new fields added since last save
+    const merged = saved.map((sp) => ({
+      ...makePair(0),
+      ...sp,
+      uac: { ...makeDefaultConfig(sp.uac?.vm_id ?? 'traffic-local', sp.uac?.metrics_port ?? 8082), ...sp.uac },
+      advancedSettings: { ...DEFAULT_ADVANCED_SETTINGS, ...(sp.advancedSettings ?? {}) },
+    }))
+    set({ pairs: merged })
   },
 
   reset: () => {

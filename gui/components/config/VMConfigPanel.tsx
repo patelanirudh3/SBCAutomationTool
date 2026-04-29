@@ -16,7 +16,7 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { Loader2, CheckCircle, XCircle, Signal } from 'lucide-react'
+import { Loader2, CheckCircle, XCircle, Signal, RotateCcw } from 'lucide-react'
 import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -69,18 +69,42 @@ export interface VMConfigPanelProps {
   warnings: Record<string, string>
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
+  onResetSection: (fields: (keyof RawVMFormValues)[]) => void
 }
+
+// Fields belonging to each logical section — used by per-section Reset buttons
+const SECTION_FIELDS = {
+  identity:       ['vm_id'] as (keyof RawVMFormValues)[],
+  agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path'] as (keyof RawVMFormValues)[],
+  sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
+                   'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers'] as (keyof RawVMFormValues)[],
+  extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps'] as (keyof RawVMFormValues)[],
+  call_traffic:   ['cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
+  media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
+} as const
 
 // ---------------------------------------------------------------------------
 // Local sub-components
 // ---------------------------------------------------------------------------
 
-function SectionHeader({ children }: { children: ReactNode }) {
+function SectionHeader({ children, onReset }: { children: ReactNode; onReset?: () => void }) {
   return (
     <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-foreground">
       <span className="h-4 w-0.5 shrink-0 rounded-full bg-emerald-500" />
       {children}
       <span className="h-px flex-1 bg-border" />
+      {onReset && (
+        <button
+          type="button"
+          onClick={onReset}
+          className="flex items-center gap-1 text-[10px] normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
+          title="Reset section to defaults"
+        >
+          <RotateCcw className="size-3" />
+          Reset
+        </button>
+      )}
     </h3>
   )
 }
@@ -288,6 +312,7 @@ export function VMConfigPanel({
   warnings,
   reachability,
   onCheckReachability,
+  onResetSection,
 }: VMConfigPanelProps) {
   const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
@@ -313,7 +338,7 @@ export function VMConfigPanel({
 
       {/* ── Identity ──────────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Identity</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.identity)}>Identity</SectionHeader>
         <FormField label="VM ID" error={e('vm_id')}>
           <Input
             value={raw.vm_id}
@@ -327,7 +352,7 @@ export function VMConfigPanel({
 
       {/* ── Traffic Agent Host ───────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Traffic Agent Host</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.agent_host)}>Traffic Agent Host</SectionHeader>
         <div className="grid grid-cols-2 gap-3">
           <FormField label="IP Address" error={e('vm_ip')}>
             <Input
@@ -392,7 +417,7 @@ export function VMConfigPanel({
 
       {/* ── Remote SIP Server ─────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Remote SIP Server</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
         <FieldHint>Target SBC, SIP proxy, or any SIP server receiving calls.</FieldHint>
 
         <div className="grid grid-cols-2 gap-3">
@@ -522,7 +547,7 @@ export function VMConfigPanel({
 
       {/* ── Extension Pool ────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Extension Pool</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.extension_pool)}>Extension Pool</SectionHeader>
         <div className="flex items-center justify-between">
           <span className="text-[11px] font-semibold text-slate-200">SIP Extension Range</span>
           {extCount > 0 && (
@@ -570,7 +595,7 @@ export function VMConfigPanel({
 
       {/* ── Registration & Subscription ───────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Registration &amp; Subscription</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.registration)}>Registration &amp; Subscription</SectionHeader>
         <div className="grid grid-cols-2 gap-3">
           <FormField label="REGISTER Expires (s)" error={e('register_expires')}
             hint="Expiry in REGISTER messages (default 3600)">
@@ -619,7 +644,7 @@ export function VMConfigPanel({
 
       {/* ── Call Traffic ──────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Call Traffic</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.call_traffic)}>Call Traffic</SectionHeader>
 
         {/* Bidirectional CPS / BHCC */}
         <CpsBhccField
@@ -674,7 +699,7 @@ export function VMConfigPanel({
 
       {/* ── Media (RTP) ───────────────────────────────────────── */}
       <div className="space-y-3">
-        <SectionHeader>Media (RTP)</SectionHeader>
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.media)}>Media (RTP)</SectionHeader>
 
         <div className={cn(
           'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',

@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Loader2,
+  Trash2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
@@ -65,6 +66,48 @@ const UA_FIELDS = [
   'cps', 'hold_time_seconds', 'metrics_port', 'traffic_mode', 'call_count',
   'duration_hours',
 ]
+
+// ---------------------------------------------------------------------------
+// pairToRaw — restores saved VMPair.uac back into form string values
+// ---------------------------------------------------------------------------
+
+function pairToRaw(p: VMPair): RawVMFormValues {
+  const u = p.uac
+  const extStart = u.ext_start ?? parseInt(DEFAULTS.ext_start)
+  const extEnd   = u.ext_end   ?? parseInt(DEFAULTS.ext_end)
+  return {
+    vm_id:              u.vm_id            ?? DEFAULTS.vm_id,
+    vm_ip:              u.vm_ip            ?? DEFAULTS.vm_ip,
+    ssh_user:           u.ssh_user         ?? '',
+    ssh_key_path:       u.ssh_key_path     ?? '',
+    ext_start:          String(extStart),
+    ext_end:            String(extEnd),
+    ext_count:          String(Math.max(extEnd - extStart + 1, 0)),
+    register_expires:   String(u.register_expires   ?? parseInt(DEFAULTS.register_expires)),
+    subscribe_expires:  String(u.subscribe_expires  ?? parseInt(DEFAULTS.subscribe_expires)),
+    register_rate_cps:  String(u.register_rate_cps  ?? parseFloat(DEFAULTS.register_rate_cps)),
+    sbc_host:           u.sbc_host         ?? DEFAULTS.sbc_host,
+    sbc_port:           String(u.sbc_port  ?? parseInt(DEFAULTS.sbc_port)),
+    secondary_host:     u.secondary_host   ?? '',
+    secondary_port:     String(u.secondary_port ?? parseInt(DEFAULTS.secondary_port)),
+    failover_enabled:   u.failover_enabled ?? false,
+    dns_servers:        u.dns_servers      ?? '',
+    sip_transport:      u.sip_transport    ?? 'TCP',
+    sip_scheme:         (u.sip_scheme      ?? 'SIP') as SipScheme,
+    domain:             u.domain           ?? DEFAULTS.domain,
+    sip_password:       u.sip_password     ?? DEFAULTS.sip_password,
+    cps:                String(u.cps               ?? parseFloat(DEFAULTS.cps)),
+    hold_time_seconds:  String(u.hold_time_seconds ?? parseFloat(DEFAULTS.hold_time_seconds)),
+    media_enabled:      u.media_enabled    ?? true,
+    rtp_codec:          (u.rtp_codec       ?? 'G711_ULAW') as RtpCodec,
+    rtp_ptime:          String(u.rtp_ptime ?? parseInt(DEFAULTS.rtp_ptime)),
+    metrics_port:       String(u.metrics_port ?? parseInt(DEFAULTS.metrics_port)),
+    traffic_mode:       u.traffic_mode     ?? 'smoke',
+    call_count:         String(u.call_count     ?? parseInt(DEFAULTS.call_count)),
+    duration_hours:     String(u.duration_hours ?? parseFloat(DEFAULTS.duration_hours)),
+    start_time_iso:     u.start_time_iso   ?? '',
+  }
+}
 
 // ---------------------------------------------------------------------------
 // parseRaw — converts string form values to typed VMConfig
@@ -156,7 +199,7 @@ function ConfigSummary({ raw }: { raw: RawVMFormValues }) {
 
 export function VMPairBook() {
   const router = useRouter()
-  const { updatePair, activePairIndex, pairs, hydrateVmIps } = useTrafficStore()
+  const { updatePair, activePairIndex, pairs, hydrateConfig } = useTrafficStore()
 
   const pair = pairs[activePairIndex]
   const [raw, setRaw] = useState<RawVMFormValues>(DEFAULTS)
@@ -167,16 +210,19 @@ export function VMPairBook() {
   const [configPushError, setConfigPushError] = useState<string | null>(null)
   const reachabilityTriggeredRef = useRef(false)
 
-  useEffect(() => { hydrateVmIps() }, [hydrateVmIps])
+  // Load full config from localStorage on first mount
+  useEffect(() => { hydrateConfig() }, [hydrateConfig])
 
-  // Restore persisted VM IP from store
+  // Restore form from saved pair after hydration (runs once per saved pair)
+  const hasHydratedFormRef = useRef(false)
   useEffect(() => {
+    if (hasHydratedFormRef.current) return
     const p = pairs[activePairIndex]
-    if (!p) return
-    if (p.uac.vm_ip !== DEFAULTS.vm_ip)
-      setRaw(prev => prev.vm_ip === p.uac.vm_ip ? prev : { ...prev, vm_ip: p.uac.vm_ip })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairs[activePairIndex]?.uac.vm_ip])
+    if (!p?.saved) return
+    hasHydratedFormRef.current = true
+    setRaw(pairToRaw(p))
+    setValidationPassed(true)
+  }, [pairs, activePairIndex])
 
   // Keep ext_count derived
   useEffect(() => {
@@ -203,8 +249,6 @@ export function VMPairBook() {
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [raw.vm_ip, raw.metrics_port, raw.vm_id])
-
-  useEffect(() => { setValidationPassed(false) }, [raw])
 
   const errors = useMemo(() => getErrors(raw), [raw])
   const warnings = useMemo(() => getFieldWarnings(raw), [raw])
@@ -235,10 +279,38 @@ export function VMPairBook() {
   }, [checkReachability])
 
   const handleChange = useCallback(
-    (field: keyof RawVMFormValues, value: string | boolean) =>
-      setRaw((prev) => ({ ...prev, [field]: value })),
+    (field: keyof RawVMFormValues, value: string | boolean) => {
+      setRaw((prev) => ({ ...prev, [field]: value }))
+      setValidationPassed(false)
+    },
     []
   )
+
+  const handleResetSection = useCallback(
+    (fields: (keyof RawVMFormValues)[]) => {
+      setRaw((prev) => {
+        const next = { ...prev }
+        for (const f of fields) {
+          (next as Record<string, unknown>)[f] = DEFAULTS[f]
+        }
+        return next
+      })
+      setTouched((prev) => {
+        const next = new Set(prev)
+        for (const f of fields) next.delete(f)
+        return next
+      })
+      setValidationPassed(false)
+    },
+    []
+  )
+
+  const handleClearAll = useCallback(() => {
+    setRaw(DEFAULTS)
+    setTouched(new Set())
+    setValidationPassed(false)
+  }, [])
+
   const handleBlur = useCallback(
     (field: string) => setTouched((prev) => new Set([...prev, field])),
     []
@@ -323,6 +395,7 @@ export function VMPairBook() {
                   onCheckReachability={() =>
                     checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)
                   }
+                  onResetSection={handleResetSection}
                 />
               </div>
 
@@ -344,6 +417,16 @@ export function VMPairBook() {
       <div className="border-t border-border bg-card">
         <div className="mx-auto flex max-w-[1440px] items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleClearAll}
+              className="gap-1.5 border-rose-500/30 text-rose-400 hover:bg-rose-500/10 hover:text-rose-300"
+              title="Clear all fields and reset to defaults"
+            >
+              <Trash2 className="size-3.5" />
+              Clear All
+            </Button>
             <Button variant="outline" size="sm" onClick={handleValidate}>
               Validate
             </Button>
