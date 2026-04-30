@@ -478,6 +478,10 @@ func shutdownCleanup(
 	runID, pairID, logDir string,
 	noUnregister bool,
 ) {
+	// Flip phase the instant cleanup starts so the GUI's polling/WS sees
+	// CLEANING_UP on the very next tick, before we drain calls or unregister.
+	collector.SetPhase("CLEANING_UP")
+
 	// Stop call engine (no-op if already stopped)
 	if eng != nil {
 		eng.Stop()
@@ -499,13 +503,16 @@ func shutdownCleanup(
 		waves := (len(agents) + concurrency - 1) / concurrency
 		outerTimeout := time.Duration(waves)*perExtTimeout + 10*time.Second
 
-		// Use all agents from pool for cleanup (idle + non-idle + reg-only)
 		var cleanupAgents []*agent.ExtensionAgent
 		if pool != nil {
 			cleanupAgents = pool.AllForCleanup()
 		} else {
 			cleanupAgents = agentsToSlice(agents)
 		}
+
+		// Seed the cleanup-status counters now that we know the agent set.
+		// Phase was already flipped to CLEANING_UP at the top of this fn.
+		collector.ResetCleanup(len(cleanupAgents))
 
 		slog.Info("Unregistering extensions",
 			"count", len(cleanupAgents),
@@ -524,9 +531,11 @@ func shutdownCleanup(
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				if err := a.Unregister(unregCtx); err != nil {
+				err := a.Unregister(unregCtx)
+				if err != nil {
 					slog.Debug("Unregister error", "ext", a.Ext, "err", err)
 				}
+				collector.IncrementCleanup(a.Ext, err == nil)
 			}(ag)
 		}
 		wg.Wait()
@@ -596,6 +605,13 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		"traffic_mode":       cfg.TrafficMode,
 	}
 
+	cleanupCount, cleanupTotal, cleanupFailed := collector.CleanupSnapshot()
+	cleanup := map[string]any{
+		"count":             cleanupCount,
+		"total":             cleanupTotal,
+		"failed_extensions": cleanupFailed,
+	}
+
 	output := map[string]any{
 		"generated_at":  time.Now().UTC().Format(time.RFC3339Nano),
 		"run_id":        runID,
@@ -606,6 +622,7 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		"config":        cfgMap,
 		"call_events":   callEvents,
 		"call_spines":   callSpines,
+		"cleanup":       cleanup,
 	}
 
 	data, err := json.MarshalIndent(output, "", "  ")

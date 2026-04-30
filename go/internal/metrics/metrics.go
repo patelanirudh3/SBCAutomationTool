@@ -53,6 +53,12 @@ type TrafficMetrics struct {
 	// InviteRetransmits counts UDP INVITE retransmissions triggered by
 	// RFC 3261 Timer A. Useful for diagnosing UDP packet loss / SBC stress.
 	InviteRetransmits int `json:"invite_retransmits"`
+	// Cleanup (unregister/unsubscribe) progress. Populated during the
+	// CLEANING_UP phase and frozen at completion so the GUI can render the
+	// final result strip after the engine moves to DONE.
+	CleanupCount    int      `json:"cleanup_count"`
+	CleanupTotal    int      `json:"cleanup_total"`
+	CleanupFailed   []string `json:"cleanup_failed,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +144,12 @@ type MetricsCollector struct {
 
 	rtpHealthCounts map[string]int
 
+	// Cleanup (unregister) progress, populated during shutdownCleanup so
+	// the GUI can render a live progress card and final failure list.
+	cleanupCount  int
+	cleanupTotal  int
+	cleanupFailed []string
+
 	// SIP message counters — UAC side
 	invitesSent       int
 	inviteRetransmits int
@@ -220,6 +232,37 @@ func (c *MetricsCollector) SetPhase(phase string) {
 	c.mu.Lock()
 	c.phase = phase
 	c.mu.Unlock()
+}
+
+// ResetCleanup clears any prior cleanup progress and seeds the total. Call
+// once at the start of shutdownCleanup so the GUI sees count=0/total=N
+// before the first IncrementCleanup arrives.
+func (c *MetricsCollector) ResetCleanup(total int) {
+	c.mu.Lock()
+	c.cleanupCount = 0
+	c.cleanupTotal = total
+	c.cleanupFailed = nil
+	c.mu.Unlock()
+}
+
+// IncrementCleanup records the result of a single Unregister attempt. ext is
+// the extension identifier used for the failed-list when ok is false.
+func (c *MetricsCollector) IncrementCleanup(ext string, ok bool) {
+	c.mu.Lock()
+	c.cleanupCount++
+	if !ok {
+		c.cleanupFailed = append(c.cleanupFailed, ext)
+	}
+	c.mu.Unlock()
+}
+
+// CleanupSnapshot returns the current cleanup progress (count, total, failed).
+func (c *MetricsCollector) CleanupSnapshot() (count, total int, failed []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.cleanupFailed))
+	copy(out, c.cleanupFailed)
+	return c.cleanupCount, c.cleanupTotal, out
 }
 
 // SetRunning updates the running flag and records the run start time.
@@ -544,6 +587,9 @@ func (c *MetricsCollector) Reset() {
 	c.acksReceived = 0
 	c.byesReceived = 0
 	c.bye200Sent = 0
+	c.cleanupCount = 0
+	c.cleanupTotal = 0
+	c.cleanupFailed = nil
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:      "unconfigured",
@@ -630,6 +676,12 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		NonIdleCount:      nonIdleCount,
 		RegOnlyCount:      regOnlyCount,
 		InviteRetransmits: c.inviteRetransmits,
+		CleanupCount:      c.cleanupCount,
+		CleanupTotal:      c.cleanupTotal,
+	}
+	if len(c.cleanupFailed) > 0 {
+		snap.CleanupFailed = make([]string, len(c.cleanupFailed))
+		copy(snap.CleanupFailed, c.cleanupFailed)
 	}
 	c.latest = snap
 	return snap
@@ -1458,6 +1510,22 @@ func BuildMux(
 		default:
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "cleanup already started or not ready"})
 		}
+	})
+
+	// GET /api/cleanup/status — live count/total + final failed-extension list.
+	// Phase semantics: CLEANING_UP → in progress; DONE/COMPLETE/FAILED with
+	// total > 0 → finished (failed array is the source of truth for retry).
+	mux.HandleFunc("GET /api/cleanup/status", func(w http.ResponseWriter, r *http.Request) {
+		count, total, failed := collector.CleanupSnapshot()
+		latest := collector.Latest()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"phase":             latest.Phase,
+			"count":             count,
+			"total":             total,
+			"failed_extensions": failed,
+			"in_progress":       latest.Phase == "CLEANING_UP",
+			"complete":          total > 0 && count >= total,
+		})
 	})
 
 	// POST /api/shutdown/graceful — drain in-flight calls then cleanup + exit

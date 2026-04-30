@@ -26,6 +26,7 @@ import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
 import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor, resetTestFor } from '@/lib/api'
+import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
 import {
   MOCK_UAC_METRICS,
   MOCK_CALL_EVENTS,
@@ -41,18 +42,10 @@ const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 // Both VM statuses are consulted; UAC drives the primary state
 // ---------------------------------------------------------------------------
 
-function mapBackendPhase(uacPhase: string): RunPhase {
-  // In the single-pool model, UAC is the sole authority for phase
-  const p = (uacPhase ?? '').toUpperCase()
-  if (p === 'FAILED') return 'FAILED'
-  if (p === 'TRAFFIC') return 'TRAFFIC'
-  if (p === 'STOPPING') return 'STOPPING'
-  if (p === 'CLEANUP_READY') return 'CLEANUP_READY'
-  if (p === 'TRAFFIC_READY') return 'TRAFFIC_READY'
-  if (p === 'PRE_PHASE' || p === 'PRE_REGISTER' || p === 'PRE_SUBSCRIBE') return 'PRE_PHASE'
-  if (p === 'DONE') return 'COMPLETE'
-  return 'IDLE'
-}
+// Re-export the shared mapper so existing call-sites in this file keep
+// working unchanged. The shared module is the single source of truth and
+// is also used by the Zustand store on every WS push.
+const mapBackendPhase = sharedMapBackendPhase
 
 // ---------------------------------------------------------------------------
 // Live Dashboard — Screen 3
@@ -354,14 +347,16 @@ export default function RunPage() {
   const wsStatus = useTrafficStore((s) => s.wsStatus)
   const pair = useTrafficStore((s) => s.pairs[s.activePairIndex])
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
-  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate, reset } =
+  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate, setCleanupStatus, reset } =
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
-  const [cleanupDone, setCleanupDone] = useState(false)
   const [reRunning, setReRunning] = useState(false)
   // Elapsed seconds frozen at the moment traffic stops (set once, never overwritten)
   const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null)
+  // Wall-clock start of the unregister phase (used to freeze
+  // cleanupStatus.elapsed_seconds at completion)
+  const cleanupStartedAtRef = useRef<number | null>(null)
 
   const mockTickRef = useRef(0)
   const mockUacRef = useRef<TrafficMetrics>(MOCK_UAC_METRICS)
@@ -433,12 +428,26 @@ export default function RunPage() {
     const prev = prevPhaseRef.current
     prevPhaseRef.current = phase
     const trafficPhases = new Set(['TRAFFIC', 'STOPPING'])
-    const postTrafficPhases = new Set(['CLEANUP_READY', 'COMPLETE', 'FAILED'])
+    const postTrafficPhases = new Set(['CLEANUP_READY', 'CLEANING_UP', 'COMPLETE', 'FAILED'])
     if (trafficPhases.has(prev) && postTrafficPhases.has(phase) && frozenElapsed === null) {
       const secs = uacMetrics?.run_elapsed_seconds ?? null
       setFrozenElapsed(secs)
     }
-  }, [phase, uacMetrics, frozenElapsed])
+
+    // Stamp the cleanup elapsed once the unregister loop completes so the
+    // result strip can render "(2.3s)" alongside the success message.
+    if (
+      prev === 'CLEANING_UP' &&
+      (phase === 'COMPLETE' || phase === 'FAILED') &&
+      cleanupStartedAtRef.current != null
+    ) {
+      const elapsed = (Date.now() - cleanupStartedAtRef.current) / 1000
+      const cur = useTrafficStore.getState().cleanupStatus
+      if (cur && cur.elapsed_seconds == null) {
+        setCleanupStatus({ ...cur, elapsed_seconds: Math.round(elapsed * 10) / 10, in_progress: false, complete: true })
+      }
+    }
+  }, [phase, uacMetrics, frozenElapsed, setCleanupStatus])
 
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
@@ -450,7 +459,7 @@ export default function RunPage() {
     } catch { /* ignore — backend may already be idle */ }
     reset()
     setFrozenElapsed(null)
-    setCleanupDone(false)
+    cleanupStartedAtRef.current = null
     router.push('/launch')
   }
 
@@ -488,17 +497,68 @@ export default function RunPage() {
 
   const handleCleanup = async () => {
     setStopping(true)
+    cleanupStartedAtRef.current = Date.now()
+    const extCount = pair ? (pair.uac.ext_end - pair.uac.ext_start + 1) : 0
+
+    // Seed cleanupStatus immediately so the progress card shows
+    // "Starting unregister… 0 / N" before the first metrics push arrives.
+    setCleanupStatus({
+      count: 0,
+      total: extCount > 0 ? extCount : 0,
+      failed_extensions: [],
+      in_progress: true,
+      complete: false,
+    })
+
     if (IS_MOCK) {
-      setPhase('COMPLETE')
-      setCleanupDone(true)
+      // Animate count up to total, then settle into COMPLETE.
+      setPhase('CLEANING_UP')
+      const total = extCount > 0 ? extCount : 10
+      let cur = 0
+      const id = setInterval(() => {
+        cur = Math.min(total, cur + Math.max(1, Math.ceil(total / 10)))
+        setCleanupStatus({
+          count: cur,
+          total,
+          failed_extensions: [],
+          in_progress: cur < total,
+          complete: cur >= total,
+        })
+        if (cur >= total) {
+          clearInterval(id)
+          setPhase('COMPLETE')
+        }
+      }, 250)
       setStopping(false)
       return
     }
     try {
       await startCleanupFor(vmIp, vmPort)
-      setCleanupDone(true)
-    } catch { /* ignore */ }
+      // Flip to CLEANING_UP optimistically so the progress card renders
+      // before the next metrics tick. The store will overwrite this with
+      // the real backend phase on the next WS push (still CLEANING_UP).
+      setPhase('CLEANING_UP')
+    } catch { /* backend will still run cleanup; polling will catch up */ }
     setStopping(false)
+  }
+
+  // Retry hook for the partial-failure / total-failure result strips.
+  // For now this re-issues /api/cleanup/start, which on a fresh DONE engine
+  // is a no-op (409). When the backend grows a "/api/unregister/retry"
+  // endpoint that accepts an extension list, swap it in here.
+  const handleRetryFailed = async (_extensions: string[]) => {
+    void _extensions
+    if (IS_MOCK) {
+      const cur = useTrafficStore.getState().cleanupStatus
+      if (!cur) return
+      setCleanupStatus({
+        ...cur,
+        failed_extensions: [],
+        complete: true,
+      })
+      return
+    }
+    try { await startCleanupFor(vmIp, vmPort) } catch { /* ignore */ }
   }
 
   // ------------------------------------------------------------------
@@ -594,7 +654,8 @@ export default function RunPage() {
           storePhase === 'TRAFFIC' ||
           storePhase === 'PRE_PHASE' ||
           storePhase === 'STOPPING' ||
-          storePhase === 'CLEANUP_READY'
+          storePhase === 'CLEANUP_READY' ||
+          storePhase === 'CLEANING_UP'
         )
       ) {
         await finish('COMPLETE')
@@ -631,8 +692,9 @@ export default function RunPage() {
   // CLEANUP_READY transitions immediately to the FinalReport.
   const isTraffic      = phase === 'TRAFFIC' || phase === 'STOPPING'
   // FinalReport surfaces as soon as traffic calls finish (CLEANUP_READY),
-  // and remains for COMPLETE and FAILED.
-  const isPostRun      = phase === 'CLEANUP_READY' || phase === 'COMPLETE' || phase === 'FAILED'
+  // remains while the user runs unregister (CLEANING_UP), and stays
+  // for COMPLETE / FAILED.
+  const isPostRun      = phase === 'CLEANUP_READY' || phase === 'CLEANING_UP' || phase === 'COMPLETE' || phase === 'FAILED'
   const showReconnectBanner =
     !IS_MOCK &&
     isTraffic &&
@@ -733,10 +795,10 @@ export default function RunPage() {
               <FinalReport
                 frozenElapsed={frozenElapsed}
                 onUnregister={handleCleanup}
-                unregisterDone={cleanupDone}
                 unregistering={stopping}
                 onReRun={handleReRun}
                 reRunning={reRunning}
+                onRetryFailed={handleRetryFailed}
               />
             </motion.div>
           )}

@@ -12,6 +12,7 @@ export type RunPhase =
   | 'TRAFFIC'
   | 'STOPPING'
   | 'CLEANUP_READY'
+  | 'CLEANING_UP'
   | 'COMPLETE'
   | 'DONE'
   | 'FAILED'
@@ -148,6 +149,25 @@ export interface TrafficMetrics {
   idle_count?: number
   non_idle_count?: number
   reg_only_count?: number
+  // Cleanup (unregister) progress, populated during CLEANING_UP and frozen
+  // at completion so the post-run UI can render the result strip.
+  cleanup_count?: number
+  cleanup_total?: number
+  cleanup_failed?: string[]
+}
+
+// CleanupStatus mirrors the backend GET /api/cleanup/status payload and the
+// cleanup_* fields on TrafficMetrics. Flat shape (count/total/failed)
+// chosen for symmetry with PrePhaseStatus.
+export interface CleanupStatus {
+  count: number
+  total: number
+  failed_extensions: string[]
+  in_progress: boolean
+  complete: boolean
+  // Wall-clock seconds the cleanup took. Set by the GUI when it observes
+  // the transition from CLEANING_UP → COMPLETE, so it survives a refresh.
+  elapsed_seconds?: number
 }
 
 export interface PrePhaseStatus {

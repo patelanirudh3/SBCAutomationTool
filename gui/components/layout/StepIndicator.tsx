@@ -22,7 +22,12 @@ function useCurrentStep(): number {
   const phase = useTrafficStore((s) => s.phase)
 
   if (pathname.startsWith('/run')) {
-    if (phase === 'COMPLETE' || phase === 'FAILED') return 3
+    // Step 4 ("Complete") activates as soon as traffic is done. While
+    // unregister is still running we keep step 3 ticked green and step 4
+    // active (animated ring) — only on COMPLETE/FAILED does step 4 itself
+    // get a green checkmark via the i < currentStep branch below.
+    if (phase === 'COMPLETE' || phase === 'FAILED') return 4
+    if (phase === 'CLEANUP_READY' || phase === 'CLEANING_UP') return 3
     return 2
   }
   if (pathname.startsWith('/launch')) return 1

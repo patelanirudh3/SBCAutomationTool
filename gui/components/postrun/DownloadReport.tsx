@@ -15,6 +15,7 @@ export function DownloadReport({ className }: DownloadReportProps) {
   const callEvents = useTrafficStore((s) => s.callEvents)
   const callSpines = useTrafficStore((s) => s.callSpines)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
+  const cleanupStatus = useTrafficStore((s) => s.cleanupStatus)
   const pairs = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
 
@@ -27,6 +28,7 @@ export function DownloadReport({ className }: DownloadReportProps) {
       config: pairs[activePairIndex],
       call_events: callEvents,
       call_spines: callSpines,
+      cleanup: cleanupStatus,
     }
 
     const blob = new Blob([JSON.stringify(report, null, 2)], {

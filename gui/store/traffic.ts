@@ -4,6 +4,7 @@ import type {
   RunMode,
   RunPhase,
   PrePhaseStatus,
+  CleanupStatus,
   TrafficMetrics,
   CallEvent,
   AggregateMetrics,
@@ -11,6 +12,7 @@ import type {
   AdvancedSettings,
 } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
+import { mapBackendPhase } from '@/lib/phase'
 
 // ---------------------------------------------------------------------------
 // Persist full VM pair config across page reloads (localStorage)
@@ -116,6 +118,11 @@ interface TrafficStore {
   prePhaseStatus: PrePhaseStatus | null
   setPrePhaseStatus: (s: PrePhaseStatus) => void
 
+  // Cleanup (unregister) progress — populated while phase === CLEANING_UP
+  // and frozen at completion so a refresh still shows the final result.
+  cleanupStatus: CleanupStatus | null
+  setCleanupStatus: (s: CleanupStatus | null) => void
+
   // Pool counts (from live metrics)
   idleCount: number
   nonIdleCount: number
@@ -160,6 +167,7 @@ const initialState = {
   reachability: {} as Record<string, ReachabilityStatus>,
   phase: 'IDLE' as RunPhase,
   prePhaseStatus: null,
+  cleanupStatus: null as CleanupStatus | null,
   idleCount: 0,
   nonIdleCount: 0,
   regOnlyCount: 0,
@@ -211,23 +219,52 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
 
   setPrePhaseStatus: (s) => set({ prePhaseStatus: s }),
 
+  setCleanupStatus: (s) => set({ cleanupStatus: s }),
+
   updateUACMetrics: (m) =>
-    set((state) => ({
-      uacMetrics: m,
-      phase: m.phase ?? state.phase,
-      idleCount: m.idle_count ?? state.idleCount,
-      nonIdleCount: m.non_idle_count ?? state.nonIdleCount,
-      regOnlyCount: m.reg_only_count ?? state.regOnlyCount,
-      metricsHistory: [
-        ...state.metricsHistory.slice(-59),
-        {
-          t: Date.now(),
-          asr: m.asr,
-          completed: m.calls_completed,
-          failed: m.calls_failed,
-        },
-      ],
-    })),
+    set((state) => {
+      // Always map raw backend phase through the normaliser so callers
+      // can't accidentally store a backend-only string (e.g. 'DONE') that
+      // the GUI's RunPhase-driven gates ignore.
+      const mappedPhase = m.phase ? mapBackendPhase(m.phase) : state.phase
+
+      // Mirror cleanup_count/total/failed onto the dedicated CleanupStatus
+      // slice so progress card / poller / final report all share one
+      // source of truth. Detect "complete" off the count here so the GUI
+      // is responsive even before the backend trips its own complete flag.
+      let cleanupStatus = state.cleanupStatus
+      const total = m.cleanup_total ?? 0
+      const count = m.cleanup_count ?? 0
+      if (total > 0 || count > 0 || (m.cleanup_failed?.length ?? 0) > 0) {
+        const failed = m.cleanup_failed ?? cleanupStatus?.failed_extensions ?? []
+        cleanupStatus = {
+          count,
+          total: Math.max(total, cleanupStatus?.total ?? 0),
+          failed_extensions: failed,
+          in_progress: mappedPhase === 'CLEANING_UP',
+          complete: total > 0 && count >= total,
+          elapsed_seconds: cleanupStatus?.elapsed_seconds,
+        }
+      }
+
+      return {
+        uacMetrics: m,
+        phase: mappedPhase,
+        idleCount: m.idle_count ?? state.idleCount,
+        nonIdleCount: m.non_idle_count ?? state.nonIdleCount,
+        regOnlyCount: m.reg_only_count ?? state.regOnlyCount,
+        cleanupStatus,
+        metricsHistory: [
+          ...state.metricsHistory.slice(-59),
+          {
+            t: Date.now(),
+            asr: m.asr,
+            completed: m.calls_completed,
+            failed: m.calls_failed,
+          },
+        ],
+      }
+    }),
 
   setWsStatus: (role, s) =>
     set((state) => ({

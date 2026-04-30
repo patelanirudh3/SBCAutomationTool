@@ -1,12 +1,13 @@
 'use client'
 
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Clock, Zap, Loader2, Users, RotateCcw } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Clock, Zap, Loader2, RotateCcw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
 import { MediaQosPanel } from '@/components/dashboard/MediaQosPanel'
 import { DownloadReport } from './DownloadReport'
+import { UnregisterProgressCard } from './UnregisterProgressCard'
 import type { CallEvent } from '@/types'
 
 // ---------------------------------------------------------------------------
@@ -73,25 +74,28 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 interface FinalReportProps {
   /** Elapsed seconds captured at the moment traffic stopped — shown as Total Run Time */
   frozenElapsed?: number | null
-  /** Called when user clicks Unregister / Unsubscribe */
+  /** Called when user clicks Unregister / Unsubscribe in the
+   *  UnregisterProgressCard (CLEANUP_READY phase). */
   onUnregister?: () => void
-  /** True once cleanup / unregister has completed */
-  unregisterDone?: boolean
-  /** True while an unregister/cleanup is in flight */
+  /** True while the start-cleanup POST is in flight. The card itself
+   *  drives all post-click visuals from `cleanupStatus` + phase. */
   unregistering?: boolean
-  /** Called when user clicks Re-Run */
+  /** Called when the user clicks Re-Run */
   onReRun?: () => void
   /** True while a re-run navigation is in progress */
   reRunning?: boolean
+  /** Optional retry hook — invoked from the result strip's
+   *  "Retry failed (n)" / "Retry all" buttons. */
+  onRetryFailed?: (extensions: string[]) => void
 }
 
 export function FinalReport({
   frozenElapsed,
   onUnregister,
-  unregisterDone = false,
   unregistering = false,
   onReRun,
   reRunning = false,
+  onRetryFailed,
 }: FinalReportProps) {
   const phase         = useTrafficStore((s) => s.phase)
   const aggregate     = useTrafficStore((s) => s.aggregate)
@@ -141,7 +145,7 @@ export function FinalReport({
       className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6"
     >
       {/* Title + action buttons row */}
-      <div className="flex items-center justify-between gap-4 flex-wrap">
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3">
           {isFailed ? (
             <XCircle className="size-6 text-rose-400" />
@@ -153,13 +157,13 @@ export function FinalReport({
           </h1>
         </div>
 
-        {/* Quick-action buttons */}
-        <div className="flex items-center gap-2 flex-wrap">
+        {/* Quick-action buttons + cleanup card */}
+        <div className="flex items-start gap-2 flex-wrap">
           {/* Re-Run: restart traffic with existing registered extensions */}
           {onReRun && (
             <button
               onClick={onReRun}
-              disabled={reRunning || unregistering}
+              disabled={reRunning || unregistering || phase === 'CLEANING_UP'}
               className={cn(
                 'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
                 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
@@ -174,32 +178,14 @@ export function FinalReport({
             </button>
           )}
 
-          {/* Unregister: clean up registered extensions */}
-          {onUnregister && !unregisterDone && (
-            <button
-              onClick={onUnregister}
-              disabled={unregistering || reRunning}
-              className={cn(
-                'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
-                'border-sky-500/40 bg-sky-500/10 text-sky-300',
-                'hover:bg-sky-500/20 hover:text-sky-200',
-                'disabled:cursor-not-allowed disabled:opacity-50',
-              )}
-            >
-              {unregistering
-                ? <Loader2 className="size-4 animate-spin" />
-                : <Users className="size-4" />}
-              Unregister / Unsubscribe
-            </button>
-          )}
-
-          {/* Confirmed unregistered badge */}
-          {unregisterDone && (
-            <span className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-400">
-              <CheckCircle2 className="size-3.5" />
-              Unregistered
-            </span>
-          )}
+          {/* Unregister card — renders idle button, live progress card,
+              or final result strip depending on phase + cleanupStatus. */}
+          <UnregisterProgressCard
+            starting={unregistering}
+            disabled={reRunning}
+            onUnregister={onUnregister}
+            onRetryFailed={onRetryFailed}
+          />
         </div>
       </div>
 
