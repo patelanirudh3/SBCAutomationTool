@@ -421,6 +421,92 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                 />
               </div>
 
+              {/* Full-width — Media QoS */}
+              <div className="border-t border-slate-700/30 pt-3 space-y-3">
+                <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-sky-300">
+                  <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-sky-400" />
+                  Media QoS
+                  <span className="h-px flex-1 bg-sky-400/30" />
+                </h3>
+
+                <div className="grid grid-cols-2 gap-x-8 gap-y-3">
+                  {/* qos_enabled toggle */}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs font-semibold text-slate-200/90">QoS Metrics</Label>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button type="button" className="text-sky-400/70 hover:text-sky-300 transition-colors">
+                            <Info className="size-3" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+                          Compute per-call interarrival jitter (RFC 3550), packet loss, and out-of-order counts.
+                          Adds negligible per-packet overhead and surfaces media-quality flags in reports.
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => setDraft((prev) => ({ ...prev, qos_enabled: !prev.qos_enabled }))}
+                      className={cn(
+                        'inline-flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                        draft.qos_enabled
+                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                          : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-sky-400/40',
+                        disabled && 'opacity-70 cursor-default',
+                      )}
+                    >
+                      <span className={cn(
+                        'inline-block size-3 rounded-sm border-2 transition-colors',
+                        draft.qos_enabled ? 'border-emerald-400 bg-emerald-400' : 'border-zinc-400 bg-transparent'
+                      )} />
+                      {draft.qos_enabled ? 'Enabled — jitter, loss, OOO tracked' : 'Disabled'}
+                    </button>
+                  </div>
+
+                  {/* qos_mos_estimation toggle */}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs font-semibold text-slate-200/90">MOS Estimation</Label>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button type="button" className="text-sky-400/70 hover:text-sky-300 transition-colors">
+                            <Info className="size-3" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+                          Compute Mean Opinion Score (1.0–4.5) per call using the simplified ITU-T G.107 E-Model
+                          for G.711. Approximation only — disable if customer reports require exact subjective scoring.
+                          Requires QoS Metrics enabled.
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={disabled || !draft.qos_enabled}
+                      onClick={() => setDraft((prev) => ({ ...prev, qos_mos_estimation: !prev.qos_mos_estimation }))}
+                      className={cn(
+                        'inline-flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                        draft.qos_mos_estimation && draft.qos_enabled
+                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                          : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-sky-400/40',
+                        (disabled || !draft.qos_enabled) && 'opacity-70 cursor-default',
+                      )}
+                    >
+                      <span className={cn(
+                        'inline-block size-3 rounded-sm border-2 transition-colors',
+                        draft.qos_mos_estimation && draft.qos_enabled ? 'border-emerald-400 bg-emerald-400' : 'border-zinc-400 bg-transparent'
+                      )} />
+                      {!draft.qos_enabled
+                        ? 'Requires QoS Metrics'
+                        : draft.qos_mos_estimation ? 'Enabled — MOS computed per call' : 'Disabled'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               {!isEditing && (
                 <div className="border-t border-slate-700/30 pt-2">
                   <TokenRow s={saved} />

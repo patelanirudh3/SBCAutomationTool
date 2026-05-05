@@ -203,8 +203,17 @@ function LiveDashboard({
       {/* Row 5 — Failed calls table */}
       <FailedCallsTable events={callEvents} />
 
-      {/* Row 6 — Media / QoS placeholder */}
-      <MediaQosPanel />
+      {/* Row 6 — Media / QoS metrics (Phase 1) */}
+      <MediaQosPanel
+        jitterMs={uacMetrics.avg_jitter_ms ?? null}
+        mosEstimate={uacMetrics.avg_mos_score ?? null}
+        qosScore={(() => {
+          const c = uacMetrics.media_quality_counts
+          if (!c) return null
+          const tracked = c.OK + c.WARNING + c.CRITICAL
+          return tracked > 0 ? (c.OK / tracked) * 100 : null
+        })()}
+      />
     </div>
   )
 }
