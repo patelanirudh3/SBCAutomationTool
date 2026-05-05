@@ -31,6 +31,8 @@ export interface AdvancedSettings {
   rtp_keepalive_interval: number       // default: 3
   metrics_interval: number             // default: 3 — reporting refresh cadence (seconds)
   rtp_pcap: boolean                    // default: false — capture RTP to pcap files
+  qos_enabled: boolean                 // default: true — track jitter, packet loss, OOO per call
+  qos_mos_estimation: boolean          // default: true — compute MOS score (G.711 R-factor approximation)
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -44,6 +46,8 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_keepalive_interval: 3,
   metrics_interval: 3,
   rtp_pcap: false,
+  qos_enabled: true,
+  qos_mos_estimation: true,
 }
 
 export interface VMConfig {
@@ -113,6 +117,12 @@ export interface VMConfig {
   call_count?: number
   duration_hours?: number
   start_time_iso?: string          // optional scheduled start (ISO 8601 UTC)
+
+  // QoS / Media metrics admin knobs (Phase 1).
+  // qos_enabled defaults to true on the backend; included here so the GUI
+  // can opt-out a customer who doesn't want media-quality computation.
+  qos_enabled?: boolean
+  qos_mos_estimation?: boolean
 }
 
 export interface VMPair {
@@ -154,6 +164,19 @@ export interface TrafficMetrics {
   cleanup_count?: number
   cleanup_total?: number
   cleanup_failed?: string[]
+
+  // QoS / Media aggregates (Phase 1) — averages over calls that produced
+  // non-zero values; media_quality_counts is a 4-bucket histogram analogous
+  // to RTPHealth (OK/WARNING/CRITICAL/UNKNOWN).
+  avg_jitter_ms?: number
+  avg_mos_score?: number
+  avg_packet_loss_pct?: number
+  media_quality_counts?: {
+    OK: number
+    WARNING: number
+    CRITICAL: number
+    UNKNOWN: number
+  }
 }
 
 // CleanupStatus mirrors the backend GET /api/cleanup/status payload and the
@@ -214,6 +237,23 @@ export interface CallEvent {
   sbc_rtp_relay_port?: number
   ts_utc?: string
   timestamp: string
+
+  // Phase-1 QoS / Media metrics (per-call). Zero / undefined means the
+  // metric was not produced for this call (no media, QoS disabled, or
+  // RTCP not received from the SBC).
+  jitter_ms?: number
+  packet_loss_pct?: number
+  lost_packets?: number
+  ooo_packets?: number
+  rtt_ms?: number
+  remote_jitter_ms?: number
+  remote_loss_pct?: number
+  mos_score?: number
+  media_quality_flag?: 'OK' | 'WARNING' | 'CRITICAL' | 'UNKNOWN'
+  call_setup_ms?: number
+  prack_rtt_ms?: number
+  sip_txn_rtt_ms?: number
+  bye_completion_ms?: number
 }
 
 export interface AggregateMetrics {
