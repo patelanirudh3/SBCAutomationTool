@@ -4,13 +4,25 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
+// sdpSessionCounter is incremented per BuildSDP call to guarantee uniqueness
+// even when two SDPs are generated within the same nanosecond on the same
+// host (e.g. burst of concurrent INVITEs at high CPS).
+var sdpSessionCounter uint64
+
 // BuildSDP builds a G.711 audio SDP for the given local host and RTP port.
+// The o= line carries a unique session-id derived from a process-local
+// monotonic timestamp combined with an atomic counter, satisfying RFC 4566
+// §5.2 ("the session id MUST be unique"). The session-version is fixed at 1
+// because we do not currently emit re-INVITEs that modify the SDP body.
 func BuildSDP(localHost string, rtpPort int) string {
+	sessID := uint64(time.Now().UnixNano()) ^ atomic.AddUint64(&sdpSessionCounter, 1)
 	return fmt.Sprintf(
 		"v=0\r\n"+
-			"o=- 0 0 IN IP4 %s\r\n"+
+			"o=- %d 1 IN IP4 %s\r\n"+
 			"s=-\r\n"+
 			"c=IN IP4 %s\r\n"+
 			"t=0 0\r\n"+
@@ -21,7 +33,7 @@ func BuildSDP(localHost string, rtpPort int) string {
 			"a=fmtp:101 0-15\r\n"+
 			"a=ptime:20\r\n"+
 			"a=sendrecv\r\n",
-		localHost, localHost, rtpPort,
+		sessID, localHost, localHost, rtpPort,
 	)
 }
 

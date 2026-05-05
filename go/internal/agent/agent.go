@@ -26,6 +26,13 @@ type DialogState struct {
 	LocalPort   int
 	RemoteTag   string
 	CSeq        int
+	// InviteCSeq is the CSeq sequence number of the (last) INVITE that
+	// established this dialog. It is set when the INVITE is sent (or when
+	// re-sent under 407 challenge in Handle407Invite) and is used by
+	// SendAck so the ACK CSeq matches the INVITE per RFC 3261 §13.2.2.4.
+	// Without this field SendAck would use dialog.CSeq, which has been
+	// incremented by intervening PRACK/BYE traffic.
+	InviteCSeq  int
 	RSeq        int
 	RouteSet    []string
 	RemoteTarget string
@@ -54,6 +61,21 @@ type DialogState struct {
 	AuthNonce        string
 	AuthRealm        string
 	AuthOpaque       string
+	// AuthNonceCount is the per-nonce request counter ("nc") required by
+	// RFC 2617 §3.3. It is reset to 0 whenever AuthNonce is replaced and
+	// incremented before each Proxy-Authorization is built so the wire
+	// values are 00000001, 00000002, ... for the same nonce.
+	AuthNonceCount int
+}
+
+// NextNCHex returns the next nonce-count value formatted as the 8-hex-digit
+// string required by RFC 2617 §3.2.2 ("nc-value = 8LHEX"). Each call
+// increments the in-memory counter; callers MUST use the return value in
+// exactly the request being built (no peeking, no caching). Reset by
+// assigning AuthNonce/AuthNonceCount when a fresh challenge arrives.
+func (d *DialogState) NextNCHex() string {
+	d.AuthNonceCount++
+	return fmt.Sprintf("%08x", d.AuthNonceCount)
 }
 
 // WildcardEvent is delivered to wildcard listeners.
@@ -114,6 +136,10 @@ type ExtensionAgent struct {
 	regOpaque      string // [FIX-4] echo opaque from 401 challenge
 	regCSeq        int
 	regGrantedExp  int // server-granted Expires from REGISTER 200 OK
+	// regNonceCount tracks the RFC 2617 §3.3 nonce-count for the active
+	// REGISTER nonce. Reset to 0 whenever regNonce is replaced; the
+	// helpers nextRegNC / resetRegNonce ensure increment-and-use semantics.
+	regNonceCount int
 
 	subCallID     string
 	subFromHeader string
@@ -123,6 +149,43 @@ type ExtensionAgent struct {
 	subRealm      string
 	subOpaque     string
 	subCSeq       int
+	// subNonceCount tracks the RFC 2617 §3.3 nonce-count for SUBSCRIBE.
+	subNonceCount int
+}
+
+// nextRegNC returns the next nonce-count for REGISTER digest auth as the
+// 8-hex-digit string required by RFC 2617 §3.2.2. Caller MUST use the
+// returned value in the request being built immediately.
+func (a *ExtensionAgent) nextRegNC() string {
+	a.regNonceCount++
+	return fmt.Sprintf("%08x", a.regNonceCount)
+}
+
+// resetRegNonce stores a fresh REGISTER nonce/realm/opaque from a 401
+// challenge and zeroes the nonce-count so the next nextRegNC() returns 1.
+func (a *ExtensionAgent) resetRegNonce(nonce, realm, opaque string) {
+	a.regNonce = nonce
+	if realm != "" {
+		a.regRealm = realm
+	}
+	a.regOpaque = opaque
+	a.regNonceCount = 0
+}
+
+// nextSubNC returns the next nonce-count for SUBSCRIBE digest auth.
+func (a *ExtensionAgent) nextSubNC() string {
+	a.subNonceCount++
+	return fmt.Sprintf("%08x", a.subNonceCount)
+}
+
+// resetSubNonce stores a fresh SUBSCRIBE nonce and zeroes the nc counter.
+func (a *ExtensionAgent) resetSubNonce(nonce, realm, opaque string) {
+	a.subNonce = nonce
+	if realm != "" {
+		a.subRealm = realm
+	}
+	a.subOpaque = opaque
+	a.subNonceCount = 0
 }
 
 // NewExtensionAgent creates a new agent for the given extension.
@@ -269,16 +332,14 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 
 	// eventCode == "401": build and send authenticated REGISTER.
 	challenge := sip.Parse401Challenge(raw)
-	a.regNonce = challenge.Nonce
-	a.regRealm = challenge.Realm
-	a.regOpaque = challenge.Opaque // [FIX-4]
+	a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque) // [FIX-4]
 	if a.regRealm == "" {
 		a.regRealm = a.Config.Domain
 	}
 
 	cnonce := sip.GenCNonce()
 	uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 
 	a.regCSeq = 2
 	authMsg := sip.CloneSipMessage(msg)
@@ -331,7 +392,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	if a.regNonce != "" {
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
@@ -350,15 +411,11 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	select {
 	case raw401 := <-ch401:
 		challenge := sip.Parse401Challenge(raw401)
-		a.regNonce = challenge.Nonce
-		a.regOpaque = challenge.Opaque
-		if challenge.Realm != "" {
-			a.regRealm = challenge.Realm
-		}
+		a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque)
 		a.regCSeq++
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		retryMsg := sip.CloneSipMessage(msg)
 		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
@@ -408,7 +465,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 	if a.regNonce != "" {
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
@@ -430,18 +487,14 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 		return nil
 	case raw401 := <-ch401:
 		challenge := sip.Parse401Challenge(raw401)
-		a.regNonce = challenge.Nonce
-		a.regOpaque = challenge.Opaque // [FIX-4]
-		if challenge.Realm != "" {
-			a.regRealm = challenge.Realm
-		}
+		a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque) // [FIX-4]
 		a.regCSeq++
 		retryMsg := sip.CloneSipMessage(msg)
 		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, "00000001", "auth", a.regOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		retryMsg.RemoveHeader(sip.HdrAuthorization)
 		retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
 		if err := a.Send(retryMsg, ""); err != nil {
@@ -503,6 +556,10 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 		if realm == "" {
 			realm = a.Config.Domain
 		}
+		// FlushRegister is fire-and-forget cleanup with a fresh local
+		// Call-ID/From-tag, NOT tied to the agent's active registration
+		// nonce sequence. nc=00000001 is correct here because this is the
+		// first (and only) request using this challenge nonce.
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "REGISTER", cnonce, "00000001", "auth", challenge.Opaque)
 		authMsg := sip.CloneSipMessage(msg)
 		authMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
@@ -584,13 +641,11 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 		if realm == "" {
 			realm = a.Config.Domain
 		}
-		a.subNonce = nonce
-		a.subRealm = realm
-		a.subOpaque = opaque
+		a.resetSubNonce(nonce, realm, opaque)
 
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", opaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", opaque)
 
 		cseq++
 		retryMsg := sip.CloneSipMessage(msg)
@@ -677,7 +732,7 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 	if a.subNonce != "" {
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.subRealm, a.subNonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", a.subOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.subRealm, a.subNonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", a.subOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
@@ -709,13 +764,11 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 		if realm == "" {
 			realm = a.Config.Domain
 		}
-		a.subNonce = nonce
-		a.subRealm = realm
-		a.subOpaque = opaque
+		a.resetSubNonce(nonce, realm, opaque)
 
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, "00000001", "auth", opaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", opaque)
 
 		a.subCSeq++
 		retryMsg := sip.CloneSipMessage(msg)
@@ -792,6 +845,7 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 		LocalHost:    a.localHost,
 		LocalPort:    a.localPort,
 		CSeq:         1,
+		InviteCSeq:   1,
 		State:        "INVITE_SENT",
 		InviteSentMs: float64(time.Now().UnixMilli()),
 		InviteMsg:    msg,
@@ -823,6 +877,9 @@ func (a *ExtensionAgent) RetransmitInvite(dialog *DialogState) error {
 // [FIX-2] buildProxyAuth computes a Proxy-Authorization header for proactive
 // in-dialog auth, reusing the nonce/realm stored from the initial 407 challenge.
 // Returns "" when the dialog has no stored credentials (e.g. Kamailio path).
+//
+// Per RFC 2617 §3.3 the nonce-count must increment on every reuse of the
+// same nonce, so we route through dialog.NextNCHex() rather than a literal.
 func (a *ExtensionAgent) buildProxyAuth(dialog *DialogState, method, uri string) string {
 	if !dialog.ProxyAuthEnabled {
 		return ""
@@ -831,7 +888,7 @@ func (a *ExtensionAgent) buildProxyAuth(dialog *DialogState, method, uri string)
 	return sip.CalcDigestResponse(
 		a.Ext, a.Config.SIPPassword,
 		dialog.AuthRealm, dialog.AuthNonce,
-		uri, method, cnonce, "00000001", "auth",
+		uri, method, cnonce, dialog.NextNCHex(), "auth",
 		dialog.AuthOpaque,
 	)
 }
@@ -891,7 +948,11 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>;tag=%s", dialog.RemoteExt, dialog.Domain, dialog.RemoteTag))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
-	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d ACK", dialog.CSeq))
+	// RFC 3261 §13.2.2.4: the ACK CSeq sequence number MUST equal the
+	// INVITE's CSeq sequence number (only the method differs). dialog.CSeq
+	// has been incremented by intervening PRACK; the authoritative INVITE
+	// CSeq is held in dialog.InviteCSeq.
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d ACK", dialog.InviteCSeq))
 	for _, route := range dialog.RouteSet {
 		msg.AddHeader(sip.HdrRoute, route)
 	}
@@ -1018,18 +1079,19 @@ func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, erro
 	remoteExt := invite.GetReqURIUserPart()
 
 	dialog := &DialogState{
-		CallID:    callID,
-		LocalTag:  localTag,
-		LocalExt:  a.Ext,
-		RemoteExt: remoteExt,
-		Domain:    a.Config.Domain,
-		Transport: a.Config.SIPTransport,
-		LocalHost: a.localHost,
-		LocalPort: a.localPort,
-		RemoteTag: remoteTag,
-		CSeq:      cseq,
-		State:     "INVITE_RCVD",
-		InviteMsg: invite,
+		CallID:     callID,
+		LocalTag:   localTag,
+		LocalExt:   a.Ext,
+		RemoteExt:  remoteExt,
+		Domain:     a.Config.Domain,
+		Transport:  a.Config.SIPTransport,
+		LocalHost:  a.localHost,
+		LocalPort:  a.localPort,
+		RemoteTag:  remoteTag,
+		CSeq:       cseq,
+		InviteCSeq: cseq,
+		State:      "INVITE_RCVD",
+		InviteMsg:  invite,
 		IsReliable: false,
 	}
 
@@ -1269,15 +1331,18 @@ func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) erro
 	if realm == "" {
 		realm = a.Config.Domain
 	}
-	// [FIX-2] Update stored auth state with fresh nonce from this 407
+	// [FIX-2] Update stored auth state with fresh nonce from this 407.
+	// Reset AuthNonceCount to 0 so the helper-driven nc starts at 1 on
+	// this new nonce per RFC 2617 §3.3.
 	dialog.ProxyAuthEnabled = true
 	dialog.AuthNonce = challenge.Nonce
 	dialog.AuthRealm = realm
 	dialog.AuthOpaque = challenge.Opaque
+	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
 	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, "00000001", "auth", challenge.Opaque)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	rackValue := fmt.Sprintf("%d %d INVITE", dialog.RSeq, dialog.CSeq-1)
 	dialog.CSeq++
@@ -1321,10 +1386,18 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
 	}
 
+	// Refresh stored auth state with the fresh nonce from this 407 so
+	// later requests in the dialog (none for BYE in practice, but kept
+	// for symmetry with Handle407Prack/Invite) honour the same counter.
+	dialog.AuthNonce = challenge.Nonce
+	dialog.AuthRealm = realm
+	dialog.AuthOpaque = challenge.Opaque
+	dialog.AuthNonceCount = 0
+
 	cnonce := sip.GenCNonce()
 	// [FIX-3] Use target (the BYE Request-URI) as digest uri per RFC 2617
 	// Revert FIX-3: change target back to fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, target, "BYE", cnonce, "00000001", "auth", challenge.Opaque)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, target, "BYE", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	msg := sip.NewSipMessage()
 	msg.SetRequestLine(fmt.Sprintf("BYE %s SIP/2.0", target))
@@ -1358,14 +1431,17 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 	}
 	// [FIX-2] Store auth state so subsequent in-dialog requests include
 	// Proxy-Authorization proactively (mirrors Python seniors' pattern).
+	// Reset AuthNonceCount to 0 so the helper-driven nc starts at 1 on
+	// this new nonce per RFC 2617 §3.3.
 	dialog.ProxyAuthEnabled = true
 	dialog.AuthNonce = challenge.Nonce
 	dialog.AuthRealm = realm
 	dialog.AuthOpaque = challenge.Opaque
+	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
 	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
-	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth", challenge.Opaque)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	if dialog.InviteMsg != nil {
 		// ACK must be sent BEFORE CSeq is incremented and Via is replaced,
@@ -1375,12 +1451,24 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 		}
 
 		dialog.CSeq++
+		// Track the CSeq of the INVITE we're about to re-send so the
+		// subsequent ACK to its 200 OK uses the matching CSeq per
+		// RFC 3261 §13.2.2.4 (regardless of any PRACK/BYE that bumps
+		// dialog.CSeq further).
+		dialog.InviteCSeq = dialog.CSeq
 		dialog.InviteMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d INVITE", dialog.CSeq))
 		dialog.InviteMsg.RemoveHeader(sip.HdrProxyAuthorization)
 		dialog.InviteMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 		dialog.InviteMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 
-		sdpBody := BuildSDP(a.localHost, rtpPort)
+		// Reuse the SDP built for the original INVITE so the 407 retry
+		// carries an identical o= session-id (RFC 4566 §5.2). Falling back
+		// to BuildSDP only if the dialog never stored one (defence in depth).
+		sdpBody := dialog.InviteSDP
+		if sdpBody == "" {
+			sdpBody = BuildSDP(a.localHost, rtpPort)
+			dialog.InviteSDP = sdpBody
+		}
 		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
 		return a.Send(dialog.InviteMsg, sdpBody)
 	}
