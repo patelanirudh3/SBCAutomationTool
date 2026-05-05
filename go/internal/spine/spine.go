@@ -118,9 +118,21 @@ func mapToSpineLeg(m map[string]any) SpineLeg {
 		effectiveRx = rxTotal
 	}
 
-	lossPct := 0.0
-	if tx > 0 {
+	// Prefer the RFC 3550-derived per-stream loss when available
+	// (Phase 1 QoS metrics). Fall back to the legacy asymmetry-style
+	// computation (|tx-rx|/tx) when the engine didn't emit packet_loss_pct.
+	lossPct := getFloat64Field(m, "packet_loss_pct")
+	if lossPct == 0 && tx > 0 {
 		lossPct = round1(math.Abs(float64(tx-effectiveRx)) / float64(tx) * 100)
+	} else {
+		lossPct = round1(lossPct)
+	}
+
+	// Phase 1: jitter — wire to the per-leg measurement when present.
+	var jitterMs *float64
+	if jv := getFloat64Field(m, "jitter_ms"); jv > 0 {
+		v := round1(jv)
+		jitterMs = &v
 	}
 
 	// Preserve sip_milestones raw JSON so field order is maintained in output.
@@ -153,6 +165,7 @@ func mapToSpineLeg(m map[string]any) SpineLeg {
 			MarkersSent:     getIntField(m, "markers_sent"),
 			MarkersReceived: getIntField(m, "markers_received"),
 			LossPct:         lossPct,
+			JitterMs:        jitterMs,
 		},
 		RTPLocalPort:    getIntField(m, "rtp_local_port"),
 		SBCRTPRelayIP:   getStrField(m, "sbc_rtp_relay_ip"),

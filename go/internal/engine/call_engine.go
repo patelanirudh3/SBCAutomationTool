@@ -355,6 +355,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
 
 		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv int
+		var lostPkts, oooPkts int
+		var jitterMs, packetLossPct, remoteJitter, remoteLoss, mosScore float64
 		var mediaOK bool
 		if rtpEP != nil {
 			st := rtpEP.Stats()
@@ -366,7 +368,18 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			markersSent = rtpEP.MarkersSent()
 			markersRecv = st.MarkersReceived
 			mediaOK = rtpRx > 0
+			jitterMs = math.Round(st.JitterMs*100) / 100
+			packetLossPct = math.Round(st.PacketLossPct*100) / 100
+			lostPkts = st.LostPackets
+			oooPkts = st.OOOPackets
+			remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
+			remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+			if cfg.IsQoSMOSEnabled() && mediaOK {
+				mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+			}
 		}
+		mediaQuality := ClassifyMediaQuality(jitterMs, packetLossPct, mosScore, mediaOK)
+		callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
 		sbcRelayIP, sbcRelayPort := "", 0
 		if dialog != nil {
 			sbcRelayIP = dialog.RTPRemoteIP
@@ -396,13 +409,26 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			TsUTC:            inviteTsUTC,
 			Direction:        "uac",
 			SipMilestones:    milestones,
+
+			JitterMs:            jitterMs,
+			PacketLossPct:       packetLossPct,
+			LostPackets:         lostPkts,
+			OOOPackets:          oooPkts,
+			RemoteJitterMs:      remoteJitter,
+			RemoteLossPct:       remoteLoss,
+			MOSScore:            mosScore,
+			MediaQualityFlag:    mediaQuality,
+			CallSetupMs:         callSetupMs,
+			PrackRTTMs:          prackRTTMs,
+			SipTransactionRTTMs: sipTxnRTTMs,
+			ByeCompletionMs:     byeCompletionMs,
 		}
 	}
 
 	// ── Allocate RTP endpoint ──────────────────────────────────────
 	if cfg.MediaEnabled {
 		var err error
-		rtpEP, err = rtp.NewRtpEndpoint(ag.LocalHost(), cfg.RTPPtime)
+		rtpEP, err = rtp.NewRtpEndpointWithOpts(ag.LocalHost(), cfg.RTPPtime, cfg.IsQoSEnabled())
 		if err != nil {
 			slog.Warn("RTP socket alloc failed — using port 9", "ext", ag.Ext, "err", err)
 		}
@@ -730,6 +756,31 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		"total_ms": math.Round(totalMs*100) / 100,
 	})
 
+	// ── QoS / Media metrics (Phase 1) ──────────────────────────────
+	var (
+		jitterMs      float64
+		packetLossPct float64
+		lostPackets   int
+		oooPackets    int
+		remoteJitter  float64
+		remoteLoss    float64
+		mosScore      float64
+	)
+	if rtpEP != nil {
+		st := rtpEP.Stats()
+		jitterMs = math.Round(st.JitterMs*100) / 100
+		packetLossPct = math.Round(st.PacketLossPct*100) / 100
+		lostPackets = st.LostPackets
+		oooPackets = st.OOOPackets
+		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
+		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		if cfg.IsQoSMOSEnabled() && mediaOK {
+			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+		}
+	}
+	mediaQuality := ClassifyMediaQuality(jitterMs, packetLossPct, mosScore, mediaOK)
+	callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
+
 	result := CallResult{
 		CallID:           callID,
 		Caller:           ag.Ext,
@@ -754,6 +805,20 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
 		MarkersSent:      markersSent,
 		MarkersReceived:  markersRecv,
+
+		JitterMs:         jitterMs,
+		PacketLossPct:    packetLossPct,
+		LostPackets:      lostPackets,
+		OOOPackets:       oooPackets,
+		RemoteJitterMs:   remoteJitter,
+		RemoteLossPct:    remoteLoss,
+		MOSScore:         mosScore,
+		MediaQualityFlag: mediaQuality,
+
+		CallSetupMs:         callSetupMs,
+		PrackRTTMs:          prackRTTMs,
+		SipTransactionRTTMs: sipTxnRTTMs,
+		ByeCompletionMs:     byeCompletionMs,
 	}
 	e.complete(result)
 }

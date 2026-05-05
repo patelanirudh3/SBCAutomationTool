@@ -90,6 +90,29 @@ type VMConfig struct {
 	ScenarioHoldDurationSeconds float64 `yaml:"scenario_hold_duration_seconds" json:"scenario_hold_duration_seconds"`
 	ScenarioPreHoldRTPSeconds   float64 `yaml:"scenario_pre_hold_rtp_seconds" json:"scenario_pre_hold_rtp_seconds"`
 	ScenarioPostHoldRTPSeconds  float64 `yaml:"scenario_post_hold_rtp_seconds" json:"scenario_post_hold_rtp_seconds"`
+
+	// QoS / Media metrics (Phase 1 — read-only computation).
+	// Pointers so the YAML decoder can distinguish "not set" (default-on)
+	// from "explicitly false" (admin opt-out). After ApplyDefaults runs both
+	// pointers are non-nil; use the IsQoS* helpers in callers.
+	QoSEnabled       *bool `yaml:"qos_enabled,omitempty" json:"qos_enabled,omitempty"`
+	QoSMOSEstimation *bool `yaml:"qos_mos_estimation,omitempty" json:"qos_mos_estimation,omitempty"`
+}
+
+// IsQoSEnabled reports whether the agent should compute jitter, packet loss,
+// and out-of-order metrics. Defaults to true when unset.
+func (c *VMConfig) IsQoSEnabled() bool {
+	return c.QoSEnabled == nil || *c.QoSEnabled
+}
+
+// IsQoSMOSEnabled reports whether MOS estimation should be computed for each
+// call. Defaults to true when unset; gated by IsQoSEnabled (no point computing
+// MOS without underlying jitter/loss data).
+func (c *VMConfig) IsQoSMOSEnabled() bool {
+	if !c.IsQoSEnabled() {
+		return false
+	}
+	return c.QoSMOSEstimation == nil || *c.QoSMOSEstimation
 }
 
 // ExtCount returns the total number of extensions in the configured range.
@@ -289,6 +312,16 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.Domain == "" {
 		cfg.Domain = "avaya.com"
+	}
+	// QoS / media metrics default to ON (Phase 1 is zero-risk read-only).
+	// Admins can opt out via qos_enabled: false in YAML or via the GUI.
+	if cfg.QoSEnabled == nil {
+		t := true
+		cfg.QoSEnabled = &t
+	}
+	if cfg.QoSMOSEstimation == nil {
+		t := true
+		cfg.QoSMOSEstimation = &t
 	}
 }
 

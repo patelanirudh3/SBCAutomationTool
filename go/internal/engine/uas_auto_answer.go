@@ -194,7 +194,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	// ── Allocate RTP endpoint ──────────────────────────────────────
 	if cfg.MediaEnabled {
 		var err error
-		rtpEP, err = rtp.NewRtpEndpoint(ag.LocalHost(), cfg.RTPPtime)
+		rtpEP, err = rtp.NewRtpEndpointWithOpts(ag.LocalHost(), cfg.RTPPtime, cfg.IsQoSEnabled())
 		if err != nil {
 			slog.Warn("RTP endpoint alloc failed — using port 9",
 				"ext", ag.Ext, "err", err)
@@ -353,6 +353,14 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		markersSent           int
 		markersRecv           int
 		mediaOK               bool
+
+		jitterMs     float64
+		packetLoss   float64
+		lostPkts     int
+		oooPkts      int
+		remoteJitter float64
+		remoteLoss   float64
+		mosScore     float64
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -364,6 +372,17 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		markersSent = rtpEP.MarkersSent()
 		markersRecv = st.MarkersReceived
 		mediaOK = rtpRx > 0
+
+		jitterMs = math.Round(st.JitterMs*100) / 100
+		packetLoss = math.Round(st.PacketLossPct*100) / 100
+		lostPkts = st.LostPackets
+		oooPkts = st.OOOPackets
+		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
+		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		if cfg.IsQoSMOSEnabled() && mediaOK {
+			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+		}
+
 		mediaEvent := ClassifyMedia(st, float64(cfg.HoldTimeSeconds))
 		emitCallEvent(u.metrics, callID, ag.Ext, mediaEvent, "uas", callerExt, 0, 0, map[string]any{
 			"rtp_tx_pkts":          rtpTx,
@@ -373,12 +392,18 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 			"rtcp_rx_pkts":         rtcpRx,
 			"markers_sent":         markersSent,
 			"markers_received":     markersRecv,
+			"jitter_ms":            jitterMs,
+			"packet_loss_pct":      packetLoss,
+			"mos_score":            mosScore,
 		})
 	}
 
 	if !cfg.MediaEnabled {
 		emit("MEDIA_DISABLED", 0, 0, nil)
 	}
+
+	mediaQuality := ClassifyMediaQuality(jitterMs, packetLoss, mosScore, mediaOK)
+	callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
 
 	totalMs := msSince(callStart)
 	result := CallResult{
@@ -403,6 +428,19 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
 		MarkersSent:      markersSent,
 		MarkersReceived:  markersRecv,
+
+		JitterMs:            jitterMs,
+		PacketLossPct:       packetLoss,
+		LostPackets:         lostPkts,
+		OOOPackets:          oooPkts,
+		RemoteJitterMs:      remoteJitter,
+		RemoteLossPct:       remoteLoss,
+		MOSScore:            mosScore,
+		MediaQualityFlag:    mediaQuality,
+		CallSetupMs:         callSetupMs,
+		PrackRTTMs:          prackRTTMs,
+		SipTransactionRTTMs: sipTxnRTTMs,
+		ByeCompletionMs:     byeCompletionMs,
 	}
 	emit("UAS_CALL_COMPLETE", 0, 0, map[string]any{
 		"total_ms": math.Round(totalMs*100) / 100,
@@ -435,6 +473,14 @@ func (u *UasAutoAnswer) handleTimeout(
 		markersSent           int
 		markersRecv           int
 		mediaOK               bool
+
+		jitterMs     float64
+		packetLoss   float64
+		lostPkts     int
+		oooPkts      int
+		remoteJitter float64
+		remoteLoss   float64
+		mosScore     float64
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -446,12 +492,23 @@ func (u *UasAutoAnswer) handleTimeout(
 		markersSent = rtpEP.MarkersSent()
 		markersRecv = st.MarkersReceived
 		mediaOK = rtpRx > 0
+		jitterMs = math.Round(st.JitterMs*100) / 100
+		packetLoss = math.Round(st.PacketLossPct*100) / 100
+		lostPkts = st.LostPackets
+		oooPkts = st.OOOPackets
+		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
+		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		if u.config.IsQoSMOSEnabled() && mediaOK {
+			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+		}
 	}
 	sbcRelayIP, sbcRelayPort := "", 0
 	if dialog != nil {
 		sbcRelayIP = dialog.RTPRemoteIP
 		sbcRelayPort = dialog.RTPRemotePort
 	}
+	mediaQuality := ClassifyMediaQuality(jitterMs, packetLoss, mosScore, mediaOK)
+	callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
 
 	result := CallResult{
 		CallID:           callID,
@@ -476,6 +533,19 @@ func (u *UasAutoAnswer) handleTimeout(
 		TsUTC:            uasInviteTsUTC,
 		Direction:        "uas",
 		SipMilestones:    milestones,
+
+		JitterMs:            jitterMs,
+		PacketLossPct:       packetLoss,
+		LostPackets:         lostPkts,
+		OOOPackets:          oooPkts,
+		RemoteJitterMs:      remoteJitter,
+		RemoteLossPct:       remoteLoss,
+		MOSScore:            mosScore,
+		MediaQualityFlag:    mediaQuality,
+		CallSetupMs:         callSetupMs,
+		PrackRTTMs:          prackRTTMs,
+		SipTransactionRTTMs: sipTxnRTTMs,
+		ByeCompletionMs:     byeCompletionMs,
 	}
 	u.complete(result)
 }

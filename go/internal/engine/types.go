@@ -71,6 +71,26 @@ type CallResult struct {
 	MarkersSent      int    `json:"markers_sent"`
 	MarkersReceived  int    `json:"markers_received"`
 	Scenario         string `json:"scenario"`
+
+	// QoS / Media metrics (Phase 1 — read-only).
+	// Populated by call_engine / uas_auto_answer from rtp.RtpStats and the
+	// engine's MOS estimator. Zero values mean the metric was not produced
+	// (e.g. QoS disabled, no RTP received, or RTCP not seen).
+	JitterMs         float64 `json:"jitter_ms"`
+	PacketLossPct    float64 `json:"packet_loss_pct"`
+	LostPackets      int     `json:"lost_packets"`
+	OOOPackets       int     `json:"ooo_packets"`
+	RTTMs            float64 `json:"rtt_ms"`           // from RTCP RR (LSR/DLSR), 0 if not available
+	RemoteJitterMs   float64 `json:"remote_jitter_ms"` // from RTCP RR
+	RemoteLossPct    float64 `json:"remote_loss_pct"`  // from RTCP RR fraction-lost
+	MOSScore         float64 `json:"mos_score"`        // 0 if MOS estimation disabled
+	MediaQualityFlag string  `json:"media_quality_flag"` // OK / WARNING / CRITICAL / UNKNOWN
+
+	// SIP-derived shortcuts computed from SipMilestones for direct GUI consumption.
+	CallSetupMs         float64 `json:"call_setup_ms"`         // Ok200Ms - InviteSentMs
+	PrackRTTMs          float64 `json:"prack_rtt_ms"`          // Prack200Ms - PrackSentMs
+	SipTransactionRTTMs float64 `json:"sip_txn_rtt_ms"`        // Trying100Ms - InviteSentMs (UAC path latency)
+	ByeCompletionMs     float64 `json:"bye_completion_ms"`     // Bye200Ms - ByeSentMs
 }
 
 // ClassifyMedia determines talk-path verification result from RTP receive
@@ -126,6 +146,113 @@ func ComputeRTPAsymmetryFlag(txPkts, rxFromSBC, rxTotal int) string {
 // msSince returns milliseconds elapsed since t using the monotonic clock.
 func msSince(t time.Time) float64 {
 	return float64(time.Since(t).Nanoseconds()) / 1e6
+}
+
+// ---------------------------------------------------------------------------
+// Media-quality thresholds (hardcoded for Phase 1; promote to config later)
+// ---------------------------------------------------------------------------
+
+const (
+	// JitterWarnMs / JitterCriticalMs match common ITU-T G.114 jitter buffer
+	// guidance for narrowband voice (G.711). Calls above the warn threshold
+	// are user-perceptible; above critical the call is unintelligible.
+	JitterWarnMs     = 30.0
+	JitterCriticalMs = 100.0
+
+	// PacketLoss thresholds expressed as percentages (0..100).
+	// G.711 with no PLC tolerates ~1%; sustained >5% is unacceptable.
+	PacketLossWarnPct     = 1.0
+	PacketLossCriticalPct = 5.0
+
+	// MOS thresholds — based on G.107 R-factor mapping. MOS is on a 1..5
+	// scale; <3.5 starts to be noticeably degraded, <2.5 is poor.
+	MOSWarnBelow     = 3.5
+	MOSCriticalBelow = 2.5
+)
+
+// ComputeMOS returns an estimated Mean Opinion Score using the simplified
+// ITU-T G.107 E-Model. The formula assumes a G.711 narrowband codec.
+// Inputs:
+//   packetLossFraction — 0.0 to 1.0 (NOT percentage)
+//   jitterMs           — interarrival jitter in milliseconds (RFC 3550)
+// Returns a MOS value clamped to [1.0, 4.5].
+//
+// This is an approximation; for production-grade reporting use a dedicated
+// E-Model library. It is intentionally conservative for traffic-test use
+// (slightly under-predicts vs. real subjective scoring).
+func ComputeMOS(packetLossFraction, jitterMs float64) float64 {
+	if packetLossFraction < 0 {
+		packetLossFraction = 0
+	}
+	if jitterMs < 0 {
+		jitterMs = 0
+	}
+	// Base R-factor for G.711 PCMU = 93.2.
+	R := 93.2
+	// Effective one-way latency: assume 50ms baseline + jitter buffer
+	// (~2.5x jitter is a typical playout-buffer rule of thumb).
+	effectiveLatency := 50.0 + jitterMs*2.5
+	if effectiveLatency > 177.3 {
+		R -= (effectiveLatency - 177.3) * 0.1
+	}
+	// Packet-loss impairment (logarithmic; G.711 has no built-in PLC).
+	R -= 17.0 * math.Log(1+100*packetLossFraction)
+
+	if R < 0 {
+		R = 0
+	}
+	if R > 100 {
+		R = 100
+	}
+	mos := 1.0 + 0.035*R + 7e-6*R*(R-60)*(100-R)
+	if mos < 1.0 {
+		mos = 1.0
+	}
+	if mos > 4.5 {
+		mos = 4.5
+	}
+	return math.Round(mos*100) / 100
+}
+
+// ClassifyMediaQuality returns "OK", "WARNING", "CRITICAL", or "UNKNOWN"
+// based on jitter, packet-loss, and (optionally) MOS thresholds. MOS is only
+// considered when mosScore > 0 (i.e. MOS estimation was enabled and the call
+// produced media). UNKNOWN is returned when there is no media data at all.
+func ClassifyMediaQuality(jitterMs, packetLossPct, mosScore float64, hadRTP bool) string {
+	if !hadRTP {
+		return "UNKNOWN"
+	}
+	if jitterMs >= JitterCriticalMs ||
+		packetLossPct >= PacketLossCriticalPct ||
+		(mosScore > 0 && mosScore < MOSCriticalBelow) {
+		return "CRITICAL"
+	}
+	if jitterMs >= JitterWarnMs ||
+		packetLossPct >= PacketLossWarnPct ||
+		(mosScore > 0 && mosScore < MOSWarnBelow) {
+		return "WARNING"
+	}
+	return "OK"
+}
+
+// DeriveSipTimings extracts the four SIP-derived helper metrics from a
+// SipMilestones block. Returns zeros for any leg whose milestone wasn't
+// recorded (e.g. UAS-side calls don't populate UAC-side fields and vice
+// versa). All return values are in milliseconds.
+func DeriveSipTimings(m SipMilestones) (callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs float64) {
+	if m.Ok200Ms > m.InviteSentMs {
+		callSetupMs = math.Round((m.Ok200Ms-m.InviteSentMs)*100) / 100
+	}
+	if m.Prack200Ms > m.PrackSentMs {
+		prackRTTMs = math.Round((m.Prack200Ms-m.PrackSentMs)*100) / 100
+	}
+	if m.Trying100Ms > m.InviteSentMs {
+		sipTxnRTTMs = math.Round((m.Trying100Ms-m.InviteSentMs)*100) / 100
+	}
+	if m.Bye200Ms > m.ByeSentMs {
+		byeCompletionMs = math.Round((m.Bye200Ms-m.ByeSentMs)*100) / 100
+	}
+	return
 }
 
 // callEvent is the JSON payload emitted for every significant call event.

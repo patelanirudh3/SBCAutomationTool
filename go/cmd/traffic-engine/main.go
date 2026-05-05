@@ -1089,6 +1089,21 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		MarkersSent:      r.MarkersSent,
 		MarkersReceived:  r.MarkersReceived,
 		Scenario:         r.Scenario,
+
+		// Phase-1 QoS metrics
+		JitterMs:            r.JitterMs,
+		PacketLossPct:       r.PacketLossPct,
+		LostPackets:         r.LostPackets,
+		OOOPackets:          r.OOOPackets,
+		RTTMs:               r.RTTMs,
+		RemoteJitterMs:      r.RemoteJitterMs,
+		RemoteLossPct:       r.RemoteLossPct,
+		MOSScore:            r.MOSScore,
+		MediaQualityFlag:    r.MediaQualityFlag,
+		CallSetupMs:         r.CallSetupMs,
+		PrackRTTMs:          r.PrackRTTMs,
+		SipTransactionRTTMs: r.SipTransactionRTTMs,
+		ByeCompletionMs:     r.ByeCompletionMs,
 	}
 	if raw, err := json.Marshal(r.SipMilestones); err == nil {
 		d.SipMilestones = raw

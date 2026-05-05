@@ -59,6 +59,15 @@ type TrafficMetrics struct {
 	CleanupCount    int      `json:"cleanup_count"`
 	CleanupTotal    int      `json:"cleanup_total"`
 	CleanupFailed   []string `json:"cleanup_failed,omitempty"`
+
+	// QoS / Media aggregate metrics (Phase 1).
+	// AvgJitterMs / AvgMOSScore are simple means over calls that produced
+	// a non-zero value (i.e. calls with at least 2 RTP packets). MediaQuality
+	// is a 3-bucket histogram analogous to RTPHealth.
+	AvgJitterMs        float64        `json:"avg_jitter_ms"`
+	AvgMOSScore        float64        `json:"avg_mos_score"`
+	AvgPacketLossPct   float64        `json:"avg_packet_loss_pct"`
+	MediaQualityCounts map[string]int `json:"media_quality_counts"`
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +108,23 @@ type CallResultData struct {
 	MarkersReceived  int
 	Scenario         string
 	SipMilestones    json.RawMessage
+
+	// QoS / Media metrics (Phase 1, mirrors engine.CallResult).
+	JitterMs         float64
+	PacketLossPct    float64
+	LostPackets      int
+	OOOPackets       int
+	RTTMs            float64
+	RemoteJitterMs   float64
+	RemoteLossPct    float64
+	MOSScore         float64
+	MediaQualityFlag string
+
+	// SIP-derived shortcuts.
+	CallSetupMs         float64
+	PrackRTTMs          float64
+	SipTransactionRTTMs float64
+	ByeCompletionMs     float64
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +170,14 @@ type MetricsCollector struct {
 
 	rtpHealthCounts map[string]int
 
+	// QoS aggregate state (Phase 1).
+	// Sample slices are appended only when the per-call value is non-zero
+	// so calls that didn't produce media don't drag the average down.
+	jitterSamples       []float64
+	mosSamples          []float64
+	packetLossSamples   []float64
+	mediaQualityCounts  map[string]int
+
 	// Cleanup (unregister) progress, populated during shutdownCleanup so
 	// the GUI can render a live progress card and final failure list.
 	cleanupCount  int
@@ -173,13 +207,14 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		metricsIntervalSec = 10
 	}
 	return &MetricsCollector{
-		vmID:            vmID,
-		interval:        time.Duration(metricsIntervalSec) * time.Second,
-		windowStart:     time.Now(),
-		phase:           "IDLE",
-		latest:          TrafficMetrics{VMID: vmID, Phase: "IDLE", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}},
-		rtpHealthCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
-		wsClients:       make(map[*websocket.Conn]struct{}),
+		vmID:               vmID,
+		interval:           time.Duration(metricsIntervalSec) * time.Second,
+		windowStart:        time.Now(),
+		phase:              "IDLE",
+		latest:             TrafficMetrics{VMID: vmID, Phase: "IDLE", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
+		rtpHealthCounts:    map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
+		mediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
+		wsClients:          make(map[*websocket.Conn]struct{}),
 	}
 }
 
@@ -338,6 +373,25 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 			c.rtpHealthCounts[result.RTPAsymmetryFlag]++
 		}
 	}
+
+	// QoS aggregation — only sample when the value is meaningful.
+	// JitterMs > 0 implies at least 2 RTP packets were received from the
+	// dominant SSRC; calls with no media contribute UNKNOWN to the bucket
+	// histogram but no sample to the average.
+	if result.JitterMs > 0 {
+		c.jitterSamples = append(c.jitterSamples, result.JitterMs)
+	}
+	if result.MOSScore > 0 {
+		c.mosSamples = append(c.mosSamples, result.MOSScore)
+	}
+	if result.PacketLossPct > 0 {
+		c.packetLossSamples = append(c.packetLossSamples, result.PacketLossPct)
+	}
+	if result.MediaQualityFlag != "" {
+		if _, ok := c.mediaQualityCounts[result.MediaQualityFlag]; ok {
+			c.mediaQualityCounts[result.MediaQualityFlag]++
+		}
+	}
 }
 
 // RecordAttempt increments the windowed attempt counter (for CPS calculation).
@@ -385,6 +439,20 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"markers_sent":         r.MarkersSent,
 			"markers_received":     r.MarkersReceived,
 			"scenario":             r.Scenario,
+			// Phase-1 QoS fields
+			"jitter_ms":            r.JitterMs,
+			"packet_loss_pct":      r.PacketLossPct,
+			"lost_packets":         r.LostPackets,
+			"ooo_packets":          r.OOOPackets,
+			"rtt_ms":               r.RTTMs,
+			"remote_jitter_ms":     r.RemoteJitterMs,
+			"remote_loss_pct":      r.RemoteLossPct,
+			"mos_score":            r.MOSScore,
+			"media_quality_flag":   r.MediaQualityFlag,
+			"call_setup_ms":        r.CallSetupMs,
+			"prack_rtt_ms":         r.PrackRTTMs,
+			"sip_txn_rtt_ms":       r.SipTransactionRTTMs,
+			"bye_completion_ms":    r.ByeCompletionMs,
 		}
 		if len(r.SipMilestones) > 0 {
 			m["sip_milestones"] = r.SipMilestones // json.RawMessage embeds as-is, preserving field order
@@ -455,6 +523,20 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
 			"ts_utc":              ts,
 			"timestamp":           ts,
+			// Phase-1 QoS fields
+			"jitter_ms":            cr.JitterMs,
+			"packet_loss_pct":      cr.PacketLossPct,
+			"lost_packets":         cr.LostPackets,
+			"ooo_packets":          cr.OOOPackets,
+			"rtt_ms":               cr.RTTMs,
+			"remote_jitter_ms":     cr.RemoteJitterMs,
+			"remote_loss_pct":      cr.RemoteLossPct,
+			"mos_score":            cr.MOSScore,
+			"media_quality_flag":   cr.MediaQualityFlag,
+			"call_setup_ms":        cr.CallSetupMs,
+			"prack_rtt_ms":         cr.PrackRTTMs,
+			"sip_txn_rtt_ms":       cr.SipTransactionRTTMs,
+			"bye_completion_ms":    cr.ByeCompletionMs,
 		}
 		out = append(out, m)
 	}
@@ -578,6 +660,10 @@ func (c *MetricsCollector) Reset() {
 	c.callSpines = nil
 	c.concurrentProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
+	c.mediaQualityCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}
+	c.jitterSamples = nil
+	c.mosSamples = nil
+	c.packetLossSamples = nil
 	c.invitesSent = 0
 	c.inviteRetransmits = 0
 	c.acksSent = 0
@@ -592,9 +678,10 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupFailed = nil
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
-		VMID:      "unconfigured",
-		Phase:     "IDLE",
-		RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
+		VMID:               "unconfigured",
+		Phase:              "IDLE",
+		RTPHealth:          map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
+		MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
 	}
 }
 
@@ -678,6 +765,16 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		InviteRetransmits: c.inviteRetransmits,
 		CleanupCount:      c.cleanupCount,
 		CleanupTotal:      c.cleanupTotal,
+
+		AvgJitterMs:      roundAvg(c.jitterSamples),
+		AvgMOSScore:      roundAvg(c.mosSamples),
+		AvgPacketLossPct: roundAvg(c.packetLossSamples),
+		MediaQualityCounts: map[string]int{
+			"OK":       c.mediaQualityCounts["OK"],
+			"WARNING":  c.mediaQualityCounts["WARNING"],
+			"CRITICAL": c.mediaQualityCounts["CRITICAL"],
+			"UNKNOWN":  c.mediaQualityCounts["UNKNOWN"],
+		},
 	}
 	if len(c.cleanupFailed) > 0 {
 		snap.CleanupFailed = make([]string, len(c.cleanupFailed))
@@ -1387,6 +1484,20 @@ func BuildMux(
 				"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
 				"ts_utc":              ts,
 				"timestamp":           ts,
+				// Phase-1 QoS fields
+				"jitter_ms":            cr.JitterMs,
+				"packet_loss_pct":      cr.PacketLossPct,
+				"lost_packets":         cr.LostPackets,
+				"ooo_packets":          cr.OOOPackets,
+				"rtt_ms":               cr.RTTMs,
+				"remote_jitter_ms":     cr.RemoteJitterMs,
+				"remote_loss_pct":      cr.RemoteLossPct,
+				"mos_score":            cr.MOSScore,
+				"media_quality_flag":   cr.MediaQualityFlag,
+				"call_setup_ms":        cr.CallSetupMs,
+				"prack_rtt_ms":         cr.PrackRTTMs,
+				"sip_txn_rtt_ms":       cr.SipTransactionRTTMs,
+				"bye_completion_ms":    cr.ByeCompletionMs,
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
