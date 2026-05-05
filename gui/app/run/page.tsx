@@ -203,7 +203,7 @@ function LiveDashboard({
       {/* Row 5 — Failed calls table */}
       <FailedCallsTable events={callEvents} />
 
-      {/* Row 6 — Media / QoS metrics (Phase 1) */}
+      {/* Row 6 — Media / QoS metrics (Phase 1+2) */}
       <MediaQosPanel
         jitterMs={uacMetrics.avg_jitter_ms ?? null}
         mosEstimate={uacMetrics.avg_mos_score ?? null}
@@ -213,6 +213,8 @@ function LiveDashboard({
           const tracked = c.OK + c.WARNING + c.CRITICAL
           return tracked > 0 ? (c.OK / tracked) * 100 : null
         })()}
+        rttMs={uacMetrics.avg_rtt_ms ?? null}
+        rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
       />
     </div>
   )

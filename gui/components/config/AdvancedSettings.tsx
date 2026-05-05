@@ -86,6 +86,9 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
   const qosTokens: string[] = []
   if (s.qos_enabled === false) qosTokens.push('qos: off')
   else if (s.qos_mos_estimation === false) qosTokens.push('qos: jitter+loss')
+  // RTCP SR defaults to OFF; when enabled, surface it prominently — the
+  // admin needs to know this risky feature is active at a glance.
+  if (s.rtcp_sr_enabled) qosTokens.push(`rtcp-sr: ${s.rtcp_sr_interval_seconds ?? 5}s`)
 
   const tokens = [
     `batch_size: ${s.register_batch_size}`,
@@ -165,16 +168,25 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
   const handleSave = () => {
     const ALLOW_ZERO: Set<string> = new Set(['register_batch_delay_ms'])
-    const SKIP: Set<string> = new Set(['rtp_mode', 'rtp_pcap', 'qos_enabled', 'qos_mos_estimation'])
+    const SKIP: Set<string> = new Set([
+      'rtp_mode', 'rtp_pcap',
+      'qos_enabled', 'qos_mos_estimation',
+      'rtcp_sr_enabled',
+    ])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
       if (SKIP.has(key)) continue
+      // RTCP SR interval is only validated when RTCP SR is on; otherwise
+      // any value is acceptable (the field is shown but disabled).
+      if (key === 'rtcp_sr_interval_seconds' && !draft.rtcp_sr_enabled) continue
       const v = val as number
       if (!Number.isFinite(v)) {
         newErrors[key as keyof AdvancedSettingsType] = 'Must be a number'
       } else if (ALLOW_ZERO.has(key) ? v < 0 : v <= 0) {
         newErrors[key as keyof AdvancedSettingsType] =
           ALLOW_ZERO.has(key) ? 'Must be ≥ 0' : 'Must be a positive number'
+      } else if (key === 'rtcp_sr_interval_seconds' && (v < 1 || v > 60)) {
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be between 1 and 60 seconds'
       }
     }
     if (Object.keys(newErrors).length > 0) { setErrors(newErrors); return }
@@ -503,6 +515,77 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                         ? 'Requires QoS Metrics'
                         : draft.qos_mos_estimation ? 'Enabled — MOS computed per call' : 'Disabled'}
                     </button>
+                  </div>
+                </div>
+
+                {/* RTCP Sender Reports — Phase 2, RISKY, default OFF */}
+                <div className={cn(
+                  'mt-3 rounded-md border p-3 space-y-3',
+                  draft.rtcp_sr_enabled
+                    ? 'border-amber-500/50 bg-amber-500/5'
+                    : 'border-amber-500/25 bg-amber-500/5',
+                )}>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-amber-300">
+                      Advanced
+                    </span>
+                    <span className="text-[11px] font-bold uppercase tracking-widest text-amber-200">
+                      RTCP Sender Reports
+                    </span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button type="button" className="text-amber-400/70 hover:text-amber-300 transition-colors">
+                          <Info className="size-3" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-sm text-xs leading-relaxed">
+                        Transmits RTCP Sender Report packets on the same UDP socket as RTP (RFC 5761 mux),
+                        enabling round-trip-time measurement via SR/RR exchange.
+                        SDP will advertise <code className="font-mono text-amber-300">a=rtcp-mux</code>.
+                        <br /><br />
+                        <strong className="text-amber-300">Risk:</strong> If the SBC does not support RTCP-mux
+                        it may drop calls. Verify in a controlled environment before enabling for production traffic.
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-x-8 gap-y-3">
+                    {/* rtcp_sr_enabled toggle */}
+                    <div className="space-y-1">
+                      <Label className="text-xs font-semibold text-slate-200/90">RTCP SR Transmission</Label>
+                      <button
+                        type="button"
+                        disabled={disabled}
+                        onClick={() => setDraft((prev) => ({ ...prev, rtcp_sr_enabled: !prev.rtcp_sr_enabled }))}
+                        className={cn(
+                          'inline-flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                          draft.rtcp_sr_enabled
+                            ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
+                            : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-amber-400/40',
+                          disabled && 'opacity-70 cursor-default',
+                        )}
+                      >
+                        <span className={cn(
+                          'inline-block size-3 rounded-sm border-2 transition-colors',
+                          draft.rtcp_sr_enabled ? 'border-amber-400 bg-amber-400' : 'border-zinc-400 bg-transparent'
+                        )} />
+                        {draft.rtcp_sr_enabled
+                          ? 'Enabled — RTCP SR + a=rtcp-mux'
+                          : 'Disabled (default — safe)'}
+                      </button>
+                    </div>
+
+                    {/* rtcp_sr_interval_seconds */}
+                    <AdvancedField
+                      label="SR Interval (s)"
+                      value={draft.rtcp_sr_interval_seconds}
+                      disabled={disabled || !draft.rtcp_sr_enabled}
+                      min={1}
+                      error={errors.rtcp_sr_interval_seconds}
+                      hint={!draft.rtcp_sr_enabled ? 'Requires RTCP SR Transmission' : '1..60 s — RFC 3550 recommends ~5%'}
+                      tooltip="How frequently RTCP Sender Reports are emitted during a call. Default 5s gives reasonable RTT samples without flooding the SBC."
+                      onChange={set('rtcp_sr_interval_seconds')}
+                    />
                   </div>
                 </div>
               </div>

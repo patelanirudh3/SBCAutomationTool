@@ -68,6 +68,11 @@ type TrafficMetrics struct {
 	AvgMOSScore        float64        `json:"avg_mos_score"`
 	AvgPacketLossPct   float64        `json:"avg_packet_loss_pct"`
 	MediaQualityCounts map[string]int `json:"media_quality_counts"`
+
+	// AvgRTTMs (Phase 2) — averaged across calls that produced a non-zero
+	// RTT sample. Always 0 when rtcp_sr_enabled is false (no SR sent → no
+	// RR with usable LSR/DLSR comes back).
+	AvgRTTMs float64 `json:"avg_rtt_ms"`
 }
 
 // ---------------------------------------------------------------------------
@@ -170,12 +175,13 @@ type MetricsCollector struct {
 
 	rtpHealthCounts map[string]int
 
-	// QoS aggregate state (Phase 1).
+	// QoS aggregate state (Phase 1+2).
 	// Sample slices are appended only when the per-call value is non-zero
 	// so calls that didn't produce media don't drag the average down.
 	jitterSamples       []float64
 	mosSamples          []float64
 	packetLossSamples   []float64
+	rttSamples          []float64
 	mediaQualityCounts  map[string]int
 
 	// Cleanup (unregister) progress, populated during shutdownCleanup so
@@ -386,6 +392,9 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 	}
 	if result.PacketLossPct > 0 {
 		c.packetLossSamples = append(c.packetLossSamples, result.PacketLossPct)
+	}
+	if result.RTTMs > 0 {
+		c.rttSamples = append(c.rttSamples, result.RTTMs)
 	}
 	if result.MediaQualityFlag != "" {
 		if _, ok := c.mediaQualityCounts[result.MediaQualityFlag]; ok {
@@ -664,6 +673,7 @@ func (c *MetricsCollector) Reset() {
 	c.jitterSamples = nil
 	c.mosSamples = nil
 	c.packetLossSamples = nil
+	c.rttSamples = nil
 	c.invitesSent = 0
 	c.inviteRetransmits = 0
 	c.acksSent = 0
@@ -769,6 +779,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		AvgJitterMs:      roundAvg(c.jitterSamples),
 		AvgMOSScore:      roundAvg(c.mosSamples),
 		AvgPacketLossPct: roundAvg(c.packetLossSamples),
+		AvgRTTMs:         roundAvg(c.rttSamples),
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],

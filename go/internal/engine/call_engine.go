@@ -356,7 +356,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv int
 		var lostPkts, oooPkts int
-		var jitterMs, packetLossPct, remoteJitter, remoteLoss, mosScore float64
+		var jitterMs, packetLossPct, remoteJitter, remoteLoss, mosScore, rttMs float64
 		var mediaOK bool
 		if rtpEP != nil {
 			st := rtpEP.Stats()
@@ -374,6 +374,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			oooPkts = st.OOOPackets
 			remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 			remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+			rttMs = math.Round(st.RTTMs*100) / 100
 			if cfg.IsQoSMOSEnabled() && mediaOK {
 				mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 			}
@@ -414,6 +415,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			PacketLossPct:       packetLossPct,
 			LostPackets:         lostPkts,
 			OOOPackets:          oooPkts,
+			RTTMs:               rttMs,
 			RemoteJitterMs:      remoteJitter,
 			RemoteLossPct:       remoteLoss,
 			MOSScore:            mosScore,
@@ -428,7 +430,13 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	// ── Allocate RTP endpoint ──────────────────────────────────────
 	if cfg.MediaEnabled {
 		var err error
-		rtpEP, err = rtp.NewRtpEndpointWithOpts(ag.LocalHost(), cfg.RTPPtime, cfg.IsQoSEnabled())
+		rtpEP, err = rtp.NewRtpEndpointFull(
+			ag.LocalHost(),
+			cfg.RTPPtime,
+			cfg.IsQoSEnabled(),
+			cfg.IsRTCPSREnabled(),
+			time.Duration(cfg.RTCPSRIntervalSeconds)*time.Second,
+		)
 		if err != nil {
 			slog.Warn("RTP socket alloc failed — using port 9", "ext", ag.Ext, "err", err)
 		}
@@ -756,7 +764,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		"total_ms": math.Round(totalMs*100) / 100,
 	})
 
-	// ── QoS / Media metrics (Phase 1) ──────────────────────────────
+	// ── QoS / Media metrics (Phase 1+2) ────────────────────────────
 	var (
 		jitterMs      float64
 		packetLossPct float64
@@ -765,6 +773,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		remoteJitter  float64
 		remoteLoss    float64
 		mosScore      float64
+		rttMs         float64
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -774,6 +783,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		oooPackets = st.OOOPackets
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		rttMs = math.Round(st.RTTMs*100) / 100
 		if cfg.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
@@ -810,6 +820,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		PacketLossPct:    packetLossPct,
 		LostPackets:      lostPackets,
 		OOOPackets:       oooPackets,
+		RTTMs:            rttMs,
 		RemoteJitterMs:   remoteJitter,
 		RemoteLossPct:    remoteLoss,
 		MOSScore:         mosScore,

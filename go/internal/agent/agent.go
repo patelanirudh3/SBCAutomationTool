@@ -820,7 +820,7 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	localTag := sip.CreateFromTag()
-	sdpBody := BuildSDP(a.localHost, rtpPort)
+	sdpBody := BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
 
 	msg := sip.NewSipMessage()
 	msg.SetRequestLine(fmt.Sprintf("INVITE sip:%s@%s SIP/2.0", calleeExt, a.Config.Domain))
@@ -1217,7 +1217,7 @@ func (a *ExtensionAgent) HandleBye(rawMsg string, dialog *DialogState) error {
 // Send200Invite sends 200 OK to an incoming INVITE.
 func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 	invite := dialog.InviteMsg
-	sdpBody := BuildSDP(a.localHost, rtpPort)
+	sdpBody := BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
 
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
@@ -1466,7 +1466,7 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 		// to BuildSDP only if the dialog never stored one (defence in depth).
 		sdpBody := dialog.InviteSDP
 		if sdpBody == "" {
-			sdpBody = BuildSDP(a.localHost, rtpPort)
+			sdpBody = BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
 			dialog.InviteSDP = sdpBody
 		}
 		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))

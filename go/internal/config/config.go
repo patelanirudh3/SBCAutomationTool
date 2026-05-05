@@ -97,6 +97,19 @@ type VMConfig struct {
 	// pointers are non-nil; use the IsQoS* helpers in callers.
 	QoSEnabled       *bool `yaml:"qos_enabled,omitempty" json:"qos_enabled,omitempty"`
 	QoSMOSEstimation *bool `yaml:"qos_mos_estimation,omitempty" json:"qos_mos_estimation,omitempty"`
+
+	// RTCP Sender Report transmission (Phase 2 — high risk, default OFF).
+	// When RTCPSREnabled is true the RTP endpoint sends RTCP SR packets on
+	// the same UDP socket as RTP every RTCPSRIntervalSeconds, and SDP
+	// advertises a=rtcp-mux. Enable only when the SBC is known to support
+	// RTCP-mux (RFC 5761) — otherwise the SBC may drop the call.
+	//
+	// RTCPMuxEnabled is auto-coerced to true by ApplyDefaults whenever
+	// RTCPSREnabled is true; the combination "SR enabled, mux disabled" is
+	// rejected by Validate as an unsafe configuration footgun.
+	RTCPSREnabled         *bool `yaml:"rtcp_sr_enabled,omitempty" json:"rtcp_sr_enabled,omitempty"`
+	RTCPSRIntervalSeconds int   `yaml:"rtcp_sr_interval_seconds,omitempty" json:"rtcp_sr_interval_seconds,omitempty"`
+	RTCPMuxEnabled        *bool `yaml:"rtcp_mux_enabled,omitempty" json:"rtcp_mux_enabled,omitempty"`
 }
 
 // IsQoSEnabled reports whether the agent should compute jitter, packet loss,
@@ -113,6 +126,21 @@ func (c *VMConfig) IsQoSMOSEnabled() bool {
 		return false
 	}
 	return c.QoSMOSEstimation == nil || *c.QoSMOSEstimation
+}
+
+// IsRTCPSREnabled reports whether the RTP endpoint should transmit RTCP
+// Sender Reports. Defaults to FALSE when unset (Phase 2 risky feature must
+// be opted-in explicitly).
+func (c *VMConfig) IsRTCPSREnabled() bool {
+	return c.RTCPSREnabled != nil && *c.RTCPSREnabled
+}
+
+// IsRTCPMuxEnabled reports whether SDP should advertise a=rtcp-mux.
+// Defaults to FALSE when unset; auto-coerced to true by ApplyDefaults
+// whenever IsRTCPSREnabled is true (you cannot safely send RTCP on the
+// RTP socket without negotiating mux).
+func (c *VMConfig) IsRTCPMuxEnabled() bool {
+	return c.RTCPMuxEnabled != nil && *c.RTCPMuxEnabled
 }
 
 // ExtCount returns the total number of extensions in the configured range.
@@ -323,6 +351,29 @@ func ApplyDefaults(cfg *VMConfig) {
 		t := true
 		cfg.QoSMOSEstimation = &t
 	}
+	// RTCP SR transmission defaults to OFF (Phase 2 — risky, opt-in only).
+	// Auto-coerce mux to ON when SR is enabled so the SDP correctly
+	// advertises a=rtcp-mux for the same-port RTCP traffic.
+	if cfg.RTCPSREnabled == nil {
+		f := false
+		cfg.RTCPSREnabled = &f
+	}
+	if cfg.RTCPMuxEnabled == nil {
+		// Default to whatever SR is set to: enabling SR without mux is
+		// always wrong (rejected by Validate); enabling mux without SR
+		// is meaningless on its own.
+		v := *cfg.RTCPSREnabled
+		cfg.RTCPMuxEnabled = &v
+	} else if *cfg.RTCPSREnabled && !*cfg.RTCPMuxEnabled {
+		// Admin opted into SR but forgot mux — coerce on, with a warning.
+		t := true
+		cfg.RTCPMuxEnabled = &t
+		slog.Warn("rtcp_mux_enabled coerced to true because rtcp_sr_enabled=true",
+			"reason", "RTCP SR on the RTP socket requires RFC 5761 mux")
+	}
+	if cfg.RTCPSRIntervalSeconds == 0 {
+		cfg.RTCPSRIntervalSeconds = 5
+	}
 }
 
 // Validate checks that a VMConfig has all required fields set and that
@@ -416,6 +467,17 @@ func Validate(cfg *VMConfig) error {
 
 	if cfg.TrafficMode != "" && cfg.TrafficMode != "smoke" && cfg.TrafficMode != "timed" && cfg.TrafficMode != "unlimited" {
 		errs = append(errs, fmt.Sprintf("traffic_mode must be 'smoke', 'timed', or 'unlimited', got %q", cfg.TrafficMode))
+	}
+
+	// RTCP SR safety checks (Phase 2). ApplyDefaults coerces mux to true
+	// whenever SR is enabled, but Validate also rejects the combination
+	// explicitly so YAML mistakes surface as errors instead of silent
+	// behavior changes after coercion.
+	if cfg.IsRTCPSREnabled() && !cfg.IsRTCPMuxEnabled() {
+		errs = append(errs, "rtcp_sr_enabled=true requires rtcp_mux_enabled=true (a=rtcp-mux must be advertised in SDP)")
+	}
+	if cfg.RTCPSRIntervalSeconds < 1 || cfg.RTCPSRIntervalSeconds > 60 {
+		errs = append(errs, fmt.Sprintf("rtcp_sr_interval_seconds must be 1..60 s, got %d", cfg.RTCPSRIntervalSeconds))
 	}
 	if cfg.TrafficMode == "smoke" && cfg.CallCount <= 0 {
 		errs = append(errs, "traffic_mode='smoke' requires call_count > 0")

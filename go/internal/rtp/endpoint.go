@@ -44,6 +44,12 @@ type RtpStats struct {
 	// (the SBC's report back to us). Zero when no RR has been parsed.
 	RemoteJitterMs float64
 	RemoteLossPct  float64
+
+	// RTTMs is the round-trip time computed from RTCP SR/RR exchange:
+	//   RTT = NTP(now) - LSR - DLSR (32-bit middle-NTP units → ms)
+	// Zero when RTCP SR transmission is disabled or no RR has been
+	// received that references one of our SRs.
+	RTTMs float64
 }
 
 // RtpEndpoint is a bidirectional G.711 PCMU RTP endpoint used by both UAC and UAS.
@@ -54,11 +60,24 @@ type RtpEndpoint struct {
 	closed    bool
 
 	txPkts      int
+	txOctets    uint64 // cumulative RTP payload bytes sent (for RTCP SR sender info)
 	markersSent int
 	// firstPacketSent tracks whether the very first RTP packet of this
 	// session has been transmitted yet. The RTP header M (marker) bit is
 	// set on that first packet only, per RFC 3551 §4.1 (start of talkspurt).
 	firstPacketSent bool
+
+	// SSRC pinned for our outbound RTP stream. Set by Run/RunUntilCancelled
+	// before any packet is sent so the RTCP SR loop can include it.
+	txSSRC    uint32
+	txSSRCSet bool
+
+	// rtpEpoch is the RTP timestamp at the beginning of the call (the
+	// random initial value picked by Run). Used to compute the RTP
+	// timestamp embedded in RTCP SR, derived as epoch + samples-since-start.
+	rtpEpoch    uint32
+	rtpEpochSet bool
+	rtpStartMs  float64 // wall clock when rtpEpoch was set
 
 	// ── QoS measurement state (RFC 3550 §6.4.1) ──────────────────
 	// qosEnabled is captured from VMConfig at endpoint construction so the
@@ -84,6 +103,18 @@ type RtpEndpoint struct {
 	// Last-SSRC-RR snapshot extracted from RTCP RR blocks the SBC sends us.
 	remoteJitterRTP float64 // raw jitter from RR (RTP units)
 	remoteLossPct   float64 // from fraction-lost field, 0..100
+
+	// ── RTCP Sender Report transmission (Phase 2, default OFF) ─────
+	// rtcpSREnabled is captured at construction; the SR loop goroutine
+	// is only spawned by Run/RunUntilCancelled when this flag is true.
+	// rtcpSRInterval defaults to 5s; min 1s, max 60s (validated upstream).
+	rtcpSREnabled  bool
+	rtcpSRInterval time.Duration
+
+	// rttMs is the most recently computed round-trip time in milliseconds,
+	// derived from RTCP SR/RR exchange (RFC 3550 §6.4.1). Zero when no RR
+	// referencing one of our SRs has been received yet.
+	rttMs float64
 
 	remoteIP   string
 	remotePort int
@@ -114,11 +145,22 @@ func NewRtpEndpoint(localIP string, ptimeMs int) (*RtpEndpoint, error) {
 	return NewRtpEndpointWithOpts(localIP, ptimeMs, true)
 }
 
-// NewRtpEndpointWithOpts is the explicit-options form of NewRtpEndpoint.
-// qosEnabled controls per-packet jitter / loss / OOO computation in the
-// receive loop. Disabling it skips the small per-packet overhead but loses
-// the jitter, packet_loss_pct, and lost_packets fields in CallResult.
+// NewRtpEndpointWithOpts is the QoS-aware constructor without RTCP SR
+// transmission. Equivalent to NewRtpEndpointFull(..., false, 0).
 func NewRtpEndpointWithOpts(localIP string, ptimeMs int, qosEnabled bool) (*RtpEndpoint, error) {
+	return NewRtpEndpointFull(localIP, ptimeMs, qosEnabled, false, 0)
+}
+
+// NewRtpEndpointFull is the fully-explicit constructor.
+//
+// qosEnabled       — track jitter / loss / OOO in receive loop (Phase 1)
+// rtcpSREnabled    — transmit RTCP Sender Reports (Phase 2, RISKY)
+// rtcpSRInterval   — interval between SR packets (only used when SR enabled;
+//                    pass 0 to default to 5 s)
+//
+// The SR loop goroutine is NOT spawned here; it starts inside Run /
+// RunUntilCancelled when there is a known remote destination to send to.
+func NewRtpEndpointFull(localIP string, ptimeMs int, qosEnabled, rtcpSREnabled bool, rtcpSRInterval time.Duration) (*RtpEndpoint, error) {
 	addr, err := net.ResolveUDPAddr("udp4", localIP+":0")
 	if err != nil {
 		return nil, err
@@ -132,6 +174,10 @@ func NewRtpEndpointWithOpts(localIP string, ptimeMs int, qosEnabled bool) (*RtpE
 
 	tsInc, _, tone, marker := ComputePtimeParams(ptimeMs)
 
+	if rtcpSREnabled && rtcpSRInterval <= 0 {
+		rtcpSRInterval = 5 * time.Second
+	}
+
 	ep := &RtpEndpoint{
 		conn:           conn,
 		localPort:      localAddr.Port,
@@ -140,6 +186,8 @@ func NewRtpEndpointWithOpts(localIP string, ptimeMs int, qosEnabled bool) (*RtpE
 		tonePayload:    tone,
 		markerTemplate: marker,
 		qosEnabled:     qosEnabled,
+		rtcpSREnabled:  rtcpSREnabled,
+		rtcpSRInterval: rtcpSRInterval,
 	}
 
 	go ep.receiveLoop()
@@ -243,17 +291,39 @@ func (ep *RtpEndpoint) Stats() RtpStats {
 		PacketLossPct:  lossPct,
 		RemoteJitterMs: remoteJitterMs,
 		RemoteLossPct:  ep.remoteLossPct,
+		RTTMs:          ep.rttMs,
 	}
 }
 
-// getPayload returns the next TX payload, embedding a marker every MarkerInterval packets.
+// getPayload returns the next TX payload, embedding a marker every
+// MarkerInterval packets. Also accumulates txOctets for the RTCP SR
+// "sender's octet count" field (RFC 3550 §6.4.1).
 func (ep *RtpEndpoint) getPayload() []byte {
 	ep.txPkts++
+	var p []byte
 	if ep.txPkts%MarkerInterval == 0 {
 		ep.markersSent++
-		return buildMarkerPayload(ep.markerTemplate, ep.markersSent)
+		p = buildMarkerPayload(ep.markerTemplate, ep.markersSent)
+	} else {
+		p = ep.tonePayload
 	}
-	return ep.tonePayload
+	ep.txOctets += uint64(len(p))
+	return p
+}
+
+// pinTxStreamLocked records the SSRC and RTP timestamp epoch (the random
+// initial values picked by Run / RunUntilCancelled) so the RTCP SR loop can
+// emit consistent sender-info blocks. Caller MUST hold ep.mu.
+func (ep *RtpEndpoint) pinTxStreamLocked(ssrc, rtpEpoch uint32) {
+	if !ep.txSSRCSet {
+		ep.txSSRC = ssrc
+		ep.txSSRCSet = true
+	}
+	if !ep.rtpEpochSet {
+		ep.rtpEpoch = rtpEpoch
+		ep.rtpEpochSet = true
+		ep.rtpStartMs = float64(time.Now().UnixMilli())
+	}
 }
 
 // consumeFirstPacketFlag returns true exactly once per endpoint lifetime, on
@@ -291,6 +361,17 @@ func (ep *RtpEndpoint) Run(
 	seq := uint16(rand.Intn(0x10000))
 	ts := rand.Uint32()
 	callDeadline := time.Now().Add(time.Duration(durationSeconds * float64(time.Second)))
+
+	// Pin TX stream identity so the RTCP SR loop (if enabled) can emit
+	// consistent sender-info blocks. Spawned only when explicitly enabled
+	// — when rtcpSREnabled=false this is a no-op (Phase 2 default).
+	ep.mu.Lock()
+	ep.pinTxStreamLocked(ssrc, ts)
+	srEnabled := ep.rtcpSREnabled
+	ep.mu.Unlock()
+	if srEnabled {
+		go ep.rtcpSRLoop(ctx, dest)
+	}
 
 	if continuous {
 		var err error
@@ -380,6 +461,15 @@ func (ep *RtpEndpoint) RunUntilCancelled(
 	ssrc := rand.Uint32() | 1
 	seq := uint16(rand.Intn(0x10000))
 	ts := rand.Uint32()
+
+	// Pin TX stream identity + spawn RTCP SR loop when enabled (Phase 2).
+	ep.mu.Lock()
+	ep.pinTxStreamLocked(ssrc, ts)
+	srEnabled := ep.rtcpSREnabled
+	ep.mu.Unlock()
+	if srEnabled {
+		go ep.rtcpSRLoop(ctx, dest)
+	}
 
 	if continuous {
 		farFuture := time.Now().Add(24 * time.Hour)
@@ -706,19 +796,141 @@ func (ep *RtpEndpoint) parseRTCPPacket(data []byte) {
 			if start+24 > off+recordLen {
 				break
 			}
-			// fraction lost = byte 4 of the report block, expressed as
-			// the integer numerator of a fraction over 256.
+			// Report-block layout (RFC 3550 §6.4.1):
+			//   byte  4    : fraction lost (numerator over 256)
+			//   bytes 12-15: interarrival jitter (RTP timestamp units)
+			//   bytes 16-19: LSR — middle 32 bits of the NTP ts in the
+			//                last SR we sent, echoed back by the SBC
+			//   bytes 20-23: DLSR — delay since the SBC received the SR,
+			//                in 1/65536 second units
 			fractionLost := data[start+4]
-			// Interarrival jitter = bytes 12-15 (RTP timestamp units).
 			jitterRTP := binary.BigEndian.Uint32(data[start+12 : start+16])
+			lsr := binary.BigEndian.Uint32(data[start+16 : start+20])
+			dlsr := binary.BigEndian.Uint32(data[start+20 : start+24])
 
 			ep.mu.Lock()
 			ep.remoteJitterRTP = float64(jitterRTP)
 			ep.remoteLossPct = float64(fractionLost) / 256.0 * 100.0
+			// RTT = NTP(now)_mid32 - LSR - DLSR
+			// All three values are in the same 1/65536-second unit; uint32
+			// subtraction wraps cleanly. Skip when LSR/DLSR are zero —
+			// that means the SBC has no SR from us yet (we never sent
+			// one, or the SR loop hasn't fired).
+			if lsr != 0 && dlsr != 0 {
+				nowHi, nowLo := getNTPNow()
+				nowMid := (nowHi << 16) | (nowLo >> 16)
+				rttUnits := nowMid - lsr - dlsr
+				ep.rttMs = float64(rttUnits) / 65536.0 * 1000.0
+			}
 			ep.mu.Unlock()
 		}
 
 		off += recordLen
+	}
+}
+
+// getNTPNow returns the current wall clock as a 64-bit NTP timestamp split
+// into 32-bit seconds and 32-bit fraction parts (RFC 3550 §4 / RFC 5905).
+// NTP epoch is Jan 1, 1900; offset from Unix epoch is 2208988800 seconds.
+func getNTPNow() (hi, lo uint32) {
+	const ntpEpochOffset uint64 = 2208988800
+	now := time.Now()
+	secs := uint64(now.Unix()) + ntpEpochOffset
+	frac := (uint64(now.Nanosecond()) << 32) / 1_000_000_000
+	return uint32(secs), uint32(frac)
+}
+
+// buildRTCPSR constructs a 28-byte RTCP Sender Report (PT=200, RC=0) per
+// RFC 3550 §6.4.1. No RR blocks are appended — we only emit SR to give the
+// SBC enough info to compute RTT back to us via DLSR in its RR.
+//
+//	 0                   1                   2                   3
+//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|V=2|P|    RC   |   PT=SR=200   |             length=6          |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|                         SSRC of sender                        |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|              NTP timestamp, most significant word             |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|             NTP timestamp, least significant word             |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|                         RTP timestamp                         |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|                     sender's packet count                     |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|                      sender's octet count                     |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+func buildRTCPSR(ssrc, ntpHi, ntpLo, rtpTs, pktCount, octCount uint32) []byte {
+	buf := make([]byte, 28)
+	buf[0] = 0x80                                      // V=2, P=0, RC=0
+	buf[1] = 200                                       // PT = SR
+	binary.BigEndian.PutUint16(buf[2:4], 6)            // length = (28/4)-1
+	binary.BigEndian.PutUint32(buf[4:8], ssrc)
+	binary.BigEndian.PutUint32(buf[8:12], ntpHi)
+	binary.BigEndian.PutUint32(buf[12:16], ntpLo)
+	binary.BigEndian.PutUint32(buf[16:20], rtpTs)
+	binary.BigEndian.PutUint32(buf[20:24], pktCount)
+	binary.BigEndian.PutUint32(buf[24:28], octCount)
+	return buf
+}
+
+// rtcpSRLoop emits an RTCP Sender Report to dest every rtcpSRInterval until
+// ctx is cancelled. Phase 2 — only spawned when ep.rtcpSREnabled is true.
+//
+// Sends on the SAME UDP socket as RTP (RFC 5761 multiplexing). The peer SDP
+// MUST advertise a=rtcp-mux for this to be safely interpreted by the SBC;
+// config.Validate enforces this coupling.
+func (ep *RtpEndpoint) rtcpSRLoop(ctx context.Context, dest *net.UDPAddr) {
+	interval := ep.rtcpSRInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		// Snapshot mutable state under the lock; build/send outside it.
+		ep.mu.Lock()
+		ssrcSet := ep.txSSRCSet
+		epochSet := ep.rtpEpochSet
+		ssrc := ep.txSSRC
+		epoch := ep.rtpEpoch
+		startMs := ep.rtpStartMs
+		pkts := uint32(ep.txPkts)
+		octs := uint32(ep.txOctets)
+		pw := ep.pcap
+		ep.mu.Unlock()
+
+		if !ssrcSet || !epochSet {
+			// No RTP sent yet — nothing meaningful to report.
+			continue
+		}
+
+		ntpHi, ntpLo := getNTPNow()
+		// Current RTP timestamp = epoch + samples elapsed since first
+		// packet. Drives the SBC's playout-buffer correlation between
+		// RTP timestamps and wall-clock.
+		elapsedMs := float64(time.Now().UnixMilli()) - startMs
+		sampleOffset := uint32(elapsedMs * float64(SampleRate) / 1000.0)
+		rtpTs := epoch + sampleOffset
+
+		sr := buildRTCPSR(ssrc, ntpHi, ntpLo, rtpTs, pkts, octs)
+		if _, err := ep.conn.WriteToUDP(sr, dest); err != nil {
+			slog.Debug("RTCP SR send error",
+				"err", err, "dest", dest.String(),
+				"local_port", ep.localPort)
+			continue
+		}
+		if pw != nil {
+			pw.WriteTx(sr, dest.IP.String(), dest.Port)
+		}
 	}
 }
 

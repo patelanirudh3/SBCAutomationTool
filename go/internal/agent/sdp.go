@@ -18,8 +18,16 @@ var sdpSessionCounter uint64
 // monotonic timestamp combined with an atomic counter, satisfying RFC 4566
 // §5.2 ("the session id MUST be unique"). The session-version is fixed at 1
 // because we do not currently emit re-INVITEs that modify the SDP body.
-func BuildSDP(localHost string, rtpPort int) string {
+//
+// When rtcpMux is true an a=rtcp-mux attribute is appended (RFC 5761),
+// signalling that the same UDP port carries both RTP and RTCP. Phase 2
+// — only enabled when the endpoint will also transmit RTCP SR.
+func BuildSDP(localHost string, rtpPort int, rtcpMux bool) string {
 	sessID := uint64(time.Now().UnixNano()) ^ atomic.AddUint64(&sdpSessionCounter, 1)
+	rtcpMuxLine := ""
+	if rtcpMux {
+		rtcpMuxLine = "a=rtcp-mux\r\n"
+	}
 	return fmt.Sprintf(
 		"v=0\r\n"+
 			"o=- %d 1 IN IP4 %s\r\n"+
@@ -32,8 +40,9 @@ func BuildSDP(localHost string, rtpPort int) string {
 			"a=rtpmap:101 telephone-event/8000\r\n"+
 			"a=fmtp:101 0-15\r\n"+
 			"a=ptime:20\r\n"+
-			"a=sendrecv\r\n",
-		sessID, localHost, localHost, rtpPort,
+			"a=sendrecv\r\n"+
+			"%s",
+		sessID, localHost, localHost, rtpPort, rtcpMuxLine,
 	)
 }
 

@@ -33,6 +33,12 @@ export interface AdvancedSettings {
   rtp_pcap: boolean                    // default: false — capture RTP to pcap files
   qos_enabled: boolean                 // default: true — track jitter, packet loss, OOO per call
   qos_mos_estimation: boolean          // default: true — compute MOS score (G.711 R-factor approximation)
+  // Phase 2 (RISKY — default OFF): RTCP Sender Report transmission.
+  // Enabling this advertises a=rtcp-mux in SDP and sends RTCP SR on the RTP
+  // socket every rtcp_sr_interval_seconds. Required for RTT measurement,
+  // but only safe when the SBC is known to support RFC 5761 RTCP-mux.
+  rtcp_sr_enabled: boolean             // default: false
+  rtcp_sr_interval_seconds: number     // default: 5 — clamp 1..60
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -48,6 +54,8 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_pcap: false,
   qos_enabled: true,
   qos_mos_estimation: true,
+  rtcp_sr_enabled: false,
+  rtcp_sr_interval_seconds: 5,
 }
 
 export interface VMConfig {
@@ -123,6 +131,14 @@ export interface VMConfig {
   // can opt-out a customer who doesn't want media-quality computation.
   qos_enabled?: boolean
   qos_mos_estimation?: boolean
+
+  // RTCP Sender Report transmission (Phase 2 — RISKY, default OFF).
+  // rtcp_mux_enabled is auto-coerced to true by the backend whenever
+  // rtcp_sr_enabled=true (RFC 5761 multiplexing is required for safe
+  // same-port RTCP transmission); GUI does not need to set it explicitly.
+  rtcp_sr_enabled?: boolean
+  rtcp_sr_interval_seconds?: number
+  rtcp_mux_enabled?: boolean
 }
 
 export interface VMPair {
@@ -177,6 +193,9 @@ export interface TrafficMetrics {
     CRITICAL: number
     UNKNOWN: number
   }
+  // Phase 2 — round-trip time averaged across calls that produced an RTCP
+  // SR/RR exchange. Always 0 when rtcp_sr_enabled is false.
+  avg_rtt_ms?: number
 }
 
 // CleanupStatus mirrors the backend GET /api/cleanup/status payload and the

@@ -194,7 +194,13 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	// ── Allocate RTP endpoint ──────────────────────────────────────
 	if cfg.MediaEnabled {
 		var err error
-		rtpEP, err = rtp.NewRtpEndpointWithOpts(ag.LocalHost(), cfg.RTPPtime, cfg.IsQoSEnabled())
+		rtpEP, err = rtp.NewRtpEndpointFull(
+			ag.LocalHost(),
+			cfg.RTPPtime,
+			cfg.IsQoSEnabled(),
+			cfg.IsRTCPSREnabled(),
+			time.Duration(cfg.RTCPSRIntervalSeconds)*time.Second,
+		)
 		if err != nil {
 			slog.Warn("RTP endpoint alloc failed — using port 9",
 				"ext", ag.Ext, "err", err)
@@ -361,6 +367,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		remoteJitter float64
 		remoteLoss   float64
 		mosScore     float64
+		rttMs        float64
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -379,6 +386,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		oooPkts = st.OOOPackets
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		rttMs = math.Round(st.RTTMs*100) / 100
 		if cfg.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
@@ -433,6 +441,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		PacketLossPct:       packetLoss,
 		LostPackets:         lostPkts,
 		OOOPackets:          oooPkts,
+		RTTMs:               rttMs,
 		RemoteJitterMs:      remoteJitter,
 		RemoteLossPct:       remoteLoss,
 		MOSScore:            mosScore,
@@ -481,6 +490,7 @@ func (u *UasAutoAnswer) handleTimeout(
 		remoteJitter float64
 		remoteLoss   float64
 		mosScore     float64
+		rttMs        float64
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -498,6 +508,7 @@ func (u *UasAutoAnswer) handleTimeout(
 		oooPkts = st.OOOPackets
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
+		rttMs = math.Round(st.RTTMs*100) / 100
 		if u.config.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
@@ -538,6 +549,7 @@ func (u *UasAutoAnswer) handleTimeout(
 		PacketLossPct:       packetLoss,
 		LostPackets:         lostPkts,
 		OOOPackets:          oooPkts,
+		RTTMs:               rttMs,
 		RemoteJitterMs:      remoteJitter,
 		RemoteLossPct:       remoteLoss,
 		MOSScore:            mosScore,
