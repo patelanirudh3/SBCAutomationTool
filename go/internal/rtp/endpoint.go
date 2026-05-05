@@ -39,6 +39,10 @@ type RtpEndpoint struct {
 
 	txPkts      int
 	markersSent int
+	// firstPacketSent tracks whether the very first RTP packet of this
+	// session has been transmitted yet. The RTP header M (marker) bit is
+	// set on that first packet only, per RFC 3551 §4.1 (start of talkspurt).
+	firstPacketSent bool
 
 	remoteIP   string
 	remotePort int
@@ -179,6 +183,19 @@ func (ep *RtpEndpoint) getPayload() []byte {
 	return ep.tonePayload
 }
 
+// consumeFirstPacketFlag returns true exactly once per endpoint lifetime, on
+// the first call. Used to set the RTP header M bit on the first transmitted
+// packet of the session per RFC 3551 §4.1.
+func (ep *RtpEndpoint) consumeFirstPacketFlag() bool {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.firstPacketSent {
+		return false
+	}
+	ep.firstPacketSent = true
+	return true
+}
+
 // Run executes the UAC send loop with 3-phase or continuous mode.
 func (ep *RtpEndpoint) Run(
 	ctx context.Context,
@@ -244,7 +261,7 @@ func (ep *RtpEndpoint) Run(
 			}
 
 			payload := ep.getPayload()
-			pkt := packRTP(seq, ts, ssrc, payload)
+			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
 			if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
 				slog.Warn("RTP keepalive sendto error", "err", err, "dest", dest.String())
 				break
@@ -314,7 +331,7 @@ func (ep *RtpEndpoint) RunUntilCancelled(
 			}
 
 			payload := ep.getPayload()
-			pkt := packRTP(seq, ts, ssrc, payload)
+			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
 			_, _ = ep.conn.WriteToUDP(pkt, dest)
 
 			ep.mu.Lock()
@@ -355,7 +372,7 @@ func (ep *RtpEndpoint) sendBurst(
 		}
 
 		payload := ep.getPayload()
-		pkt := packRTP(seq, ts, ssrc, payload)
+		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
 		if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
 			remaining := time.Until(deadline)
 			if remaining > 0 {
@@ -476,10 +493,16 @@ func (ep *RtpEndpoint) receiveLoop() {
 }
 
 // packRTP builds a minimal 12-byte RFC 3550 RTP header + payload.
-func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte) []byte {
+// When marker is true the RTP M bit (bit 7 of byte 1) is set, signalling the
+// start of a talkspurt per RFC 3551 §4.1.
+func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte, marker bool) []byte {
 	hdr := make([]byte, 12+len(payload))
 	hdr[0] = 0x80          // V=2, P=0, X=0, CC=0
-	hdr[1] = PT_PCMU       // M=0, PT=0
+	pt := byte(PT_PCMU)    // PT=0 (PCMU)
+	if marker {
+		pt |= 0x80 // M=1
+	}
+	hdr[1] = pt
 	binary.BigEndian.PutUint16(hdr[2:4], seq)
 	binary.BigEndian.PutUint32(hdr[4:8], ts)
 	binary.BigEndian.PutUint32(hdr[8:12], ssrc)

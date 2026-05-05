@@ -244,6 +244,13 @@ func (m *SipMessage) requestURI() string {
 	return parts[1]
 }
 
+// GetRequestURI is the public form of requestURI, used by callers that must
+// echo the exact original Request-URI of a stored request (e.g. CANCEL must
+// reuse the INVITE Request-URI byte-for-byte per RFC 3261 §9.1).
+func (m *SipMessage) GetRequestURI() string {
+	return m.requestURI()
+}
+
 // ReplaceRequestURI replaces the URI portion of the request line.
 func (m *SipMessage) ReplaceRequestURI(uri string) {
 	if !m.isReq || m.reqLine == "" {
@@ -358,7 +365,29 @@ func (m *SipMessage) GetEvent() string {
 // NormalizeHeaderName maps a raw header name to its canonical constant using
 // prefix matching, mirroring the Python getHeaderName function. Unknown
 // headers are returned as-is.
+//
+// RFC 3261 §20 compact form short names are normalized first so that headers
+// arriving as "v:", "f:", "t:", etc. are stored under the same canonical key
+// as their full-form counterparts.
 func NormalizeHeaderName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "i":
+		return HdrCallID
+	case "m":
+		return HdrContact
+	case "l":
+		return HdrContentLength
+	case "c":
+		return HdrContentType
+	case "f":
+		return HdrFrom
+	case "t":
+		return HdrTo
+	case "v":
+		return HdrVia
+	case "k":
+		return HdrSupported
+	}
 	switch {
 	case strings.HasPrefix(name, "Call-ID"):
 		return HdrCallID

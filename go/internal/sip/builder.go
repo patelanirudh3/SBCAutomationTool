@@ -39,7 +39,9 @@ func BuildInitialRegister(fromUser, domain, transport, localIP string, localPort
 	fromTag := CreateFromTag()
 	m.AddHeader(HdrFrom, fmt.Sprintf("<sip:%s@%s>;tag=%s", fromUser, domain, fromTag))
 	m.AddHeader(HdrTo, fmt.Sprintf("<sip:%s@%s>", fromUser, domain))
-	m.AddHeader(HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", transport, localIP, CreateBranchID()))
+	// RFC 3261 §20.42: include the listening port in the Via sent-by so
+	// stateless responses can be returned to the correct UDP socket.
+	m.AddHeader(HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", transport, localIP, localPort, CreateBranchID()))
 
 	contact := fmt.Sprintf(
 		"<sip:%s@%s:%d;transport=%s;avaya-sc-enabled>;q=1;expires=%d;",
@@ -251,6 +253,9 @@ func Build200OK(req *SipMessage, localIP string, localPort int, sdpBody string) 
 	m.AddHeader(HdrCallID, req.GetCallID())
 	m.AddHeader(HdrCSeq, firstHeader(req, HdrCSeq))
 	m.AddHeader(HdrContact, fmt.Sprintf("<sip:%s:%d>", localIP, localPort))
+	// RFC 3261 §20.5 / §13.3.1: a 2xx response to INVITE MUST include the
+	// Allow header listing the methods supported within the dialog.
+	m.AddHeader(HdrAllow, "INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,INFO,UPDATE,PRACK")
 
 	if sdpBody != "" {
 		m.AddHeader(HdrContentType, "application/sdp")
