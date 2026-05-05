@@ -81,6 +81,12 @@ function AdvancedField({
 function TokenRow({ s }: { s: AdvancedSettingsType }) {
   const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
 
+  // qos_enabled / qos_mos_estimation default to true; show a token only when
+  // the admin has explicitly opted out, to keep the row uncluttered.
+  const qosTokens: string[] = []
+  if (s.qos_enabled === false) qosTokens.push('qos: off')
+  else if (s.qos_mos_estimation === false) qosTokens.push('qos: jitter+loss')
+
   const tokens = [
     `batch_size: ${s.register_batch_size}`,
     `batch_delay: ${s.register_batch_delay_ms}ms`,
@@ -92,6 +98,7 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     `keepalive: ${s.rtp_keepalive_interval}s`,
     `refresh: ${s.metrics_interval}s`,
     ...(s.rtp_pcap ? ['pcap: on'] : []),
+    ...qosTokens,
   ]
 
   return (
@@ -158,7 +165,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
   const handleSave = () => {
     const ALLOW_ZERO: Set<string> = new Set(['register_batch_delay_ms'])
-    const SKIP: Set<string> = new Set(['rtp_mode', 'rtp_pcap'])
+    const SKIP: Set<string> = new Set(['rtp_mode', 'rtp_pcap', 'qos_enabled', 'qos_mos_estimation'])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
       if (SKIP.has(key)) continue
