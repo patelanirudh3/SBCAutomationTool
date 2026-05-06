@@ -187,6 +187,18 @@ function getErrors(raw: RawVMFormValues): Record<string, string> {
 // is passed before that to keep the tab labels clean during initial entry).
 // ---------------------------------------------------------------------------
 
+/**
+ * ConfigTabTrigger — boxed browser-tab style on dark background.
+ * Inactive tabs: subtle muted-orange text + transparent fill + thin border
+ * so they unmistakably look like tabs (not labels).
+ * Active tab: vivid orange text + filled bg + visible border on top/sides;
+ * the bottom border merges into the form panel below to convey "this tab
+ * owns the panel beneath."
+ *
+ * Orange (rather than rose-red or amber) was picked because rose is already
+ * the error palette and amber is the warning palette — orange is the only
+ * warm hue free of semantic baggage in this codebase.
+ */
 function ConfigTabTrigger({
   value,
   label,
@@ -200,9 +212,22 @@ function ConfigTabTrigger({
     <TabsTrigger
       value={value}
       className={cn(
-        'px-4 text-sm font-bold uppercase tracking-wide transition-colors',
-        'text-slate-400 hover:text-slate-200',
-        'data-[state=active]:text-emerald-400',
+        // Layout — taller and wider so it reads clearly as a tab control.
+        'h-9 px-4 text-sm font-bold uppercase tracking-wide transition-colors',
+        // Browser-tab shape: rounded top, flat bottom, sits ON the panel.
+        'rounded-t-md rounded-b-none border border-b-0',
+        // Inactive state — visible border + warm muted color.
+        'border-slate-700/60 bg-slate-800/30 text-orange-300/70',
+        'hover:bg-slate-800/60 hover:text-orange-200',
+        // Active state — vivid orange fill + emphasised border. The
+        // -mb-px nudges the active trigger down 1px so its bottom edge
+        // overlaps the panel border, giving the "tab merges with content"
+        // effect.
+        'data-[state=active]:-mb-px',
+        'data-[state=active]:border-orange-500/60',
+        'data-[state=active]:bg-orange-500/15',
+        'data-[state=active]:text-orange-300',
+        'data-[state=active]:shadow-[0_-2px_8px_-4px_rgba(251,146,60,0.35)]',
       )}
     >
       <span>{label}</span>
@@ -564,8 +589,17 @@ export function VMPairBook() {
               onValueChange={(v) => setActiveTab(v as 'server' | 'traffic' | 'media')}
               className="gap-0"
             >
-              <div className="border-b border-border bg-card/40 px-4 pt-2 pb-0">
-                <TabsList variant="line" className="gap-3">
+              {/* Tab strip — sits above the form panel. The boxed
+                  ConfigTabTrigger is taller than the line variant, so the
+                  container needs more vertical room. The bottom border of
+                  this strip becomes the "shelf" the tabs visually sit on,
+                  and the active tab's -mb-px overlaps it for a seamless
+                  browser-tab merge with the form below. */}
+              <div className="relative border-b border-border bg-card/40 px-4 pt-2 pb-0">
+                <TabsList
+                  variant="line"
+                  className="h-auto gap-1.5 bg-transparent p-0"
+                >
                   <ConfigTabTrigger value="server"  label="Server & Auth"        errCount={hasValidated ? tabErrCount('server')  : 0} />
                   <ConfigTabTrigger value="traffic" label="Traffic & Registration" errCount={hasValidated ? tabErrCount('traffic') : 0} />
                   <ConfigTabTrigger value="media"   label="Media & QoS"          errCount={hasValidated ? tabErrCount('media')   : 0} />
