@@ -2,6 +2,19 @@ import * as React from "react"
 
 import { cn } from "@/lib/utils"
 
+/**
+ * Single-line input. Defaults to `w-full` so it fills its container, but the
+ * cn() helper uses tailwind-merge so any width class passed via `className`
+ * (e.g. "w-24" for a port, "w-44" for an IP) wins over the default. Use the
+ * tightest reasonable width per field type to avoid wasting horizontal space.
+ *
+ * Recommended widths:
+ *   port / numeric :  w-20  / w-24
+ *   IP             :  w-44
+ *   extension      :  w-32
+ *   domain         :  w-48
+ *   filesystem path:  w-full   (legitimately long)
+ */
 function Input({ className, type, ...props }: React.ComponentProps<"input">) {
   return (
     <input

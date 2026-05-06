@@ -17,6 +17,13 @@ import { FieldError, FieldHint } from './ConfigValidator'
 // Field helper
 // ---------------------------------------------------------------------------
 
+/**
+ * AdvancedField — horizontal row layout to match VMConfigPanel's FormRow.
+ * 130px label column on the left, compact w-20 numeric input on the right.
+ * Hint text moves into the tooltip when both are provided to keep the row
+ * to a single line; the standalone hint render is preserved for cases
+ * where only `hint` is set.
+ */
 function AdvancedField({
   label,
   value,
@@ -39,13 +46,17 @@ function AdvancedField({
   onChange: (v: number) => void
 }) {
   return (
-    <div className="space-y-1">
-      <div className="flex items-center gap-1.5">
+    <div className="grid grid-cols-[130px_1fr] items-start gap-3 py-1">
+      <div className="flex h-8 items-center gap-1">
         <Label className="text-xs font-semibold text-slate-200/90">{label}</Label>
         {tooltip && (
           <Tooltip>
             <TooltipTrigger asChild>
-              <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
+              <button
+                type="button"
+                tabIndex={-1}
+                className="text-indigo-400/70 hover:text-indigo-300 transition-colors"
+              >
                 <Info className="size-3" />
               </button>
             </TooltipTrigger>
@@ -55,21 +66,23 @@ function AdvancedField({
           </Tooltip>
         )}
       </div>
-      <Input
-        type="number"
-        min={min ?? 1}
-        step={step ?? 1}
-        value={value}
-        disabled={disabled}
-        onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-        className={cn(
-          'font-mono border-slate-600/50 bg-slate-800/80 text-slate-100',
-          'focus-visible:border-indigo-400/60 focus-visible:ring-1 focus-visible:ring-indigo-400/30',
-          disabled && 'cursor-default opacity-75'
-        )}
-      />
-      {error && <FieldError error={error} />}
-      {!error && hint && <FieldHint>{hint}</FieldHint>}
+      <div className="min-w-0 space-y-1">
+        <Input
+          type="number"
+          min={min ?? 1}
+          step={step ?? 1}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+          className={cn(
+            'w-20 font-mono border-slate-600/50 bg-slate-800/80 text-slate-100',
+            'focus-visible:border-indigo-400/60 focus-visible:ring-1 focus-visible:ring-indigo-400/30',
+            disabled && 'cursor-default opacity-75'
+          )}
+        />
+        {error && <FieldError error={error} />}
+        {!error && hint && !tooltip && <FieldHint>{hint}</FieldHint>}
+      </div>
     </div>
   )
 }
@@ -269,11 +282,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
             transition={{ duration: 0.2, ease: 'easeInOut' }}
             className="overflow-hidden"
           >
-            <div className="border-t border-slate-700/40 px-5 py-4 space-y-4">
-              <div className="grid grid-cols-2 gap-x-8 gap-y-3">
+            <div className="border-t border-slate-700/40 px-5 py-3 space-y-3">
+              <div className="grid grid-cols-2 gap-x-6 gap-y-2">
 
                 {/* Left — Pre-Phase / Registration */}
-                <div className="space-y-3">
+                <div className="space-y-1">
                   <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
                     Pre-Phase Settings
@@ -329,17 +342,17 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                 </div>
 
                 {/* Right — RTP */}
-                <div className="space-y-3">
+                <div className="space-y-1">
                   <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-indigo-300">
                     <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-indigo-400" />
                     RTP
                     <span className="h-px flex-1 bg-indigo-400/30" />
                   </h3>
 
-                  {/* RTP Mode */}
-                  <div className="space-y-1">
+                  {/* RTP Mode — horizontal row to match AdvancedField layout */}
+                  <div className="grid grid-cols-[130px_1fr] items-center gap-3 py-1">
                     <Label className="text-xs font-semibold text-slate-200/90">RTP Mode</Label>
-                    <div className="flex gap-2">
+                    <div className="flex gap-1.5">
                       {(['3phase', 'continuous'] as const).map((m) => (
                         <button
                           key={m}
@@ -347,26 +360,30 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                           disabled={disabled}
                           onClick={() => setDraft((prev) => ({ ...prev, rtp_mode: m as RtpMode }))}
                           className={cn(
-                            'flex-1 rounded-md px-3 py-2 text-xs font-bold border transition-colors',
+                            'rounded-md px-2.5 py-1 text-[11px] font-bold border transition-colors',
                             draft.rtp_mode === m
                               ? 'border-indigo-500/70 bg-indigo-600/25 text-white'
                               : 'border-slate-600/60 bg-slate-800/70 text-slate-300 hover:border-indigo-500/40 hover:text-slate-200',
                             disabled && 'opacity-70 cursor-default',
                           )}
                         >
-                          {m === '3phase' ? '3-Phase Burst' : 'Continuous'}
+                          {m === '3phase' ? '3-Phase' : 'Continuous'}
                         </button>
                       ))}
                     </div>
                   </div>
 
-                  {/* PCAP capture */}
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-1.5">
+                  {/* PCAP capture — horizontal row */}
+                  <div className="grid grid-cols-[130px_1fr] items-center gap-3 py-1">
+                    <div className="flex items-center gap-1">
                       <Label className="text-xs font-semibold text-slate-200/90">PCAP Capture</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <button type="button" className="text-indigo-400/70 hover:text-indigo-300 transition-colors">
+                          <button
+                            type="button"
+                            tabIndex={-1}
+                            className="text-indigo-400/70 hover:text-indigo-300 transition-colors"
+                          >
                             <Info className="size-3" />
                           </button>
                         </TooltipTrigger>
@@ -380,7 +397,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                       disabled={disabled}
                       onClick={() => setDraft((prev) => ({ ...prev, rtp_pcap: !prev.rtp_pcap }))}
                       className={cn(
-                        'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                        'inline-flex w-fit items-center gap-2 rounded-md px-2.5 py-1 text-[11px] font-semibold border transition-colors',
                         draft.rtp_pcap
                           ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                           : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-indigo-400/40',
@@ -391,7 +408,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                         'inline-block size-3 rounded-sm border-2 transition-colors',
                         draft.rtp_pcap ? 'border-emerald-400 bg-emerald-400' : 'border-zinc-400 bg-transparent'
                       )} />
-                      {draft.rtp_pcap ? 'Enabled — pcap files saved to logs/' : 'Disabled'}
+                      {draft.rtp_pcap ? 'On — pcap saved to logs/' : 'Off'}
                     </button>
                   </div>
 

@@ -11,12 +11,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { FieldError, FieldHint, FieldWarning, FieldSoftWarning } from './ConfigValidator'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { FieldError, FieldSoftWarning } from './ConfigValidator'
 import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { Loader2, CheckCircle, XCircle, Signal, RotateCcw } from 'lucide-react'
+import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info } from 'lucide-react'
 import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -119,7 +120,37 @@ function SectionHeader({ children, onReset }: { children: ReactNode; onReset?: (
   )
 }
 
-function FormField({
+/**
+ * InfoTooltip — small "ⓘ" icon next to a Label that reveals descriptive
+ * help text on hover/focus. Replaces the old below-input FieldHint pattern
+ * so each field occupies one row instead of three lines.
+ */
+function InfoTooltip({ children }: { children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="text-muted-foreground/60 transition-colors hover:text-emerald-400"
+          tabIndex={-1}
+        >
+          <Info className="size-3" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+        {children}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+/**
+ * FormRow — horizontal field layout: 140px label column on the left, input
+ * on the right. Hint text moves to a tooltip icon next to the label;
+ * inline error/warning sits below the input. Each row occupies ~28px
+ * (one line) instead of the previous ~72px stacked Label/Input/Hint.
+ */
+function FormRow({
   label,
   error,
   warning,
@@ -129,16 +160,20 @@ function FormField({
   label: string
   error?: string
   warning?: string
-  hint?: string
+  hint?: ReactNode
   children: ReactNode
 }) {
   return (
-    <div className="space-y-1">
-      <Label className="text-xs font-medium text-foreground/80">{label}</Label>
-      {children}
-      {error && <FieldError error={error} />}
-      {!error && warning && <FieldSoftWarning warning={warning} />}
-      {!error && !warning && hint && <FieldHint>{hint}</FieldHint>}
+    <div className="grid grid-cols-[140px_1fr] items-start gap-3 py-1">
+      <Label className="flex h-8 items-center gap-1 text-xs font-medium text-foreground/80">
+        <span>{label}</span>
+        {hint && <InfoTooltip>{hint}</InfoTooltip>}
+      </Label>
+      <div className="min-w-0 space-y-1">
+        {children}
+        {error && <FieldError error={error} />}
+        {!error && warning && <FieldSoftWarning warning={warning} />}
+      </div>
     </div>
   )
 }
@@ -269,43 +304,48 @@ function CpsBhccField({
   const bhccNum = Number.isFinite(cpsNum) && cpsNum > 0 ? Math.round(cpsNum * 3600) : null
 
   return (
-    <div className="space-y-1">
-      <Label className="text-xs font-medium text-foreground/80">Call Rate</Label>
-      <div className="grid grid-cols-2 gap-2">
-        <div className="space-y-1">
-          <Label className="text-[10px] text-muted-foreground">CPS (calls/sec)</Label>
-          <Input
-            type="number"
-            min={0.01}
-            step={0.1}
-            value={cps}
-            onChange={(ev) => handleCpsChange(ev.target.value)}
-            onBlur={onBlur}
-            className={cn('font-mono', inputMode === 'cps' ? 'ring-1 ring-emerald-500/40' : '')}
-          />
-        </div>
-        <div className="space-y-1">
-          <Label className="text-[10px] text-muted-foreground">BHCC (calls/hour)</Label>
-          <Input
-            type="number"
-            min={1}
-            step={1}
-            value={bhccDraft}
-            onChange={(ev) => handleBhccChange(ev.target.value)}
-            onBlur={onBlur}
-            className={cn('font-mono', inputMode === 'bhcc' ? 'ring-1 ring-amber-500/40' : '')}
-            placeholder={bhccNum ? String(bhccNum) : '—'}
-          />
-        </div>
+    <FormRow
+      label="Call Rate"
+      error={error}
+      warning={warning}
+      hint="Either CPS or BHCC may be edited — the other auto-derives. CPS = calls per second, BHCC = busy-hour call count (calls/hour)."
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type="number"
+          min={0.01}
+          step={0.1}
+          value={cps}
+          onChange={(ev) => handleCpsChange(ev.target.value)}
+          onBlur={onBlur}
+          className={cn(
+            'w-24 font-mono',
+            inputMode === 'cps' ? 'ring-1 ring-emerald-500/40' : '',
+          )}
+        />
+        <span className="text-[11px] font-medium text-slate-400">CPS</span>
+        <span className="text-slate-500">·</span>
+        <Input
+          type="number"
+          min={1}
+          step={1}
+          value={bhccDraft}
+          onChange={(ev) => handleBhccChange(ev.target.value)}
+          onBlur={onBlur}
+          className={cn(
+            'w-28 font-mono',
+            inputMode === 'bhcc' ? 'ring-1 ring-amber-500/40' : '',
+          )}
+          placeholder={bhccNum ? String(bhccNum) : '—'}
+        />
+        <span className="text-[11px] font-medium text-slate-400">BHCC</span>
+        {bhccNum !== null && (
+          <span className="ml-1 font-mono text-[11px] text-amber-400/80">
+            ≈ <span className="font-bold text-amber-400">{bhccNum.toLocaleString()}</span> calls/hour
+          </span>
+        )}
       </div>
-      {bhccNum !== null && (
-        <p className="font-mono text-[11px] text-amber-400/80">
-          {cps} CPS = <span className="font-bold text-amber-400">{bhccNum.toLocaleString()} BHCC</span>
-        </p>
-      )}
-      {error && <FieldError error={error} />}
-      {!error && warning && <FieldSoftWarning warning={warning} />}
-    </div>
+    </FormRow>
   )
 }
 
@@ -344,150 +384,155 @@ export function VMConfigPanel({
   const ppsDisplay = Math.round(1000 / ptimeNum)
 
   return (
-    <div className="space-y-6 px-4 py-5">
+    <div className="space-y-4 px-4 py-4">
 
       {/* ── Identity ──────────────────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.identity)}>Identity</SectionHeader>
-        <FormField label="VM ID" error={e('vm_id')}>
+        <FormRow label="VM ID" error={e('vm_id')}>
           <Input
             value={raw.vm_id}
             onChange={(ev) => onChange('vm_id', ev.target.value)}
             onBlur={() => onBlur('vm_id')}
             placeholder="traffic-local"
+            className="w-48"
             aria-invalid={t('vm_id') && !!errors.vm_id ? true : undefined}
           />
-        </FormField>
+        </FormRow>
       </div>
 
       {/* ── Traffic Agent Host ───────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.agent_host)}>Traffic Agent Host</SectionHeader>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="IP Address" error={e('vm_ip')}>
+        <FormRow label="IP Address" error={e('vm_ip')}>
+          <Input
+            value={raw.vm_ip}
+            onChange={(ev) => onChange('vm_ip', ev.target.value)}
+            onBlur={handleIpBlur}
+            placeholder="127.0.0.1"
+            className="w-44 font-mono"
+            aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
+          />
+        </FormRow>
+        <FormRow label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
+          <div className="flex items-center gap-2">
             <Input
-              value={raw.vm_ip}
-              onChange={(ev) => onChange('vm_ip', ev.target.value)}
-              onBlur={handleIpBlur}
-              placeholder="127.0.0.1"
-              className="font-mono"
-              aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
+              type="number"
+              value={raw.metrics_port}
+              onChange={(ev) => onChange('metrics_port', ev.target.value)}
+              onBlur={handleMetricsPortBlur}
+              placeholder="8082"
+              className="w-24 font-mono"
+              aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
             />
-          </FormField>
-          <FormField label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
-            <div className="flex gap-2">
-              <Input
-                type="number"
-                value={raw.metrics_port}
-                onChange={(ev) => onChange('metrics_port', ev.target.value)}
-                onBlur={handleMetricsPortBlur}
-                placeholder="8082"
-                className="font-mono"
-                aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
-              />
-              <TestReachabilityButton
-                vmIp={raw.vm_ip}
-                metricsPort={raw.metrics_port}
-                reachability={reachability}
-                onTest={onCheckReachability}
-              />
-            </div>
-          </FormField>
-        </div>
-        <div className="space-y-1">
-          <p className="mt-0.5 text-xs text-slate-400">
-            Health check:{' '}
-            <span className="font-mono text-sky-400 underline decoration-sky-400/30 underline-offset-2">
-              {`http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
-            </span>
-          </p>
-          <FieldWarning>
-            The traffic agent must be running on this port before the GUI can connect.
-          </FieldWarning>
-          {reachability && <div className="pt-0.5"><ReachabilityIndicator status={reachability} /></div>}
-        </div>
-        <FormField label="SSH User (optional)" error={e('ssh_user')}>
+            <TestReachabilityButton
+              vmIp={raw.vm_ip}
+              metricsPort={raw.metrics_port}
+              reachability={reachability}
+              onTest={onCheckReachability}
+            />
+            {reachability && <ReachabilityIndicator status={reachability} />}
+          </div>
+        </FormRow>
+        <p className="ml-[140px] pl-3 text-[11px] text-slate-400">
+          Health:{' '}
+          <span className="font-mono text-sky-400 underline decoration-sky-400/30 underline-offset-2">
+            {`http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
+          </span>
+        </p>
+        <FormRow
+          label="SSH User"
+          error={e('ssh_user')}
+          hint="Optional — only needed when connecting to a remote VM."
+        >
           <Input
             value={raw.ssh_user}
             onChange={(ev) => onChange('ssh_user', ev.target.value)}
             onBlur={() => onBlur('ssh_user')}
             placeholder="ubuntu"
+            className="w-44"
           />
-        </FormField>
-        <FormField label="SSH Key Path (optional)" error={e('ssh_key_path')}>
+        </FormRow>
+        <FormRow
+          label="SSH Key Path"
+          error={e('ssh_key_path')}
+          hint="Optional — path to the private key for SSH access to a remote VM."
+        >
           <Input
             value={raw.ssh_key_path}
             onChange={(ev) => onChange('ssh_key_path', ev.target.value)}
             onBlur={() => onBlur('ssh_key_path')}
             placeholder="/home/user/.ssh/id_rsa"
-            className="font-mono text-xs"
+            className="w-full font-mono text-xs"
           />
-        </FormField>
+        </FormRow>
       </div>
 
       {/* ── Remote SIP Server ─────────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
-        <FieldHint>Target SBC, SIP proxy, or any SIP server receiving calls.</FieldHint>
 
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="Host (IP or FQDN)" error={e('sbc_host')}>
-            <Input
-              value={raw.sbc_host}
-              onChange={(ev) => onChange('sbc_host', ev.target.value)}
-              onBlur={() => onBlur('sbc_host')}
-              placeholder="10.133.63.117"
-              aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
-            />
-          </FormField>
-          <FormField label="Port" error={e('sbc_port')} warning={w('sbc_port')}>
-            <Input
-              type="number"
-              value={raw.sbc_port}
-              onChange={(ev) => onChange('sbc_port', ev.target.value)}
-              onBlur={() => onBlur('sbc_port')}
-              placeholder="5060"
-              className="font-mono"
-              aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
-            />
-          </FormField>
-        </div>
-
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="Transport" error={e('sip_transport')}>
-            <Select
-              value={raw.sip_transport}
-              onValueChange={(v) => { onChange('sip_transport', v as SipTransport); onBlur('sip_transport') }}
-            >
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="TCP">TCP</SelectItem>
-                <SelectItem value="TLS">TLS</SelectItem>
-              </SelectContent>
-            </Select>
-          </FormField>
-          <FormField label="Scheme" error={e('sip_scheme')}
-            hint="SIP = plain (port 5060), SIPS = secure (port 5061)">
-            <Select
-              value={raw.sip_scheme}
-              onValueChange={(v) => { onChange('sip_scheme', v as SipScheme); onBlur('sip_scheme') }}
-            >
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="SIP">SIP</SelectItem>
-                <SelectItem value="SIPS">SIPS</SelectItem>
-              </SelectContent>
-            </Select>
-          </FormField>
-        </div>
+        <FormRow
+          label="Host"
+          error={e('sbc_host')}
+          hint="Target SBC, SIP proxy, or any SIP server receiving calls. Accepts IP or FQDN."
+        >
+          <Input
+            value={raw.sbc_host}
+            onChange={(ev) => onChange('sbc_host', ev.target.value)}
+            onBlur={() => onBlur('sbc_host')}
+            placeholder="x.x.x.x"
+            className="w-44 font-mono"
+            aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+          />
+        </FormRow>
+        <FormRow label="Port" error={e('sbc_port')} warning={w('sbc_port')}>
+          <Input
+            type="number"
+            value={raw.sbc_port}
+            onChange={(ev) => onChange('sbc_port', ev.target.value)}
+            onBlur={() => onBlur('sbc_port')}
+            placeholder="5060"
+            className="w-24 font-mono"
+            aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+          />
+        </FormRow>
+        <FormRow label="Transport" error={e('sip_transport')}>
+          <Select
+            value={raw.sip_transport}
+            onValueChange={(v) => { onChange('sip_transport', v as SipTransport); onBlur('sip_transport') }}
+          >
+            <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="TCP">TCP</SelectItem>
+              <SelectItem value="TLS">TLS</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormRow>
+        <FormRow
+          label="Scheme"
+          error={e('sip_scheme')}
+          hint="SIP = plain (port 5060). SIPS = secure (port 5061)."
+        >
+          <Select
+            value={raw.sip_scheme}
+            onValueChange={(v) => { onChange('sip_scheme', v as SipScheme); onBlur('sip_scheme') }}
+          >
+            <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="SIP">SIP</SelectItem>
+              <SelectItem value="SIPS">SIPS</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormRow>
 
         {raw.sip_transport === 'TLS' && (
-          <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
             <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-amber-300">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
               TLS Settings
             </div>
-            <FormField
+            <FormRow
               label="TLS Mode"
               error={e('tls_mode')}
               hint="Choose how the SBC certificate is validated and whether to present a client cert."
@@ -496,7 +541,7 @@ export function VMConfigPanel({
                 value={raw.tls_mode || 'insecure'}
                 onValueChange={(v) => { onChange('tls_mode', v as TLSMode); onBlur('tls_mode') }}
               >
-                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-72"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="insecure">Insecure (skip verify) — lab/testing only</SelectItem>
                   <SelectItem value="server_ca">Server CA verification (one-way TLS)</SelectItem>
@@ -504,11 +549,11 @@ export function VMConfigPanel({
                   <SelectItem value="mutual">Mutual TLS (CA + client cert)</SelectItem>
                 </SelectContent>
               </Select>
-            </FormField>
+            </FormRow>
 
             {(raw.tls_mode === 'server_ca' || raw.tls_mode === 'mutual') && (
-              <FormField
-                label="CA Certificate Path"
+              <FormRow
+                label="CA Cert Path"
                 error={e('tls_ca_path')}
                 hint="PEM file on the engine VM, e.g. /etc/ssl/certs/sbc-ca.pem"
               >
@@ -517,16 +562,16 @@ export function VMConfigPanel({
                   onChange={(ev) => onChange('tls_ca_path', ev.target.value)}
                   onBlur={() => onBlur('tls_ca_path')}
                   placeholder="/path/to/ca.pem"
-                  className="font-mono text-xs"
+                  className="w-full font-mono text-xs"
                   aria-invalid={t('tls_ca_path') && !!errors.tls_ca_path ? true : undefined}
                 />
-              </FormField>
+              </FormRow>
             )}
 
             {(raw.tls_mode === 'client_cert' || raw.tls_mode === 'mutual') && (
-              <div className="grid grid-cols-1 gap-3">
-                <FormField
-                  label="Client Certificate Path"
+              <>
+                <FormRow
+                  label="Client Cert Path"
                   error={e('tls_cert_path')}
                   hint="PEM containing the tool's identity certificate."
                 >
@@ -535,12 +580,12 @@ export function VMConfigPanel({
                     onChange={(ev) => onChange('tls_cert_path', ev.target.value)}
                     onBlur={() => onBlur('tls_cert_path')}
                     placeholder="/path/to/client.crt"
-                    className="font-mono text-xs"
+                    className="w-full font-mono text-xs"
                     aria-invalid={t('tls_cert_path') && !!errors.tls_cert_path ? true : undefined}
                   />
-                </FormField>
-                <FormField
-                  label="Client Private Key Path"
+                </FormRow>
+                <FormRow
+                  label="Client Key Path"
                   error={e('tls_key_path')}
                   hint="Private key (chmod 600 on the VM). Must match the certificate above."
                 >
@@ -549,16 +594,16 @@ export function VMConfigPanel({
                     onChange={(ev) => onChange('tls_key_path', ev.target.value)}
                     onBlur={() => onBlur('tls_key_path')}
                     placeholder="/path/to/client.key"
-                    className="font-mono text-xs"
+                    className="w-full font-mono text-xs"
                     aria-invalid={t('tls_key_path') && !!errors.tls_key_path ? true : undefined}
                   />
-                </FormField>
-              </div>
+                </FormRow>
+              </>
             )}
 
             {raw.tls_mode && raw.tls_mode !== 'insecure' && (
-              <FormField
-                label="TLS Server Name (SNI)"
+              <FormRow
+                label="Server Name (SNI)"
                 error={e('tls_server_name')}
                 hint="Override only if the SBC certificate CN/SAN differs from the host above."
               >
@@ -567,170 +612,174 @@ export function VMConfigPanel({
                   onChange={(ev) => onChange('tls_server_name', ev.target.value)}
                   onBlur={() => onBlur('tls_server_name')}
                   placeholder="sbc.example.com"
-                  className="font-mono text-xs"
+                  className="w-48 font-mono text-xs"
                 />
-              </FormField>
+              </FormRow>
             )}
           </div>
         )}
 
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="Domain" error={e('domain')}>
-            <Input
-              value={raw.domain}
-              onChange={(ev) => onChange('domain', ev.target.value)}
-              onBlur={() => onBlur('domain')}
-              placeholder="avaya.com"
-              aria-invalid={t('domain') && !!errors.domain ? true : undefined}
-            />
-          </FormField>
-          <FormField label="SIP Password" error={e('sip_password')}>
-            <Input
-              type="password"
-              value={raw.sip_password}
-              onChange={(ev) => onChange('sip_password', ev.target.value)}
-              onBlur={() => onBlur('sip_password')}
-              placeholder="••••••••"
-              aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
-            />
-          </FormField>
-        </div>
+        <FormRow label="Domain" error={e('domain')}>
+          <Input
+            value={raw.domain}
+            onChange={(ev) => onChange('domain', ev.target.value)}
+            onBlur={() => onBlur('domain')}
+            placeholder="avaya.com"
+            className="w-48"
+            aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+          />
+        </FormRow>
+        <FormRow label="SIP Password" error={e('sip_password')}>
+          <Input
+            type="password"
+            value={raw.sip_password}
+            onChange={(ev) => onChange('sip_password', ev.target.value)}
+            onBlur={() => onBlur('sip_password')}
+            placeholder="••••••••"
+            className="w-44"
+            aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
+          />
+        </FormRow>
 
         {/* Failover */}
-        <div className={cn(
-          'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
-          raw.failover_enabled ? 'border-amber-500/30 bg-amber-950/20' : 'border-slate-600/30 bg-slate-800/20',
-        )}>
-          <div className="space-y-0.5">
-            <Label className="text-xs font-bold tracking-wide text-slate-100">Enable Failover</Label>
-            <p className="text-[11px] leading-relaxed text-slate-300">
-              {raw.failover_enabled ? 'Secondary host configured for failover' : 'Single host — no failover'}
-            </p>
+        <FormRow
+          label="Failover"
+          hint="Enable to add a secondary SBC host for failover during a run."
+        >
+          <div className="flex items-center gap-3">
+            <Switch
+              checked={raw.failover_enabled}
+              onCheckedChange={(checked) => onChange('failover_enabled', checked)}
+            />
+            <span className="text-[11px] text-slate-400">
+              {raw.failover_enabled ? 'Secondary host configured' : 'Single host — no failover'}
+            </span>
           </div>
-          <Switch
-            checked={raw.failover_enabled}
-            onCheckedChange={(checked) => onChange('failover_enabled', checked)}
-          />
-        </div>
+        </FormRow>
 
         {raw.failover_enabled && (
-          <div className="grid grid-cols-2 gap-3">
-            <FormField label="Secondary Host">
+          <>
+            <FormRow label="Secondary Host">
               <Input
                 value={raw.secondary_host}
                 onChange={(ev) => onChange('secondary_host', ev.target.value)}
                 onBlur={() => onBlur('secondary_host')}
-                placeholder="10.133.63.118"
+                placeholder="x.x.x.x"
+                className="w-44 font-mono"
               />
-            </FormField>
-            <FormField label="Secondary Port">
+            </FormRow>
+            <FormRow label="Secondary Port">
               <Input
                 type="number"
                 value={raw.secondary_port}
                 onChange={(ev) => onChange('secondary_port', ev.target.value)}
                 onBlur={() => onBlur('secondary_port')}
                 placeholder="5060"
-                className="font-mono"
+                className="w-24 font-mono"
               />
-            </FormField>
-          </div>
+            </FormRow>
+          </>
         )}
 
-        <FormField label="DNS Servers (optional)"
-          hint="Comma-separated IPs for FQDN resolution. Leave empty for system DNS.">
+        <FormRow
+          label="DNS Servers"
+          hint="Optional — comma-separated IPs for FQDN resolution. Leave empty to use system DNS."
+        >
           <Input
             value={raw.dns_servers}
             onChange={(ev) => onChange('dns_servers', ev.target.value)}
             onBlur={() => onBlur('dns_servers')}
             placeholder="10.0.0.53, 168.63.129.16"
-            className="font-mono text-xs"
+            className="w-full font-mono text-xs"
           />
-        </FormField>
+        </FormRow>
       </div>
 
       {/* ── Extension Pool ────────────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.extension_pool)}>Extension Pool</SectionHeader>
-        <div className="flex items-center justify-between">
-          <span className="text-[11px] font-semibold text-slate-200">SIP Extension Range</span>
-          {extCount > 0 && (
-            <span className="flex items-center gap-1 rounded border border-slate-700/50 bg-slate-800/60 px-1.5 py-0.5 font-mono text-[11px]">
-              <span className="font-bold text-amber-400">{raw.ext_start}</span>
-              <span className="text-slate-500">→</span>
-              <span className="font-bold text-amber-400">{raw.ext_end}</span>
-              <span className="text-slate-500">·</span>
-              <span className="text-slate-400">{extCount} ext</span>
-            </span>
-          )}
-        </div>
-        <div className="grid grid-cols-3 gap-3">
-          <FormField label="Start" error={e('ext_start')}>
+        <FormRow
+          label="Range"
+          hint="Any two extensions from this pool may be paired for a call."
+        >
+          <div className="flex flex-wrap items-center gap-2">
             <Input
               type="number"
               value={raw.ext_start}
               onChange={(ev) => onChange('ext_start', ev.target.value)}
               onBlur={() => onBlur('ext_start')}
               placeholder="4001000"
-              className="font-mono text-xs"
+              className="w-32 font-mono text-xs"
               aria-invalid={t('ext_start') && !!errors.ext_start ? true : undefined}
             />
-          </FormField>
-          <FormField label="End" error={e('ext_end')}>
+            <span className="text-slate-500">→</span>
             <Input
               type="number"
               value={raw.ext_end}
               onChange={(ev) => onChange('ext_end', ev.target.value)}
               onBlur={() => onBlur('ext_end')}
               placeholder="4001009"
-              className="font-mono text-xs"
+              className="w-32 font-mono text-xs"
               aria-invalid={t('ext_end') && !!errors.ext_end ? true : undefined}
             />
-          </FormField>
-          <div className="space-y-1">
-            <Label className="text-xs font-medium text-foreground/80">Count</Label>
-            <div className="flex h-9 items-center rounded-md border border-input bg-secondary/40 px-3 font-mono text-xs text-muted-foreground">
-              {extCount > 0 ? extCount : '—'}
-            </div>
+            <span className="text-slate-500">·</span>
+            <span className="font-mono text-xs text-slate-300">
+              {extCount > 0 ? `${extCount} ext` : '—'}
+            </span>
           </div>
-        </div>
-        <FieldHint>Any two extensions from this pool may be paired for a call.</FieldHint>
+          {(e('ext_start') || e('ext_end')) && null /* errors shown via FormRow on each Input below if needed */}
+        </FormRow>
+        {/* Inline per-field errors when start/end are individually invalid */}
+        {(e('ext_start') || e('ext_end')) && (
+          <div className="ml-[140px] pl-3 space-y-1">
+            {e('ext_start') && <FieldError error={e('ext_start')} />}
+            {e('ext_end')   && <FieldError error={e('ext_end')} />}
+          </div>
+        )}
       </div>
 
       {/* ── Registration & Subscription ───────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.registration)}>Registration &amp; Subscription</SectionHeader>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="REGISTER Expires (s)" error={e('register_expires')}
-            hint="Expiry in REGISTER messages (default 3600)">
-            <Input
-              type="number"
-              min={60}
-              step={60}
-              value={raw.register_expires}
-              onChange={(ev) => onChange('register_expires', ev.target.value)}
-              onBlur={() => onBlur('register_expires')}
-              placeholder="3600"
-              className="font-mono"
-              aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
-            />
-          </FormField>
-          <FormField label="SUBSCRIBE Expires (s)" error={e('subscribe_expires')}
-            hint="Expiry in SUBSCRIBE messages (default 3600)">
-            <Input
-              type="number"
-              min={60}
-              step={60}
-              value={raw.subscribe_expires}
-              onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
-              onBlur={() => onBlur('subscribe_expires')}
-              placeholder="3600"
-              className="font-mono"
-              aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
-            />
-          </FormField>
-        </div>
-        <FormField label="Registration Rate (reg/s)" error={e('register_rate_cps')}
-          hint="Rate at which REGISTER messages are pumped (default 10/s). Backend may need updating to enforce this.">
+        <FormRow
+          label="REG Expires"
+          error={e('register_expires')}
+          hint="Expires header in REGISTER messages (seconds). Default 3600."
+        >
+          <Input
+            type="number"
+            min={60}
+            step={60}
+            value={raw.register_expires}
+            onChange={(ev) => onChange('register_expires', ev.target.value)}
+            onBlur={() => onBlur('register_expires')}
+            placeholder="3600"
+            className="w-24 font-mono"
+            aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
+          />
+        </FormRow>
+        <FormRow
+          label="SUB Expires"
+          error={e('subscribe_expires')}
+          hint="Expires header in SUBSCRIBE messages (seconds). Default 3600."
+        >
+          <Input
+            type="number"
+            min={60}
+            step={60}
+            value={raw.subscribe_expires}
+            onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
+            onBlur={() => onBlur('subscribe_expires')}
+            placeholder="3600"
+            className="w-24 font-mono"
+            aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+          />
+        </FormRow>
+        <FormRow
+          label="Reg Rate"
+          error={e('register_rate_cps')}
+          hint="Rate at which REGISTER messages are pumped (reg/s). Default 10."
+        >
           <Input
             type="number"
             min={1}
@@ -739,14 +788,15 @@ export function VMConfigPanel({
             onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
             onBlur={() => onBlur('register_rate_cps')}
             placeholder="10"
-            className="font-mono"
+            className="w-24 font-mono"
             aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
           />
-        </FormField>
-
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label="T1 (ms)" error={e('t1_ms')}
-            hint="RFC 3261 INVITE retransmit interval (UDP only). Default 500 ms.">
+        </FormRow>
+        <FormRow
+          label="T1 / Timer-B"
+          hint="RFC 3261 §17.1.1 INVITE client transaction timers. T1 is the UDP retransmit interval (default 500 ms); Timer B is the overall INVITE transaction timeout (default 64*T1 = 32 s)."
+        >
+          <div className="flex items-center gap-2">
             <Input
               type="number"
               min={100}
@@ -756,12 +806,11 @@ export function VMConfigPanel({
               onChange={(ev) => onChange('t1_ms', ev.target.value)}
               onBlur={() => onBlur('t1_ms')}
               placeholder="500"
-              className="font-mono"
+              className="w-20 font-mono"
               aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
             />
-          </FormField>
-          <FormField label="Timer B (s)" error={e('timer_b_seconds')}
-            hint="RFC 3261 INVITE transaction timeout (default 64*T1 = 32 s).">
+            <span className="text-[11px] text-slate-400">ms</span>
+            <span className="text-slate-500">·</span>
             <Input
               type="number"
               min={1}
@@ -771,18 +820,25 @@ export function VMConfigPanel({
               onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
               onBlur={() => onBlur('timer_b_seconds')}
               placeholder="32"
-              className="font-mono"
+              className="w-20 font-mono"
               aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
             />
-          </FormField>
-        </div>
+            <span className="text-[11px] text-slate-400">s</span>
+          </div>
+          {(e('t1_ms') || e('timer_b_seconds')) && (
+            <>
+              {e('t1_ms') && <FieldError error={e('t1_ms')} />}
+              {e('timer_b_seconds') && <FieldError error={e('timer_b_seconds')} />}
+            </>
+          )}
+        </FormRow>
       </div>
 
       {/* ── Call Traffic ──────────────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.call_traffic)}>Call Traffic</SectionHeader>
 
-        {/* Bidirectional CPS / BHCC */}
+        {/* Bidirectional CPS / BHCC — kept compact via FormRow */}
         <CpsBhccField
           cps={raw.cps}
           onCpsChange={(v) => onChange('cps', v)}
@@ -791,21 +847,28 @@ export function VMConfigPanel({
           onBlur={() => onBlur('cps')}
         />
 
-        <FormField label="Hold Time (s)" error={e('hold_time_seconds')} warning={w('hold_time_seconds')}
-          hint="Duration of each call leg before BYE is sent">
-          <Input
-            type="number"
-            min={0}
-            value={raw.hold_time_seconds}
-            onChange={(ev) => onChange('hold_time_seconds', ev.target.value)}
-            onBlur={() => onBlur('hold_time_seconds')}
-            className="font-mono"
-            aria-invalid={t('hold_time_seconds') && !!errors.hold_time_seconds ? true : undefined}
-          />
-        </FormField>
+        <FormRow
+          label="Hold Time"
+          error={e('hold_time_seconds')}
+          warning={w('hold_time_seconds')}
+          hint="Duration of each call leg before BYE is sent (seconds)."
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              value={raw.hold_time_seconds}
+              onChange={(ev) => onChange('hold_time_seconds', ev.target.value)}
+              onBlur={() => onBlur('hold_time_seconds')}
+              className="w-20 font-mono"
+              aria-invalid={t('hold_time_seconds') && !!errors.hold_time_seconds ? true : undefined}
+            />
+            <span className="text-[11px] text-slate-400">s</span>
+          </div>
+        </FormRow>
 
         {/* Traffic mode: smoke / timed / unlimited */}
-        <div className="space-y-3">
+        <div className="space-y-2 pt-1">
           <TrafficModeSelector
             value={raw.traffic_mode as TrafficMode}
             onChange={(m) => onChange('traffic_mode', m)}
@@ -834,43 +897,45 @@ export function VMConfigPanel({
       </div>
 
       {/* ── Media (RTP) ───────────────────────────────────────── */}
-      <div className="space-y-3">
+      <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.media)}>Media (RTP)</SectionHeader>
 
-        <div className={cn(
-          'inline-flex items-center gap-3 rounded-md border px-3 py-2.5',
-          raw.media_enabled ? 'border-emerald-500/30 bg-emerald-950/20' : 'border-amber-500/30 bg-amber-950/20',
-        )}>
-          <div className="space-y-0.5">
-            <Label className="text-xs font-bold tracking-wide text-slate-100">Enable RTP Media</Label>
-            <p className="text-[11px] leading-relaxed text-slate-300">
-              {raw.media_enabled ? 'RTP packets sent during calls' : 'Signaling-only — no RTP'}
-            </p>
+        <FormRow
+          label="RTP Media"
+          hint="Disable for signaling-only test runs (no RTP packets transmitted)."
+        >
+          <div className="flex items-center gap-3">
+            <Switch
+              checked={raw.media_enabled}
+              onCheckedChange={(checked) => onChange('media_enabled', checked)}
+            />
+            <span className="text-[11px] text-slate-400">
+              {raw.media_enabled ? 'RTP enabled' : 'Signaling-only — no RTP'}
+            </span>
           </div>
-          <Switch
-            checked={raw.media_enabled}
-            onCheckedChange={(checked) => onChange('media_enabled', checked)}
-          />
-        </div>
+        </FormRow>
 
         {raw.media_enabled && (
-          <div className="space-y-3 pl-1">
-            <div className="grid grid-cols-2 gap-3">
-              <FormField label="Codec">
-                <Select
-                  value={raw.rtp_codec}
-                  onValueChange={(v) => { onChange('rtp_codec', v as RtpCodec); onBlur('rtp_codec') }}
-                >
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="G711_ULAW">G.711 μ-law (PCMU)</SelectItem>
-                    <SelectItem value="G711_ALAW">G.711 A-law (PCMA)</SelectItem>
-                    <SelectItem value="G729">G.729</SelectItem>
-                    <SelectItem value="OPUS">OPUS</SelectItem>
-                  </SelectContent>
-                </Select>
-              </FormField>
-              <FormField label="ptime (ms)" hint={`Packet interval → ${ppsDisplay} PPS`}>
+          <>
+            <FormRow label="Codec">
+              <Select
+                value={raw.rtp_codec}
+                onValueChange={(v) => { onChange('rtp_codec', v as RtpCodec); onBlur('rtp_codec') }}
+              >
+                <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="G711_ULAW">G.711 μ-law (PCMU)</SelectItem>
+                  <SelectItem value="G711_ALAW">G.711 A-law (PCMA)</SelectItem>
+                  <SelectItem value="G729">G.729</SelectItem>
+                  <SelectItem value="OPUS">OPUS</SelectItem>
+                </SelectContent>
+              </Select>
+            </FormRow>
+            <FormRow
+              label="ptime"
+              hint={`Packet interval (ms). 1000 ÷ ptime = packets per second.`}
+            >
+              <div className="flex items-center gap-2">
                 <Input
                   type="number"
                   min={10}
@@ -880,15 +945,16 @@ export function VMConfigPanel({
                   onChange={(ev) => onChange('rtp_ptime', ev.target.value)}
                   onBlur={() => onBlur('rtp_ptime')}
                   placeholder="20"
-                  className="font-mono"
+                  className="w-20 font-mono"
                 />
-              </FormField>
-            </div>
-            <p className="font-mono text-[11px] text-slate-400">
-              PPS = 1000 ÷ {raw.rtp_ptime || 20} ={' '}
-              <span className="font-bold text-emerald-400">{ppsDisplay} packets/s</span>
-            </p>
-          </div>
+                <span className="text-[11px] text-slate-400">ms</span>
+                <span className="text-slate-500">·</span>
+                <span className="font-mono text-[11px] text-emerald-400">
+                  {ppsDisplay} pps
+                </span>
+              </div>
+            </FormRow>
+          </>
         )}
       </div>
 
