@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   Loader2,
   Trash2,
+  Pencil,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
@@ -175,6 +176,63 @@ function getErrors(raw: RawVMFormValues): Record<string, string> {
   const flat = result.error.flatten().fieldErrors
   return Object.fromEntries(
     Object.entries(flat).map(([k, v]) => [k, (v as string[])?.[0] ?? ''])
+  )
+}
+
+// ---------------------------------------------------------------------------
+// InlineVMIdEditor — click-to-edit replacement for the dedicated Identity
+// section. The VM ID is the only field in that section and is always shown
+// at the top of the UA card anyway, so editing inline saves a full row.
+// ---------------------------------------------------------------------------
+
+function InlineVMIdEditor({
+  value,
+  onChange,
+  onBlur,
+  invalid,
+}: {
+  value: string
+  onChange: (v: string) => void
+  onBlur: () => void
+  invalid?: boolean
+}) {
+  const [editing, setEditing] = useState(false)
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={() => { onBlur(); setEditing(false) }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === 'Escape') {
+            (e.target as HTMLInputElement).blur()
+          }
+        }}
+        placeholder="traffic-local"
+        className={cn(
+          'h-6 w-44 rounded border bg-background px-1.5 font-mono text-sm text-foreground',
+          'focus:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/40',
+          invalid ? 'border-rose-500/60' : 'border-emerald-500/40',
+        )}
+      />
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      title="Click to edit VM ID"
+      className={cn(
+        'group flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors',
+        'hover:bg-emerald-500/10',
+      )}
+    >
+      <span className="font-mono text-sm text-foreground">{value || 'User Agent'}</span>
+      <Pencil className="size-3 text-slate-500 opacity-0 transition-opacity group-hover:opacity-100" />
+    </button>
   )
 }
 
@@ -377,7 +435,15 @@ export function VMPairBook() {
                 <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
                   UA
                 </span>
-                <span className="font-mono text-sm text-foreground">{raw.vm_id || 'User Agent'}</span>
+                <InlineVMIdEditor
+                  value={raw.vm_id}
+                  onChange={(v) => handleChange('vm_id', v)}
+                  onBlur={() => handleBlur('vm_id')}
+                  invalid={touched.has('vm_id') && !!errors.vm_id}
+                />
+                {touched.has('vm_id') && errors.vm_id && (
+                  <span className="text-[10px] text-rose-400">{errors.vm_id}</span>
+                )}
                 {hasValidated && errorCount > 0 && (
                   <span className="ml-auto text-[10px] font-medium text-rose-400">
                     {errorCount} error{errorCount !== 1 ? 's' : ''}

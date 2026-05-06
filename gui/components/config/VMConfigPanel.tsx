@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, type ReactNode } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -17,7 +18,7 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info } from 'lucide-react'
+import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
 import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode } from '@/types'
 
 // All form values stored as strings so inputs stay fully controlled
@@ -82,6 +83,16 @@ export interface VMConfigPanelProps {
   onResetSection: (fields: (keyof RawVMFormValues)[]) => void
 }
 
+// Default values for the Registration section — used to detect "dirty" state
+// and auto-expand the collapsed section when any value differs.
+const DEFAULTS_REGISTRATION = {
+  register_expires:  '3600',
+  subscribe_expires: '3600',
+  register_rate_cps: '10',
+  t1_ms:             '500',
+  timer_b_seconds:   '32',
+}
+
 // Fields belonging to each logical section — used by per-section Reset buttons
 const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
@@ -117,6 +128,85 @@ function SectionHeader({ children, onReset }: { children: ReactNode; onReset?: (
         </button>
       )}
     </h3>
+  )
+}
+
+/**
+ * CollapsibleSection — sibling of SectionHeader that wraps content in an
+ * animated collapse. Use for sections that are rarely edited (Registration
+ * timers, custom DNS, failover) so the form is shorter by default but the
+ * fields are still one click away. The "Reset" button is rendered inside
+ * the header and only acts on this section's fields.
+ *
+ * `dirty` (optional) shows a small dot next to the header when any field in
+ * the section has been changed from defaults — encourages users to expand
+ * sections that have customizations even when collapsed.
+ */
+function CollapsibleSection({
+  title,
+  defaultOpen = false,
+  dirty = false,
+  onReset,
+  children,
+}: {
+  title: ReactNode
+  defaultOpen?: boolean
+  dirty?: boolean
+  onReset?: () => void
+  children: ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="space-y-2">
+      <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-foreground">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="flex flex-1 items-center gap-2 text-left transition-colors hover:text-emerald-400"
+          aria-expanded={open}
+        >
+          <ChevronDown
+            className={cn(
+              'size-3.5 shrink-0 text-slate-500 transition-transform duration-200',
+              open && 'rotate-180',
+            )}
+          />
+          <span>{title}</span>
+          {dirty && (
+            <span
+              className="size-1.5 shrink-0 rounded-full bg-amber-400"
+              title="Customised — click to expand"
+            />
+          )}
+        </button>
+        <span className="h-px flex-1 bg-border" />
+        {onReset && open && (
+          <button
+            type="button"
+            onClick={onReset}
+            className="flex items-center gap-1 text-[10px] normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
+            title="Reset section to defaults"
+          >
+            <RotateCcw className="size-3" />
+            Reset
+          </button>
+        )}
+      </h3>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            key="body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: 'easeInOut' }}
+            className="overflow-hidden"
+          >
+            <div className="space-y-2 pt-1">{children}</div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   )
 }
 
@@ -383,23 +473,46 @@ export function VMConfigPanel({
   const ptimeNum = parseInt(raw.rtp_ptime, 10) || 20
   const ppsDisplay = Math.round(1000 / ptimeNum)
 
+  // Subscribe Expires is identical to Register Expires in 99% of deployments.
+  // Hide it behind a "Customise" toggle that's auto-on when the values differ
+  // (so previously-customised configs keep showing the field on reload).
+  const [customSub, setCustomSub] = useState(
+    raw.subscribe_expires !== '' && raw.subscribe_expires !== raw.register_expires,
+  )
+  // When the toggle is OFF, keep subscribe_expires in lock-step with
+  // register_expires so the value stored / saved is still correct.
+  useEffect(() => {
+    if (!customSub && raw.subscribe_expires !== raw.register_expires) {
+      onChange('subscribe_expires', raw.register_expires)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customSub, raw.register_expires])
+
+  // Heuristic for "is this a local target?" — used to hide SSH credentials
+  // when they're irrelevant. Loopback or empty IP means same-host execution
+  // (the engine binary runs alongside the GUI, no SSH needed).
+  const isLocalAgent =
+    !raw.vm_ip || raw.vm_ip === '127.0.0.1' || raw.vm_ip === 'localhost' || raw.vm_ip === '::1'
+
+  // Hide SSH fields when local OR when neither has been touched/customised.
+  // If the user previously typed a value, surface it again so they can clear/
+  // edit it — never silently drop their input.
+  const showSSHFields =
+    !isLocalAgent || !!raw.ssh_user || !!raw.ssh_key_path
+
+  // Heuristic: looks like a numeric IPv4/IPv6. When sbc_host is a literal
+  // address, custom DNS resolution is irrelevant. Show DNS only for FQDNs
+  // or when the user has previously set a value.
+  const isLiteralIP = (h: string) =>
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(h) || /^[0-9a-fA-F:]+$/.test(h)
+  const showDNSField = !isLiteralIP(raw.sbc_host || '') || !!raw.dns_servers
+
   return (
     <div className="space-y-4 px-4 py-4">
 
-      {/* ── Identity ──────────────────────────────────────────── */}
-      <div className="space-y-2">
-        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.identity)}>Identity</SectionHeader>
-        <FormRow label="VM ID" error={e('vm_id')}>
-          <Input
-            value={raw.vm_id}
-            onChange={(ev) => onChange('vm_id', ev.target.value)}
-            onBlur={() => onBlur('vm_id')}
-            placeholder="traffic-local"
-            className="w-48"
-            aria-invalid={t('vm_id') && !!errors.vm_id ? true : undefined}
-          />
-        </FormRow>
-      </div>
+      {/* Identity (vm_id) is now click-to-edit inline in the UA card header
+          — see VMPairBook.tsx. The dedicated Identity section was removed
+          since it held only one field. */}
 
       {/* ── Traffic Agent Host ───────────────────────────────── */}
       <div className="space-y-2">
@@ -440,32 +553,39 @@ export function VMConfigPanel({
             {`http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
           </span>
         </p>
-        <FormRow
-          label="SSH User"
-          error={e('ssh_user')}
-          hint="Optional — only needed when connecting to a remote VM."
-        >
-          <Input
-            value={raw.ssh_user}
-            onChange={(ev) => onChange('ssh_user', ev.target.value)}
-            onBlur={() => onBlur('ssh_user')}
-            placeholder="ubuntu"
-            className="w-44"
-          />
-        </FormRow>
-        <FormRow
-          label="SSH Key Path"
-          error={e('ssh_key_path')}
-          hint="Optional — path to the private key for SSH access to a remote VM."
-        >
-          <Input
-            value={raw.ssh_key_path}
-            onChange={(ev) => onChange('ssh_key_path', ev.target.value)}
-            onBlur={() => onBlur('ssh_key_path')}
-            placeholder="/home/user/.ssh/id_rsa"
-            className="w-full font-mono text-xs"
-          />
-        </FormRow>
+        {/* SSH credentials — auto-hidden when the agent runs locally
+            (vm_ip is loopback). Shown automatically as soon as a remote IP
+            is entered, or when the user has previously typed a value. */}
+        {showSSHFields && (
+          <>
+            <FormRow
+              label="SSH User"
+              error={e('ssh_user')}
+              hint="Only needed when connecting to a remote VM."
+            >
+              <Input
+                value={raw.ssh_user}
+                onChange={(ev) => onChange('ssh_user', ev.target.value)}
+                onBlur={() => onBlur('ssh_user')}
+                placeholder="ubuntu"
+                className="w-44"
+              />
+            </FormRow>
+            <FormRow
+              label="SSH Key Path"
+              error={e('ssh_key_path')}
+              hint="Path to the private key for SSH access to a remote VM."
+            >
+              <Input
+                value={raw.ssh_key_path}
+                onChange={(ev) => onChange('ssh_key_path', ev.target.value)}
+                onBlur={() => onBlur('ssh_key_path')}
+                placeholder="/home/user/.ssh/id_rsa"
+                className="w-full font-mono text-xs"
+              />
+            </FormRow>
+          </>
+        )}
       </div>
 
       {/* ── Remote SIP Server ─────────────────────────────────── */}
@@ -681,18 +801,23 @@ export function VMConfigPanel({
           </>
         )}
 
-        <FormRow
-          label="DNS Servers"
-          hint="Optional — comma-separated IPs for FQDN resolution. Leave empty to use system DNS."
-        >
-          <Input
-            value={raw.dns_servers}
-            onChange={(ev) => onChange('dns_servers', ev.target.value)}
-            onBlur={() => onBlur('dns_servers')}
-            placeholder="10.0.0.53, 168.63.129.16"
-            className="w-full font-mono text-xs"
-          />
-        </FormRow>
+        {/* DNS Servers — auto-hidden when sbc_host is a literal IP (no
+            resolution needed). Surfaces automatically when an FQDN is used
+            or when the user has previously set a value. */}
+        {showDNSField && (
+          <FormRow
+            label="DNS Servers"
+            hint="Optional — comma-separated IPs for FQDN resolution. Leave empty to use system DNS."
+          >
+            <Input
+              value={raw.dns_servers}
+              onChange={(ev) => onChange('dns_servers', ev.target.value)}
+              onBlur={() => onBlur('dns_servers')}
+              placeholder="10.0.0.53, 168.63.129.16"
+              className="w-full font-mono text-xs"
+            />
+          </FormRow>
+        )}
       </div>
 
       {/* ── Extension Pool ────────────────────────────────────── */}
@@ -738,101 +863,147 @@ export function VMConfigPanel({
         )}
       </div>
 
-      {/* ── Registration & Subscription ───────────────────────── */}
-      <div className="space-y-2">
-        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.registration)}>Registration &amp; Subscription</SectionHeader>
-        <FormRow
-          label="REG Expires"
-          error={e('register_expires')}
-          hint="Expires header in REGISTER messages (seconds). Default 3600."
-        >
-          <Input
-            type="number"
-            min={60}
-            step={60}
-            value={raw.register_expires}
-            onChange={(ev) => onChange('register_expires', ev.target.value)}
-            onBlur={() => onBlur('register_expires')}
-            placeholder="3600"
-            className="w-24 font-mono"
-            aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
-          />
-        </FormRow>
-        <FormRow
-          label="SUB Expires"
-          error={e('subscribe_expires')}
-          hint="Expires header in SUBSCRIBE messages (seconds). Default 3600."
-        >
-          <Input
-            type="number"
-            min={60}
-            step={60}
-            value={raw.subscribe_expires}
-            onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
-            onBlur={() => onBlur('subscribe_expires')}
-            placeholder="3600"
-            className="w-24 font-mono"
-            aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
-          />
-        </FormRow>
-        <FormRow
-          label="Reg Rate"
-          error={e('register_rate_cps')}
-          hint="Rate at which REGISTER messages are pumped (reg/s). Default 10."
-        >
-          <Input
-            type="number"
-            min={1}
-            step={1}
-            value={raw.register_rate_cps}
-            onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
-            onBlur={() => onBlur('register_rate_cps')}
-            placeholder="10"
-            className="w-24 font-mono"
-            aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
-          />
-        </FormRow>
-        <FormRow
-          label="T1 / Timer-B"
-          hint="RFC 3261 §17.1.1 INVITE client transaction timers. T1 is the UDP retransmit interval (default 500 ms); Timer B is the overall INVITE transaction timeout (default 64*T1 = 32 s)."
-        >
-          <div className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={100}
-              max={5000}
-              step={50}
-              value={raw.t1_ms}
-              onChange={(ev) => onChange('t1_ms', ev.target.value)}
-              onBlur={() => onBlur('t1_ms')}
-              placeholder="500"
-              className="w-20 font-mono"
-              aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
-            />
-            <span className="text-[11px] text-slate-400">ms</span>
-            <span className="text-slate-500">·</span>
-            <Input
-              type="number"
-              min={1}
-              max={300}
-              step={1}
-              value={raw.timer_b_seconds}
-              onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
-              onBlur={() => onBlur('timer_b_seconds')}
-              placeholder="32"
-              className="w-20 font-mono"
-              aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
-            />
-            <span className="text-[11px] text-slate-400">s</span>
-          </div>
-          {(e('t1_ms') || e('timer_b_seconds')) && (
-            <>
-              {e('t1_ms') && <FieldError error={e('t1_ms')} />}
-              {e('timer_b_seconds') && <FieldError error={e('timer_b_seconds')} />}
-            </>
-          )}
-        </FormRow>
-      </div>
+      {/* ── Registration & Subscription (collapsed by default) ─── */}
+      {(() => {
+        const regDirty =
+          raw.register_expires !== DEFAULTS_REGISTRATION.register_expires ||
+          raw.subscribe_expires !== DEFAULTS_REGISTRATION.subscribe_expires ||
+          raw.register_rate_cps !== DEFAULTS_REGISTRATION.register_rate_cps ||
+          raw.t1_ms !== DEFAULTS_REGISTRATION.t1_ms ||
+          raw.timer_b_seconds !== DEFAULTS_REGISTRATION.timer_b_seconds
+        return (
+          <CollapsibleSection
+            title="Registration & SIP Timers"
+            defaultOpen={regDirty}
+            dirty={regDirty}
+            onReset={() => onResetSection(SECTION_FIELDS.registration)}
+          >
+            <FormRow
+              label="REG Expires"
+              error={e('register_expires')}
+              hint="Expires header in REGISTER messages (seconds). Default 3600."
+            >
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={60}
+                  step={60}
+                  value={raw.register_expires}
+                  onChange={(ev) => onChange('register_expires', ev.target.value)}
+                  onBlur={() => onBlur('register_expires')}
+                  placeholder="3600"
+                  className="w-24 font-mono"
+                  aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
+                />
+                <span className="text-[11px] text-slate-400">s</span>
+              </div>
+            </FormRow>
+            <FormRow
+              label="SUB Expires"
+              error={customSub ? e('subscribe_expires') : undefined}
+              hint="Expires header in SUBSCRIBE messages. Almost always identical to REGISTER Expires."
+            >
+              {customSub ? (
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number"
+                    min={60}
+                    step={60}
+                    value={raw.subscribe_expires}
+                    onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
+                    onBlur={() => onBlur('subscribe_expires')}
+                    placeholder="3600"
+                    className="w-24 font-mono"
+                    aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+                  />
+                  <span className="text-[11px] text-slate-400">s</span>
+                  <button
+                    type="button"
+                    onClick={() => setCustomSub(false)}
+                    className="ml-1 text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                    title="Reset to match REGISTER Expires"
+                  >
+                    same as REG
+                  </button>
+                </div>
+              ) : (
+                <div className="flex h-8 items-center gap-2">
+                  <span className="font-mono text-xs text-slate-400">
+                    = {raw.register_expires || '3600'}s
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setCustomSub(true)}
+                    className="text-[10px] text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                  >
+                    Customise
+                  </button>
+                </div>
+              )}
+            </FormRow>
+            <FormRow
+              label="Reg Rate"
+              error={e('register_rate_cps')}
+              hint="Rate at which REGISTER messages are pumped (reg/s). Default 10."
+            >
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={raw.register_rate_cps}
+                  onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
+                  onBlur={() => onBlur('register_rate_cps')}
+                  placeholder="10"
+                  className="w-24 font-mono"
+                  aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
+                />
+                <span className="text-[11px] text-slate-400">reg/s</span>
+              </div>
+            </FormRow>
+            <FormRow
+              label="T1 / Timer-B"
+              hint="RFC 3261 §17.1.1 INVITE client transaction timers. T1 is the UDP retransmit interval (default 500 ms); Timer B is the overall INVITE transaction timeout (default 64*T1 = 32 s)."
+            >
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={100}
+                  max={5000}
+                  step={50}
+                  value={raw.t1_ms}
+                  onChange={(ev) => onChange('t1_ms', ev.target.value)}
+                  onBlur={() => onBlur('t1_ms')}
+                  placeholder="500"
+                  className="w-20 font-mono"
+                  aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
+                />
+                <span className="text-[11px] text-slate-400">ms</span>
+                <span className="text-slate-500">·</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={300}
+                  step={1}
+                  value={raw.timer_b_seconds}
+                  onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
+                  onBlur={() => onBlur('timer_b_seconds')}
+                  placeholder="32"
+                  className="w-20 font-mono"
+                  aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
+                />
+                <span className="text-[11px] text-slate-400">s</span>
+              </div>
+              {(e('t1_ms') || e('timer_b_seconds')) && (
+                <>
+                  {e('t1_ms') && <FieldError error={e('t1_ms')} />}
+                  {e('timer_b_seconds') && <FieldError error={e('timer_b_seconds')} />}
+                </>
+              )}
+            </FormRow>
+          </CollapsibleSection>
+        )
+      })()}
 
       {/* ── Call Traffic ──────────────────────────────────────── */}
       <div className="space-y-2">
