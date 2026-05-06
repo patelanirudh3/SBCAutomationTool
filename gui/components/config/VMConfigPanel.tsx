@@ -71,6 +71,17 @@ export type RawVMFormValues = {
   start_time_iso: string
 }
 
+/**
+ * Tab identifier — selects which group of sections the panel renders.
+ * "all" preserves the legacy single-page rendering and is used as the
+ * fallback when the parent doesn't pass a tab. Tabs map:
+ *   server  → Traffic Agent Host + Remote SIP Server (incl. TLS / Failover / DNS)
+ *   traffic → Extension Pool + Call Traffic + Registration & SIP Timers
+ *   media   → Media (RTP). The AdvancedSettings card is rendered separately
+ *             by the parent (VMPairBook) inside the same Media & QoS tab.
+ */
+export type VMConfigTab = 'server' | 'traffic' | 'media' | 'all'
+
 export interface VMConfigPanelProps {
   raw: RawVMFormValues
   onChange: (field: keyof RawVMFormValues, value: string | boolean) => void
@@ -81,6 +92,27 @@ export interface VMConfigPanelProps {
   reachability: ReachabilityStatus | null
   onCheckReachability: () => void
   onResetSection: (fields: (keyof RawVMFormValues)[]) => void
+  tab?: VMConfigTab
+}
+
+/**
+ * TAB_FIELDS — used by the parent to count per-tab validation errors and
+ * render a small red badge on each tab trigger. Mirrors the section-to-tab
+ * mapping in the panel's render block below; keep these in sync.
+ */
+export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof RawVMFormValues>> = {
+  server: [
+    'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
+    'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
+    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
+    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name',
+  ],
+  traffic: [
+    'ext_start', 'ext_end',
+    'cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
+    'register_expires', 'subscribe_expires', 'register_rate_cps', 't1_ms', 'timer_b_seconds',
+  ],
+  media: ['media_enabled', 'rtp_codec', 'rtp_ptime'],
 }
 
 // Default values for the Registration section — used to detect "dirty" state
@@ -112,9 +144,8 @@ const SECTION_FIELDS = {
 
 function SectionHeader({ children, onReset }: { children: ReactNode; onReset?: () => void }) {
   return (
-    <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-foreground">
-      <span className="h-4 w-0.5 shrink-0 rounded-full bg-emerald-500" />
-      {children}
+    <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
+      <span>{children}</span>
       <span className="h-px flex-1 bg-border" />
       {onReset && (
         <button
@@ -158,7 +189,7 @@ function CollapsibleSection({
   const [open, setOpen] = useState(defaultOpen)
   return (
     <div className="space-y-2">
-      <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-foreground">
+      <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
@@ -167,7 +198,7 @@ function CollapsibleSection({
         >
           <ChevronDown
             className={cn(
-              'size-3.5 shrink-0 text-slate-500 transition-transform duration-200',
+              'size-3 shrink-0 text-slate-500 transition-transform duration-200',
               open && 'rotate-180',
             )}
           />
@@ -453,7 +484,14 @@ export function VMConfigPanel({
   reachability,
   onCheckReachability,
   onResetSection,
+  tab = 'all',
 }: VMConfigPanelProps) {
+  // Tab gates — each section renders only when its tab is selected.
+  // 'all' (the default) renders every section so the legacy single-page
+  // layout still works for any caller that doesn't pass a tab prop.
+  const showServer  = tab === 'all' || tab === 'server'
+  const showTraffic = tab === 'all' || tab === 'traffic'
+  const showMedia   = tab === 'all' || tab === 'media'
   const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
   const t = (field: string) => touched.has(field)
@@ -514,7 +552,8 @@ export function VMConfigPanel({
           — see VMPairBook.tsx. The dedicated Identity section was removed
           since it held only one field. */}
 
-      {/* ── Traffic Agent Host ───────────────────────────────── */}
+      {/* ── Traffic Agent Host (Server tab) ──────────────────── */}
+      {showServer && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.agent_host)}>Traffic Agent Host</SectionHeader>
         <FormRow label="IP Address" error={e('vm_ip')}>
@@ -587,8 +626,10 @@ export function VMConfigPanel({
           </>
         )}
       </div>
+      )}
 
-      {/* ── Remote SIP Server ─────────────────────────────────── */}
+      {/* ── Remote SIP Server (Server tab) ──────────────────────── */}
+      {showServer && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
 
@@ -819,8 +860,10 @@ export function VMConfigPanel({
           </FormRow>
         )}
       </div>
+      )}
 
-      {/* ── Extension Pool ────────────────────────────────────── */}
+      {/* ── Extension Pool (Traffic tab) ───────────────────────── */}
+      {showTraffic && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.extension_pool)}>Extension Pool</SectionHeader>
         <FormRow
@@ -862,9 +905,10 @@ export function VMConfigPanel({
           </div>
         )}
       </div>
+      )}
 
-      {/* ── Registration & Subscription (collapsed by default) ─── */}
-      {(() => {
+      {/* ── Registration & Subscription (Traffic tab, collapsed default) ─ */}
+      {showTraffic && (() => {
         const regDirty =
           raw.register_expires !== DEFAULTS_REGISTRATION.register_expires ||
           raw.subscribe_expires !== DEFAULTS_REGISTRATION.subscribe_expires ||
@@ -1005,7 +1049,8 @@ export function VMConfigPanel({
         )
       })()}
 
-      {/* ── Call Traffic ──────────────────────────────────────── */}
+      {/* ── Call Traffic (Traffic tab) ─────────────────────────── */}
+      {showTraffic && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.call_traffic)}>Call Traffic</SectionHeader>
 
@@ -1066,8 +1111,10 @@ export function VMConfigPanel({
           />
         </div>
       </div>
+      )}
 
-      {/* ── Media (RTP) ───────────────────────────────────────── */}
+      {/* ── Media (RTP) (Media tab) ────────────────────────────── */}
+      {showMedia && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.media)}>Media (RTP)</SectionHeader>
 
@@ -1128,6 +1175,7 @@ export function VMConfigPanel({
           </>
         )}
       </div>
+      )}
 
     </div>
   )

@@ -12,7 +12,8 @@ import {
   Pencil,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
+import { VMConfigPanel, type RawVMFormValues, TAB_FIELDS } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
 import { ConfigSummaryStrip, ConfigSummaryDrawer } from './ConfigSummary'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
@@ -180,6 +181,37 @@ function getErrors(raw: RawVMFormValues): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
+// ConfigTabTrigger — TabsTrigger wrapper that adds a small red error count
+// badge when fields belonging to that tab fail validation. The badge only
+// appears AFTER the user has clicked Validate at least once (errCount=0
+// is passed before that to keep the tab labels clean during initial entry).
+// ---------------------------------------------------------------------------
+
+function ConfigTabTrigger({
+  value,
+  label,
+  errCount,
+}: {
+  value: 'server' | 'traffic' | 'media'
+  label: string
+  errCount: number
+}) {
+  return (
+    <TabsTrigger value={value} className="px-2.5 text-xs font-semibold">
+      <span>{label}</span>
+      {errCount > 0 && (
+        <span
+          className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500/15 px-1 font-mono text-[10px] font-bold text-rose-400"
+          title={`${errCount} validation error${errCount === 1 ? '' : 's'}`}
+        >
+          {errCount}
+        </span>
+      )}
+    </TabsTrigger>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // InlineVMIdEditor — click-to-edit replacement for the dedicated Identity
 // section. The VM ID is the only field in that section and is always shown
 // at the top of the UA card anyway, so editing inline saves a full row.
@@ -252,6 +284,10 @@ export function VMPairBook() {
   const [isSaving, setIsSaving] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
   const [summaryOpen, setSummaryOpen] = useState(false)
+  // Active config tab. Defaults to "server" — the most-edited group on a
+  // first-time setup. Controlled (vs. defaultValue) so we can auto-switch
+  // to the first tab containing errors after Validate is clicked.
+  const [activeTab, setActiveTab] = useState<'server' | 'traffic' | 'media'>('server')
   const reachabilityTriggeredRef = useRef(false)
 
   // Load full config from localStorage on first mount
@@ -322,8 +358,10 @@ export function VMPairBook() {
     checkReachability(DEFAULTS.vm_ip, parseInt(DEFAULTS.metrics_port))
   }, [checkReachability])
 
-  // Cmd/Ctrl+I — toggle the Config Review drawer. Skipped while typing in a
-  // form input so the shortcut doesn't hijack normal text entry.
+  // Cmd/Ctrl+I keyboard shortcut: toggle the Config Review drawer.
+  // Skipped while focus is inside a form input so users can still type "i".
+  // Other shortcuts (Cmd+Enter for Validate, Cmd+S for Save) are wired via
+  // a separate effect AFTER handleSaveAndContinue is declared (see below).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'i') return
@@ -375,9 +413,28 @@ export function VMPairBook() {
     []
   )
 
+  // Per-tab error counts — used to render small red badges on each tab
+  // trigger so users see at a glance which tab needs attention.
+  const tabErrCount = useCallback(
+    (tab: 'server' | 'traffic' | 'media') =>
+      TAB_FIELDS[tab].reduce((n, f) => (errors[f] ? n + 1 : n), 0),
+    [errors],
+  )
+
   const handleValidate = () => {
     setTouched(new Set(UA_FIELDS))
-    if (IS_MOCK || isValid) setValidationPassed(true)
+    if (IS_MOCK || isValid) {
+      setValidationPassed(true)
+      return
+    }
+    // Validation failed — jump to the first tab containing an error so the
+    // user sees the offending field without having to click around.
+    for (const tab of ['server', 'traffic', 'media'] as const) {
+      if (tabErrCount(tab) > 0) {
+        setActiveTab(tab)
+        break
+      }
+    }
   }
 
   const handleSaveAndContinue = async () => {
@@ -416,6 +473,38 @@ export function VMPairBook() {
     router.push('/launch')
   }
 
+  // Keyboard shortcuts wired AFTER handleSaveAndContinue so the closure can
+  // reference it. The latestRef pattern keeps the listener registered exactly
+  // once — no stale closures, no per-render re-registration.
+  const latestRef = useRef({ errors, validationPassed, isSaving, handleSaveAndContinue })
+  useEffect(() => {
+    latestRef.current = { errors, validationPassed, isSaving, handleSaveAndContinue }
+  })
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      // Cmd/Ctrl + Enter — Validate. Allowed even while focus is in an input
+      // (matches the muscle-memory of "press Enter to submit").
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        setTouched(new Set(UA_FIELDS))
+        if (IS_MOCK || Object.keys(latestRef.current.errors).length === 0) {
+          setValidationPassed(true)
+        }
+        return
+      }
+      // Cmd/Ctrl + S — Save & Continue. Skipped silently when prerequisites
+      // aren't met; the button itself is also disabled until then.
+      if (e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        const { validationPassed: ok, isSaving: saving, handleSaveAndContinue: save } = latestRef.current
+        if (ok && !saving) save()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+
   const errorCount = Object.keys(errors).length
   const hasValidated = touched.size > 0
 
@@ -426,10 +515,14 @@ export function VMPairBook() {
             (always visible) plus a Config Review drawer (Cmd/Ctrl+I). The
             full-width form area gives the inputs the room they need without
             wasting 280px on a permanent sidebar. */}
-        <div className="mx-auto w-full max-w-[1440px] px-6 py-5 space-y-5">
+        <div className="mx-auto w-full max-w-[1440px] px-6 py-5">
 
-          {/* UA card */}
+          {/* UA card — tabbed layout. Header (UA badge + InlineVMIdEditor)
+              stays visible across all tabs; the form content is split into
+              three tabs so each one fits one viewport on a typical laptop. */}
           <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
+
+            {/* Persistent header */}
             <div className="flex items-center border-b border-border px-4 py-2.5">
               <div className="flex flex-1 items-center gap-2 px-2">
                 <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
@@ -451,25 +544,61 @@ export function VMPairBook() {
                 )}
               </div>
             </div>
-            <VMConfigPanel
-              raw={raw}
-              onChange={handleChange}
-              touched={touched}
-              onBlur={handleBlur}
-              errors={errors}
-              warnings={warnings}
-              reachability={reachability}
-              onCheckReachability={() =>
-                checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)
-              }
-              onResetSection={handleResetSection}
-            />
-          </div>
 
-          {/* Advanced Settings */}
-          <motion.div className="overflow-hidden rounded-xl border border-border bg-card">
-            <AdvancedSettings pairIndex={activePairIndex} />
-          </motion.div>
+            {/* Tabs */}
+            <Tabs
+              value={activeTab}
+              onValueChange={(v) => setActiveTab(v as 'server' | 'traffic' | 'media')}
+              className="gap-0"
+            >
+              <div className="border-b border-border bg-card/40 px-4 pt-2 pb-0">
+                <TabsList variant="line" className="gap-3">
+                  <ConfigTabTrigger value="server"  label="Server & Auth"        errCount={hasValidated ? tabErrCount('server')  : 0} />
+                  <ConfigTabTrigger value="traffic" label="Traffic & Registration" errCount={hasValidated ? tabErrCount('traffic') : 0} />
+                  <ConfigTabTrigger value="media"   label="Media & QoS"          errCount={hasValidated ? tabErrCount('media')   : 0} />
+                </TabsList>
+              </div>
+
+              <TabsContent value="server" className="m-0">
+                <VMConfigPanel
+                  raw={raw} onChange={handleChange} touched={touched} onBlur={handleBlur}
+                  errors={errors} warnings={warnings}
+                  reachability={reachability}
+                  onCheckReachability={() => checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)}
+                  onResetSection={handleResetSection}
+                  tab="server"
+                />
+              </TabsContent>
+
+              <TabsContent value="traffic" className="m-0">
+                <VMConfigPanel
+                  raw={raw} onChange={handleChange} touched={touched} onBlur={handleBlur}
+                  errors={errors} warnings={warnings}
+                  reachability={reachability}
+                  onCheckReachability={() => checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)}
+                  onResetSection={handleResetSection}
+                  tab="traffic"
+                />
+              </TabsContent>
+
+              <TabsContent value="media" className="m-0">
+                <VMConfigPanel
+                  raw={raw} onChange={handleChange} touched={touched} onBlur={handleBlur}
+                  errors={errors} warnings={warnings}
+                  reachability={reachability}
+                  onCheckReachability={() => checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)}
+                  onResetSection={handleResetSection}
+                  tab="media"
+                />
+                {/* AdvancedSettings (Pre-Phase tuning, RTP advanced, QoS,
+                    RTCP SR) lives in the Media & QoS tab — that's where
+                    most of its knobs are semantically grouped. */}
+                <motion.div className="overflow-hidden border-t border-border">
+                  <AdvancedSettings pairIndex={activePairIndex} />
+                </motion.div>
+              </TabsContent>
+            </Tabs>
+          </div>
 
         </div>
       </div>
@@ -489,7 +618,12 @@ export function VMPairBook() {
               <Trash2 className="size-3.5" />
               Clear All
             </Button>
-            <Button variant="outline" size="sm" onClick={handleValidate}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleValidate}
+              title="Validate (⌘/Ctrl + Enter)"
+            >
               Validate
             </Button>
             {hasValidated && errorCount > 0 && (
@@ -516,6 +650,7 @@ export function VMPairBook() {
             size="sm"
             disabled={!validationPassed || isSaving}
             onClick={handleSaveAndContinue}
+            title="Save & Continue (⌘/Ctrl + S)"
             className={cn(
               'transition-opacity',
               (!validationPassed || isSaving) && 'cursor-not-allowed opacity-40'
