@@ -375,18 +375,34 @@ function ReachabilityIndicator({ status }: { status: ReachabilityStatus | null }
 // CPS ↔ BHCC bidirectional sub-component
 // ---------------------------------------------------------------------------
 
+/**
+ * TrafficRateField — single FormRow that combines CPS, BHCC (auto-derived
+ * sibling input), and Hold Time. Replaces what used to be three separate
+ * stacked rows. Either CPS or BHCC may be edited; the other auto-syncs.
+ * Hold time has its own small input with an "s" suffix.
+ */
 function CpsBhccField({
   cps,
   onCpsChange,
   error,
   warning,
   onBlur,
+  holdSeconds,
+  onHoldChange,
+  onHoldBlur,
+  holdError,
+  holdWarning,
 }: {
   cps: string
   onCpsChange: (v: string) => void
   error?: string
   warning?: string
   onBlur: () => void
+  holdSeconds: string
+  onHoldChange: (v: string) => void
+  onHoldBlur: () => void
+  holdError?: string
+  holdWarning?: string
 }) {
   // 'cps' or 'bhcc' — which input the user last typed in
   const [inputMode, setInputMode] = useState<'cps' | 'bhcc'>('cps')
@@ -426,12 +442,12 @@ function CpsBhccField({
 
   return (
     <FormRow
-      label="Call Rate"
+      label="Traffic"
       error={error}
       warning={warning}
-      hint="Either CPS or BHCC may be edited — the other auto-derives. CPS = calls per second, BHCC = busy-hour call count (calls/hour)."
+      hint="Call rate (CPS = calls/sec or BHCC = calls/hour, either auto-derives the other) and hold time per call (seconds before BYE is sent)."
     >
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-1.5">
         <Input
           type="number"
           min={0.01}
@@ -440,11 +456,11 @@ function CpsBhccField({
           onChange={(ev) => handleCpsChange(ev.target.value)}
           onBlur={onBlur}
           className={cn(
-            'w-24 font-mono',
+            'w-16 font-mono',
             inputMode === 'cps' ? 'ring-1 ring-emerald-500/40' : '',
           )}
         />
-        <span className="text-[11px] font-medium text-slate-400">CPS</span>
+        <span className="text-[10px] font-medium text-slate-400">cps</span>
         <span className="text-slate-500">·</span>
         <Input
           type="number"
@@ -454,18 +470,31 @@ function CpsBhccField({
           onChange={(ev) => handleBhccChange(ev.target.value)}
           onBlur={onBlur}
           className={cn(
-            'w-28 font-mono',
+            'w-20 font-mono',
             inputMode === 'bhcc' ? 'ring-1 ring-amber-500/40' : '',
           )}
           placeholder={bhccNum ? String(bhccNum) : '—'}
         />
-        <span className="text-[11px] font-medium text-slate-400">BHCC</span>
+        <span className="text-[10px] font-medium text-slate-400">bhcc</span>
+        <span className="text-slate-500">·</span>
+        <Input
+          type="number"
+          min={0}
+          value={holdSeconds}
+          onChange={(ev) => onHoldChange(ev.target.value)}
+          onBlur={onHoldBlur}
+          className="w-14 font-mono"
+          aria-invalid={!!holdError ? true : undefined}
+        />
+        <span className="text-[10px] font-medium text-slate-400">s hold</span>
         {bhccNum !== null && (
           <span className="ml-1 font-mono text-[11px] text-amber-400/80">
-            ≈ <span className="font-bold text-amber-400">{bhccNum.toLocaleString()}</span> calls/hour
+            ≈ <span className="font-bold text-amber-400">{bhccNum.toLocaleString()}</span>/hr
           </span>
         )}
       </div>
+      {holdError && <FieldError error={holdError} />}
+      {!holdError && holdWarning && <FieldSoftWarning warning={holdWarning} />}
     </FormRow>
   )
 }
@@ -562,7 +591,7 @@ export function VMConfigPanel({
             onChange={(ev) => onChange('vm_ip', ev.target.value)}
             onBlur={handleIpBlur}
             placeholder="127.0.0.1"
-            className="w-44 font-mono"
+            className="w-36 font-mono"
             aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
           />
         </FormRow>
@@ -607,7 +636,7 @@ export function VMConfigPanel({
                 onChange={(ev) => onChange('ssh_user', ev.target.value)}
                 onBlur={() => onBlur('ssh_user')}
                 placeholder="ubuntu"
-                className="w-44"
+                className="w-36"
               />
             </FormRow>
             <FormRow
@@ -620,7 +649,7 @@ export function VMConfigPanel({
                 onChange={(ev) => onChange('ssh_key_path', ev.target.value)}
                 onBlur={() => onBlur('ssh_key_path')}
                 placeholder="/home/user/.ssh/id_rsa"
-                className="w-full font-mono text-xs"
+                className="w-72 font-mono text-xs"
               />
             </FormRow>
           </>
@@ -633,58 +662,82 @@ export function VMConfigPanel({
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
 
+        {/* Endpoint row — Host : Port + Transport packed onto one line.
+            Reads naturally as "10.0.0.1 : 5060 TCP". */}
         <FormRow
-          label="Host"
-          error={e('sbc_host')}
-          hint="Target SBC, SIP proxy, or any SIP server receiving calls. Accepts IP or FQDN."
+          label="Endpoint"
+          hint="Target SBC, SIP proxy, or any SIP server receiving calls. Host accepts IP or FQDN."
         >
-          <Input
-            value={raw.sbc_host}
-            onChange={(ev) => onChange('sbc_host', ev.target.value)}
-            onBlur={() => onBlur('sbc_host')}
-            placeholder="x.x.x.x"
-            className="w-44 font-mono"
-            aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
-          />
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Input
+              value={raw.sbc_host}
+              onChange={(ev) => onChange('sbc_host', ev.target.value)}
+              onBlur={() => onBlur('sbc_host')}
+              placeholder="x.x.x.x"
+              className="w-36 font-mono"
+              aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+            />
+            <span className="text-slate-500">:</span>
+            <Input
+              type="number"
+              value={raw.sbc_port}
+              onChange={(ev) => onChange('sbc_port', ev.target.value)}
+              onBlur={() => onBlur('sbc_port')}
+              placeholder="5060"
+              className="w-20 font-mono"
+              aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+            />
+            <Select
+              value={raw.sip_transport}
+              onValueChange={(v) => { onChange('sip_transport', v as SipTransport); onBlur('sip_transport') }}
+            >
+              <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="TCP">TCP</SelectItem>
+                <SelectItem value="TLS">TLS</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
+            <>
+              {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
+              {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
+              {e('sip_transport') && <FieldError error={e('sip_transport')} />}
+            </>
+          )}
         </FormRow>
-        <FormRow label="Port" error={e('sbc_port')} warning={w('sbc_port')}>
-          <Input
-            type="number"
-            value={raw.sbc_port}
-            onChange={(ev) => onChange('sbc_port', ev.target.value)}
-            onBlur={() => onBlur('sbc_port')}
-            placeholder="5060"
-            className="w-24 font-mono"
-            aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
-          />
-        </FormRow>
-        <FormRow label="Transport" error={e('sip_transport')}>
-          <Select
-            value={raw.sip_transport}
-            onValueChange={(v) => { onChange('sip_transport', v as SipTransport); onBlur('sip_transport') }}
-          >
-            <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="TCP">TCP</SelectItem>
-              <SelectItem value="TLS">TLS</SelectItem>
-            </SelectContent>
-          </Select>
-        </FormRow>
+
+        {/* Identity row — Scheme + Domain packed onto one line. */}
         <FormRow
-          label="Scheme"
-          error={e('sip_scheme')}
-          hint="SIP = plain (port 5060). SIPS = secure (port 5061)."
+          label="Identity"
+          hint="Scheme: SIP = plain (port 5060). SIPS = secure (port 5061). Domain is the SIP realm sent in From/To URIs."
         >
-          <Select
-            value={raw.sip_scheme}
-            onValueChange={(v) => { onChange('sip_scheme', v as SipScheme); onBlur('sip_scheme') }}
-          >
-            <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="SIP">SIP</SelectItem>
-              <SelectItem value="SIPS">SIPS</SelectItem>
-            </SelectContent>
-          </Select>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Select
+              value={raw.sip_scheme}
+              onValueChange={(v) => { onChange('sip_scheme', v as SipScheme); onBlur('sip_scheme') }}
+            >
+              <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="SIP">SIP</SelectItem>
+                <SelectItem value="SIPS">SIPS</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              value={raw.domain}
+              onChange={(ev) => onChange('domain', ev.target.value)}
+              onBlur={() => onBlur('domain')}
+              placeholder="avaya.com"
+              className="w-40 font-mono"
+              aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+            />
+          </div>
+          {(e('sip_scheme') || e('domain')) && (
+            <>
+              {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
+              {e('domain')     && <FieldError error={e('domain')} />}
+            </>
+          )}
         </FormRow>
 
         {raw.sip_transport === 'TLS' && (
@@ -723,7 +776,7 @@ export function VMConfigPanel({
                   onChange={(ev) => onChange('tls_ca_path', ev.target.value)}
                   onBlur={() => onBlur('tls_ca_path')}
                   placeholder="/path/to/ca.pem"
-                  className="w-full font-mono text-xs"
+                  className="w-72 font-mono text-xs"
                   aria-invalid={t('tls_ca_path') && !!errors.tls_ca_path ? true : undefined}
                 />
               </FormRow>
@@ -741,7 +794,7 @@ export function VMConfigPanel({
                     onChange={(ev) => onChange('tls_cert_path', ev.target.value)}
                     onBlur={() => onBlur('tls_cert_path')}
                     placeholder="/path/to/client.crt"
-                    className="w-full font-mono text-xs"
+                    className="w-72 font-mono text-xs"
                     aria-invalid={t('tls_cert_path') && !!errors.tls_cert_path ? true : undefined}
                   />
                 </FormRow>
@@ -755,7 +808,7 @@ export function VMConfigPanel({
                     onChange={(ev) => onChange('tls_key_path', ev.target.value)}
                     onBlur={() => onBlur('tls_key_path')}
                     placeholder="/path/to/client.key"
-                    className="w-full font-mono text-xs"
+                    className="w-72 font-mono text-xs"
                     aria-invalid={t('tls_key_path') && !!errors.tls_key_path ? true : undefined}
                   />
                 </FormRow>
@@ -773,23 +826,13 @@ export function VMConfigPanel({
                   onChange={(ev) => onChange('tls_server_name', ev.target.value)}
                   onBlur={() => onBlur('tls_server_name')}
                   placeholder="sbc.example.com"
-                  className="w-48 font-mono text-xs"
+                  className="w-40 font-mono text-xs"
                 />
               </FormRow>
             )}
           </div>
         )}
 
-        <FormRow label="Domain" error={e('domain')}>
-          <Input
-            value={raw.domain}
-            onChange={(ev) => onChange('domain', ev.target.value)}
-            onBlur={() => onBlur('domain')}
-            placeholder="avaya.com"
-            className="w-48"
-            aria-invalid={t('domain') && !!errors.domain ? true : undefined}
-          />
-        </FormRow>
         <FormRow label="SIP Password" error={e('sip_password')}>
           <Input
             type="password"
@@ -797,7 +840,7 @@ export function VMConfigPanel({
             onChange={(ev) => onChange('sip_password', ev.target.value)}
             onBlur={() => onBlur('sip_password')}
             placeholder="••••••••"
-            className="w-44"
+            className="w-36"
             aria-invalid={t('sip_password') && !!errors.sip_password ? true : undefined}
           />
         </FormRow>
@@ -826,7 +869,7 @@ export function VMConfigPanel({
                 onChange={(ev) => onChange('secondary_host', ev.target.value)}
                 onBlur={() => onBlur('secondary_host')}
                 placeholder="x.x.x.x"
-                className="w-44 font-mono"
+                className="w-36 font-mono"
               />
             </FormRow>
             <FormRow label="Secondary Port">
@@ -855,7 +898,7 @@ export function VMConfigPanel({
               onChange={(ev) => onChange('dns_servers', ev.target.value)}
               onBlur={() => onBlur('dns_servers')}
               placeholder="10.0.0.53, 168.63.129.16"
-              className="w-full font-mono text-xs"
+              className="w-72 font-mono text-xs"
             />
           </FormRow>
         )}
@@ -1054,34 +1097,19 @@ export function VMConfigPanel({
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.call_traffic)}>Call Traffic</SectionHeader>
 
-        {/* Bidirectional CPS / BHCC — kept compact via FormRow */}
+        {/* Combined Traffic row — CPS + BHCC + Hold all on one line. */}
         <CpsBhccField
           cps={raw.cps}
           onCpsChange={(v) => onChange('cps', v)}
           error={t('cps') ? errors.cps : undefined}
           warning={t('cps') ? warnings.cps : undefined}
           onBlur={() => onBlur('cps')}
+          holdSeconds={raw.hold_time_seconds}
+          onHoldChange={(v) => onChange('hold_time_seconds', v)}
+          onHoldBlur={() => onBlur('hold_time_seconds')}
+          holdError={e('hold_time_seconds')}
+          holdWarning={w('hold_time_seconds')}
         />
-
-        <FormRow
-          label="Hold Time"
-          error={e('hold_time_seconds')}
-          warning={w('hold_time_seconds')}
-          hint="Duration of each call leg before BYE is sent (seconds)."
-        >
-          <div className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={0}
-              value={raw.hold_time_seconds}
-              onChange={(ev) => onChange('hold_time_seconds', ev.target.value)}
-              onBlur={() => onBlur('hold_time_seconds')}
-              className="w-20 font-mono"
-              aria-invalid={t('hold_time_seconds') && !!errors.hold_time_seconds ? true : undefined}
-            />
-            <span className="text-[11px] text-slate-400">s</span>
-          </div>
-        </FormRow>
 
         {/* Traffic mode: smoke / timed / unlimited */}
         <div className="space-y-2 pt-1">

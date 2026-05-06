@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { Zap, Clock, Infinity as InfinityIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { FieldError, FieldSoftWarning } from './ConfigValidator'
 import { deriveMaxCalls } from '@/lib/config-schema'
 import { cn } from '@/lib/utils'
@@ -116,29 +117,40 @@ export function TrafficModeSelector({
   const currentPresetValue = String(dhFloat)
 
   return (
-    <div className="space-y-3">
-      {/* Mode radio cards */}
-      <div className="grid grid-cols-3 gap-2">
-        {MODES.map(({ value: modeVal, label, Icon, desc }) => {
-          const isSelected = value === modeVal
-          return (
-            <button
-              key={modeVal}
-              type="button"
-              onClick={() => onChange(modeVal)}
-              className={cn(
-                'flex flex-col items-center gap-1.5 rounded-lg border px-2 py-3 text-center transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                isSelected
-                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
-                  : 'border-border bg-secondary/40 text-muted-foreground hover:border-border/80 hover:bg-secondary hover:text-foreground'
-              )}
-            >
-              <Icon className="size-4 shrink-0" />
-              <span className="text-xs font-semibold">{label}</span>
-              <span className="text-[10px] leading-tight opacity-70">{desc}</span>
-            </button>
-          )
-        })}
+    <div className="space-y-2">
+      {/* Mode segmented-pill row — compact horizontal selector. The previous
+          card layout (icon + label + description, ~70px tall) was overkill
+          for a 3-option radio. Description moves to a hover tooltip. */}
+      <div className="grid grid-cols-[140px_1fr] items-center gap-3 py-1">
+        <Label className="text-xs font-medium text-foreground/80">Mode</Label>
+        <div className="inline-flex w-fit items-center rounded-md border border-slate-700/60 bg-slate-800/40 p-0.5">
+          {MODES.map(({ value: modeVal, label, Icon, desc }) => {
+            const isSelected = value === modeVal
+            return (
+              <Tooltip key={modeVal}>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => onChange(modeVal)}
+                    className={cn(
+                      'flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-semibold transition-colors',
+                      'focus:outline-none focus-visible:ring-1 focus-visible:ring-emerald-500/50',
+                      isSelected
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'text-slate-400 hover:text-slate-100',
+                    )}
+                  >
+                    <Icon className="size-3 shrink-0" />
+                    {label}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {desc}
+                </TooltipContent>
+              </Tooltip>
+            )
+          })}
+        </div>
       </div>
 
       {/* Smoke: call_count */}

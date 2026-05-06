@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { VMConfigPanel, type RawVMFormValues, TAB_FIELDS } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
-import { ConfigSummaryStrip, ConfigSummaryDrawer } from './ConfigSummary'
+import { ConfigSummaryStrip, ConfigSummaryDrawer, ConfigSummarySidebar } from './ConfigSummary'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth, putConfigFor } from '@/lib/api'
@@ -197,11 +197,18 @@ function ConfigTabTrigger({
   errCount: number
 }) {
   return (
-    <TabsTrigger value={value} className="px-2.5 text-xs font-semibold">
+    <TabsTrigger
+      value={value}
+      className={cn(
+        'px-4 text-sm font-bold uppercase tracking-wide transition-colors',
+        'text-slate-400 hover:text-slate-200',
+        'data-[state=active]:text-emerald-400',
+      )}
+    >
       <span>{label}</span>
       {errCount > 0 && (
         <span
-          className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500/15 px-1 font-mono text-[10px] font-bold text-rose-400"
+          className="ml-1.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500/20 px-1.5 font-mono text-[11px] font-bold text-rose-300"
           title={`${errCount} validation error${errCount === 1 ? '' : 's'}`}
         >
           {errCount}
@@ -517,6 +524,12 @@ export function VMPairBook() {
             wasting 280px on a permanent sidebar. */}
         <div className="mx-auto w-full max-w-[1440px] px-6 py-5">
 
+          {/* Responsive split: at lg+ (>=1280px) the sticky Config Summary
+              sidebar is visible to the right; below lg the form takes the
+              full canvas and the footer strip + drawer (always mounted)
+              provide summary access. */}
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
+
           {/* UA card — tabbed layout. Header (UA badge + InlineVMIdEditor)
               stays visible across all tabs; the form content is split into
               three tabs so each one fits one viewport on a typical laptop. */}
@@ -600,12 +613,26 @@ export function VMPairBook() {
             </Tabs>
           </div>
 
+          {/* Sticky sidebar — visible only at lg+ (>=1280px). At narrower
+              viewports the footer strip + drawer combo provides summary
+              access without crowding the form. */}
+          <div className="hidden lg:block">
+            <ConfigSummarySidebar
+              raw={raw}
+              advancedSettings={pairs[activePairIndex]?.advancedSettings}
+            />
+          </div>
+
+          </div>
         </div>
       </div>
 
-      {/* Footer — sticky strip on top, action buttons below */}
+      {/* Footer — sticky strip on top, action buttons below.
+          The strip is hidden at lg+ where the sidebar takes its job. */}
       <div className="border-t border-border bg-card">
-        <ConfigSummaryStrip raw={raw} onOpenDrawer={() => setSummaryOpen(true)} />
+        <div className="lg:hidden">
+          <ConfigSummaryStrip raw={raw} onOpenDrawer={() => setSummaryOpen(true)} />
+        </div>
         <div className="mx-auto flex max-w-[1440px] items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
             <Button

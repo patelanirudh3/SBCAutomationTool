@@ -196,6 +196,54 @@ function SummarySection({ title, items }: { title: string; items: SummaryItem[] 
 }
 
 // ---------------------------------------------------------------------------
+// ConfigSummarySidebar — sticky right-side panel showing the same categorised
+// breakdown as the drawer, but always visible (no toggle). Used at lg+
+// viewports (>=1280px) where there is room to accommodate it; below that
+// breakpoint VMPairBook keeps the footer strip + drawer combo so narrow
+// windows aren't crowded.
+//
+// Reuses summarize() and <SummarySection> so the sidebar and drawer can
+// never drift out of sync.
+// ---------------------------------------------------------------------------
+
+export interface ConfigSummarySidebarProps {
+  raw: RawVMFormValues
+  advancedSettings?: AdvancedSettings
+}
+
+export function ConfigSummarySidebar({ raw, advancedSettings }: ConfigSummarySidebarProps) {
+  const data = summarize(raw, advancedSettings)
+  return (
+    <aside
+      aria-label="Config Summary"
+      className={cn(
+        'flex flex-col rounded-xl border border-border bg-card',
+        'sticky top-5 max-h-[calc(100vh-7rem)]',
+      )}
+    >
+      <header className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2.5">
+        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-emerald-400">
+          Live
+        </span>
+        <h2 className="text-xs font-bold uppercase tracking-widest text-slate-100">
+          Config Summary
+        </h2>
+      </header>
+      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+        <SummarySection title="SIP Server"   items={data.server} />
+        <SummarySection title="Extensions"   items={data.extensions} />
+        <SummarySection title="Traffic"      items={data.traffic} />
+        <SummarySection title="Registration" items={data.registration} />
+        <SummarySection title="Media"        items={data.media} />
+        {data.advanced.length > 0 && (
+          <SummarySection title="QoS / Advanced" items={data.advanced} />
+        )}
+      </div>
+    </aside>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // ConfigSummaryDrawer — right-side slide-in panel with the full categorised
 // breakdown. Closes on backdrop click, ESC key, or X button.
 // ---------------------------------------------------------------------------
