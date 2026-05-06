@@ -32,13 +32,11 @@ const MODES = [
   { value: 'unlimited' as const, label: 'Unlimited', Icon: InfinityIcon, desc: 'Until stopped' },
 ]
 
-// Duration presets — stored internally as decimal hours
+// Duration presets — only long-running shortcuts. Short durations
+// (15 min, 30 min, 1 h) are easier to type than to click.
 const DURATION_PRESETS = [
-  { label: '15 min', hours: 0, mins: 15 },
-  { label: '30 min', hours: 0, mins: 30 },
-  { label: '1h',     hours: 1, mins: 0  },
-  { label: '8h',     hours: 8, mins: 0  },
-  { label: '24h',    hours: 24, mins: 0 },
+  { label: '8h',  hours: 8,  mins: 0 },
+  { label: '24h', hours: 24, mins: 0 },
 ]
 
 /** Format a call count as a BHCC string: 3600 → "3.6k", 15000 → "15k", 500 → "500" */
@@ -175,19 +173,14 @@ export function TrafficModeSelector({
         </div>
       )}
 
-      {/* Timed: H + M split inputs with presets inline */}
+      {/* Timed: Duration on a single horizontal row matching FormRow style.
+          Label on left, H/M inputs + 8h/24h preset shortcuts on right. */}
       {value === 'timed' && (
         <div className="space-y-2">
-          {/* Visible "Duration" section label */}
-          <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-slate-200">
-            <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-slate-400" />
-            Duration
-          </p>
-
-          {/* H + M inputs + presets on the same row */}
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Hours input */}
-            <div className="flex items-center gap-1">
+          <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1.5">
+            <Label className="text-sm font-medium text-foreground/85">Duration</Label>
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Hours input */}
               <Input
                 type="number"
                 min={0}
@@ -199,10 +192,7 @@ export function TrafficModeSelector({
                 aria-invalid={touched.duration_hours && !!errors.duration_hours ? true : undefined}
               />
               <span className="text-xs font-medium text-slate-400">h</span>
-            </div>
-
-            {/* Minutes input */}
-            <div className="flex items-center gap-1">
+              {/* Minutes input */}
               <Input
                 type="number"
                 min={0}
@@ -214,10 +204,9 @@ export function TrafficModeSelector({
                 aria-label="minutes"
               />
               <span className="text-xs font-medium text-slate-400">min</span>
-            </div>
-
-            {/* Preset chips — inline beside inputs */}
-            <div className="flex flex-wrap gap-1">
+              {/* Preset shortcuts — only long-running durations (8h, 24h)
+                  since shorter values are easier to type than to click. */}
+              <span className="text-slate-600">·</span>
               {DURATION_PRESETS.map((p) => {
                 const isActive = hours === p.hours && mins === p.mins
                 return (

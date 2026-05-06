@@ -477,6 +477,7 @@ function CpsBhccField({
         />
         <span className="text-xs font-medium text-slate-400">bhcc</span>
         <span className="text-slate-500">·</span>
+        <span className="text-xs font-medium text-slate-400">call hold time</span>
         <Input
           type="number"
           min={0}
@@ -486,7 +487,7 @@ function CpsBhccField({
           className="w-14 font-mono"
           aria-invalid={!!holdError ? true : undefined}
         />
-        <span className="text-xs font-medium text-slate-400">s hold</span>
+        <span className="text-xs font-medium text-slate-400">s</span>
         {bhccNum !== null && (
           <span className="ml-1 font-mono text-xs text-amber-400/80">
             ≈ <span className="font-bold text-amber-400">{bhccNum.toLocaleString()}</span>/hr
@@ -585,25 +586,29 @@ export function VMConfigPanel({
       {showServer && (
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.agent_host)}>Traffic Agent Host</SectionHeader>
-        <FormRow label="IP Address" error={e('vm_ip')}>
-          <Input
-            value={raw.vm_ip}
-            onChange={(ev) => onChange('vm_ip', ev.target.value)}
-            onBlur={handleIpBlur}
-            placeholder="127.0.0.1"
-            className="w-36 font-mono"
-            aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
-          />
-        </FormRow>
-        <FormRow label="Metrics Port" error={e('metrics_port')} warning={w('metrics_port')}>
-          <div className="flex items-center gap-2">
+        {/* Agent endpoint — IP : Port + Test button + reachability all on
+            one row. Reads naturally as "127.0.0.1 : 8082 [Test ✓]". */}
+        <FormRow
+          label="Agent"
+          hint="IP and metrics port the GUI uses to reach the traffic agent. Click Test to verify."
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={raw.vm_ip}
+              onChange={(ev) => onChange('vm_ip', ev.target.value)}
+              onBlur={handleIpBlur}
+              placeholder="127.0.0.1"
+              className="w-36 font-mono"
+              aria-invalid={t('vm_ip') && !!errors.vm_ip ? true : undefined}
+            />
+            <span className="text-slate-500">:</span>
             <Input
               type="number"
               value={raw.metrics_port}
               onChange={(ev) => onChange('metrics_port', ev.target.value)}
               onBlur={handleMetricsPortBlur}
               placeholder="8082"
-              className="w-24 font-mono"
+              className="w-20 font-mono"
               aria-invalid={t('metrics_port') && !!errors.metrics_port ? true : undefined}
             />
             <TestReachabilityButton
@@ -614,6 +619,12 @@ export function VMConfigPanel({
             />
             {reachability && <ReachabilityIndicator status={reachability} />}
           </div>
+          {(e('vm_ip') || e('metrics_port')) && (
+            <>
+              {e('vm_ip')        && <FieldError error={e('vm_ip')} />}
+              {e('metrics_port') && <FieldError error={e('metrics_port')} />}
+            </>
+          )}
         </FormRow>
         <p className="ml-[160px] pl-3 text-xs text-slate-400">
           Health:{' '}
@@ -623,27 +634,22 @@ export function VMConfigPanel({
         </p>
         {/* SSH credentials — auto-hidden when the agent runs locally
             (vm_ip is loopback). Shown automatically as soon as a remote IP
-            is entered, or when the user has previously typed a value. */}
+            is entered, or when the user has previously typed a value.
+            User + key path packed onto one row (only relevant for remote VMs). */}
         {showSSHFields && (
-          <>
-            <FormRow
-              label="SSH User"
-              error={e('ssh_user')}
-              hint="Only needed when connecting to a remote VM."
-            >
+          <FormRow
+            label="SSH"
+            error={e('ssh_user') || e('ssh_key_path')}
+            hint="User and private-key path for SSH access to a remote VM."
+          >
+            <div className="flex flex-wrap items-center gap-2">
               <Input
                 value={raw.ssh_user}
                 onChange={(ev) => onChange('ssh_user', ev.target.value)}
                 onBlur={() => onBlur('ssh_user')}
                 placeholder="ubuntu"
-                className="w-36"
+                className="w-32"
               />
-            </FormRow>
-            <FormRow
-              label="SSH Key Path"
-              error={e('ssh_key_path')}
-              hint="Path to the private key for SSH access to a remote VM."
-            >
               <Input
                 value={raw.ssh_key_path}
                 onChange={(ev) => onChange('ssh_key_path', ev.target.value)}
@@ -651,8 +657,8 @@ export function VMConfigPanel({
                 placeholder="/home/user/.ssh/id_rsa"
                 className="w-72 font-mono text-xs"
               />
-            </FormRow>
-          </>
+            </div>
+          </FormRow>
         )}
       </div>
       )}
@@ -965,121 +971,138 @@ export function VMConfigPanel({
             dirty={regDirty}
             onReset={() => onResetSection(SECTION_FIELDS.registration)}
           >
+            {/* Expiry & rate — three logical fields packed onto one row.
+                Each input keeps an inline mini-label (REG / SUB / Rate)
+                so the values stay self-describing. */}
             <FormRow
-              label="REG Expires"
-              error={e('register_expires')}
-              hint="Expires header in REGISTER messages (seconds). Default 3600."
+              label="Expiry & Rate"
+              hint="REGISTER and SUBSCRIBE Expires headers (seconds) plus the rate at which REGISTER messages are pumped (reg/s). Defaults: 3600 / 3600 / 10."
             >
-              <div className="flex items-center gap-2">
-                <Input
-                  type="number"
-                  min={60}
-                  step={60}
-                  value={raw.register_expires}
-                  onChange={(ev) => onChange('register_expires', ev.target.value)}
-                  onBlur={() => onBlur('register_expires')}
-                  placeholder="3600"
-                  className="w-24 font-mono"
-                  aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
-                />
-                <span className="text-xs text-slate-400">s</span>
-              </div>
-            </FormRow>
-            <FormRow
-              label="SUB Expires"
-              error={customSub ? e('subscribe_expires') : undefined}
-              hint="Expires header in SUBSCRIBE messages. Almost always identical to REGISTER Expires."
-            >
-              {customSub ? (
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                {/* REG Expires */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-400">REG</span>
                   <Input
                     type="number"
                     min={60}
                     step={60}
-                    value={raw.subscribe_expires}
-                    onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
-                    onBlur={() => onBlur('subscribe_expires')}
+                    value={raw.register_expires}
+                    onChange={(ev) => onChange('register_expires', ev.target.value)}
+                    onBlur={() => onBlur('register_expires')}
                     placeholder="3600"
-                    className="w-24 font-mono"
-                    aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+                    className="w-20 font-mono"
+                    aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
                   />
                   <span className="text-xs text-slate-400">s</span>
-                  <button
-                    type="button"
-                    onClick={() => setCustomSub(false)}
-                    className="ml-1 text-xs text-slate-500 hover:text-slate-300 transition-colors"
-                    title="Reset to match REGISTER Expires"
-                  >
-                    same as REG
-                  </button>
                 </div>
-              ) : (
-                <div className="flex h-8 items-center gap-2">
-                  <span className="font-mono text-xs text-slate-400">
-                    = {raw.register_expires || '3600'}s
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setCustomSub(true)}
-                    className="text-xs text-emerald-400/80 hover:text-emerald-300 transition-colors"
-                  >
-                    Customise
-                  </button>
+                <span className="text-slate-600">·</span>
+                {/* SUB Expires — collapses to "= REG" when not customised */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-400">SUB</span>
+                  {customSub ? (
+                    <>
+                      <Input
+                        type="number"
+                        min={60}
+                        step={60}
+                        value={raw.subscribe_expires}
+                        onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
+                        onBlur={() => onBlur('subscribe_expires')}
+                        placeholder="3600"
+                        className="w-20 font-mono"
+                        aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+                      />
+                      <span className="text-xs text-slate-400">s</span>
+                      <button
+                        type="button"
+                        onClick={() => setCustomSub(false)}
+                        className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                        title="Reset to match REG Expires"
+                      >
+                        = REG
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-mono text-xs text-slate-400">
+                        = {raw.register_expires || '3600'}s
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setCustomSub(true)}
+                        className="text-xs text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                      >
+                        customise
+                      </button>
+                    </>
+                  )}
                 </div>
+                <span className="text-slate-600">·</span>
+                {/* Reg Rate */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-400">Rate</span>
+                  <Input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={raw.register_rate_cps}
+                    onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
+                    onBlur={() => onBlur('register_rate_cps')}
+                    placeholder="10"
+                    className="w-16 font-mono"
+                    aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
+                  />
+                  <span className="text-xs text-slate-400">reg/s</span>
+                </div>
+              </div>
+              {(e('register_expires') || (customSub && e('subscribe_expires')) || e('register_rate_cps')) && (
+                <>
+                  {e('register_expires')                 && <FieldError error={e('register_expires')} />}
+                  {customSub && e('subscribe_expires')   && <FieldError error={e('subscribe_expires')} />}
+                  {e('register_rate_cps')                && <FieldError error={e('register_rate_cps')} />}
+                </>
               )}
             </FormRow>
+
+            {/* SIP Timers — T1 and Timer-B with explicit per-input labels. */}
             <FormRow
-              label="Reg Rate"
-              error={e('register_rate_cps')}
-              hint="Rate at which REGISTER messages are pumped (reg/s). Default 10."
+              label="SIP Timers"
+              hint="RFC 3261 §17.1.1 INVITE client transaction timers. T1 is the UDP retransmit interval (default 500 ms); Timer-B is the overall INVITE transaction timeout (default 64*T1 = 32 s)."
             >
-              <div className="flex items-center gap-2">
-                <Input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={raw.register_rate_cps}
-                  onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
-                  onBlur={() => onBlur('register_rate_cps')}
-                  placeholder="10"
-                  className="w-24 font-mono"
-                  aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
-                />
-                <span className="text-xs text-slate-400">reg/s</span>
-              </div>
-            </FormRow>
-            <FormRow
-              label="T1 / Timer-B"
-              hint="RFC 3261 §17.1.1 INVITE client transaction timers. T1 is the UDP retransmit interval (default 500 ms); Timer B is the overall INVITE transaction timeout (default 64*T1 = 32 s)."
-            >
-              <div className="flex items-center gap-2">
-                <Input
-                  type="number"
-                  min={100}
-                  max={5000}
-                  step={50}
-                  value={raw.t1_ms}
-                  onChange={(ev) => onChange('t1_ms', ev.target.value)}
-                  onBlur={() => onBlur('t1_ms')}
-                  placeholder="500"
-                  className="w-20 font-mono"
-                  aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
-                />
-                <span className="text-xs text-slate-400">ms</span>
-                <span className="text-slate-500">·</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={300}
-                  step={1}
-                  value={raw.timer_b_seconds}
-                  onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
-                  onBlur={() => onBlur('timer_b_seconds')}
-                  placeholder="32"
-                  className="w-20 font-mono"
-                  aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
-                />
-                <span className="text-xs text-slate-400">s</span>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-400">T1</span>
+                  <Input
+                    type="number"
+                    min={100}
+                    max={5000}
+                    step={50}
+                    value={raw.t1_ms}
+                    onChange={(ev) => onChange('t1_ms', ev.target.value)}
+                    onBlur={() => onBlur('t1_ms')}
+                    placeholder="500"
+                    className="w-20 font-mono"
+                    aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
+                  />
+                  <span className="text-xs text-slate-400">ms</span>
+                </div>
+                <span className="text-slate-600">·</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-400">Timer-B</span>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={300}
+                    step={1}
+                    value={raw.timer_b_seconds}
+                    onChange={(ev) => onChange('timer_b_seconds', ev.target.value)}
+                    onBlur={() => onBlur('timer_b_seconds')}
+                    placeholder="32"
+                    className="w-20 font-mono"
+                    aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
+                  />
+                  <span className="text-xs text-slate-400">s</span>
+                </div>
               </div>
               {(e('t1_ms') || e('timer_b_seconds')) && (
                 <>

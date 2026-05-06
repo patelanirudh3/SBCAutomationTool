@@ -217,23 +217,23 @@ function ConfigTabTrigger({
         // generous padding make them legible across the room.
         'h-11 px-5 text-base font-bold uppercase tracking-wide transition-colors',
         // Browser-tab shape: rounded top, flat bottom, sits ON the panel.
-        // border-2 (instead of 1) gives the tab a clearly visible outline
+        // border-[3px] gives the tab a thick, unmistakable outline
         // against the dark page background.
-        'rounded-t-lg rounded-b-none border-2 border-b-0',
-        // Inactive state — VISIBLE warm-orange-tinted border + medium
-        // slate fill so the tab is unmistakably a tab even when not
-        // selected. The orange tint unifies the whole tab strip.
-        'border-orange-500/30 bg-slate-800/70 text-orange-200/80',
-        'hover:bg-slate-700/80 hover:text-orange-200 hover:border-orange-400/50',
-        // Active state — vivid orange fill + bright orange border. The
-        // -mb-[2px] nudges the active trigger down 2px (matches border-2)
-        // so its bottom edge overlaps the panel border for the "tab
-        // merges with content" effect.
-        'data-[state=active]:-mb-[2px]',
+        'rounded-t-lg rounded-b-none border-[3px] border-b-0',
+        // Inactive state — clearly VISIBLE orange border + medium slate
+        // fill. The orange tint at /60 opacity unifies the whole tab
+        // strip and reads as "this is a tab control" at a glance.
+        'border-orange-500/60 bg-slate-800/70 text-orange-200/80',
+        'hover:bg-slate-700/80 hover:text-orange-100 hover:border-orange-400/80',
+        // Active state — full vivid orange border + brighter fill + soft
+        // glow. The -mb-[3px] nudges the active trigger down 3px (matches
+        // border-[3px]) so its bottom edge overlaps the panel border for
+        // the "tab merges with content" effect.
+        'data-[state=active]:-mb-[3px]',
         'data-[state=active]:border-orange-400',
         'data-[state=active]:bg-orange-500/20',
-        'data-[state=active]:text-orange-200',
-        'data-[state=active]:shadow-[0_-3px_12px_-4px_rgba(251,146,60,0.5)]',
+        'data-[state=active]:text-orange-100',
+        'data-[state=active]:shadow-[0_-4px_14px_-4px_rgba(251,146,60,0.6)]',
       )}
     >
       <span>{label}</span>
