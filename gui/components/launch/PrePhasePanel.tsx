@@ -81,18 +81,39 @@ function CountBadge({ label, value, color, pulsing = false }: {
 
 // ---------------------------------------------------------------------------
 // PrepButton — corner control for the optional async unregister flush.
-// Three locked states: idle (clickable) -> running (spinner) -> done (locked
-// green check). Failed shows a small retry link.
+// Visual states (in order of lifecycle):
+//   idle      → outline button "Start Prep"
+//   starting  → countdown "Wiring up… Ns" while the POST /api/prep/start
+//               request is in flight (server may wait up to 10 s for the
+//               OnPrepStart handler to be wired during transport connect)
+//   running   → sky spinner "Cleaning up…"
+//   done      → green check "Prep Complete" (locked)
+//   failed    → amber retry link
 // ---------------------------------------------------------------------------
 function PrepButton({
   status,
   disabled,
   onClick,
+  startingCountdown,
 }: {
   status: PrepStatus
   disabled: boolean
   onClick: () => void
+  /** When non-null the request to /api/prep/start is in flight; show a
+   *  countdown from this many seconds down to 0 so the operator knows
+   *  why the button is "stuck". */
+  startingCountdown: number | null
 }) {
+  // Starting state takes precedence over all other states because it
+  // represents the active request lifecycle before status changes server-side.
+  if (startingCountdown !== null) {
+    return (
+      <span className="inline-flex items-center gap-2 rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-300 tabular-nums">
+        <Loader2 className="size-3.5 animate-spin" />
+        Wiring up… {startingCountdown}s
+      </span>
+    )
+  }
   if (status === 'running') {
     return (
       <span className="inline-flex items-center gap-2 rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-300">
@@ -190,6 +211,10 @@ export function PrePhasePanel() {
   const [localRegOnlyCount, setLocalRegOnlyCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [isStartingPrep, setIsStartingPrep] = useState(false)
+  // Server-side wait for OnPrepStart wiring is up to 10 s. Show a countdown
+  // so the operator knows the button isn't hung. null = no request in flight.
+  const PREP_START_TIMEOUT_S = 10
+  const [prepCountdown, setPrepCountdown] = useState<number | null>(null)
   const [isStartingReg, setIsStartingReg] = useState(false)
   const [isStartingTraffic, setIsStartingTraffic] = useState(false)
   const [isAborting, setIsAborting] = useState(false)
@@ -337,6 +362,12 @@ export function PrePhasePanel() {
     if (isStartingPrep || prepStatus === 'running' || prepStatus === 'done') return
     setIsStartingPrep(true)
     setError(null)
+    // Kick off a 1 Hz countdown that mirrors the backend's max wait window
+    // for OnPrepStart wiring. Stops as soon as the request returns.
+    setPrepCountdown(PREP_START_TIMEOUT_S)
+    const tick = setInterval(() => {
+      setPrepCountdown((n) => (n == null || n <= 1 ? n : n - 1))
+    }, 1000)
     try {
       // Prep needs the engine in CONFIGURED state (StartFunc spawned). The
       // backend lifecycle blocks at REGSUB_READY waiting for our gate.
@@ -347,6 +378,8 @@ export function PrePhasePanel() {
       const msg = err instanceof Error ? err.message : 'Failed to start prep'
       setError(`Could not start Prep at http://${vmIp}:${vmPort} — ${msg}`)
     } finally {
+      clearInterval(tick)
+      setPrepCountdown(null)
       setIsStartingPrep(false)
     }
   }, [isStartingPrep, prepStatus, vmIp, vmPort, ensureRunIdAndStartTest])
@@ -499,6 +532,7 @@ export function PrePhasePanel() {
           status={prepStatus}
           disabled={prepDisabled}
           onClick={handleStartPrep}
+          startingCountdown={prepCountdown}
         />
       </div>
 
