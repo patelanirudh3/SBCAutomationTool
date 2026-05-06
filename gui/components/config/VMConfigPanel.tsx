@@ -541,20 +541,9 @@ export function VMConfigPanel({
   const ptimeNum = parseInt(raw.rtp_ptime, 10) || 20
   const ppsDisplay = Math.round(1000 / ptimeNum)
 
-  // Subscribe Expires is identical to Register Expires in 99% of deployments.
-  // Hide it behind a "Customise" toggle that's auto-on when the values differ
-  // (so previously-customised configs keep showing the field on reload).
-  const [customSub, setCustomSub] = useState(
-    raw.subscribe_expires !== '' && raw.subscribe_expires !== raw.register_expires,
-  )
-  // When the toggle is OFF, keep subscribe_expires in lock-step with
-  // register_expires so the value stored / saved is still correct.
-  useEffect(() => {
-    if (!customSub && raw.subscribe_expires !== raw.register_expires) {
-      onChange('subscribe_expires', raw.register_expires)
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customSub, raw.register_expires])
+  // SUB Expires used to be hidden behind a "Customise" toggle that synced
+  // it to REG Expires when off. Per UX feedback the field is now always
+  // shown as a normal input alongside REG so the two fields look symmetric.
 
   // Heuristic for "is this a local target?" — used to hide SSH credentials
   // when they're irrelevant. Loopback or empty IP means same-host execution
@@ -996,51 +985,28 @@ export function VMConfigPanel({
                   <span className="text-xs text-slate-400">s</span>
                 </div>
                 <span className="text-slate-600">·</span>
-                {/* SUB Expires — collapses to "= REG" when not customised */}
+                {/* SUB Expires — same shape as REG Expires for visual
+                    symmetry. Defaults to 3600 from DEFAULTS but can be
+                    set independently. */}
                 <div className="flex items-center gap-1.5">
                   <span className="text-xs font-medium text-slate-400">SUB</span>
-                  {customSub ? (
-                    <>
-                      <Input
-                        type="number"
-                        min={60}
-                        step={60}
-                        value={raw.subscribe_expires}
-                        onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
-                        onBlur={() => onBlur('subscribe_expires')}
-                        placeholder="3600"
-                        className="w-20 font-mono"
-                        aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
-                      />
-                      <span className="text-xs text-slate-400">s</span>
-                      <button
-                        type="button"
-                        onClick={() => setCustomSub(false)}
-                        className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
-                        title="Reset to match REG Expires"
-                      >
-                        = REG
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <span className="font-mono text-xs text-slate-400">
-                        = {raw.register_expires || '3600'}s
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setCustomSub(true)}
-                        className="text-xs text-emerald-400/80 hover:text-emerald-300 transition-colors"
-                      >
-                        customise
-                      </button>
-                    </>
-                  )}
+                  <Input
+                    type="number"
+                    min={60}
+                    step={60}
+                    value={raw.subscribe_expires}
+                    onChange={(ev) => onChange('subscribe_expires', ev.target.value)}
+                    onBlur={() => onBlur('subscribe_expires')}
+                    placeholder="3600"
+                    className="w-20 font-mono"
+                    aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
+                  />
+                  <span className="text-xs text-slate-400">s</span>
                 </div>
                 <span className="text-slate-600">·</span>
-                {/* Reg Rate */}
+                {/* Reg. Rate */}
                 <div className="flex items-center gap-1.5">
-                  <span className="text-xs font-medium text-slate-400">Rate</span>
+                  <span className="text-xs font-medium text-slate-400">Reg. Rate</span>
                   <Input
                     type="number"
                     min={1}
@@ -1055,11 +1021,11 @@ export function VMConfigPanel({
                   <span className="text-xs text-slate-400">reg/s</span>
                 </div>
               </div>
-              {(e('register_expires') || (customSub && e('subscribe_expires')) || e('register_rate_cps')) && (
+              {(e('register_expires') || e('subscribe_expires') || e('register_rate_cps')) && (
                 <>
-                  {e('register_expires')                 && <FieldError error={e('register_expires')} />}
-                  {customSub && e('subscribe_expires')   && <FieldError error={e('subscribe_expires')} />}
-                  {e('register_rate_cps')                && <FieldError error={e('register_rate_cps')} />}
+                  {e('register_expires')   && <FieldError error={e('register_expires')} />}
+                  {e('subscribe_expires')  && <FieldError error={e('subscribe_expires')} />}
+                  {e('register_rate_cps')  && <FieldError error={e('register_rate_cps')} />}
                 </>
               )}
             </FormRow>
