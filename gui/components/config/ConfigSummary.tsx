@@ -175,7 +175,7 @@ function SummarySection({ title, items }: { title: string; items: SummaryItem[] 
         {title}
         <span className="h-px flex-1 bg-slate-700/40" />
       </h3>
-      <dl className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 px-1 text-sm leading-relaxed">
+      <dl className="grid grid-cols-[90px_1fr] gap-x-3 gap-y-1 px-1 text-sm leading-relaxed">
         {items.map((it, idx) => (
           <div key={idx} className="contents">
             <dt className="text-slate-400">{it.label}</dt>

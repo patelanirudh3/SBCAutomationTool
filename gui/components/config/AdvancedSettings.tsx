@@ -6,6 +6,13 @@ import { Settings2, Pencil, Check, ChevronDown, Info } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTrafficStore } from '@/store/traffic'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
@@ -349,28 +356,26 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                     <span className="h-px flex-1 bg-indigo-400/30" />
                   </h3>
 
-                  {/* RTP Mode — horizontal row to match AdvancedField layout */}
+                  {/* RTP Mode — Select dropdown for visual consistency with
+                      the other Selects in the form (Transport, Scheme,
+                      TLS Mode, Codec). Two options only, but a Select
+                      keeps the row compact and matches the established
+                      pattern. */}
                   <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1">
                     <Label className="text-sm font-semibold text-slate-200/90">RTP Mode</Label>
-                    <div className="flex gap-1.5">
-                      {(['3phase', 'continuous'] as const).map((m) => (
-                        <button
-                          key={m}
-                          type="button"
-                          disabled={disabled}
-                          onClick={() => setDraft((prev) => ({ ...prev, rtp_mode: m as RtpMode }))}
-                          className={cn(
-                            'rounded-md px-2.5 py-1 text-xs font-bold border transition-colors',
-                            draft.rtp_mode === m
-                              ? 'border-indigo-500/70 bg-indigo-600/25 text-white'
-                              : 'border-slate-600/60 bg-slate-800/70 text-slate-300 hover:border-indigo-500/40 hover:text-slate-200',
-                            disabled && 'opacity-70 cursor-default',
-                          )}
-                        >
-                          {m === '3phase' ? '3-Phase' : 'Continuous'}
-                        </button>
-                      ))}
-                    </div>
+                    <Select
+                      value={draft.rtp_mode}
+                      disabled={disabled}
+                      onValueChange={(v) => setDraft((prev) => ({ ...prev, rtp_mode: v as RtpMode }))}
+                    >
+                      <SelectTrigger className="w-40 text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="3phase">3-Phase Burst</SelectItem>
+                        <SelectItem value="continuous">Continuous</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
 
                   {/* PCAP capture — horizontal row */}

@@ -558,12 +558,12 @@ export function VMPairBook() {
               sidebar is visible to the right; below lg the form takes the
               full canvas and the footer strip + drawer (always mounted)
               provide summary access. */}
-          {/* Wider sidebar (400px instead of 320px) gives the Config
-              Summary enough room to render long values like
-              "10.133.63.117:5060/TCP" without truncation. The form
-              column shrinks correspondingly — its right-sized fields
-              don't need the extra width. */}
-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_400px]">
+          {/* Wide sidebar (480px) gives the Config Summary plenty of
+              room to render long values like "10.133.63.117:5060/TCP"
+              without truncation. The form column shrinks correspondingly
+              — its right-sized fields and multi-field rows don't need
+              the extra horizontal real estate. */}
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_480px]">
 
           {/* UA card — tabbed layout. Header (UA badge + InlineVMIdEditor)
               stays visible across all tabs; the form content is split into
