@@ -105,11 +105,11 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
 
 function SummaryPill({ label, value }: { label: string; value: string | number }) {
   return (
-    <span className="flex shrink-0 items-center gap-1.5 rounded border border-slate-700/60 bg-slate-800/40 px-2 py-0.5">
-      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+    <span className="flex shrink-0 items-center gap-1.5 rounded border border-slate-700/60 bg-slate-800/40 px-2 py-1">
+      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
         {label}
       </span>
-      <span className="font-mono text-[11px] font-semibold text-slate-100">
+      <span className="font-mono text-sm font-semibold text-slate-100">
         {String(value)}
       </span>
     </span>
@@ -141,7 +141,7 @@ export function ConfigSummaryStrip({ raw, onOpenDrawer }: ConfigSummaryStripProp
         'transition-colors hover:bg-card cursor-pointer',
       )}
     >
-      <span className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-slate-500 group-hover:text-slate-300">
+      <span className="shrink-0 text-xs font-bold uppercase tracking-widest text-slate-400 group-hover:text-slate-200">
         Config
       </span>
       <span className="text-slate-700">·</span>
@@ -154,8 +154,8 @@ export function ConfigSummaryStrip({ raw, onOpenDrawer }: ConfigSummaryStripProp
         value={raw.media_enabled ? raw.rtp_codec.replace('G711_', 'G711-') : 'off'}
       />
       <SummaryPill label="Mode" value={raw.traffic_mode || '—'} />
-      <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-slate-500 group-hover:text-emerald-400 transition-colors">
-        <Info className="size-3" />
+      <span className="ml-auto flex shrink-0 items-center gap-1 text-xs text-slate-400 group-hover:text-emerald-400 transition-colors">
+        <Info className="size-3.5" />
         Review
       </span>
     </button>
@@ -169,13 +169,13 @@ export function ConfigSummaryStrip({ raw, onOpenDrawer }: ConfigSummaryStripProp
 function SummarySection({ title, items }: { title: string; items: SummaryItem[] }) {
   if (items.length === 0) return null
   return (
-    <div className="space-y-1.5">
-      <h3 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-400">
-        <span className="h-2 w-0.5 shrink-0 rounded-full bg-emerald-500/60" />
+    <div className="space-y-2">
+      <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-slate-300">
+        <span className="h-2.5 w-0.5 shrink-0 rounded-full bg-emerald-500/60" />
         {title}
         <span className="h-px flex-1 bg-slate-700/40" />
       </h3>
-      <dl className="grid grid-cols-[110px_1fr] gap-x-3 gap-y-1 px-1 text-[11px] leading-relaxed">
+      <dl className="grid grid-cols-[120px_1fr] gap-x-3 gap-y-1 px-1 text-sm leading-relaxed">
         {items.map((it, idx) => (
           <div key={idx} className="contents">
             <dt className="text-slate-400">{it.label}</dt>
@@ -222,10 +222,10 @@ export function ConfigSummarySidebar({ raw, advancedSettings }: ConfigSummarySid
       )}
     >
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2.5">
-        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-emerald-400">
+        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-xs font-bold uppercase tracking-widest text-emerald-400">
           Live
         </span>
-        <h2 className="text-xs font-bold uppercase tracking-widest text-slate-100">
+        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-100">
           Config Summary
         </h2>
       </header>
@@ -301,10 +301,10 @@ export function ConfigSummaryDrawer({
           >
             <header className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
               <div className="flex items-center gap-2">
-                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-emerald-400">
+                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-xs font-bold uppercase tracking-widest text-emerald-400">
                   Review
                 </span>
-                <h2 className="text-xs font-bold uppercase tracking-widest text-slate-100">
+                <h2 className="text-sm font-bold uppercase tracking-widest text-slate-100">
                   Config Summary
                 </h2>
               </div>
@@ -329,9 +329,9 @@ export function ConfigSummaryDrawer({
               )}
             </div>
 
-            <footer className="shrink-0 border-t border-border bg-card/60 px-4 py-2.5 text-[10px] text-slate-500">
+            <footer className="shrink-0 border-t border-border bg-card/60 px-4 py-2.5 text-xs text-slate-500">
               <div className="flex items-center justify-between">
-                <span>Press <kbd className="rounded border border-slate-700 bg-slate-800/60 px-1 font-mono text-[10px]">ESC</kbd> to close</span>
+                <span>Press <kbd className="rounded border border-slate-700 bg-slate-800/60 px-1 font-mono text-xs">ESC</kbd> to close</span>
                 <button
                   type="button"
                   onClick={onClose}

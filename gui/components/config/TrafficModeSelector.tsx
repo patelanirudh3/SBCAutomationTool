@@ -121,8 +121,8 @@ export function TrafficModeSelector({
       {/* Mode segmented-pill row — compact horizontal selector. The previous
           card layout (icon + label + description, ~70px tall) was overkill
           for a 3-option radio. Description moves to a hover tooltip. */}
-      <div className="grid grid-cols-[140px_1fr] items-center gap-3 py-1">
-        <Label className="text-xs font-medium text-foreground/80">Mode</Label>
+      <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1.5">
+        <Label className="text-sm font-medium text-foreground/85">Mode</Label>
         <div className="inline-flex w-fit items-center rounded-md border border-slate-700/60 bg-slate-800/40 p-0.5">
           {MODES.map(({ value: modeVal, label, Icon, desc }) => {
             const isSelected = value === modeVal
@@ -133,18 +133,18 @@ export function TrafficModeSelector({
                     type="button"
                     onClick={() => onChange(modeVal)}
                     className={cn(
-                      'flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-semibold transition-colors',
+                      'flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-semibold transition-colors',
                       'focus:outline-none focus-visible:ring-1 focus-visible:ring-emerald-500/50',
                       isSelected
                         ? 'bg-emerald-500/20 text-emerald-300'
                         : 'text-slate-400 hover:text-slate-100',
                     )}
                   >
-                    <Icon className="size-3 shrink-0" />
+                    <Icon className="size-3.5 shrink-0" />
                     {label}
                   </button>
                 </TooltipTrigger>
-                <TooltipContent side="top" className="text-xs">
+                <TooltipContent side="top" className="text-sm">
                   {desc}
                 </TooltipContent>
               </Tooltip>
@@ -156,7 +156,7 @@ export function TrafficModeSelector({
       {/* Smoke: call_count */}
       {value === 'smoke' && (
         <div className="space-y-1">
-          <Label className="text-xs font-medium text-foreground/80">Smoke Call Count</Label>
+          <Label className="text-sm font-medium text-foreground/85">Smoke Call Count</Label>
           <Input
             type="number"
             min={1}
@@ -169,7 +169,7 @@ export function TrafficModeSelector({
           />
           {touched.call_count && <FieldError error={errors.call_count} />}
           {touched.call_count && !errors.call_count && <FieldSoftWarning warning={warnings.call_count} />}
-          <p className="text-[11px] text-slate-400 leading-relaxed">
+          <p className="text-xs text-slate-400 leading-relaxed">
             e.g. 20 = 20 callers call 20 others, selected from the full registered pool. Only INVITE calls are made.
           </p>
         </div>
@@ -179,7 +179,7 @@ export function TrafficModeSelector({
       {value === 'timed' && (
         <div className="space-y-2">
           {/* Visible "Duration" section label */}
-          <p className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-200">
+          <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-slate-200">
             <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-slate-400" />
             Duration
           </p>
@@ -226,7 +226,7 @@ export function TrafficModeSelector({
                     type="button"
                     onClick={() => handlePreset(p.hours, p.mins)}
                     className={cn(
-                      'rounded border px-2 py-1 text-[10px] font-semibold transition-colors',
+                      'rounded border px-2 py-1 text-xs font-semibold transition-colors',
                       isActive
                         ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
                         : 'border-slate-600 bg-slate-800/50 text-slate-300 hover:border-slate-500 hover:text-slate-100'
@@ -252,7 +252,7 @@ export function TrafficModeSelector({
                 <span className="text-xs font-bold text-amber-400">
                   ≈ {maxCalls.toLocaleString()} max calls
                 </span>
-                <span className="text-[11px] text-amber-400/70">
+                <span className="text-xs text-amber-400/70">
                   at {cps} CPS × {durationLabel}
                 </span>
                 <span className="text-xs font-semibold text-amber-300">
@@ -275,7 +275,7 @@ export function TrafficModeSelector({
       {/* Scheduled start time — shown for timed + unlimited */}
       {(value === 'timed' || value === 'unlimited') && onStartTimeIsoChange && (
         <div className="space-y-1 border-t border-slate-700/40 pt-3">
-          <Label className="text-xs font-medium text-foreground/80">Scheduled Start Time (optional)</Label>
+          <Label className="text-sm font-medium text-foreground/85">Scheduled Start Time (optional)</Label>
           <input
             type="datetime-local"
             value={startTimeIso ? startTimeIso.slice(0, 16) : ''}
@@ -288,7 +288,7 @@ export function TrafficModeSelector({
               'focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
             )}
           />
-          <p className="text-[11px] text-slate-400">
+          <p className="text-xs text-slate-400">
             {startTimeIso
               ? `Traffic will start at ${new Date(startTimeIso).toLocaleString()} (local time)`
               : 'Leave empty to start traffic immediately after pre-phase completes.'}

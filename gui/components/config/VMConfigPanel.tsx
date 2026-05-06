@@ -144,14 +144,14 @@ const SECTION_FIELDS = {
 
 function SectionHeader({ children, onReset }: { children: ReactNode; onReset?: () => void }) {
   return (
-    <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
+    <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-200">
       <span>{children}</span>
       <span className="h-px flex-1 bg-border" />
       {onReset && (
         <button
           type="button"
           onClick={onReset}
-          className="flex items-center gap-1 text-[10px] normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
+          className="flex items-center gap-1 text-xs normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
           title="Reset section to defaults"
         >
           <RotateCcw className="size-3" />
@@ -189,7 +189,7 @@ function CollapsibleSection({
   const [open, setOpen] = useState(defaultOpen)
   return (
     <div className="space-y-2">
-      <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
+      <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-200">
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
@@ -198,14 +198,14 @@ function CollapsibleSection({
         >
           <ChevronDown
             className={cn(
-              'size-3 shrink-0 text-slate-500 transition-transform duration-200',
+              'size-3.5 shrink-0 text-slate-500 transition-transform duration-200',
               open && 'rotate-180',
             )}
           />
           <span>{title}</span>
           {dirty && (
             <span
-              className="size-1.5 shrink-0 rounded-full bg-amber-400"
+              className="size-2 shrink-0 rounded-full bg-amber-400"
               title="Customised — click to expand"
             />
           )}
@@ -215,7 +215,7 @@ function CollapsibleSection({
           <button
             type="button"
             onClick={onReset}
-            className="flex items-center gap-1 text-[10px] normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
+            className="flex items-center gap-1 text-xs normal-case tracking-normal font-normal text-slate-500 hover:text-slate-300 transition-colors"
             title="Reset section to defaults"
           >
             <RotateCcw className="size-3" />
@@ -255,10 +255,10 @@ function InfoTooltip({ children }: { children: ReactNode }) {
           className="text-muted-foreground/60 transition-colors hover:text-emerald-400"
           tabIndex={-1}
         >
-          <Info className="size-3" />
+          <Info className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+      <TooltipContent side="top" className="max-w-xs text-sm leading-relaxed">
         {children}
       </TooltipContent>
     </Tooltip>
@@ -285,8 +285,8 @@ function FormRow({
   children: ReactNode
 }) {
   return (
-    <div className="grid grid-cols-[140px_1fr] items-start gap-3 py-1">
-      <Label className="flex h-8 items-center gap-1 text-xs font-medium text-foreground/80">
+    <div className="grid grid-cols-[160px_1fr] items-start gap-3 py-1.5">
+      <Label className="flex h-9 items-center gap-1.5 text-sm font-medium text-foreground/85">
         <span>{label}</span>
         {hint && <InfoTooltip>{hint}</InfoTooltip>}
       </Label>
@@ -460,7 +460,7 @@ function CpsBhccField({
             inputMode === 'cps' ? 'ring-1 ring-emerald-500/40' : '',
           )}
         />
-        <span className="text-[10px] font-medium text-slate-400">cps</span>
+        <span className="text-xs font-medium text-slate-400">cps</span>
         <span className="text-slate-500">·</span>
         <Input
           type="number"
@@ -475,7 +475,7 @@ function CpsBhccField({
           )}
           placeholder={bhccNum ? String(bhccNum) : '—'}
         />
-        <span className="text-[10px] font-medium text-slate-400">bhcc</span>
+        <span className="text-xs font-medium text-slate-400">bhcc</span>
         <span className="text-slate-500">·</span>
         <Input
           type="number"
@@ -486,9 +486,9 @@ function CpsBhccField({
           className="w-14 font-mono"
           aria-invalid={!!holdError ? true : undefined}
         />
-        <span className="text-[10px] font-medium text-slate-400">s hold</span>
+        <span className="text-xs font-medium text-slate-400">s hold</span>
         {bhccNum !== null && (
-          <span className="ml-1 font-mono text-[11px] text-amber-400/80">
+          <span className="ml-1 font-mono text-xs text-amber-400/80">
             ≈ <span className="font-bold text-amber-400">{bhccNum.toLocaleString()}</span>/hr
           </span>
         )}
@@ -615,7 +615,7 @@ export function VMConfigPanel({
             {reachability && <ReachabilityIndicator status={reachability} />}
           </div>
         </FormRow>
-        <p className="ml-[140px] pl-3 text-[11px] text-slate-400">
+        <p className="ml-[160px] pl-3 text-xs text-slate-400">
           Health:{' '}
           <span className="font-mono text-sky-400 underline decoration-sky-400/30 underline-offset-2">
             {`http://${raw.vm_ip || '<ip>'}:${raw.metrics_port || '<port>'}/api/ping`}
@@ -742,7 +742,7 @@ export function VMConfigPanel({
 
         {raw.sip_transport === 'TLS' && (
           <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-            <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-amber-300">
+            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-300">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
               TLS Settings
             </div>
@@ -855,7 +855,7 @@ export function VMConfigPanel({
               checked={raw.failover_enabled}
               onCheckedChange={(checked) => onChange('failover_enabled', checked)}
             />
-            <span className="text-[11px] text-slate-400">
+            <span className="text-xs text-slate-400">
               {raw.failover_enabled ? 'Secondary host configured' : 'Single host — no failover'}
             </span>
           </div>
@@ -942,7 +942,7 @@ export function VMConfigPanel({
         </FormRow>
         {/* Inline per-field errors when start/end are individually invalid */}
         {(e('ext_start') || e('ext_end')) && (
-          <div className="ml-[140px] pl-3 space-y-1">
+          <div className="ml-[160px] pl-3 space-y-1">
             {e('ext_start') && <FieldError error={e('ext_start')} />}
             {e('ext_end')   && <FieldError error={e('ext_end')} />}
           </div>
@@ -982,7 +982,7 @@ export function VMConfigPanel({
                   className="w-24 font-mono"
                   aria-invalid={t('register_expires') && !!errors.register_expires ? true : undefined}
                 />
-                <span className="text-[11px] text-slate-400">s</span>
+                <span className="text-xs text-slate-400">s</span>
               </div>
             </FormRow>
             <FormRow
@@ -1003,11 +1003,11 @@ export function VMConfigPanel({
                     className="w-24 font-mono"
                     aria-invalid={t('subscribe_expires') && !!errors.subscribe_expires ? true : undefined}
                   />
-                  <span className="text-[11px] text-slate-400">s</span>
+                  <span className="text-xs text-slate-400">s</span>
                   <button
                     type="button"
                     onClick={() => setCustomSub(false)}
-                    className="ml-1 text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                    className="ml-1 text-xs text-slate-500 hover:text-slate-300 transition-colors"
                     title="Reset to match REGISTER Expires"
                   >
                     same as REG
@@ -1021,7 +1021,7 @@ export function VMConfigPanel({
                   <button
                     type="button"
                     onClick={() => setCustomSub(true)}
-                    className="text-[10px] text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                    className="text-xs text-emerald-400/80 hover:text-emerald-300 transition-colors"
                   >
                     Customise
                   </button>
@@ -1045,7 +1045,7 @@ export function VMConfigPanel({
                   className="w-24 font-mono"
                   aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
                 />
-                <span className="text-[11px] text-slate-400">reg/s</span>
+                <span className="text-xs text-slate-400">reg/s</span>
               </div>
             </FormRow>
             <FormRow
@@ -1065,7 +1065,7 @@ export function VMConfigPanel({
                   className="w-20 font-mono"
                   aria-invalid={t('t1_ms') && !!errors.t1_ms ? true : undefined}
                 />
-                <span className="text-[11px] text-slate-400">ms</span>
+                <span className="text-xs text-slate-400">ms</span>
                 <span className="text-slate-500">·</span>
                 <Input
                   type="number"
@@ -1079,7 +1079,7 @@ export function VMConfigPanel({
                   className="w-20 font-mono"
                   aria-invalid={t('timer_b_seconds') && !!errors.timer_b_seconds ? true : undefined}
                 />
-                <span className="text-[11px] text-slate-400">s</span>
+                <span className="text-xs text-slate-400">s</span>
               </div>
               {(e('t1_ms') || e('timer_b_seconds')) && (
                 <>
@@ -1155,7 +1155,7 @@ export function VMConfigPanel({
               checked={raw.media_enabled}
               onCheckedChange={(checked) => onChange('media_enabled', checked)}
             />
-            <span className="text-[11px] text-slate-400">
+            <span className="text-xs text-slate-400">
               {raw.media_enabled ? 'RTP enabled' : 'Signaling-only — no RTP'}
             </span>
           </div>
@@ -1193,9 +1193,9 @@ export function VMConfigPanel({
                   placeholder="20"
                   className="w-20 font-mono"
                 />
-                <span className="text-[11px] text-slate-400">ms</span>
+                <span className="text-xs text-slate-400">ms</span>
                 <span className="text-slate-500">·</span>
-                <span className="font-mono text-[11px] text-emerald-400">
+                <span className="font-mono text-xs text-emerald-400">
                   {ppsDisplay} pps
                 </span>
               </div>

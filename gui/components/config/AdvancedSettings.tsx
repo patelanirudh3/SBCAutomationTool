@@ -46,9 +46,9 @@ function AdvancedField({
   onChange: (v: number) => void
 }) {
   return (
-    <div className="grid grid-cols-[130px_1fr] items-start gap-3 py-1">
-      <div className="flex h-8 items-center gap-1">
-        <Label className="text-xs font-semibold text-slate-200/90">{label}</Label>
+    <div className="grid grid-cols-[160px_1fr] items-start gap-3 py-1.5">
+      <div className="flex h-9 items-center gap-1.5">
+        <Label className="text-sm font-semibold text-slate-200/90">{label}</Label>
         {tooltip && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -121,7 +121,7 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       {tokens.map((tok, i) => (
         <span key={i} className="flex items-center gap-2">
-          <span className="font-mono text-[11px] font-medium text-slate-300">{tok}</span>
+          <span className="font-mono text-xs font-medium text-slate-300">{tok}</span>
           {i < tokens.length - 1 && <span className="text-slate-600">·</span>}
         </span>
       ))}
@@ -230,7 +230,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
           className="flex flex-1 items-center gap-2 text-left"
         >
           <Settings2 className="size-4 shrink-0 text-indigo-400" />
-          <span className="text-[11px] font-bold uppercase tracking-widest text-slate-100">
+          <span className="text-sm font-bold uppercase tracking-wide text-slate-100">
             Advanced Settings — Registration &amp; RTP
           </span>
           <ChevronDown
@@ -256,7 +256,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
               Edit
             </button>
           ) : (
-            <Button size="sm" onClick={handleSave} className="h-6 gap-1 px-2.5 text-[11px]">
+            <Button size="sm" onClick={handleSave} className="h-6 gap-1 px-2.5 text-xs">
               <Check className="size-3" />
               Save
             </Button>
@@ -287,8 +287,8 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
                 {/* Left — Pre-Phase / Registration */}
                 <div className="space-y-1">
-                  <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
-                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-blue-400" />
+                  <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-blue-300">
+                    <span className="h-4 w-0.5 shrink-0 rounded-full bg-blue-400" />
                     Pre-Phase Settings
                     <span className="h-px flex-1 bg-blue-400/30" />
                   </h3>
@@ -301,7 +301,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                       tooltip="Number of extensions per batch for TCP socket creation and concurrent REGISTER operations."
                       onChange={set('register_batch_size')}
                     />
-                    <p className="font-mono text-[11px] text-slate-300">
+                    <p className="font-mono text-xs text-slate-300">
                       Batch size: <span className="font-bold text-emerald-400">{draft.register_batch_size}</span> ext/batch
                     </p>
                   </div>
@@ -343,15 +343,15 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
                 {/* Right — RTP */}
                 <div className="space-y-1">
-                  <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-indigo-300">
-                    <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-indigo-400" />
+                  <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-indigo-300">
+                    <span className="h-4 w-0.5 shrink-0 rounded-full bg-indigo-400" />
                     RTP
                     <span className="h-px flex-1 bg-indigo-400/30" />
                   </h3>
 
                   {/* RTP Mode — horizontal row to match AdvancedField layout */}
-                  <div className="grid grid-cols-[130px_1fr] items-center gap-3 py-1">
-                    <Label className="text-xs font-semibold text-slate-200/90">RTP Mode</Label>
+                  <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1">
+                    <Label className="text-sm font-semibold text-slate-200/90">RTP Mode</Label>
                     <div className="flex gap-1.5">
                       {(['3phase', 'continuous'] as const).map((m) => (
                         <button
@@ -360,7 +360,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                           disabled={disabled}
                           onClick={() => setDraft((prev) => ({ ...prev, rtp_mode: m as RtpMode }))}
                           className={cn(
-                            'rounded-md px-2.5 py-1 text-[11px] font-bold border transition-colors',
+                            'rounded-md px-2.5 py-1 text-xs font-bold border transition-colors',
                             draft.rtp_mode === m
                               ? 'border-indigo-500/70 bg-indigo-600/25 text-white'
                               : 'border-slate-600/60 bg-slate-800/70 text-slate-300 hover:border-indigo-500/40 hover:text-slate-200',
@@ -374,9 +374,9 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   </div>
 
                   {/* PCAP capture — horizontal row */}
-                  <div className="grid grid-cols-[130px_1fr] items-center gap-3 py-1">
+                  <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1">
                     <div className="flex items-center gap-1">
-                      <Label className="text-xs font-semibold text-slate-200/90">PCAP Capture</Label>
+                      <Label className="text-sm font-semibold text-slate-200/90">PCAP Capture</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button
@@ -397,7 +397,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                       disabled={disabled}
                       onClick={() => setDraft((prev) => ({ ...prev, rtp_pcap: !prev.rtp_pcap }))}
                       className={cn(
-                        'inline-flex w-fit items-center gap-2 rounded-md px-2.5 py-1 text-[11px] font-semibold border transition-colors',
+                        'inline-flex w-fit items-center gap-2 rounded-md px-2.5 py-1 text-xs font-semibold border transition-colors',
                         draft.rtp_pcap
                           ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                           : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-indigo-400/40',
@@ -452,8 +452,8 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
 
               {/* Full-width — Media QoS */}
               <div className="border-t border-slate-700/30 pt-3 space-y-3">
-                <h3 className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-sky-300">
-                  <span className="h-3.5 w-0.5 shrink-0 rounded-full bg-sky-400" />
+                <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-sky-300">
+                  <span className="h-4 w-0.5 shrink-0 rounded-full bg-sky-400" />
                   Media QoS
                   <span className="h-px flex-1 bg-sky-400/30" />
                 </h3>
@@ -462,7 +462,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   {/* qos_enabled toggle */}
                   <div className="space-y-1">
                     <div className="flex items-center gap-1.5">
-                      <Label className="text-xs font-semibold text-slate-200/90">QoS Metrics</Label>
+                      <Label className="text-sm font-semibold text-slate-200/90">QoS Metrics</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button type="button" className="text-sky-400/70 hover:text-sky-300 transition-colors">
@@ -498,7 +498,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   {/* qos_mos_estimation toggle */}
                   <div className="space-y-1">
                     <div className="flex items-center gap-1.5">
-                      <Label className="text-xs font-semibold text-slate-200/90">MOS Estimation</Label>
+                      <Label className="text-sm font-semibold text-slate-200/90">MOS Estimation</Label>
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button type="button" className="text-sky-400/70 hover:text-sky-300 transition-colors">
@@ -546,7 +546,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                     <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-amber-300">
                       Advanced
                     </span>
-                    <span className="text-[11px] font-bold uppercase tracking-widest text-amber-200">
+                    <span className="text-xs font-bold uppercase tracking-widest text-amber-200">
                       RTCP Sender Reports
                     </span>
                     <Tooltip>
@@ -569,7 +569,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   <div className="grid grid-cols-2 gap-x-8 gap-y-3">
                     {/* rtcp_sr_enabled toggle */}
                     <div className="space-y-1">
-                      <Label className="text-xs font-semibold text-slate-200/90">RTCP SR Transmission</Label>
+                      <Label className="text-sm font-semibold text-slate-200/90">RTCP SR Transmission</Label>
                       <button
                         type="button"
                         disabled={disabled}

@@ -212,28 +212,34 @@ function ConfigTabTrigger({
     <TabsTrigger
       value={value}
       className={cn(
-        // Layout — taller and wider so it reads clearly as a tab control.
-        'h-9 px-4 text-sm font-bold uppercase tracking-wide transition-colors',
+        // Layout — much bigger / taller so the tabs read clearly as
+        // navigation rather than as labels. Increased font size and
+        // generous padding make them legible across the room.
+        'h-11 px-5 text-base font-bold uppercase tracking-wide transition-colors',
         // Browser-tab shape: rounded top, flat bottom, sits ON the panel.
-        'rounded-t-md rounded-b-none border border-b-0',
-        // Inactive state — visible border + warm muted color.
-        'border-slate-700/60 bg-slate-800/30 text-orange-300/70',
-        'hover:bg-slate-800/60 hover:text-orange-200',
-        // Active state — vivid orange fill + emphasised border. The
-        // -mb-px nudges the active trigger down 1px so its bottom edge
-        // overlaps the panel border, giving the "tab merges with content"
-        // effect.
-        'data-[state=active]:-mb-px',
-        'data-[state=active]:border-orange-500/60',
-        'data-[state=active]:bg-orange-500/15',
-        'data-[state=active]:text-orange-300',
-        'data-[state=active]:shadow-[0_-2px_8px_-4px_rgba(251,146,60,0.35)]',
+        // border-2 (instead of 1) gives the tab a clearly visible outline
+        // against the dark page background.
+        'rounded-t-lg rounded-b-none border-2 border-b-0',
+        // Inactive state — VISIBLE warm-orange-tinted border + medium
+        // slate fill so the tab is unmistakably a tab even when not
+        // selected. The orange tint unifies the whole tab strip.
+        'border-orange-500/30 bg-slate-800/70 text-orange-200/80',
+        'hover:bg-slate-700/80 hover:text-orange-200 hover:border-orange-400/50',
+        // Active state — vivid orange fill + bright orange border. The
+        // -mb-[2px] nudges the active trigger down 2px (matches border-2)
+        // so its bottom edge overlaps the panel border for the "tab
+        // merges with content" effect.
+        'data-[state=active]:-mb-[2px]',
+        'data-[state=active]:border-orange-400',
+        'data-[state=active]:bg-orange-500/20',
+        'data-[state=active]:text-orange-200',
+        'data-[state=active]:shadow-[0_-3px_12px_-4px_rgba(251,146,60,0.5)]',
       )}
     >
       <span>{label}</span>
       {errCount > 0 && (
         <span
-          className="ml-1.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500/20 px-1.5 font-mono text-[11px] font-bold text-rose-300"
+          className="ml-2 inline-flex h-6 min-w-6 items-center justify-center rounded-full bg-rose-500/25 px-2 font-mono text-xs font-bold text-rose-300"
           title={`${errCount} validation error${errCount === 1 ? '' : 's'}`}
         >
           {errCount}
@@ -563,7 +569,7 @@ export function VMPairBook() {
             {/* Persistent header */}
             <div className="flex items-center border-b border-border px-4 py-2.5">
               <div className="flex flex-1 items-center gap-2 px-2">
-                <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
+                <span className="rounded px-2 py-0.5 text-xs font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
                   UA
                 </span>
                 <InlineVMIdEditor
@@ -576,7 +582,7 @@ export function VMPairBook() {
                   <span className="text-[10px] text-rose-400">{errors.vm_id}</span>
                 )}
                 {hasValidated && errorCount > 0 && (
-                  <span className="ml-auto text-[10px] font-medium text-rose-400">
+                  <span className="ml-auto text-xs font-semibold text-rose-400">
                     {errorCount} error{errorCount !== 1 ? 's' : ''}
                   </span>
                 )}
