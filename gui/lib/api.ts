@@ -13,6 +13,38 @@ export class APIError extends Error {
   }
 }
 
+// parseJsonResponse — robust JSON-or-text response handler used by every
+// per-VM POST / PUT / DELETE caller below.
+//
+// Why: the previous pattern called `await res.json()` unconditionally and
+// only checked `res.ok` afterwards. When a backend returns a non-JSON body
+// (e.g. Go's net/http default `404 page not found\n` for a missing route)
+// the JSON parser threw before we could read the actual HTTP status, so
+// the operator saw a cryptic "Unexpected non-whitespace character at
+// position 4" instead of "HTTP 404: 404 page not found".
+//
+// This helper:
+//   1. Reads the body as text (always succeeds).
+//   2. Tries to JSON.parse it; on failure, leaves data=null.
+//   3. On non-2xx, throws APIError with `HTTP {status}: {body.error|body|statusText}`.
+//   4. On 2xx, returns the parsed object (or {} when the body was empty).
+async function parseJsonResponse<T>(res: Response): Promise<T> {
+  const text = await res.text().catch(() => '')
+  let data: unknown = null
+  if (text) {
+    try { data = JSON.parse(text) } catch { /* body is plain text */ }
+  }
+  if (!res.ok) {
+    const errMsg =
+      data && typeof data === 'object' && 'error' in data &&
+      typeof (data as Record<string, unknown>).error === 'string'
+        ? (data as { error: string }).error
+        : (text || res.statusText || 'request failed')
+    throw new APIError(res.status, `HTTP ${res.status}: ${errMsg}`)
+  }
+  return (data ?? {}) as T
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   // Only set Content-Type when sending a body — GET requests must not send it
   // because that triggers a CORS preflight OPTIONS the backend doesn't handle
@@ -144,7 +176,7 @@ export async function getStatusFor(
   port: number
 ): Promise<VMStatusResponse> {
   const res = await fetch(`http://${ip}:${port}/api/test/status`)
-  return res.json() as Promise<VMStatusResponse>
+  return parseJsonResponse<VMStatusResponse>(res)
 }
 
 export async function getMetricsFor(
@@ -152,7 +184,7 @@ export async function getMetricsFor(
   port: number
 ): Promise<TrafficMetrics> {
   const res = await fetch(`http://${ip}:${port}/metrics`)
-  return res.json() as Promise<TrafficMetrics>
+  return parseJsonResponse<TrafficMetrics>(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,9 +273,7 @@ export async function putConfigFor(
     body: JSON.stringify(config),
     signal: AbortSignal.timeout(10_000),
   })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string; vm_id?: string }
+  return parseJsonResponse<{ status: string; vm_id?: string }>(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +292,7 @@ export async function startTestFor(
     body: JSON.stringify({ run_id: runId, pair_id: pairId }),
     signal: AbortSignal.timeout(10_000),
   })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string; vm_id?: string }
+  return parseJsonResponse<{ status: string; vm_id?: string }>(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -279,109 +307,67 @@ export async function stopTestFor(
     method: 'POST',
     signal: AbortSignal.timeout(10_000),
   })
-  return res.json() as Promise<{ status: string }>
+  return parseJsonResponse<{ status: string }>(res)
 }
 
 // ---------------------------------------------------------------------------
 // Phase-gated lifecycle endpoints (new unified-pool model)
 // ---------------------------------------------------------------------------
 
-export async function startPrePhaseFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/prephase/start`, {
+// postNoBody — shared helper for the dozen phase-gate endpoints that all
+// follow the same shape: POST a path, no body, expect a small JSON {status}
+// response. Routes through parseJsonResponse so a stale-binary 404 (or any
+// other non-JSON error body) surfaces as a readable HTTP-status message.
+async function postNoBody(ip: string, port: number, path: string): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}${path}`, {
     method: 'POST',
     signal: AbortSignal.timeout(10_000),
   })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+  return parseJsonResponse<{ status: string }>(res)
+}
+
+export function startPrePhaseFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/prephase/start')
 }
 
 // startPrepFor — fire-and-forget unregister flush. Returns 200 immediately.
 // The actual completion is observed via the prep_status field on metrics.
-export async function startPrepFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/prep/start`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function startPrepFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/prep/start')
 }
 
 // startRegSubFor — gates the REGISTER + SUBSCRIBE phase. Backend returns 409
 // if prep_status == 'running' (defensive guardrail; GUI also disables button).
-export async function startRegSubFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/regsub/start`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function startRegSubFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/regsub/start')
 }
 
 // abortRegSubFor — cancels in-flight Reg/Sub by setting stopNew so RegisterAll
 // / SubscribeAll halt new batches and let in-flight work drain.
-export async function abortRegSubFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/regsub/abort`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function abortRegSubFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/regsub/abort')
 }
 
 // restartTrafficFor — re-enter the traffic loop from CLEANUP_READY without
 // re-running prep / register / subscribe. Reuses the existing populated pool.
-export async function restartTrafficFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/restart-traffic`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function restartTrafficFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/restart-traffic')
 }
 
-export async function startTrafficFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/traffic/start`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function startTrafficFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/traffic/start')
 }
 
-export async function startCleanupFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/cleanup/start`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function startCleanupFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/cleanup/start')
 }
 
-export async function gracefulStopFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/shutdown/graceful`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function gracefulStopFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/shutdown/graceful')
 }
 
-export async function interruptStopFor(ip: string, port: number): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/shutdown/interrupt`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+export function interruptStopFor(ip: string, port: number): Promise<{ status: string }> {
+  return postNoBody(ip, port, '/api/shutdown/interrupt')
 }
 
 // ---------------------------------------------------------------------------
@@ -396,26 +382,18 @@ export async function resetTestFor(
     method: 'POST',
     signal: AbortSignal.timeout(10_000),
   })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string; state?: string }
+  return parseJsonResponse<{ status: string; state?: string }>(res)
 }
 
 // ---------------------------------------------------------------------------
 // Per-VM shutdown — POST /api/shutdown on a specific VM backend
 // ---------------------------------------------------------------------------
 
-export async function shutdownFor(
+export function shutdownFor(
   ip: string,
   port: number
 ): Promise<{ status: string }> {
-  const res = await fetch(`http://${ip}:${port}/api/shutdown`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
-  return data as { status: string }
+  return postNoBody(ip, port, '/api/shutdown')
 }
 
 // ---------------------------------------------------------------------------
