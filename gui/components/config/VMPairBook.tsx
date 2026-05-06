@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { VMConfigPanel, type RawVMFormValues } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
+import { ConfigSummaryStrip, ConfigSummaryDrawer } from './ConfigSummary'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth, putConfigFor } from '@/lib/api'
@@ -178,43 +179,6 @@ function getErrors(raw: RawVMFormValues): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
-// Config Summary sidebar
-// ---------------------------------------------------------------------------
-
-function ConfigSummary({ raw }: { raw: RawVMFormValues }) {
-  const extStart = parseInt(raw.ext_start) || 0
-  const extEnd = parseInt(raw.ext_end) || 0
-  const poolCount = Math.max(extEnd - extStart + 1, 0)
-  const bhcc = parseFloat(raw.cps) > 0 ? Math.round(parseFloat(raw.cps) * 3600) : null
-
-  return (
-    <div className="rounded-lg border border-slate-700/50 bg-slate-800/50 p-3.5 space-y-2.5">
-      <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-100">Config Summary</p>
-      <div className="space-y-1.5 text-[11px] leading-relaxed">
-        {[
-          ['SIP Server', `${raw.sbc_host || '—'}:${raw.sbc_port}`],
-          ['Transport', `${raw.sip_scheme} / ${raw.sip_transport}`],
-          ['Extensions', poolCount > 0 ? `${raw.ext_start} → ${raw.ext_end} (${poolCount})` : '—'],
-          ['CPS', raw.cps],
-          ...(bhcc !== null ? [['BHCC', bhcc.toLocaleString()]] : []),
-          ['Hold Time', `${raw.hold_time_seconds}s`],
-          ['Reg Expires', `${raw.register_expires || '3600'}s`],
-          ['Sub Expires', `${raw.subscribe_expires || '3600'}s`],
-          ['Reg Rate', `${raw.register_rate_cps || '10'} reg/s`],
-          ['Media', raw.media_enabled ? `${raw.rtp_codec} @ ${raw.rtp_ptime || 20}ms` : 'Disabled'],
-          ['Mode', raw.traffic_mode || '—'],
-        ].map(([label, value]) => (
-          <div key={String(label)} className="flex justify-between text-slate-300">
-            <span>{label}</span>
-            <span className="font-mono text-slate-100 text-right ml-2 truncate max-w-[120px]">{String(value)}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Main export
 // ---------------------------------------------------------------------------
 
@@ -229,6 +193,7 @@ export function VMPairBook() {
   const [validationPassed, setValidationPassed] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
+  const [summaryOpen, setSummaryOpen] = useState(false)
   const reachabilityTriggeredRef = useRef(false)
 
   // Load full config from localStorage on first mount
@@ -298,6 +263,21 @@ export function VMPairBook() {
     reachabilityTriggeredRef.current = true
     checkReachability(DEFAULTS.vm_ip, parseInt(DEFAULTS.metrics_port))
   }, [checkReachability])
+
+  // Cmd/Ctrl+I — toggle the Config Review drawer. Skipped while typing in a
+  // form input so the shortcut doesn't hijack normal text entry.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'i') return
+      const target = e.target as HTMLElement | null
+      const tag = target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return
+      e.preventDefault()
+      setSummaryOpen((o) => !o)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
 
   const handleChange = useCallback(
     (field: keyof RawVMFormValues, value: string | boolean) => {
@@ -384,58 +364,53 @@ export function VMPairBook() {
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto bg-background">
-        <div className="mx-auto w-full max-w-[1440px] px-6 py-5">
-          <div className="grid grid-cols-[1fr_280px] items-start gap-5">
+        {/* Single-column layout — Config Summary moved to sticky footer strip
+            (always visible) plus a Config Review drawer (Cmd/Ctrl+I). The
+            full-width form area gives the inputs the room they need without
+            wasting 280px on a permanent sidebar. */}
+        <div className="mx-auto w-full max-w-[1440px] px-6 py-5 space-y-5">
 
-            {/* Main column */}
-            <div className="space-y-5">
-
-              {/* UA card */}
-              <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
-                <div className="flex items-center border-b border-border px-4 py-2.5">
-                  <div className="flex flex-1 items-center gap-2 px-2">
-                    <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
-                      UA
-                    </span>
-                    <span className="font-mono text-sm text-foreground">{raw.vm_id || 'User Agent'}</span>
-                    {hasValidated && errorCount > 0 && (
-                      <span className="ml-auto text-[10px] font-medium text-rose-400">
-                        {errorCount} error{errorCount !== 1 ? 's' : ''}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <VMConfigPanel
-                  raw={raw}
-                  onChange={handleChange}
-                  touched={touched}
-                  onBlur={handleBlur}
-                  errors={errors}
-                  warnings={warnings}
-                  reachability={reachability}
-                  onCheckReachability={() =>
-                    checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)
-                  }
-                  onResetSection={handleResetSection}
-                />
+          {/* UA card */}
+          <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
+            <div className="flex items-center border-b border-border px-4 py-2.5">
+              <div className="flex flex-1 items-center gap-2 px-2">
+                <span className="rounded px-1.5 py-0.5 text-[10px] font-bold tracking-widest bg-emerald-500/15 text-emerald-400">
+                  UA
+                </span>
+                <span className="font-mono text-sm text-foreground">{raw.vm_id || 'User Agent'}</span>
+                {hasValidated && errorCount > 0 && (
+                  <span className="ml-auto text-[10px] font-medium text-rose-400">
+                    {errorCount} error{errorCount !== 1 ? 's' : ''}
+                  </span>
+                )}
               </div>
-
-              {/* Advanced Settings */}
-              <motion.div className="overflow-hidden rounded-xl border border-border bg-card">
-                <AdvancedSettings pairIndex={activePairIndex} />
-              </motion.div>
             </div>
-
-            {/* Sticky sidebar */}
-            <div className="sticky top-5">
-              <ConfigSummary raw={raw} />
-            </div>
+            <VMConfigPanel
+              raw={raw}
+              onChange={handleChange}
+              touched={touched}
+              onBlur={handleBlur}
+              errors={errors}
+              warnings={warnings}
+              reachability={reachability}
+              onCheckReachability={() =>
+                checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)
+              }
+              onResetSection={handleResetSection}
+            />
           </div>
+
+          {/* Advanced Settings */}
+          <motion.div className="overflow-hidden rounded-xl border border-border bg-card">
+            <AdvancedSettings pairIndex={activePairIndex} />
+          </motion.div>
+
         </div>
       </div>
 
-      {/* Footer action bar */}
+      {/* Footer — sticky strip on top, action buttons below */}
       <div className="border-t border-border bg-card">
+        <ConfigSummaryStrip raw={raw} onOpenDrawer={() => setSummaryOpen(true)} />
         <div className="mx-auto flex max-w-[1440px] items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
             <Button
@@ -488,6 +463,16 @@ export function VMPairBook() {
           </Button>
         </div>
       </div>
+
+      {/* Config Review drawer — slides in from the right when the strip is
+          clicked or Cmd/Ctrl+I is pressed. Includes the AdvancedSettings
+          QoS / RTCP knobs from the active pair so the review is complete. */}
+      <ConfigSummaryDrawer
+        raw={raw}
+        advancedSettings={pairs[activePairIndex]?.advancedSettings}
+        open={summaryOpen}
+        onClose={() => setSummaryOpen(false)}
+      />
     </div>
   )
 }
