@@ -235,12 +235,16 @@ func runLifecycle(
 
 	// Wire optional async Prep handler (GUI mode only). The metrics server's
 	// /api/prep/start handler invokes this in a goroutine and updates
-	// collector.PrepStatus() before/after.
+	// collector.PrepStatus() before/after. Reads/writes of OnPrepStart are
+	// guarded by pctx.Mu so the handler can poll for it during the brief
+	// window between /api/test/start and connectTransportsBatched finishing.
 	if pctx != nil {
+		pctx.Mu.Lock()
 		pctx.OnPrepStart = func() error {
 			slog.Info("Prep flush starting via API", "ext_count", len(agentSlice))
 			return prephase.RunPrep(ctx, agentSlice, cfg)
 		}
+		pctx.Mu.Unlock()
 	}
 
 	// ── REGSUB phase ─────────────────────────────────────────────────────────

@@ -1720,13 +1720,31 @@ func BuildMux(
 	// immediately and runs FlushStaleRegistrations in a goroutine. Updates
 	// collector.PrepStatus() to "running" → "done" / "failed". The HTTP
 	// response only confirms the async kick-off, not completion.
+	//
+	// OnPrepStart is wired inside runLifecycle after connectTransportsBatched
+	// completes (can take a few seconds with many extensions). If the GUI
+	// races and calls this endpoint before the wiring is done we wait up
+	// to 10 s for it to appear instead of returning 500 immediately.
 	mux.HandleFunc("POST /api/prep/start", func(w http.ResponseWriter, r *http.Request) {
 		if processCtx == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
 			return
 		}
-		if processCtx.OnPrepStart == nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "prep handler not registered"})
+		var prepFn func() error
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			processCtx.Mu.Lock()
+			prepFn = processCtx.OnPrepStart
+			processCtx.Mu.Unlock()
+			if prepFn != nil || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if prepFn == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "prep handler not yet wired — push config and start the run first",
+			})
 			return
 		}
 		if collector.PrepStatus() == "running" {
@@ -1735,7 +1753,7 @@ func BuildMux(
 		}
 		collector.SetPrepStatus("running")
 		go func() {
-			err := processCtx.OnPrepStart()
+			err := prepFn()
 			if err != nil {
 				slog.Warn("Prep flush ended with error", "err", err)
 				collector.SetPrepStatus("failed")
