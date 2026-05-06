@@ -94,6 +94,11 @@ func (r *PrePhaseResult) AllReady() bool {
 //	agentCb(ag, true)  — registration succeeded
 //	agentCb(ag, false) — registration failed
 //
+// onProgress, if non-nil, is invoked once per agent (after the agent finishes,
+// regardless of success). Used to drive the live REGISTER progress counter in
+// MetricsCollector — callee just increments a counter; total is set by caller
+// before invocation via SetRegisterTotal.
+//
 // If stopNew is non-nil and becomes true, no further batches are started.
 // Returns the list of extensions that failed to register.
 func RegisterAll(
@@ -101,6 +106,7 @@ func RegisterAll(
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 	agentCb func(ag *agent.ExtensionAgent, succeeded bool),
+	onProgress func(),
 	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
@@ -154,6 +160,9 @@ func RegisterAll(
 				}
 				if agentCb != nil {
 					agentCb(ag, ok)
+				}
+				if onProgress != nil {
+					onProgress()
 				}
 			}(a)
 		}
@@ -247,11 +256,16 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 //
 // If stopNew is non-nil and becomes true, no further subscriptions are started.
 // Returns the list of extensions that failed to subscribe.
+// SubscribeAll subscribes successfully-registered extensions concurrently.
+//
+// onProgress, if non-nil, is invoked once per agent after its subscribe
+// attempt completes. Used to drive the live SUBSCRIBE progress counter.
 func SubscribeAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 	agentCb func(ag *agent.ExtensionAgent, succeeded bool),
+	onProgress func(),
 	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
@@ -290,6 +304,9 @@ func SubscribeAll(
 			}
 			if agentCb != nil {
 				agentCb(ag, ok)
+			}
+			if onProgress != nil {
+				onProgress()
 			}
 		}(a)
 	}
@@ -552,7 +569,7 @@ func RunPrePhase(
 			registeredAg = append(registeredAg, ag)
 			regMu.Unlock()
 		}
-	}, stopNew)
+	}, nil, stopNew)
 
 	if len(failedReg) > 0 {
 		slog.Warn("PRE-PHASE REGISTER partial failure",
@@ -597,7 +614,7 @@ func RunPrePhase(
 					onRegOnly(ag)
 				}
 			}
-		}, stopNew)
+		}, nil, stopNew)
 
 		if len(failedSub) > 0 {
 			slog.Warn("PRE-PHASE SUBSCRIBE partial failure",
@@ -649,4 +666,123 @@ func RunPrePhase(
 	slog.Info("============================================================")
 
 	return result, stopRefresh
+}
+
+// ---------------------------------------------------------------------------
+// Split entry points used by GUI mode (operator-gated lifecycle).
+//
+// RunPrep — optional, async, fire-and-forget unregister flush.
+// RunRegister — Phase 1 with live progress callback for the GUI.
+// RunSubscribe — Phase 2 with live progress callback for the GUI.
+//
+// CLI mode still uses RunPrePhase above as a one-shot pipeline.
+// ---------------------------------------------------------------------------
+
+// RunPrep wraps FlushStaleRegistrations for the GUI's optional Prep button.
+// Always returns nil (errors are swallowed inside FlushRegister); the caller
+// reports completion to the operator via prep_status on the metrics snapshot.
+func RunPrep(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+) error {
+	FlushStaleRegistrations(ctx, agents, cfg)
+	return nil
+}
+
+// RunRegister executes Phase 1 (REGISTER all extensions) and returns the
+// list of agents that registered successfully along with the failed slice.
+// onProgress is fired once per agent to drive the live REGISTER counter.
+func RunRegister(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+	onProgress func(),
+	stopNew *atomic.Bool,
+) (registered []*agent.ExtensionAgent, failed []string, stopRefresh func()) {
+	noopStop := func() {}
+	total := len(agents)
+
+	slog.Info("============================================================")
+	slog.Info("REG/SUB 1/2 — REGISTER", "count", total)
+	slog.Info("============================================================")
+
+	var (
+		regMu        sync.Mutex
+		registeredAg []*agent.ExtensionAgent
+	)
+
+	failed = RegisterAll(ctx, agents, cfg, func(ag *agent.ExtensionAgent, ok bool) {
+		if ok {
+			regMu.Lock()
+			registeredAg = append(registeredAg, ag)
+			regMu.Unlock()
+		}
+	}, onProgress, stopNew)
+
+	if len(failed) > 0 {
+		slog.Warn("REG/SUB REGISTER partial failure",
+			"failed_count", len(failed), "extensions", failed)
+	}
+	if len(registeredAg) == 0 {
+		slog.Error("REG/SUB: no extensions registered — caller should skip SUBSCRIBE")
+		return nil, failed, noopStop
+	}
+
+	stopRefresh = StartRegisterRefreshLoop(ctx, registeredAg, cfg)
+	return registeredAg, failed, stopRefresh
+}
+
+// RunSubscribe executes Phase 2 (SUBSCRIBE successfully-registered extensions).
+// onIdle/onRegOnly are per-agent callbacks the caller uses to populate the
+// idle vs reg-only pools. onProgress drives the live SUBSCRIBE counter.
+//
+// If skipSubscribe is true, every registered agent is routed to onRegOnly
+// without sending any SUBSCRIBE on the wire and refresh loop is not started.
+func RunSubscribe(
+	ctx context.Context,
+	registered []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+	skipSubscribe bool,
+	onIdle func(ag *agent.ExtensionAgent),
+	onRegOnly func(ag *agent.ExtensionAgent),
+	onProgress func(),
+	stopNew *atomic.Bool,
+) (failed []string, stopRefresh func()) {
+	noopStop := func() {}
+	stopRefresh = noopStop
+
+	if skipSubscribe {
+		slog.Info("REG/SUB 2/2 — SUBSCRIBE skipped")
+		if onRegOnly != nil {
+			for _, ag := range registered {
+				onRegOnly(ag)
+			}
+		}
+		return []string{}, noopStop
+	}
+
+	slog.Info("============================================================")
+	slog.Info("REG/SUB 2/2 — SUBSCRIBE", "count", len(registered))
+	slog.Info("============================================================")
+
+	failed = SubscribeAll(ctx, registered, cfg, func(ag *agent.ExtensionAgent, ok bool) {
+		if ok {
+			if onIdle != nil {
+				onIdle(ag)
+			}
+		} else {
+			if onRegOnly != nil {
+				onRegOnly(ag)
+			}
+		}
+	}, onProgress, stopNew)
+
+	if len(failed) > 0 {
+		slog.Warn("REG/SUB SUBSCRIBE partial failure",
+			"failed_count", len(failed), "extensions", failed)
+	}
+
+	stopRefresh = StartSubscribeRefreshLoop(ctx, registered, cfg)
+	return failed, stopRefresh
 }

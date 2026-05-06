@@ -120,7 +120,8 @@ func main() {
 //
 // Phase state machine (GUI mode):
 //
-//	CONFIGURED → PRE_REGISTER → TRAFFIC_READY → TRAFFIC → CLEANUP_READY → DONE
+//	CONFIGURED → REGSUB_READY → REGSUB_RUNNING → REGSUB_DONE → TRAFFIC → CLEANUP_READY → DONE
+//	(Optional async Prep flush is independent — invoked from REGSUB_READY via /api/prep/start.)
 //
 // In CLI mode (pctx == nil), every phase gate is skipped and the pipeline runs
 // straight through.
@@ -227,31 +228,134 @@ func runLifecycle(
 		slog.Debug("Agent added to reg-only pool (sub failed)", "ext", ag.Ext)
 	}
 
-	// ── Pre-phase ────────────────────────────────────────────────────────────
-	collector.SetPhase("PRE_REGISTER")
-	slog.Info("Starting pre-phase (Register + Subscribe)")
-
 	if stopNew == nil {
 		var sn atomic.Bool
 		stopNew = &sn
 	}
 
-	preResult, stopRefresh := prephase.RunPrePhase(
-		ctx, agentSlice, cfg, skipSubscribe,
-		onIdle, onRegOnly, stopNew,
+	// Wire optional async Prep handler (GUI mode only). The metrics server's
+	// /api/prep/start handler invokes this in a goroutine and updates
+	// collector.PrepStatus() before/after.
+	if pctx != nil {
+		pctx.OnPrepStart = func() error {
+			slog.Info("Prep flush starting via API", "ext_count", len(agentSlice))
+			return prephase.RunPrep(ctx, agentSlice, cfg)
+		}
+	}
+
+	// ── REGSUB phase ─────────────────────────────────────────────────────────
+	// GUI mode: wait for the operator to click "Start Reg/Sub" (the optional
+	// Prep button is independent — see /api/prep/start handler in metrics.go).
+	// CLI mode: run the legacy one-shot RunPrePhase (Phase 0 + 1 + 2).
+	var (
+		registeredAg    []*agent.ExtensionAgent
+		failedRegister  []string
+		failedSubscribe []string
+		stopRegRefresh  = func() {}
+		stopSubRefresh  = func() {}
 	)
-	defer stopRefresh()
 
-	collector.UpdateCounts(0, len(agents), preResult.Registered, preResult.Subscribed)
+	if pctx != nil {
+		// ── GUI mode: gated REG + SUB with live progress ─────────────────────
+		collector.SetPhase("REGSUB_READY")
+		slog.Info("REGSUB_READY — waiting for Start Reg/Sub signal", "ext_count", len(agents))
 
-	slog.Info("Pre-phase complete",
-		"total", preResult.Total,
-		"registered", preResult.Registered,
-		"subscribed", preResult.Subscribed,
-		"idle", preResult.IdleCount,
-		"reg_only", preResult.RegOnlyCount,
-		"failed_reg", len(preResult.FailedRegister),
-		"failed_sub", len(preResult.FailedSubscribe),
+		select {
+		case <-pctx.RegSubStartCh:
+			slog.Info("Start Reg/Sub signal received via API")
+		case <-pctx.PrePhaseStartCh:
+			// Legacy alias — older clients still hit /api/prephase/start
+			slog.Info("Start Reg/Sub signal received via legacy /api/prephase/start")
+		case <-pctx.GracefulStopCh:
+			slog.Info("Graceful stop received before Reg/Sub started")
+			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			collector.SetPhase("DONE")
+			return 0
+		case <-pctx.InterruptStopCh:
+			slog.Info("Interrupted stop received before Reg/Sub started")
+			stopNew.Store(true)
+			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			collector.SetPhase("DONE")
+			return 0
+		case <-ctx.Done():
+			return 0
+		}
+
+		collector.SetPhase("REGSUB_RUNNING")
+		// Wire RegSubAbortCh into stopNew so an Abort click cleanly halts new batches.
+		go func() {
+			select {
+			case <-pctx.RegSubAbortCh:
+				slog.Info("RegSub abort received — halting new batches")
+				stopNew.Store(true)
+			case <-ctx.Done():
+			}
+		}()
+
+		// Live REG progress
+		collector.SetRegisterTotal(len(agentSlice))
+		regStart := time.Now()
+		registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
+			ctx, agentSlice, cfg,
+			func() { collector.IncrementRegistered() },
+			stopNew,
+		)
+		slog.Info("REGISTER phase complete",
+			"registered", len(registeredAg),
+			"failed", len(failedRegister),
+			"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
+
+		// Live SUB progress (only if any agent registered)
+		if len(registeredAg) > 0 {
+			collector.SetSubscribeTotal(len(registeredAg))
+			subStart := time.Now()
+			failedSubscribe, stopSubRefresh = prephase.RunSubscribe(
+				ctx, registeredAg, cfg, skipSubscribe,
+				onIdle, onRegOnly,
+				func() { collector.IncrementSubscribed() },
+				stopNew,
+			)
+			slog.Info("SUBSCRIBE phase complete",
+				"subscribed", len(registeredAg)-len(failedSubscribe),
+				"failed", len(failedSubscribe),
+				"elapsed_s", fmt.Sprintf("%.1f", time.Since(subStart).Seconds()))
+		} else {
+			slog.Error("REG/SUB: no extensions registered — skipping SUBSCRIBE")
+		}
+	} else {
+		// ── CLI mode: legacy monolithic pipeline (Phase 0 + 1 + 2) ───────────
+		collector.SetPhase("PRE_REGISTER")
+		slog.Info("Starting pre-phase (Flush + Register + Subscribe)")
+		preResult, stopRefresh := prephase.RunPrePhase(
+			ctx, agentSlice, cfg, skipSubscribe,
+			onIdle, onRegOnly, stopNew,
+		)
+		defer stopRefresh()
+		registeredAg = make([]*agent.ExtensionAgent, 0, preResult.Registered)
+		// In CLI mode the registered/failed lists are not exposed by RunPrePhase
+		// in agent form; we only need them for cleanup which iterates `agents`.
+		failedRegister = preResult.FailedRegister
+		failedSubscribe = preResult.FailedSubscribe
+	}
+
+	defer stopRegRefresh()
+	defer stopSubRefresh()
+
+	registered := len(registeredAg)
+	if pctx == nil {
+		// Reconstitute count from CLI-mode RunPrePhase result for the log line below
+		registered = len(agents) - len(failedRegister)
+	}
+	subscribed := registered - len(failedSubscribe)
+
+	collector.UpdateCounts(0, len(agents), registered, subscribed)
+
+	slog.Info("REG/SUB phase complete",
+		"total", len(agents),
+		"registered", registered,
+		"subscribed", subscribed,
+		"failed_reg", len(failedRegister),
+		"failed_sub", len(failedSubscribe),
 	)
 
 	if prePhaseOnly {
@@ -264,15 +368,22 @@ func runLifecycle(
 	}
 
 	// ── Wait for "Start Traffic" gate (GUI mode) ─────────────────────────────
-	collector.SetPhase("TRAFFIC_READY")
+	collector.SetPhase("REGSUB_DONE")
 	idle, _, _ := pool.Counts()
-	slog.Info("TRAFFIC_READY — waiting for Start Traffic signal", "idle_agents", idle)
+	slog.Info("REGSUB_DONE — waiting for Start Traffic signal", "idle_agents", idle)
 
 	if pctx != nil {
 		// GUI mode: block until either traffic is started or a stop is requested
 		select {
 		case <-pctx.TrafficStartCh:
 			slog.Info("Start Traffic signal received via API")
+		case <-pctx.CleanupStartCh:
+			// Operator clicked "Unregister All" from the REGSUB_DONE view —
+			// skip traffic entirely and go straight to cleanup.
+			slog.Info("Cleanup signal received from REGSUB_DONE — skipping traffic")
+			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			collector.SetPhase("DONE")
+			return 0
 		case <-pctx.GracefulStopCh:
 			slog.Info("Graceful stop received before traffic started")
 			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
@@ -290,116 +401,129 @@ func runLifecycle(
 	}
 	// In CLI mode: proceed immediately to traffic
 
-	// ── Traffic phase ─────────────────────────────────────────────────────────
-	collector.SetPhase("TRAFFIC")
-	collector.SetRunning(true)
+	// ── Traffic phase (loop, supports Restart Traffic from Complete) ─────────
+trafficLoop:
+	for {
+		collector.SetPhase("TRAFFIC")
+		collector.SetRunning(true)
 
-	// Timed-mode hard deadline
-	trafficCtx := ctx
-	var trafficCancel context.CancelFunc = func() {}
-	if cfg.TrafficMode == "timed" && cfg.DurationHours > 0 {
-		deadline := time.Duration(cfg.DurationHours * float64(time.Hour))
-		trafficCtx, trafficCancel = context.WithTimeout(ctx, deadline)
-		slog.Info("Traffic deadline set",
-			"duration_hours", cfg.DurationHours,
-			"deadline", time.Now().Add(deadline).Format(time.RFC3339),
+		// Timed-mode hard deadline (re-derived per iteration so a Restart
+		// gets a fresh duration window).
+		trafficCtx := ctx
+		var trafficCancel context.CancelFunc = func() {}
+		if cfg.TrafficMode == "timed" && cfg.DurationHours > 0 {
+			deadline := time.Duration(cfg.DurationHours * float64(time.Hour))
+			trafficCtx, trafficCancel = context.WithTimeout(ctx, deadline)
+			slog.Info("Traffic deadline set",
+				"duration_hours", cfg.DurationHours,
+				"deadline", time.Now().Add(deadline).Format(time.RFC3339),
+			)
+		}
+
+		callEngine := engine.NewCallEngine(
+			pool, cfg,
+			engine.WithOnComplete(func(r engine.CallResult) {
+				collector.RecordCall(callResultToMetrics(r))
+			}),
+			engine.WithOnAttempt(func() {
+				collector.RecordAttempt()
+			}),
+			engine.WithMaxCalls(maxCalls),
+			engine.WithMetrics(collector),
 		)
-	}
+		collector.SetConcurrentProvider(func() int { return callEngine.ActiveCallCount() })
 
-	callEngine := engine.NewCallEngine(
-		pool, cfg,
-		engine.WithOnComplete(func(r engine.CallResult) {
-			collector.RecordCall(callResultToMetrics(r))
-		}),
-		engine.WithOnAttempt(func() {
-			collector.RecordAttempt()
-		}),
-		engine.WithMaxCalls(maxCalls),
-		engine.WithMetrics(collector),
-	)
-	collector.SetConcurrentProvider(func() int { return callEngine.ActiveCallCount() })
+		slog.Info("Traffic starting",
+			"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
+			"max_concurrent", cfg.EffectiveMaxConcurrent(),
+			"ramp_s", cfg.RampUpSeconds, "max_calls", maxCalls,
+			"idle_agents", idle,
+		)
 
-	slog.Info("Traffic starting",
-		"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
-		"max_concurrent", cfg.EffectiveMaxConcurrent(),
-		"ramp_s", cfg.RampUpSeconds, "max_calls", maxCalls,
-		"idle_agents", idle,
-	)
+		engineDone := make(chan error, 1)
+		go func() {
+			engineDone <- callEngine.Run(trafficCtx)
+		}()
 
-	engineDone := make(chan error, 1)
-	go func() {
-		engineDone <- callEngine.Run(trafficCtx)
-	}()
+		// Monitor phase-gate channels during traffic
+		if pctx != nil {
+			for {
+				select {
+				case <-trafficCtx.Done():
+					callEngine.Stop()
+					<-engineDone
+					goto trafficDone
 
-	// Monitor phase-gate channels during traffic
-	if pctx != nil {
-		for {
+				case err := <-engineDone:
+					if err != nil {
+						slog.Warn("Call engine stopped with error", "err", err)
+					}
+					goto trafficDone
+
+				case <-pctx.GracefulStopCh:
+					slog.Info("Graceful stop received — draining in-flight calls")
+					callEngine.Stop()
+					<-engineDone
+					goto trafficDone
+
+				case <-pctx.InterruptStopCh:
+					slog.Info("Interrupted stop received — cancelling in-flight calls")
+					trafficCancel()
+					callEngine.Stop()
+					<-engineDone
+					goto trafficDone
+				}
+			}
+		} else {
+			// CLI mode: wait for engine or context cancellation
 			select {
 			case <-trafficCtx.Done():
-				// Timed-mode deadline or parent cancellation
 				callEngine.Stop()
 				<-engineDone
-				goto trafficDone
-
 			case err := <-engineDone:
 				if err != nil {
 					slog.Warn("Call engine stopped with error", "err", err)
 				}
-				goto trafficDone
-
-			case <-pctx.GracefulStopCh:
-				slog.Info("Graceful stop received — draining in-flight calls")
-				callEngine.Stop()
-				<-engineDone
-				goto trafficDone
-
-			case <-pctx.InterruptStopCh:
-				slog.Info("Interrupted stop received — cancelling in-flight calls")
-				trafficCancel()
-				callEngine.Stop()
-				<-engineDone
-				goto trafficDone
 			}
 		}
-	} else {
-		// CLI mode: wait for engine or context cancellation
-		select {
-		case <-trafficCtx.Done():
-			callEngine.Stop()
-			<-engineDone
-		case err := <-engineDone:
-			if err != nil {
-				slog.Warn("Call engine stopped with error", "err", err)
+
+	trafficDone:
+		trafficCancel()
+		collector.SetPhase("STOPPING")
+		collector.SetRunning(false)
+		slog.Info("Traffic phase complete (this iteration)")
+
+		// ── CLEANUP_READY gate (GUI mode) ────────────────────────────────────
+		// Operator can pick Restart Traffic (re-enter loop with same pool)
+		// or Cleanup (drop out and unregister all).
+		collector.SetPhase("CLEANUP_READY")
+		slog.Info("CLEANUP_READY — waiting for Cleanup or Restart Traffic signal")
+
+		if pctx != nil {
+			select {
+			case <-pctx.RestartTrafficCh:
+				slog.Info("Restart Traffic received — re-running traffic with current pool")
+				continue trafficLoop
+			case <-pctx.CleanupStartCh:
+				slog.Info("Cleanup signal received via API")
+				break trafficLoop
+			case <-ctx.Done():
+				break trafficLoop
 			}
 		}
+		// CLI mode: proceed immediately to cleanup
+		break trafficLoop
 	}
-
-trafficDone:
-	trafficCancel()
-	collector.SetPhase("STOPPING")
-	collector.SetRunning(false)
-	slog.Info("Traffic phase complete")
-
-	// ── Wait for "Cleanup" gate (GUI mode) ────────────────────────────────────
-	collector.SetPhase("CLEANUP_READY")
-	slog.Info("CLEANUP_READY — waiting for Cleanup signal")
-
-	if pctx != nil {
-		select {
-		case <-pctx.CleanupStartCh:
-			slog.Info("Cleanup signal received via API")
-		case <-ctx.Done():
-		}
-	}
-	// In CLI mode: proceed immediately to cleanup
 
 	// Build call spines (using local results split by direction — no remote peer fetch)
 	buildAndStoreSpines(collector)
 
 	// ── Cleanup ───────────────────────────────────────────────────────────────
+	// callEngine has already been stopped + drained by the traffic loop before
+	// breaking out, so we pass nil here (shutdownCleanup tolerates nil eng).
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer shutdownCancel()
-	shutdownCleanup(shutdownCtx, agents, pool, callEngine, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+	shutdownCleanup(shutdownCtx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
 
 	// Stop all per-agent auto-answer loops
 	for _, stop := range agentAutoAnswerStops {

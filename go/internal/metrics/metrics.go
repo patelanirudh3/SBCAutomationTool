@@ -42,7 +42,14 @@ type TrafficMetrics struct {
 	AvgTotalMs       float64            `json:"avg_total_ms"`
 	SocketCount      int                `json:"socket_count"`
 	RegisteredCount  int                `json:"registered_count"`
+	RegisteredTotal  int                `json:"registered_total"`
 	SubscribedCount  int                `json:"subscribed_count"`
+	SubscribedTotal  int                `json:"subscribed_total"`
+	// PrepStatus tracks the optional async unregister-flush invoked by the
+	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
+	// | "failed". The GUI reads this to drive the corner-button visual state
+	// and to disable Start Reg/Sub while running.
+	PrepStatus       string             `json:"prep_status"`
 	RunElapsedSec    float64            `json:"run_elapsed_seconds"`
 	Running          bool               `json:"running"`
 	RTPHealth        map[string]int     `json:"rtp_health"`
@@ -161,7 +168,10 @@ type MetricsCollector struct {
 	concurrentCalls int
 	socketCount     int
 	registeredCount int
+	registeredTotal int
 	subscribedCount int
+	subscribedTotal int
+	prepStatus      string // "idle" | "running" | "done" | "failed"
 	phase           string
 	runStart        time.Time
 	running         bool
@@ -217,7 +227,8 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		interval:           time.Duration(metricsIntervalSec) * time.Second,
 		windowStart:        time.Now(),
 		phase:              "IDLE",
-		latest:             TrafficMetrics{VMID: vmID, Phase: "IDLE", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
+		prepStatus:         "idle",
+		latest:             TrafficMetrics{VMID: vmID, Phase: "IDLE", PrepStatus: "idle", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
 		rtpHealthCounts:    map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
 		mediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
 		wsClients:          make(map[*websocket.Conn]struct{}),
@@ -325,6 +336,59 @@ func (c *MetricsCollector) UpdateCounts(concurrent, sockets, registered, subscri
 	c.registeredCount = registered
 	c.subscribedCount = subscribed
 	c.mu.Unlock()
+}
+
+// SetRegisterTotal sets the expected total for the live REGISTER progress
+// counter. Called once before RunRegister starts so the GUI knows the
+// denominator for the progress bar.
+func (c *MetricsCollector) SetRegisterTotal(total int) {
+	c.mu.Lock()
+	c.registeredTotal = total
+	c.registeredCount = 0
+	c.mu.Unlock()
+}
+
+// SetSubscribeTotal sets the expected total for the live SUBSCRIBE progress
+// counter. Called once before RunSubscribe starts.
+func (c *MetricsCollector) SetSubscribeTotal(total int) {
+	c.mu.Lock()
+	c.subscribedTotal = total
+	c.subscribedCount = 0
+	c.mu.Unlock()
+}
+
+// IncrementRegistered bumps the live REGISTER progress counter by one. Called
+// from RegisterAll's per-agent goroutine once the agent's REGISTER attempt
+// finishes (regardless of success).
+func (c *MetricsCollector) IncrementRegistered() {
+	c.mu.Lock()
+	c.registeredCount++
+	c.mu.Unlock()
+}
+
+// IncrementSubscribed bumps the live SUBSCRIBE progress counter by one.
+// Called from SubscribeAll's per-agent goroutine.
+func (c *MetricsCollector) IncrementSubscribed() {
+	c.mu.Lock()
+	c.subscribedCount++
+	c.mu.Unlock()
+}
+
+// SetPrepStatus updates the optional async prep flag exposed to the GUI as
+// prep_status on the metrics snapshot. Valid values: "idle", "running",
+// "done", "failed".
+func (c *MetricsCollector) SetPrepStatus(status string) {
+	c.mu.Lock()
+	c.prepStatus = status
+	c.mu.Unlock()
+}
+
+// PrepStatus returns the current prep flag (used by the API handler to
+// reject /api/regsub/start with 409 while a flush is running).
+func (c *MetricsCollector) PrepStatus() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.prepStatus
 }
 
 // SetConcurrentProvider sets a callable that returns the current active call count.
@@ -659,7 +723,10 @@ func (c *MetricsCollector) Reset() {
 	c.concurrentCalls = 0
 	c.socketCount = 0
 	c.registeredCount = 0
+	c.registeredTotal = 0
 	c.subscribedCount = 0
+	c.subscribedTotal = 0
+	c.prepStatus = "idle"
 	c.phase = "IDLE"
 	c.runStart = time.Time{}
 	c.runStartSet = false
@@ -690,6 +757,7 @@ func (c *MetricsCollector) Reset() {
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
 		Phase:              "IDLE",
+		PrepStatus:         "idle",
 		RTPHealth:          map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
 		MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
 	}
@@ -761,7 +829,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		AvgTotalMs:      roundAvg(c.totalSamples),
 		SocketCount:     c.socketCount,
 		RegisteredCount: c.registeredCount,
+		RegisteredTotal: c.registeredTotal,
 		SubscribedCount: c.subscribedCount,
+		SubscribedTotal: c.subscribedTotal,
+		PrepStatus:      c.prepStatus,
 		RunElapsedSec:   runElapsed,
 		Running:         c.running,
 		RTPHealth: map[string]int{
@@ -920,11 +991,20 @@ type ProcessContext struct {
 
 	// Phase-gate channels for the single-pool state machine.
 	// Closed by the corresponding API endpoint to unblock the lifecycle goroutine.
-	PrePhaseStartCh  chan struct{} // POST /api/prephase/start
+	PrePhaseStartCh  chan struct{} // POST /api/prephase/start (legacy alias of /api/regsub/start)
+	RegSubStartCh    chan struct{} // POST /api/regsub/start
+	RegSubAbortCh    chan struct{} // POST /api/regsub/abort
 	TrafficStartCh   chan struct{} // POST /api/traffic/start
+	RestartTrafficCh chan struct{} // POST /api/restart-traffic
 	CleanupStartCh   chan struct{} // POST /api/cleanup/start
 	GracefulStopCh   chan struct{} // POST /api/shutdown/graceful
 	InterruptStopCh  chan struct{} // POST /api/shutdown/interrupt
+
+	// OnPrepStart is invoked by POST /api/prep/start. It runs the
+	// FlushStaleRegistrations flow in a goroutine so the HTTP request
+	// returns immediately. The handler updates collector.PrepStatus().
+	// Injected by main.go to avoid importing the prephase package from metrics.
+	OnPrepStart func() error
 
 	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
 	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
@@ -936,17 +1016,20 @@ type ProcessContext struct {
 // channels initialised.
 func NewProcessContext(collector *MetricsCollector, port int) *ProcessContext {
 	return &ProcessContext{
-		Collector:       collector,
-		StopEvent:       make(chan struct{}, 1),
-		ProcessExit:     make(chan struct{}, 1),
-		Port:            port,
-		State:           "IDLE",
-		LogLevel:        "INFO",
-		PrePhaseStartCh: make(chan struct{}, 1),
-		TrafficStartCh:  make(chan struct{}, 1),
-		CleanupStartCh:  make(chan struct{}, 1),
-		GracefulStopCh:  make(chan struct{}, 1),
-		InterruptStopCh: make(chan struct{}, 1),
+		Collector:        collector,
+		StopEvent:        make(chan struct{}, 1),
+		ProcessExit:      make(chan struct{}, 1),
+		Port:             port,
+		State:            "IDLE",
+		LogLevel:         "INFO",
+		PrePhaseStartCh:  make(chan struct{}, 1),
+		RegSubStartCh:    make(chan struct{}, 1),
+		RegSubAbortCh:    make(chan struct{}, 1),
+		TrafficStartCh:   make(chan struct{}, 1),
+		RestartTrafficCh: make(chan struct{}, 1),
+		CleanupStartCh:   make(chan struct{}, 1),
+		GracefulStopCh:   make(chan struct{}, 1),
+		InterruptStopCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -1589,19 +1672,78 @@ func BuildMux(
 	// Single-pool phase-gate endpoints
 	// ---------------------------------------------------------------------------
 
-	// POST /api/prephase/start — unblock the lifecycle to start Reg/Sub
-	mux.HandleFunc("POST /api/prephase/start", func(w http.ResponseWriter, r *http.Request) {
+	// POST /api/prephase/start — legacy alias of /api/regsub/start. Kept for
+	// older clients. Both endpoints close RegSubStartCh.
+	regSubStartHandler := func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		// Defensive 409 guardrail: refuse to start Reg/Sub while the optional
+		// async Prep flush is still running. The GUI also disables the button,
+		// but this stops a stray API call from racing.
+		if collector.PrepStatus() == "running" {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":       "prep is still running — wait for prep_status=done",
+				"prep_status": "running",
+			})
+			return
+		}
+		select {
+		case processCtx.RegSubStartCh <- struct{}{}:
+			slog.Info("RegSub start signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_starting"})
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "reg/sub already started or not ready"})
+		}
+	}
+	mux.HandleFunc("POST /api/prephase/start", regSubStartHandler)
+	mux.HandleFunc("POST /api/regsub/start", regSubStartHandler)
+
+	// POST /api/regsub/abort — set stopNew so RegisterAll/SubscribeAll halt
+	// new batches and let in-flight work drain.
+	mux.HandleFunc("POST /api/regsub/abort", func(w http.ResponseWriter, r *http.Request) {
 		if processCtx == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
 			return
 		}
 		select {
-		case processCtx.PrePhaseStartCh <- struct{}{}:
-			slog.Info("PrePhase start signalled via API")
-			writeJSON(w, http.StatusAccepted, map[string]any{"status": "prephase_starting"})
+		case processCtx.RegSubAbortCh <- struct{}{}:
+			slog.Info("RegSub abort signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_aborting"})
 		default:
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "pre-phase already started or not ready"})
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "abort already in flight"})
 		}
+	})
+
+	// POST /api/prep/start — fire-and-forget unregister flush. Returns 200
+	// immediately and runs FlushStaleRegistrations in a goroutine. Updates
+	// collector.PrepStatus() to "running" → "done" / "failed". The HTTP
+	// response only confirms the async kick-off, not completion.
+	mux.HandleFunc("POST /api/prep/start", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		if processCtx.OnPrepStart == nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "prep handler not registered"})
+			return
+		}
+		if collector.PrepStatus() == "running" {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "prep already running"})
+			return
+		}
+		collector.SetPrepStatus("running")
+		go func() {
+			err := processCtx.OnPrepStart()
+			if err != nil {
+				slog.Warn("Prep flush ended with error", "err", err)
+				collector.SetPrepStatus("failed")
+				return
+			}
+			collector.SetPrepStatus("done")
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "prep_starting"})
 	})
 
 	// POST /api/traffic/start — unblock the lifecycle to start traffic
@@ -1616,6 +1758,22 @@ func BuildMux(
 			writeJSON(w, http.StatusAccepted, map[string]any{"status": "traffic_starting"})
 		default:
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "traffic already started or not ready"})
+		}
+	})
+
+	// POST /api/restart-traffic — re-enter the traffic loop after Complete,
+	// reusing the existing populated pool (no re-prep, no re-reg).
+	mux.HandleFunc("POST /api/restart-traffic", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		select {
+		case processCtx.RestartTrafficCh <- struct{}{}:
+			slog.Info("Restart traffic signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "traffic_restarting"})
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "restart already in flight"})
 		}
 	})
 
