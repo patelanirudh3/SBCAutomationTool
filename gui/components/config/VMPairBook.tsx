@@ -188,16 +188,17 @@ function getErrors(raw: RawVMFormValues): Record<string, string> {
 // ---------------------------------------------------------------------------
 
 /**
- * ConfigTabTrigger — boxed browser-tab style on dark background.
- * Inactive tabs: subtle muted-orange text + transparent fill + thin border
- * so they unmistakably look like tabs (not labels).
- * Active tab: vivid orange text + filled bg + visible border on top/sides;
- * the bottom border merges into the form panel below to convey "this tab
- * owns the panel beneath."
+ * ConfigTabTrigger — filled-pill (iOS Settings / Stripe) style on dark.
+ * All three pills sit inside a single slate-tinted rounded container
+ * (rendered by the parent TabsList). Active pill has a solid orange
+ * fill with white text and a subtle warm glow shadow; inactive pills
+ * are transparent with muted-orange text.
  *
- * Orange (rather than rose-red or amber) was picked because rose is already
- * the error palette and amber is the warning palette — orange is the only
- * warm hue free of semantic baggage in this codebase.
+ * The `!` (important) modifier is required on the active-state classes
+ * to defeat the base shadcn TabsTrigger primitive's built-in active
+ * styles, which use the data-active: selector — Tailwind treats those
+ * as different selectors from our data-[state=active]: so both apply
+ * unless one is forced.
  */
 function ConfigTabTrigger({
   value,
@@ -212,28 +213,26 @@ function ConfigTabTrigger({
     <TabsTrigger
       value={value}
       className={cn(
-        // Layout — much bigger / taller so the tabs read clearly as
-        // navigation rather than as labels. Increased font size and
-        // generous padding make them legible across the room.
-        'h-11 px-5 text-base font-bold uppercase tracking-wide transition-colors',
-        // Browser-tab shape: rounded top, flat bottom, sits ON the panel.
-        // border-[3px] gives the tab a thick, unmistakable outline
-        // against the dark page background.
-        'rounded-t-lg rounded-b-none border-[3px] border-b-0',
-        // Inactive state — clearly VISIBLE orange border + medium slate
-        // fill. The orange tint at /60 opacity unifies the whole tab
-        // strip and reads as "this is a tab control" at a glance.
-        'border-orange-500/60 bg-slate-800/70 text-orange-200/80',
-        'hover:bg-slate-700/80 hover:text-orange-100 hover:border-orange-400/80',
-        // Active state — full vivid orange border + brighter fill + soft
-        // glow. The -mb-[3px] nudges the active trigger down 3px (matches
-        // border-[3px]) so its bottom edge overlaps the panel border for
-        // the "tab merges with content" effect.
-        'data-[state=active]:-mb-[3px]',
-        'data-[state=active]:border-orange-400',
-        'data-[state=active]:bg-orange-500/20',
-        'data-[state=active]:text-orange-100',
-        'data-[state=active]:shadow-[0_-4px_14px_-4px_rgba(251,146,60,0.6)]',
+        // Layout — same size as before but rounded all corners (pill)
+        // and generous padding so each pill is a comfortable click target.
+        'h-9 rounded-md px-4 text-sm font-bold uppercase tracking-wide transition-colors',
+        'border border-transparent',
+        // Inactive — transparent fill, muted-orange text. Hover dims a
+        // soft slate fill in for affordance feedback.
+        'text-orange-200/70 bg-transparent',
+        'hover:bg-slate-700/60 hover:text-orange-100',
+        // Active — solid orange pill with white text + soft warm glow.
+        // The ! modifier is mandatory here: the shadcn TabsTrigger
+        // primitive sets dark:data-active:bg-input/30 and friends which
+        // would otherwise win on cascade and produce the grey/white look.
+        'data-[state=active]:!bg-orange-500',
+        'data-[state=active]:!text-white',
+        'data-[state=active]:!border-orange-600',
+        'data-[state=active]:shadow-md',
+        'data-[state=active]:shadow-orange-500/25',
+        // Suppress the line-variant after-underline accent (white bar)
+        // — pills don't use it.
+        'after:!opacity-0',
       )}
     >
       <span>{label}</span>
@@ -600,20 +599,24 @@ export function VMPairBook() {
               onValueChange={(v) => setActiveTab(v as 'server' | 'traffic' | 'media')}
               className="gap-0"
             >
-              {/* Tab strip — sits above the form panel. The boxed
-                  ConfigTabTrigger is taller than the line variant, so the
-                  container needs more vertical room. The bottom border of
-                  this strip becomes the "shelf" the tabs visually sit on,
-                  and the active tab's -mb-px overlaps it for a seamless
-                  browser-tab merge with the form below. */}
-              <div className="relative border-b border-border bg-card/40 px-4 pt-2 pb-0">
+              {/* Tab strip — pills inside a single slate-tinted container,
+                  iOS Settings / Stripe style. The container has a thin
+                  border + soft fill so the whole control reads as a tab
+                  group; the active pill is solid orange (fill + white
+                  text) and stands out unmistakably against the inactive
+                  transparent pills. Symmetric vertical padding (py-3)
+                  centers the pill row. */}
+              <div className="border-b border-border bg-card/40 px-4 py-3">
                 <TabsList
-                  variant="line"
-                  className="h-auto gap-1.5 bg-transparent p-0"
+                  variant="default"
+                  className={cn(
+                    'inline-flex h-auto items-center gap-1 rounded-lg p-1',
+                    'border border-slate-700/60 bg-slate-800/60',
+                  )}
                 >
-                  <ConfigTabTrigger value="server"  label="Server & Auth"        errCount={hasValidated ? tabErrCount('server')  : 0} />
+                  <ConfigTabTrigger value="server"  label="Server & Auth"          errCount={hasValidated ? tabErrCount('server')  : 0} />
                   <ConfigTabTrigger value="traffic" label="Traffic & Registration" errCount={hasValidated ? tabErrCount('traffic') : 0} />
-                  <ConfigTabTrigger value="media"   label="Media & QoS"          errCount={hasValidated ? tabErrCount('media')   : 0} />
+                  <ConfigTabTrigger value="media"   label="Media & QoS"            errCount={hasValidated ? tabErrCount('media')   : 0} />
                 </TabsList>
               </div>
 
