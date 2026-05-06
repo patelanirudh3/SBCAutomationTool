@@ -143,7 +143,7 @@ interface TrafficStore {
   aggregate: AggregateMetrics | null
   setCallEvents: (events: CallEvent[]) => void
   setCallSpines: (spines: Record<string, unknown>[]) => void
-  setAggregate: (a: AggregateMetrics) => void
+  setAggregate: (a: AggregateMetrics | null) => void
 
   // Run-level ID (one per traffic run, shared by all pairs)
   currentRunId: string

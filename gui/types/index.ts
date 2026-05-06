@@ -6,9 +6,12 @@ export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
 export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
 export type RunPhase =
   | 'IDLE'
-  | 'PRE_PHASE'
-  | 'PRE_REGISTER'
-  | 'TRAFFIC_READY'
+  | 'PRE_PHASE'        // legacy alias of REGSUB_RUNNING
+  | 'PRE_REGISTER'     // legacy alias of REGSUB_RUNNING
+  | 'REGSUB_READY'     // waiting for Start Reg/Sub click
+  | 'REGSUB_RUNNING'   // REGISTER + SUBSCRIBE in flight (live progress)
+  | 'REGSUB_DONE'      // all reg/sub done — gates Start Traffic
+  | 'TRAFFIC_READY'    // legacy alias of REGSUB_DONE
   | 'TRAFFIC'
   | 'STOPPING'
   | 'CLEANUP_READY'
@@ -16,6 +19,11 @@ export type RunPhase =
   | 'COMPLETE'
   | 'DONE'
   | 'FAILED'
+
+// PrepStatus tracks the optional async unregister flush invoked by the
+// corner "Start Prep" button on the Reg/Sub view. Always present in
+// TrafficMetrics; defaults to 'idle' before the operator clicks the button.
+export type PrepStatus = 'idle' | 'running' | 'done' | 'failed'
 export type RunMode = 'local' | 'multi-vm'
 
 export type RtpMode = '3phase' | 'continuous'
@@ -170,6 +178,13 @@ export interface TrafficMetrics {
   avg_hold_ms: number
   socket_count: number
   registered_count: number
+  registered_total?: number
+  subscribed_count?: number
+  subscribed_total?: number
+  // prep_status drives the corner Prep button visual state and the
+  // disabled/enabled state of Start Reg/Sub. Backend defaults to 'idle'
+  // until the operator clicks Start Prep.
+  prep_status?: PrepStatus
   run_elapsed_seconds: number
   // Unified pool counts
   idle_count?: number

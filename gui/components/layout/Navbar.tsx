@@ -11,8 +11,11 @@ import { cn } from '@/lib/utils'
 
 const PHASE_LABEL: Record<RunPhase, string> = {
   IDLE: 'Idle',
-  PRE_PHASE: 'Pre-Phase',
+  PRE_PHASE: 'Reg/Sub',
   PRE_REGISTER: 'Registering',
+  REGSUB_READY: 'Reg/Sub Ready',
+  REGSUB_RUNNING: 'Reg/Sub',
+  REGSUB_DONE: 'Traffic Ready',
   TRAFFIC_READY: 'Traffic Ready',
   TRAFFIC: 'Running',
   STOPPING: 'Stopping',
@@ -27,6 +30,9 @@ const PHASE_COLOR: Record<RunPhase, string> = {
   IDLE: 'text-muted-foreground',
   PRE_PHASE: 'text-amber-400',
   PRE_REGISTER: 'text-amber-400',
+  REGSUB_READY: 'text-sky-400',
+  REGSUB_RUNNING: 'text-amber-400',
+  REGSUB_DONE: 'text-sky-400',
   TRAFFIC_READY: 'text-sky-400',
   TRAFFIC: 'text-emerald-400',
   STOPPING: 'text-amber-400',

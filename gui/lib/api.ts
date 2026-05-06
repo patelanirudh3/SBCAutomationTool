@@ -296,6 +296,54 @@ export async function startPrePhaseFor(ip: string, port: number): Promise<{ stat
   return data as { status: string }
 }
 
+// startPrepFor — fire-and-forget unregister flush. Returns 200 immediately.
+// The actual completion is observed via the prep_status field on metrics.
+export async function startPrepFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/prep/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+// startRegSubFor — gates the REGISTER + SUBSCRIBE phase. Backend returns 409
+// if prep_status == 'running' (defensive guardrail; GUI also disables button).
+export async function startRegSubFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/regsub/start`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+// abortRegSubFor — cancels in-flight Reg/Sub by setting stopNew so RegisterAll
+// / SubscribeAll halt new batches and let in-flight work drain.
+export async function abortRegSubFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/regsub/abort`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
+// restartTrafficFor — re-enter the traffic loop from CLEANUP_READY without
+// re-running prep / register / subscribe. Reuses the existing populated pool.
+export async function restartTrafficFor(ip: string, port: number): Promise<{ status: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/restart-traffic`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new APIError(res.status, data.error ?? res.statusText)
+  return data as { status: string }
+}
+
 export async function startTrafficFor(ip: string, port: number): Promise<{ status: string }> {
   const res = await fetch(`http://${ip}:${port}/api/traffic/start`, {
     method: 'POST',

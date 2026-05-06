@@ -1,7 +1,6 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import { WifiOff, Loader2, AlertOctagon, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -25,7 +24,7 @@ import { FinalReport } from '@/components/postrun/FinalReport'
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor, resetTestFor } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor, resetTestFor, restartTrafficFor } from '@/lib/api'
 import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
 import {
   MOCK_UAC_METRICS,
@@ -353,12 +352,11 @@ async function finalFetchCallEventsWithRetry(
 // ---------------------------------------------------------------------------
 
 export default function RunPage() {
-  const router = useRouter()
   const phase = useTrafficStore((s) => s.phase)
   const wsStatus = useTrafficStore((s) => s.wsStatus)
   const pair = useTrafficStore((s) => s.pairs[s.activePairIndex])
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
-  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate, setCleanupStatus, reset } =
+  const { setPhase, updateUACMetrics, setWsStatus, setCallEvents, setAggregate, setCleanupStatus } =
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
@@ -378,7 +376,7 @@ export default function RunPage() {
   useEffect(() => {
     if (!IS_MOCK) return
 
-    if (phase === 'IDLE' || phase === 'PRE_PHASE' || phase === 'TRAFFIC_READY') {
+    if (phase === 'IDLE' || phase === 'PRE_PHASE' || phase === 'REGSUB_RUNNING' || phase === 'REGSUB_READY' || phase === 'REGSUB_DONE' || phase === 'TRAFFIC_READY') {
       setPhase('TRAFFIC')
     }
 
@@ -463,16 +461,36 @@ export default function RunPage() {
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
 
+  // Restart Traffic — re-enters the traffic loop using the existing pool
+  // (no re-prep, no re-reg). Backend's CLEANUP_READY phase accepts a
+  // RestartTrafficCh signal and goes back into TRAFFIC. We clear the
+  // local aggregate / events so the UI starts fresh; the engine keeps
+  // its cumulative call counters.
   const handleReRun = async () => {
     setReRunning(true)
     try {
-      await resetTestFor(vmIp, vmPort)
-    } catch { /* ignore — backend may already be idle */ }
-    reset()
-    setFrozenElapsed(null)
-    cleanupStartedAtRef.current = null
-    router.push('/launch')
+      await restartTrafficFor(vmIp, vmPort)
+      // Reset display-only state. Don't call full `reset()` — that would
+      // wipe pair config + run id. The engine drives the new phase which
+      // the polling loop picks up.
+      setCallEvents([])
+      setAggregate(null)
+      setFrozenElapsed(null)
+      cleanupStartedAtRef.current = null
+      setPhase('TRAFFIC')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Restart failed'
+      // Surface the error inline rather than navigating away — the
+      // operator can fall back to a full reset by going Home.
+      console.error('Restart Traffic failed:', msg)
+    } finally {
+      setReRunning(false)
+    }
   }
+
+  // Bind for ESLint. The full reset path is no longer used inside Re-Run
+  // but is still imported for potential future "Hard Reset" affordance.
+  void resetTestFor
 
   const handleGracefulStop = async () => {
     setStopping(true)
@@ -664,6 +682,7 @@ export default function RunPage() {
         (
           storePhase === 'TRAFFIC' ||
           storePhase === 'PRE_PHASE' ||
+          storePhase === 'REGSUB_RUNNING' ||
           storePhase === 'STOPPING' ||
           storePhase === 'CLEANUP_READY' ||
           storePhase === 'CLEANING_UP'
@@ -697,8 +716,8 @@ export default function RunPage() {
     !IS_MOCK
   )
 
-  const isPrePhase     = phase === 'PRE_PHASE'
-  const isTrafficReady = phase === 'TRAFFIC_READY'
+  const isPrePhase     = phase === 'PRE_PHASE' || phase === 'REGSUB_RUNNING' || phase === 'REGSUB_READY'
+  const isTrafficReady = phase === 'TRAFFIC_READY' || phase === 'REGSUB_DONE'
   // LiveDashboard shows only during active traffic / stopping phase.
   // CLEANUP_READY transitions immediately to the FinalReport.
   const isTraffic      = phase === 'TRAFFIC' || phase === 'STOPPING'

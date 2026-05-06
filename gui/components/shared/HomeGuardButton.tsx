@@ -53,6 +53,7 @@ function getGuardConfig(phase: RunPhase): GuardConfig | null {
       }
 
     case 'PRE_PHASE':
+    case 'REGSUB_RUNNING':
       return {
         title: 'Registration In Progress',
         message:
@@ -60,6 +61,17 @@ function getGuardConfig(phase: RunPhase): GuardConfig | null {
         severity: 'block',
       }
 
+    case 'REGSUB_READY':
+      return {
+        title: 'Reg/Sub Not Yet Started',
+        message:
+          'You are on the Reg/Sub setup page but have not clicked Start Reg/Sub yet. Are you sure you want to leave?',
+        severity: 'warn',
+        allowOverride: true,
+        overrideLabel: 'Leave anyway',
+      }
+
+    case 'REGSUB_DONE':
     case 'TRAFFIC_READY':
       return {
         title: 'Extensions Ready — Run Not Started',

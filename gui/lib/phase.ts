@@ -3,15 +3,9 @@ import type { RunPhase } from '@/types'
 // Map a raw backend phase string (from /metrics, /api/test/status, or the
 // WebSocket push) onto the GUI's RunPhase union.
 //
-// The backend uses a slightly broader vocabulary (PRE_REGISTER,
-// PRE_SUBSCRIBE, DONE) than the GUI cares about. Collapse those into the
-// GUI phases that actually drive rendering:
-//
-//   PRE_REGISTER | PRE_SUBSCRIBE → PRE_PHASE
-//   DONE                          → COMPLETE
-//
-// CLEANING_UP is passed through unchanged so the post-run UI can render
-// the unregister progress card. Anything unrecognised falls back to IDLE.
+// The backend now emits explicit REGSUB_READY / REGSUB_RUNNING / REGSUB_DONE
+// for the operator-gated Reg/Sub lifecycle. Older clients still see the
+// legacy aliases (PRE_REGISTER, PRE_PHASE, TRAFFIC_READY).
 export function mapBackendPhase(rawPhase: string | undefined | null): RunPhase {
   const p = (rawPhase ?? '').toUpperCase()
   switch (p) {
@@ -25,12 +19,16 @@ export function mapBackendPhase(rawPhase: string | undefined | null): RunPhase {
       return 'CLEANUP_READY'
     case 'CLEANING_UP':
       return 'CLEANING_UP'
-    case 'TRAFFIC_READY':
-      return 'TRAFFIC_READY'
+    case 'REGSUB_READY':
+      return 'REGSUB_READY'
+    case 'REGSUB_RUNNING':
     case 'PRE_PHASE':
     case 'PRE_REGISTER':
     case 'PRE_SUBSCRIBE':
-      return 'PRE_PHASE'
+      return 'REGSUB_RUNNING'
+    case 'REGSUB_DONE':
+    case 'TRAFFIC_READY':
+      return 'REGSUB_DONE'
     case 'DONE':
     case 'COMPLETE':
       return 'COMPLETE'

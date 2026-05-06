@@ -12,7 +12,7 @@ interface Step {
 
 const STEPS: Step[] = [
   { label: 'Config', index: 0 },
-  { label: 'Launch', index: 1 },
+  { label: 'Reg / Sub', index: 1 },
   { label: 'Running', index: 2 },
   { label: 'Complete', index: 3 },
 ]
