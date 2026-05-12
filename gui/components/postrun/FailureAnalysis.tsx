@@ -12,7 +12,9 @@ export function FailureAnalysis({ className }: FailureAnalysisProps) {
   const callEvents = useTrafficStore((s) => s.callEvents)
   const aggregate = useTrafficStore((s) => s.aggregate)
 
-  const failedCalls = callEvents.filter((e) => e.result === 'FAILED')
+  // Filter to UAC-only so the same call (which has a UAC + UAS leg in the
+  // raw event list) doesn't appear twice in the failure breakdown.
+  const failedCalls = callEvents.filter((e) => e.direction !== 'uas' && e.result === 'FAILED')
   if (failedCalls.length === 0 || !aggregate) return null
 
   // Derive root cause from the most common failure reason

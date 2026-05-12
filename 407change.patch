@@ -1,0 +1,195 @@
+diff --git a/go/go.mod b/go/go.mod
+index 784dda6..a04c6e2 100644
+--- a/go/go.mod
++++ b/go/go.mod
+@@ -3,6 +3,6 @@ module github.com/cci/traffic-engine
+ go 1.22.12
+ 
+ require (
+-	github.com/gorilla/websocket v1.5.3 // indirect
+-	gopkg.in/yaml.v3 v3.0.1 // indirect
++	github.com/gorilla/websocket v1.5.3
++	gopkg.in/yaml.v3 v3.0.1
+ )
+diff --git a/go/go.sum b/go/go.sum
+index 27b5003..6a2c68d 100644
+--- a/go/go.sum
++++ b/go/go.sum
+@@ -1,5 +1,6 @@
+ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+ github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
++gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/go/internal/agent/agent.go b/go/internal/agent/agent.go
+index d9d482a..59aad41 100644
+--- a/go/internal/agent/agent.go
++++ b/go/internal/agent/agent.go
+@@ -488,6 +488,11 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
+ // Subscribe performs the SUBSCRIBE flow handling both 407 (Proxy-Auth) and
+ // 401 (WWW-Auth) challenges. Avaya Session Manager issues 401 for SUBSCRIBE.
+ // On success it saves dialog state so Resubscribe can issue in-dialog refreshes.
++//
++// A wildcard listener catches any unexpected final-error response (4xx/5xx/6xx
++// other than 407/401) so the call fails fast instead of timing out after the
++// full RegisterTimeout when the SBC rejects the subscription immediately
++// (e.g. 403 Forbidden, 489 Bad Event, 405 Method Not Allowed).
+ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+ 	a.syncLocalPort()
+ 	callID := sip.CreateCallID()
+@@ -513,6 +518,11 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+ 	msg.AddHeader(sip.HdrContentLength, "0")
+ 	msg.AddHeader(sip.HdrSupported, "100rel")
+ 
++	// Wildcard listener catches any response code not explicitly handled below
++	// (e.g. 403 Forbidden, 489 Bad Event) so we fail fast instead of timing out.
++	wc := a.RegisterWildcardListener()
++	defer a.DeregisterWildcardListener(wc)
++
+ 	ch407 := a.waitForEvent("407")
+ 	ch401 := a.waitForEvent("401")
+ 	ch200 := a.waitForEvent("200")
+@@ -564,33 +574,51 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+ 		return a.Send(retryMsg, "")
+ 	}
+ 
+-	select {
+-	case raw407 := <-ch407:
+-		if err := sendAuthRetry(raw407, false); err != nil {
+-			return err
+-		}
+-		select {
+-		case <-ch200:
+-		case <-ch202:
+-		case <-tCtx.Done():
+-			return tCtx.Err()
++	// waitFinalOK waits for 200/202 after an auth retry. It also fails fast on
++	// any unexpected final-error response delivered via the wildcard channel.
++	waitFinalOK := func() error {
++		for {
++			select {
++			case <-ch200:
++				return nil
++			case <-ch202:
++				return nil
++			case ev := <-wc:
++				if isSubscribeFinalError(ev.EventCode) {
++					return fmt.Errorf("SUBSCRIBE rejected with %s", ev.EventCode)
++				}
++			case <-tCtx.Done():
++				return tCtx.Err()
++			}
+ 		}
++	}
+ 
+-	case raw401 := <-ch401:
+-		if err := sendAuthRetry(raw401, true); err != nil {
+-			return err
+-		}
++	for {
+ 		select {
++		case raw407 := <-ch407:
++			if err := sendAuthRetry(raw407, false); err != nil {
++				return err
++			}
++			return waitFinalOK()
++
++		case raw401 := <-ch401:
++			if err := sendAuthRetry(raw401, true); err != nil {
++				return err
++			}
++			return waitFinalOK()
++
+ 		case <-ch200:
+ 		case <-ch202:
++		case ev := <-wc:
++			if isSubscribeFinalError(ev.EventCode) {
++				return fmt.Errorf("SUBSCRIBE rejected with %s", ev.EventCode)
++			}
++			// Non-final codes (100, NOTIFY, etc.) — keep waiting.
++			continue
+ 		case <-tCtx.Done():
+ 			return tCtx.Err()
+ 		}
+-
+-	case <-ch200:
+-	case <-ch202:
+-	case <-tCtx.Done():
+-		return tCtx.Err()
++		break
+ 	}
+ 
+ 	// Save dialog state for in-dialog refresh via Resubscribe.
+@@ -605,6 +633,20 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+ 	return nil
+ }
+ 
++// isSubscribeFinalError reports whether an event code represents a final SIP
++// error response that permanently rejects a SUBSCRIBE (4xx/5xx/6xx, excluding
++// 407 and 401 which are auth challenges handled separately).
++func isSubscribeFinalError(code string) bool {
++	if len(code) != 3 {
++		return false
++	}
++	switch code[0] {
++	case '4', '5', '6':
++		return code != "407" && code != "401"
++	}
++	return false
++}
++
+ // Resubscribe sends an in-dialog SUBSCRIBE refresh using the state saved from
+ // the initial Subscribe call. It reuses the same Call-ID and From tag (keeping
+ // the subscription dialog alive) and increments CSeq. A fresh auth challenge
+diff --git a/go/uac.yaml b/go/uac.yaml
+index 49ba7a5..aeee099 100644
+--- a/go/uac.yaml
++++ b/go/uac.yaml
+@@ -1,12 +1,12 @@
+ # Auto-generated by GUI — UAC config
+-# 2026-04-22T09:22:18Z
++# 2026-04-24T06:31:20Z
+ 
+ vm_role: UAC
+ vm_id: uac-local
+ uac_ext_start: 6000000
+-uac_ext_end: 6000009
+-uas_ext_start: 6000010
+-uas_ext_end: 6000019
++uac_ext_end: 6000048
++uas_ext_start: 6000049
++uas_ext_end: 6000097
+ sbc_host: 10.133.48.203
+ sbc_port: 5060
+ secondary_host: ""
+@@ -16,7 +16,7 @@ dns_servers: ""
+ sip_transport: TCP
+ domain: avaya.com
+ sip_password: "123456"
+-cps: 1
++cps: 5
+ hold_time_seconds: 5
+ ramp_up_seconds: 5
+ metrics_interval: 3
+diff --git a/go/uas.yaml b/go/uas.yaml
+index bc7a7fc..4ffbb83 100644
+--- a/go/uas.yaml
++++ b/go/uas.yaml
+@@ -1,12 +1,12 @@
+ # Auto-generated by GUI — UAS config
+-# 2026-04-22T09:22:18Z
++# 2026-04-24T06:31:20Z
+ 
+ vm_role: UAS
+ vm_id: uas-local
+ uac_ext_start: 6000000
+-uac_ext_end: 6000009
+-uas_ext_start: 6000010
+-uas_ext_end: 6000019
++uac_ext_end: 6000048
++uas_ext_start: 6000049
++uas_ext_end: 6000097
+ sbc_host: 10.133.48.203
+ sbc_port: 5060
+ secondary_host: ""

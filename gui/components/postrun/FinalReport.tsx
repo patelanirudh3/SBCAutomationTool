@@ -1,7 +1,7 @@
 'use client'
 
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Clock, Zap, Loader2, RotateCcw } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, Loader2, RotateCcw, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
@@ -116,13 +116,28 @@ export function FinalReport({
   const subTotal = prePhaseStatus?.subscribe_total ?? extCount
 
   // Call traffic summary
+  // inviteSent = total INVITEs we transmitted (loose upper bound).
+  // attempted  = INVITEs the SBC accepted (received a 100 Trying back).
+  // The gap inviteSent − attempted is diagnostic of network/SBC-reachability
+  // problems — surfaced as a separate StatCard so failures of "we couldn't
+  // even reach the SBC" are visible distinct from "the SBC took the call
+  // but didn't answer".
+  const inviteSent = uacMetrics?.calls_invite_sent ?? 0
   const attempted  = aggregate?.total_attempted  ?? uacMetrics?.calls_attempted  ?? 0
-  // Prefer aggregate.total_answered, fall back to live metric, then derive
-  // from event list as a last resort (handles legacy backends without the
-  // calls_answered counter).
-  const answered   = aggregate?.total_answered
-                  ?? uacMetrics?.calls_answered
-                  ?? callEvents.filter((e) => e.answered === true).length
+  // Prefer aggregate, fall back to live metric, then derive from event list
+  // as a last resort. UAC-only filtering keeps the totals correct (events
+  // contain both UAC and UAS legs).
+  //
+  // answered = 200 OK seen (RFC 3261 §13.2.2.4); independent of ACK.
+  // acknowledged = full INV/200/ACK three-way handshake completed.
+  // The gap between them surfaces 100rel/PRACK or SBC 200-OK delivery
+  // problems at a glance.
+  const answered     = aggregate?.total_answered
+                    ?? uacMetrics?.calls_answered
+                    ?? callEvents.filter((e) => e.direction !== 'uas' && e.answered === true).length
+  const acknowledged = aggregate?.total_acknowledged
+                    ?? uacMetrics?.calls_acknowledged
+                    ?? callEvents.filter((e) => e.direction !== 'uas' && e.acknowledged === true).length
   const completed  = aggregate?.total_completed  ?? uacMetrics?.calls_completed  ?? 0
   const failed     = aggregate?.total_failed     ?? uacMetrics?.calls_failed     ?? 0
   const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
@@ -144,6 +159,33 @@ export function FinalReport({
       transition={{ duration: 0.4 }}
       className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6"
     >
+      {/* Pool reconciliation alert — surfaced when post-drain reconciliation
+          could not return all agents to idle within the 3 × 60s budget.
+          Block-level red banner advises the operator to Unregister rather
+          than Re-Run with stuck agents (which would compound the problem). */}
+      {uacMetrics?.reconciliation_status?.failed && (
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 flex items-start gap-3">
+          <AlertTriangle className="size-5 text-rose-400 shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1">
+            <p className="text-sm font-semibold text-rose-200">
+              Pool reconciliation failed
+            </p>
+            <p className="text-xs text-rose-300/80">
+              Expected {uacMetrics.reconciliation_status.expected_idle} idle
+              agents, only {uacMetrics.reconciliation_status.actual_idle}{' '}
+              returned to idle after 3 reconciliation windows (180 s total).{' '}
+              {(uacMetrics.reconciliation_status.stuck_agents?.length ?? 0)} extension(s)
+              still in non-idle state.
+            </p>
+            <p className="text-xs text-rose-300/80">
+              <strong>Recommended:</strong> click <strong>Unregister / Unsubscribe</strong>{' '}
+              for a clean slate before the next run. Re-Run is unlikely to behave
+              correctly with stuck agents.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Title + action buttons row */}
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3">
@@ -203,11 +245,19 @@ export function FinalReport({
       {/* Call traffic summary */}
       <div className="space-y-3">
         <SectionLabel>Call Traffic</SectionLabel>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard icon={Phone}          label="Attempted"            value={attempted.toLocaleString()}  color="info" />
-          <StatCard icon={PhoneIncoming}  label="Answered (INV/200/ACK)" value={answered.toLocaleString()}   color={answered > 0 ? 'success' : 'default'} />
-          <StatCard icon={CheckCircle2}   label="Completed (BYE/200)"  value={completed.toLocaleString()}  color="success" />
-          <StatCard icon={PhoneMissed}    label="Failed"               value={failed.toLocaleString()}     color={failed > 0 ? 'danger' : 'default'} />
+        {/* Six-step funnel: INVITEs Sent → Attempted (got 100) → Answered
+            → Acknowledged → Completed → Failed. Each gap is diagnostic:
+            • Sent − Attempted = SBC didn't respond at all (network/reach)
+            • Attempted − Answered = SBC didn't deliver the 200 OK
+            • Answered − Acknowledged = ACK didn't reach the UAS
+            • Acknowledged − Completed = BYE didn't complete */}
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
+          <StatCard icon={Phone}          label="INVITEs Sent"               value={inviteSent.toLocaleString()}    color="default" sub="all transmitted" />
+          <StatCard icon={Phone}          label="Attempted"                  value={attempted.toLocaleString()}     color="info"    sub="got 100 Trying" />
+          <StatCard icon={PhoneIncoming}  label="Answered (INV/200)"         value={answered.toLocaleString()}      color={answered > 0 ? 'success' : 'default'} />
+          <StatCard icon={PhoneCall}      label="Acknowledged (INV/200/ACK)" value={acknowledged.toLocaleString()}  color={acknowledged > 0 ? 'success' : 'default'} />
+          <StatCard icon={CheckCircle2}   label="Completed (BYE/200)"        value={completed.toLocaleString()}     color="success" />
+          <StatCard icon={PhoneMissed}    label="Failed"                     value={failed.toLocaleString()}        color={failed > 0 ? 'danger' : 'default'} />
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <StatCard icon={Zap}        label="ASR"            value={`${asr.toFixed(1)}%`}         color={asr >= 95 ? 'success' : asr >= 80 ? 'warning' : 'danger'} />
@@ -220,7 +270,10 @@ export function FinalReport({
       {/* Failed calls table */}
       <div className="space-y-2">
         <SectionLabel>Failed Call Records</SectionLabel>
-        <FailedCallsTable events={callEvents} />
+        <FailedCallsTable
+          events={callEvents}
+          reportedFailedCount={failed}
+        />
       </div>
 
       {/* Media QoS */}

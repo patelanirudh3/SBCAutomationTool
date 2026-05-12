@@ -47,6 +47,18 @@ export interface AdvancedSettings {
   // but only safe when the SBC is known to support RFC 5761 RTCP-mux.
   rtcp_sr_enabled: boolean             // default: false
   rtcp_sr_interval_seconds: number     // default: 5 — clamp 1..60
+  // OS-level TCP keepalive period (seconds) applied to the SBC connection.
+  // Detects silently-dropped sockets (NAT/firewall idle, SBC idle timeouts)
+  // without waiting for the next failed Send. 0 disables keepalive (legacy).
+  // Validation enforces 0 OR 5..300 s range.
+  tcp_keepalive_seconds: number        // default: 30
+  // Whether UAC advertises Supported: 100rel on outbound INVITEs (RFC 3262).
+  // Default OFF — back-to-back emission of 200/PRACK + 200/INVITE on the
+  // same dialog reliably triggers a 15-byte TCP sequence gap on at least
+  // one SBC's send pipeline (deterministic 100% loss of 200/INVITE).
+  // Disable unless the SBC has been independently verified to handle
+  // consecutive 2xx responses correctly. Backend mirror: VMConfig.Use100Rel.
+  use_100rel: boolean                  // default: false
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -64,6 +76,8 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   qos_mos_estimation: true,
   rtcp_sr_enabled: false,
   rtcp_sr_interval_seconds: 5,
+  tcp_keepalive_seconds: 30,
+  use_100rel: false,
 }
 
 export interface VMConfig {
@@ -120,9 +134,22 @@ export interface VMConfig {
   // Traffic
   cps: number
   hold_time_seconds: number
+  // Wall-clock seconds the engine should take to climb from 0 cps to
+  // the configured cps when traffic starts. Mirrors backend
+  // VMConfig.RampUpSeconds. 0 disables ramp-up (full speed from t=0).
+  ramp_up_seconds?: number
+  // Optional explicit ceiling for concurrent calls. When >0 it overrides
+  // the cps × hold_time_seconds steady-state estimate (mirrors backend
+  // VMConfig.EffectiveMaxConcurrent in go/internal/config/config.go).
+  max_concurrent_calls?: number
   media_enabled?: boolean
   metrics_port: number
   peer_stop_url?: string
+
+  // OS-level TCP keepalive seconds for the SBC connection. Mirrors
+  // VMConfig.TCPKeepAliveSeconds in go/internal/config/config.go. 0 disables;
+  // valid non-zero range 5..300. See AdvancedSettings.tcp_keepalive_seconds.
+  tcp_keepalive_seconds?: number
 
   // Media
   rtp_codec?: RtpCodec             // default: 'G711_ULAW'
@@ -164,11 +191,30 @@ export interface TrafficMetrics {
   phase: RunPhase
   running: boolean
   cps_actual: number
+  // concurrent_calls: dialogs in the post-ACK / pre-BYE-completion phase
+  // (RFC 3261 §13.2.2.4 "confirmed" state). Reflects only truly established
+  // calls — does NOT include calls in the INVITE→ACK setup window. Sourced
+  // from PoolEngine.establishedCount / 2 on the backend.
   concurrent_calls: number
+  // calls_invite_sent: total INVITEs we transmitted, regardless of whether
+  // the SBC ever responded. The gap calls_invite_sent − calls_attempted is
+  // diagnostic of network/SBC-reachability problems (INVITEs that left our
+  // process but never elicited a 100 Trying).
+  calls_invite_sent?: number
+  // calls_attempted: INVITEs that the SBC accepted (received a 100 Trying).
+  // Strict "the SBC saw our request" boundary; auth-retry second-100 is
+  // suppressed by a once-per-call guard on the backend.
   calls_attempted: number
-  // calls_answered: count of calls that completed the INV/200/ACK three-way
-  // handshake (UAC sent ACK, or UAS received ACK). Always ≥ calls_completed.
+  // calls_answered: number of INVITEs that received a 200 OK response
+  // (RFC 3261 §13.2.2.4 sense — "answered"). Independent of whether ACK
+  // followed. Compare against calls_acknowledged to spot 100rel/PRACK or
+  // SBC 200-OK delivery problems (high answered + low acknowledged means
+  // the called party answered but the caller never confirmed).
   calls_answered?: number
+  // calls_acknowledged: number of INVITEs that completed the full
+  // INV/200/ACK three-way handshake (UAC sent ACK, UAS received ACK).
+  // Below this counter the call is in established media phase.
+  calls_acknowledged?: number
   calls_completed: number
   calls_failed: number
   asr: number
@@ -186,9 +232,15 @@ export interface TrafficMetrics {
   // until the operator clicks Start Prep.
   prep_status?: PrepStatus
   run_elapsed_seconds: number
-  // Unified pool counts
+  // Unified pool counts (3-state model). non_idle_count is the legacy
+  // alias for setting_up_count + established_count, kept for backward
+  // compatibility. New code should prefer established_count for the
+  // "currently in call" tile because it excludes the transient call-setup
+  // window between INVITE and ACK.
   idle_count?: number
   non_idle_count?: number
+  setting_up_count?: number
+  established_count?: number
   reg_only_count?: number
   // Cleanup (unregister) progress, populated during CLEANING_UP and frozen
   // at completion so the post-run UI can render the result strip.
@@ -211,6 +263,38 @@ export interface TrafficMetrics {
   // Phase 2 — round-trip time averaged across calls that produced an RTCP
   // SR/RR exchange. Always 0 when rtcp_sr_enabled is false.
   avg_rtt_ms?: number
+
+  // Graceful-drain timer surfaced when the timed-mode deadline fires or
+  // when the operator clicks Graceful Stop. While `graceful_drain_active`
+  // is true the run timer (`run_elapsed_seconds`) is frozen at the
+  // deadline value and the GUI renders the drain countdown instead.
+  graceful_drain_active?: boolean
+  graceful_drain_total_seconds?: number
+  graceful_drain_seconds_remaining?: number
+
+  // Re-Run pre-flight REGISTER refresh result. Surfaces a non-blocking
+  // warning banner during the iteration when some agents could not refresh
+  // their SBC binding before traffic resumed.
+  reregister_status?: {
+    iteration: number
+    attempted: number
+    refreshed: number
+    full_reregistered: number
+    failed: number
+    failed_extensions?: string[]
+  }
+
+  // Post-drain pool reconciliation result. When `failed` is true, the GUI
+  // renders a red alert in the Final Report advising the operator to
+  // Unregister rather than Re-Run with stuck agents.
+  reconciliation_status?: {
+    expected_idle: number
+    actual_idle: number
+    attempt: number
+    reconciled: boolean
+    failed: boolean
+    stuck_agents?: string[]
+  }
 }
 
 // CleanupStatus mirrors the backend GET /api/cleanup/status payload and the
@@ -251,10 +335,14 @@ export interface CallEvent {
   peer_ext?: string
   direction?: 'uac' | 'uas'
   result: 'COMPLETED' | 'FAILED'
-  // answered: true if the INV/200/ACK three-way handshake completed
-  // (orthogonal to result — a call can be answered=true, result=FAILED if
-  // media or BYE handshake failed afterwards).
+  // answered: true when 200 OK was sent (UAS) or received (UAC) in
+  // response to the INVITE — RFC 3261 §13.2.2.4 sense. Independent of
+  // whether ACK followed.
   answered?: boolean
+  // acknowledged: true when the full INV/200/ACK three-way handshake
+  // completed. Orthogonal to result — a call can be acknowledged=true,
+  // result=FAILED if media or BYE handshake failed afterwards.
+  acknowledged?: boolean
   failure_reason?: string
   pdd_ms: number
   hold_ms: number
@@ -292,7 +380,10 @@ export interface CallEvent {
 
 export interface AggregateMetrics {
   total_attempted: number
+  // total_answered: 200 OK count (semantic match to TrafficMetrics.calls_answered).
   total_answered?: number
+  // total_acknowledged: full INV/200/ACK count.
+  total_acknowledged?: number
   total_completed: number
   total_failed: number
   aggregate_asr: number

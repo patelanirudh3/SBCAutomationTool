@@ -233,18 +233,29 @@ export async function getCallSpinesFor(
 
 // ---------------------------------------------------------------------------
 // Build AggregateMetrics from fetched call events
-// UAC is source of truth for attempts (UAC drives all calls)
+//
+// UAC is the source of truth for session-level totals because each call
+// session produces TWO records in /api/calls (one per leg, kept for spine
+// correlation). Counting both legs would double `total_attempted` etc. —
+// e.g. a 15-call smoke test would report 30. The first arg is named
+// `allEvents` (not `uacEvents`) to make this filtering explicit; the
+// second is reserved for symmetry / future cross-VM correlation work.
 // ---------------------------------------------------------------------------
 
 export function buildAggregate(
-  uacEvents: import('@/types').CallEvent[],
-  _uasEvents: import('@/types').CallEvent[],
+  allEvents: import('@/types').CallEvent[],
+  _uasEventsReserved: import('@/types').CallEvent[],
   runId: string,
   startedAt: string
 ): import('@/types').AggregateMetrics {
-  const attempted = uacEvents.length
-  const answered = uacEvents.filter((e) => e.answered === true).length
-  const completed = uacEvents.filter((e) => e.result === 'COMPLETED').length
+  // Accept records that are explicitly direction='uac' OR have no direction
+  // field at all (older payloads). Anything tagged 'uas' is the callee leg
+  // of a session UAC has already counted.
+  const uacOnly = allEvents.filter((e) => e.direction !== 'uas')
+  const attempted = uacOnly.length
+  const answered = uacOnly.filter((e) => e.answered === true).length
+  const acknowledged = uacOnly.filter((e) => e.acknowledged === true).length
+  const completed = uacOnly.filter((e) => e.result === 'COMPLETED').length
   const failed = attempted - completed
   return {
     run_id: runId,
@@ -252,6 +263,7 @@ export function buildAggregate(
     ended_at: new Date().toISOString(),
     total_attempted: attempted,
     total_answered: answered,
+    total_acknowledged: acknowledged,
     total_completed: completed,
     total_failed: failed,
     aggregate_asr: attempted > 0 ? Math.round((completed / attempted) * 1000) / 10 : 0,

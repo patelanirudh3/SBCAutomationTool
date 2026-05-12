@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import { DM_Sans, Space_Mono } from 'next/font/google'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { StoreHydrator } from '@/components/shared/StoreHydrator'
 import './globals.css'
 
 const dmSans = DM_Sans({
@@ -31,7 +32,9 @@ export default function RootLayout({
       <body
         className={`${dmSans.variable} ${spaceMono.variable} font-sans antialiased bg-background text-foreground`}
       >
-        <TooltipProvider delayDuration={300}>{children}</TooltipProvider>
+        <StoreHydrator>
+          <TooltipProvider delayDuration={300}>{children}</TooltipProvider>
+        </StoreHydrator>
       </body>
     </html>
   )

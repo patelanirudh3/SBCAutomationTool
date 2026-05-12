@@ -20,8 +20,11 @@ export function ConcurrentCallsBar({
   return (
     <div className={cn('flex flex-col gap-2', className)}>
       <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-widest text-foreground/75">
-          Active Calls
+        <span
+          className="text-xs font-semibold uppercase tracking-widest text-foreground/75"
+          title="Calls in the established (post-ACK / pre-BYE-completion) state. Calls in the INVITE→ACK setup window or in failure timeouts are NOT counted here."
+        >
+          Concurrent Calls
         </span>
         <span className="font-mono text-sm tabular-nums text-foreground">
           <span className={cn('font-bold', isAlarm ? 'text-rose-500' : 'text-foreground')}>

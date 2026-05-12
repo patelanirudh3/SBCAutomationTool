@@ -72,6 +72,7 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     tls_server_name: '',
     cps: 1,
     hold_time_seconds: 5,
+    ramp_up_seconds: 30,
     media_enabled: true,
     rtp_codec: 'G711_ULAW' as const,
     rtp_ptime: 20,
@@ -123,9 +124,14 @@ interface TrafficStore {
   cleanupStatus: CleanupStatus | null
   setCleanupStatus: (s: CleanupStatus | null) => void
 
-  // Pool counts (from live metrics)
+  // Pool counts (from live metrics, 3-state granularity).
+  // nonIdleCount is the legacy combined view (settingUp + established) kept
+  // for backward compatibility; the GUI's "currently in call" tile reads
+  // establishedCount instead.
   idleCount: number
   nonIdleCount: number
+  settingUpCount: number
+  establishedCount: number
   regOnlyCount: number
 
   // Live metrics
@@ -170,6 +176,8 @@ const initialState = {
   cleanupStatus: null as CleanupStatus | null,
   idleCount: 0,
   nonIdleCount: 0,
+  settingUpCount: 0,
+  establishedCount: 0,
   regOnlyCount: 0,
   uacMetrics: null,
   metricsHistory: [] as MetricsHistoryPoint[],
@@ -252,6 +260,8 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
         phase: mappedPhase,
         idleCount: m.idle_count ?? state.idleCount,
         nonIdleCount: m.non_idle_count ?? state.nonIdleCount,
+        settingUpCount: m.setting_up_count ?? state.settingUpCount,
+        establishedCount: m.established_count ?? state.establishedCount,
         regOnlyCount: m.reg_only_count ?? state.regOnlyCount,
         cleanupStatus,
         metricsHistory: [

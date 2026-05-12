@@ -59,6 +59,7 @@ const DEFAULTS: RawVMFormValues = {
   tls_server_name: '',
   cps: '1',
   hold_time_seconds: '5',
+  ramp_up_seconds: '30',
   media_enabled: true,
   rtp_codec: 'G711_ULAW',
   rtp_ptime: '20',
@@ -115,6 +116,7 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     tls_server_name:    u.tls_server_name  ?? '',
     cps:                String(u.cps               ?? parseFloat(DEFAULTS.cps)),
     hold_time_seconds:  String(u.hold_time_seconds ?? parseFloat(DEFAULTS.hold_time_seconds)),
+    ramp_up_seconds:    String(u.ramp_up_seconds   ?? parseInt(DEFAULTS.ramp_up_seconds)),
     media_enabled:      u.media_enabled    ?? true,
     rtp_codec:          (u.rtp_codec       ?? 'G711_ULAW') as RtpCodec,
     rtp_ptime:          String(u.rtp_ptime ?? parseInt(DEFAULTS.rtp_ptime)),
@@ -160,6 +162,7 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     timer_b_seconds: raw.timer_b_seconds ? parseInt(raw.timer_b_seconds) : undefined,
     cps: parseFloat(raw.cps) || 0,
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
+    ramp_up_seconds: raw.ramp_up_seconds ? parseInt(raw.ramp_up_seconds) : undefined,
     media_enabled: raw.media_enabled,
     rtp_codec: raw.rtp_codec as RtpCodec,
     rtp_ptime: raw.rtp_ptime ? parseInt(raw.rtp_ptime) : undefined,
@@ -205,7 +208,7 @@ function ConfigTabTrigger({
   label,
   errCount,
 }: {
-  value: 'server' | 'traffic' | 'media'
+  value: 'server' | 'signaling' | 'media' | 'traffic'
   label: string
   errCount: number
 }) {
@@ -324,7 +327,7 @@ export function VMPairBook() {
   // Active config tab. Defaults to "server" — the most-edited group on a
   // first-time setup. Controlled (vs. defaultValue) so we can auto-switch
   // to the first tab containing errors after Validate is clicked.
-  const [activeTab, setActiveTab] = useState<'server' | 'traffic' | 'media'>('server')
+  const [activeTab, setActiveTab] = useState<'server' | 'signaling' | 'media' | 'traffic'>('server')
   const reachabilityTriggeredRef = useRef(false)
 
   // Load full config from localStorage on first mount
@@ -453,7 +456,7 @@ export function VMPairBook() {
   // Per-tab error counts — used to render small red badges on each tab
   // trigger so users see at a glance which tab needs attention.
   const tabErrCount = useCallback(
-    (tab: 'server' | 'traffic' | 'media') =>
+    (tab: 'server' | 'signaling' | 'media' | 'traffic') =>
       TAB_FIELDS[tab].reduce((n, f) => (errors[f] ? n + 1 : n), 0),
     [errors],
   )
@@ -465,8 +468,9 @@ export function VMPairBook() {
       return
     }
     // Validation failed — jump to the first tab containing an error so the
-    // user sees the offending field without having to click around.
-    for (const tab of ['server', 'traffic', 'media'] as const) {
+    // user sees the offending field without having to click around. Order
+    // here matches the visible tab order (server → signaling → media → traffic).
+    for (const tab of ['server', 'signaling', 'media', 'traffic'] as const) {
       if (tabErrCount(tab) > 0) {
         setActiveTab(tab)
         break
@@ -596,7 +600,7 @@ export function VMPairBook() {
             {/* Tabs */}
             <Tabs
               value={activeTab}
-              onValueChange={(v) => setActiveTab(v as 'server' | 'traffic' | 'media')}
+              onValueChange={(v) => setActiveTab(v as 'server' | 'signaling' | 'media' | 'traffic')}
               className="gap-0"
             >
               {/* Tab strip — pills inside a single slate-tinted container,
@@ -605,7 +609,10 @@ export function VMPairBook() {
                   group; the active pill is solid orange (fill + white
                   text) and stands out unmistakably against the inactive
                   transparent pills. Symmetric vertical padding (py-3)
-                  centers the pill row. */}
+                  centers the pill row.
+
+                  Tab order is fixed: SERVER & AUTH → SIGNALING → MEDIA & QOS
+                  → TRAFFIC. Labels are intentionally UPPERCASE per UX spec. */}
               <div className="border-b border-border bg-card/40 px-4 py-3">
                 <TabsList
                   variant="default"
@@ -614,9 +621,10 @@ export function VMPairBook() {
                     'border border-slate-700/60 bg-slate-800/60',
                   )}
                 >
-                  <ConfigTabTrigger value="server"  label="Server & Auth"          errCount={hasValidated ? tabErrCount('server')  : 0} />
-                  <ConfigTabTrigger value="traffic" label="Traffic & Registration" errCount={hasValidated ? tabErrCount('traffic') : 0} />
-                  <ConfigTabTrigger value="media"   label="Media & QoS"            errCount={hasValidated ? tabErrCount('media')   : 0} />
+                  <ConfigTabTrigger value="server"    label="SERVER & AUTH"  errCount={hasValidated ? tabErrCount('server')    : 0} />
+                  <ConfigTabTrigger value="signaling" label="SIGNALING"      errCount={hasValidated ? tabErrCount('signaling') : 0} />
+                  <ConfigTabTrigger value="media"     label="MEDIA & QOS"    errCount={hasValidated ? tabErrCount('media')     : 0} />
+                  <ConfigTabTrigger value="traffic"   label="TRAFFIC"        errCount={hasValidated ? tabErrCount('traffic')   : 0} />
                 </TabsList>
               </div>
 
@@ -631,15 +639,22 @@ export function VMPairBook() {
                 />
               </TabsContent>
 
-              <TabsContent value="traffic" className="m-0">
+              <TabsContent value="signaling" className="m-0">
                 <VMConfigPanel
                   raw={raw} onChange={handleChange} touched={touched} onBlur={handleBlur}
                   errors={errors} warnings={warnings}
                   reachability={reachability}
                   onCheckReachability={() => checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)}
                   onResetSection={handleResetSection}
-                  tab="traffic"
+                  tab="signaling"
                 />
+                {/* SIP-side Advanced rows (REGISTER batching, retry,
+                    SUBSCRIBE concurrency, TCP keepalive, 100rel) are
+                    rendered here — semantically grouped with their
+                    related VMConfig timer fields above. */}
+                <motion.div className="overflow-hidden border-t border-border">
+                  <AdvancedSettings pairIndex={activePairIndex} tab="signaling" />
+                </motion.div>
               </TabsContent>
 
               <TabsContent value="media" className="m-0">
@@ -651,12 +666,23 @@ export function VMPairBook() {
                   onResetSection={handleResetSection}
                   tab="media"
                 />
-                {/* AdvancedSettings (Pre-Phase tuning, RTP advanced, QoS,
-                    RTCP SR) lives in the Media & QoS tab — that's where
-                    most of its knobs are semantically grouped. */}
+                {/* Media-side Advanced rows (RTP advanced, QoS, RTCP SR,
+                    PCAP, metrics interval) — grouped with the Media (RTP)
+                    section above. */}
                 <motion.div className="overflow-hidden border-t border-border">
-                  <AdvancedSettings pairIndex={activePairIndex} />
+                  <AdvancedSettings pairIndex={activePairIndex} tab="media" />
                 </motion.div>
+              </TabsContent>
+
+              <TabsContent value="traffic" className="m-0">
+                <VMConfigPanel
+                  raw={raw} onChange={handleChange} touched={touched} onBlur={handleBlur}
+                  errors={errors} warnings={warnings}
+                  reachability={reachability}
+                  onCheckReachability={() => checkReachability(raw.vm_ip, parseInt(raw.metrics_port) || 0)}
+                  onResetSection={handleResetSection}
+                  tab="traffic"
+                />
               </TabsContent>
             </Tabs>
           </div>

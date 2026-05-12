@@ -98,24 +98,33 @@ function AdvancedField({
 // Token row (collapsed read-only summary)
 // ---------------------------------------------------------------------------
 
-function TokenRow({ s }: { s: AdvancedSettingsType }) {
+// Per-tab token lists. The collapsed token row only shows the tokens that
+// belong to the currently rendered tab so the row stays scannable. 'all'
+// preserves the legacy single-row behaviour (used by ConfigSummary, etc.).
+type AdvancedTab = 'signaling' | 'media' | 'all'
+
+function TokenRow({ s, tab = 'all' }: { s: AdvancedSettingsType; tab?: AdvancedTab }) {
   const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
 
-  // qos_enabled / qos_mos_estimation default to true; show a token only when
-  // the admin has explicitly opted out, to keep the row uncluttered.
-  const qosTokens: string[] = []
-  if (s.qos_enabled === false) qosTokens.push('qos: off')
-  else if (s.qos_mos_estimation === false) qosTokens.push('qos: jitter+loss')
-  // RTCP SR defaults to OFF; when enabled, surface it prominently — the
-  // admin needs to know this risky feature is active at a glance.
-  if (s.rtcp_sr_enabled) qosTokens.push(`rtcp-sr: ${s.rtcp_sr_interval_seconds ?? 5}s`)
-
-  const tokens = [
+  // Signaling-side tokens (REGISTER batching, retries, SUBSCRIBE concurrency,
+  // TCP keepalive, 100rel toggle).
+  const signalingTokens = [
     `batch_size: ${s.register_batch_size}`,
     `batch_delay: ${s.register_batch_delay_ms}ms`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
     `subscribe: ${s.subscribe_concurrency}`,
+    `tcp_keepalive: ${s.tcp_keepalive_seconds === 0 ? 'off' : `${s.tcp_keepalive_seconds}s`}`,
+    `100rel: ${s.use_100rel ? 'on' : 'off'}`,
+  ]
+
+  // Media-side tokens (RTP shape, burst, keepalive, PCAP, refresh, QoS, RTCP SR).
+  const qosTokens: string[] = []
+  if (s.qos_enabled === false) qosTokens.push('qos: off')
+  else if (s.qos_mos_estimation === false) qosTokens.push('qos: jitter+loss')
+  if (s.rtcp_sr_enabled) qosTokens.push(`rtcp-sr: ${s.rtcp_sr_interval_seconds ?? 5}s`)
+
+  const mediaTokens = [
     `rtp: ${modeLabel}`,
     `burst: ${s.rtp_burst_seconds}s`,
     `keepalive: ${s.rtp_keepalive_interval}s`,
@@ -123,6 +132,11 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
     ...(s.rtp_pcap ? ['pcap: on'] : []),
     ...qosTokens,
   ]
+
+  const tokens =
+    tab === 'signaling' ? signalingTokens :
+    tab === 'media'     ? mediaTokens :
+    [...signalingTokens, ...mediaTokens]
 
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -140,10 +154,35 @@ function TokenRow({ s }: { s: AdvancedSettingsType }) {
 // Main component
 // ---------------------------------------------------------------------------
 
-export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
+export function AdvancedSettings({
+  pairIndex,
+  tab = 'all',
+}: {
+  pairIndex: number
+  /**
+   * Which slice of advanced settings to render:
+   *  - 'signaling' : Pre-Phase / Registration block + TCP keepalive + 100rel
+   *  - 'media'     : RTP block + Reporting Refresh + Media QoS + RTCP SR
+   *  - 'all'       : full panel (legacy single-page rendering)
+   */
+  tab?: AdvancedTab
+}) {
   const { pairs, updateAdvancedSettings } = useTrafficStore()
   const saved: AdvancedSettingsType =
     pairs[pairIndex]?.advancedSettings ?? { ...DEFAULT_ADVANCED_SETTINGS }
+
+  // Tab gates — drive both the token row's filtering and the expanded
+  // body's field groups so the same component renders cleanly under
+  // either Signaling or Media tab without duplicating sections.
+  const showSignaling = tab === 'all' || tab === 'signaling'
+  const showMedia     = tab === 'all' || tab === 'media'
+
+  // Header label adapts to the active tab so the operator sees an
+  // accurate description of what the panel actually contains.
+  const headerLabel =
+    tab === 'signaling' ? 'Advanced Settings — Registration & SIP'
+    : tab === 'media'   ? 'Advanced Settings — RTP & Media QoS'
+    :                     'Advanced Settings — Registration & RTP'
 
   const [isOpen, setIsOpen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -187,11 +226,16 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
   }
 
   const handleSave = () => {
-    const ALLOW_ZERO: Set<string> = new Set(['register_batch_delay_ms'])
+    const ALLOW_ZERO: Set<string> = new Set([
+      'register_batch_delay_ms',
+      // TCP keepalive: 0 explicitly disables; non-zero range checked below.
+      'tcp_keepalive_seconds',
+    ])
     const SKIP: Set<string> = new Set([
       'rtp_mode', 'rtp_pcap',
       'qos_enabled', 'qos_mos_estimation',
       'rtcp_sr_enabled',
+      'use_100rel',
     ])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
     for (const [key, val] of Object.entries(draft)) {
@@ -207,6 +251,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
           ALLOW_ZERO.has(key) ? 'Must be ≥ 0' : 'Must be a positive number'
       } else if (key === 'rtcp_sr_interval_seconds' && (v < 1 || v > 60)) {
         newErrors[key as keyof AdvancedSettingsType] = 'Must be between 1 and 60 seconds'
+      } else if (key === 'tcp_keepalive_seconds' && v > 0 && (v < 5 || v > 300)) {
+        // Non-zero keepalive must fall in [5, 300] seconds — shorter is
+        // wasteful chatter, longer leaves dead sockets undetected past
+        // most NAT idle timeouts.
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be 0 (disabled) or between 5 and 300 seconds'
       }
     }
     if (Object.keys(newErrors).length > 0) { setErrors(newErrors); return }
@@ -238,7 +287,7 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
         >
           <Settings2 className="size-4 shrink-0 text-indigo-400" />
           <span className="text-sm font-bold uppercase tracking-wide text-slate-100">
-            Advanced Settings — Registration &amp; RTP
+            {headerLabel}
           </span>
           <ChevronDown
             className={cn(
@@ -271,10 +320,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
         </div>
       </div>
 
-      {/* Token row (collapsed) */}
+      {/* Token row (collapsed) — filtered to the active tab so each tab
+          shows only its own knobs at a glance. */}
       {!isOpen && (
         <div className="border-t border-slate-700/40 px-5 py-2">
-          <TokenRow s={saved} />
+          <TokenRow s={saved} tab={tab} />
         </div>
       )}
 
@@ -290,9 +340,17 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
             className="overflow-hidden"
           >
             <div className="border-t border-slate-700/40 px-5 py-3 space-y-3">
-              <div className="grid grid-cols-2 gap-x-6 gap-y-2">
+              {/* Top grid is two columns when both halves are visible
+                  ('all' tab); collapses to one column when only one side
+                  is requested. The empty-side render is suppressed by the
+                  showSignaling / showMedia gates below. */}
+              <div className={cn(
+                'grid gap-x-6 gap-y-2',
+                showSignaling && showMedia ? 'grid-cols-2' : 'grid-cols-1',
+              )}>
 
-                {/* Left — Pre-Phase / Registration */}
+                {/* Left — Pre-Phase / Registration (Signaling tab) */}
+                {showSignaling && (
                 <div className="space-y-1">
                   <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-blue-300">
                     <span className="h-4 w-0.5 shrink-0 rounded-full bg-blue-400" />
@@ -347,8 +405,10 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                     onChange={set('subscribe_concurrency')}
                   />
                 </div>
+                )}
 
-                {/* Right — RTP */}
+                {/* Right — RTP (Media tab) */}
+                {showMedia && (
                 <div className="space-y-1">
                   <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-indigo-300">
                     <span className="h-4 w-0.5 shrink-0 rounded-full bg-indigo-400" />
@@ -439,9 +499,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                     </>
                   )}
                 </div>
+                )}
               </div>
 
-              {/* Full-width — Reporting Refresh Interval */}
+              {/* Full-width — Reporting Refresh Interval (Media tab) */}
+              {showMedia && (
               <div className="border-t border-slate-700/30 pt-3">
                 <AdvancedField
                   label="Reporting Refresh Interval (s)"
@@ -454,8 +516,93 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   onChange={set('metrics_interval')}
                 />
               </div>
+              )}
 
-              {/* Full-width — Media QoS */}
+              {/* Full-width — TCP Keepalive (Signaling tab) */}
+              {showSignaling && (
+              <div className="border-t border-slate-700/30 pt-3">
+                <AdvancedField
+                  label="TCP Keepalive (s)"
+                  value={draft.tcp_keepalive_seconds}
+                  disabled={disabled}
+                  min={0}
+                  error={errors.tcp_keepalive_seconds}
+                  hint="OS-level TCP keepalive period for the SBC connection. Detects silently-dropped sockets (NAT/firewall idle, SBC idle timeouts) within ~5 minutes on Linux. 0 disables. Valid non-zero range: 5..300."
+                  tooltip="Without keepalive, a stateful firewall or SBC can silently drop a long-idle TCP socket without our side noticing — the next INVITE then fails with 500 because the SBC has lost the registration binding. Recommended default: 30s."
+                  onChange={set('tcp_keepalive_seconds')}
+                />
+              </div>
+              )}
+
+              {/* Full-width — 100rel (Signaling tab)
+                  Default OFF; SBC-bug-aware. Risk-banner styled like the
+                  RTCP-SR block to make it clear this is opt-in only. */}
+              {showSignaling && (
+              <div className="border-t border-slate-700/30 pt-3">
+                <div className={cn(
+                  'rounded-md border p-3 space-y-2',
+                  draft.use_100rel
+                    ? 'border-amber-500/50 bg-amber-500/5'
+                    : 'border-amber-500/25 bg-amber-500/5',
+                )}>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-amber-300">
+                      Advanced
+                    </span>
+                    <span className="text-xs font-bold uppercase tracking-widest text-amber-200">
+                      100rel — Reliable Provisional Responses (RFC 3262)
+                    </span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button type="button" className="text-amber-400/70 hover:text-amber-300 transition-colors">
+                          <Info className="size-3" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-sm text-xs leading-relaxed">
+                        When enabled, UAC advertises <code className="font-mono text-amber-300">Supported: 100rel</code> on
+                        outbound INVITEs and the call goes through the PRACK loop:
+                        180 (Require:100rel + RSeq) → PRACK → 200/PRACK → 200/INVITE.
+                        <br /><br />
+                        <strong className="text-amber-300">Risk:</strong> at least one SBC has a TCP send-pipeline bug that
+                        deterministically loses the 200/INVITE when 200/PRACK and 200/INVITE leave back-to-back on the same
+                        dialog (15-byte sequence-number gap, never retransmitted). When this flag is on, the engine inserts
+                        a 50 ms gap between 200/PRACK and 200/INVITE on the UAS side as a workaround. Leave OFF unless the
+                        SBC is independently verified.
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-x-8 gap-y-1">
+                    <div className="space-y-1">
+                      <Label className="text-sm font-semibold text-slate-200/90">100rel</Label>
+                      <button
+                        type="button"
+                        disabled={disabled}
+                        onClick={() => setDraft((prev) => ({ ...prev, use_100rel: !prev.use_100rel }))}
+                        className={cn(
+                          'inline-flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors',
+                          draft.use_100rel
+                            ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
+                            : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-amber-400/40',
+                          disabled && 'opacity-70 cursor-default',
+                        )}
+                      >
+                        <span className={cn(
+                          'inline-block size-3 rounded-sm border-2 transition-colors',
+                          draft.use_100rel ? 'border-amber-400 bg-amber-400' : 'border-zinc-400 bg-transparent'
+                        )} />
+                        {draft.use_100rel
+                          ? 'Enabled — PRACK loop active, 50 ms gap before 200/INVITE'
+                          : 'Disabled (default — safe)'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              )}
+
+              {/* Full-width — Media QoS (Media tab) */}
+              {showMedia && (
               <div className="border-t border-slate-700/30 pt-3 space-y-3">
                 <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-sky-300">
                   <span className="h-4 w-0.5 shrink-0 rounded-full bg-sky-400" />
@@ -611,10 +758,11 @@ export function AdvancedSettings({ pairIndex }: { pairIndex: number }) {
                   </div>
                 </div>
               </div>
+              )}
 
               {!isEditing && (
                 <div className="border-t border-slate-700/30 pt-2">
-                  <TokenRow s={saved} />
+                  <TokenRow s={saved} tab={tab} />
                 </div>
               )}
             </div>

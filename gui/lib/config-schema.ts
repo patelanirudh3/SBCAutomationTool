@@ -86,6 +86,10 @@ export const VMConfigSchema = z
 
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
+    // Wall-clock seconds for the engine to ramp from 0 cps → configured cps.
+    // 0 disables ramp (full speed from t=0). Mirrors backend
+    // VMConfig.RampUpSeconds semantics in go/internal/engine/call_engine.go.
+    ramp_up_seconds: z.number().int().nonnegative('Ramp-up must be ≥ 0').max(3600, 'Cannot exceed 3600s').optional(),
     media_enabled: z.boolean().optional(),
     rtp_codec: RtpCodecSchema.optional(),
     rtp_ptime: z.number().int().min(10).max(80).optional(),

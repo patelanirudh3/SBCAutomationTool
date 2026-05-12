@@ -67,6 +67,14 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     { label: 'CPS', value: raw.cps },
     ...(bhcc !== null ? [{ label: 'BHCC', value: bhcc.toLocaleString(), muted: true }] : []),
     { label: 'Hold', value: `${raw.hold_time_seconds}s` },
+    {
+      label: 'Ramp-Up',
+      // 0 (or empty) explicitly means "no ramp" — show a clear marker
+      // instead of "0s" so the operator doesn't mistake it for a typo.
+      value: raw.ramp_up_seconds && parseInt(raw.ramp_up_seconds) > 0
+        ? `${raw.ramp_up_seconds}s`
+        : 'off',
+    },
     { label: 'Mode', value: raw.traffic_mode || '—' },
     ...(raw.traffic_mode === 'smoke' ? [{ label: 'Calls', value: raw.call_count }] : []),
     ...(raw.traffic_mode === 'timed' ? [{ label: 'Duration', value: `${raw.duration_hours}h` }] : []),

@@ -12,6 +12,7 @@ import { useTrafficStore } from '@/store/traffic'
 import {
   getMetricsFor, startPrepFor, startRegSubFor, abortRegSubFor,
   startTrafficFor, startTestFor, resetTestFor, startCleanupFor,
+  APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { PrepStatus } from '@/types'
@@ -397,8 +398,19 @@ export function PrePhasePanel() {
       setRegStarted(true)
       setPhase('REGSUB_RUNNING')
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to start reg/sub'
-      setError(`Could not start Reg/Sub at http://${vmIp}:${vmPort} — ${msg}`)
+      // Treat 409 as benign — it means the lifecycle already advanced past
+      // REGSUB_READY (e.g. another tab clicked first, the click was a
+      // duplicate, or a stale buffered signal was consumed). Polling will
+      // catch up the GUI state automatically; flip the local flag now so
+      // the progress bars render immediately rather than waiting for the
+      // next polling tick.
+      if (err instanceof APIError && err.status === 409) {
+        setRegStarted(true)
+        setPhase('REGSUB_RUNNING')
+      } else {
+        const msg = err instanceof Error ? err.message : 'Failed to start reg/sub'
+        setError(`Could not start Reg/Sub at http://${vmIp}:${vmPort} — ${msg}`)
+      }
     } finally {
       setIsStartingReg(false)
     }
@@ -510,6 +522,22 @@ export function PrePhasePanel() {
   const subAmberPct = Math.round((displayRegOnly / total) * 100)
   const failedCount = regDone ? Math.max(0, total - regCount) : 0
 
+  // regSubViewActive — derived flag that tells us "the Reg/Sub flow is in
+  // progress or has produced data, so render the progress card and pool
+  // badges". Driving this from polling-derived state (regCount, regTotal,
+  // etc.) instead of just the local regStarted click flag means a browser
+  // refresh during pre-phase still surfaces the progress UI even though
+  // the click handler in this component instance never ran. Also covers
+  // the 409 "click was too late" path — polling has already populated
+  // regCount/regTotal so the card renders immediately.
+  const regSubViewActive =
+    regStarted ||
+    regDone ||
+    regCount > 0 ||
+    regTotal > 0 ||
+    subCount > 0 ||
+    subTotal > 0
+
   // The Prep button is locked while running OR while Reg/Sub has started.
   const prepDisabled = prepStatus === 'running' || prepStatus === 'done' || isStartingPrep || regStarted || !engineIsReady
 
@@ -575,7 +603,12 @@ export function PrePhasePanel() {
           )}
 
           {/* ── Start button row ──────────────────────────────────────── */}
-          {!regStarted && (
+          {/* Gated on the derived regSubViewActive flag, not just
+              !regStarted, so a refresh after pre-phase has already
+              completed (regDone=true via polling) doesn't expose a
+              destructive re-register click. The pool-counts row + ready
+              banner below render in that case instead. */}
+          {!regSubViewActive && (
             <div className="flex flex-col items-center gap-3">
               <p className="text-sm text-muted-foreground text-center">
                 Click <span className="font-semibold text-foreground">Start Reg / Sub</span> to register
@@ -620,7 +653,7 @@ export function PrePhasePanel() {
           )}
 
           {/* ── Registration Status card ──────────────────────────────── */}
-          {regStarted && (
+          {regSubViewActive && (
             <div className="space-y-4 rounded-xl border border-border bg-card p-5">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-foreground">Reg / Sub Status</h3>
@@ -668,7 +701,7 @@ export function PrePhasePanel() {
           )}
 
           {/* ── Pool count badges ─────────────────────────────────────── */}
-          {regStarted && (
+          {regSubViewActive && (
             <div className="grid grid-cols-3 gap-3">
               <CountBadge label="Ready for Traffic" value={displayIdle}    color="emerald" pulsing={!regDone} />
               <CountBadge label="Reg w/o Sub"       value={displayRegOnly} color="amber"   pulsing={!regDone} />
@@ -677,7 +710,7 @@ export function PrePhasePanel() {
           )}
 
           {/* ── Abort button (visible only while reg/sub running) ─────── */}
-          {regStarted && !regDone && !isMock && (
+          {regSubViewActive && !regDone && !isMock && (
             <div className="flex justify-end">
               <Button
                 size="sm"

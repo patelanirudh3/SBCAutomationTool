@@ -58,6 +58,7 @@ export type RawVMFormValues = {
   // Traffic
   cps: string
   hold_time_seconds: string
+  ramp_up_seconds: string
   // Media
   media_enabled: boolean
   rtp_codec: RtpCodec
@@ -75,12 +76,16 @@ export type RawVMFormValues = {
  * Tab identifier — selects which group of sections the panel renders.
  * "all" preserves the legacy single-page rendering and is used as the
  * fallback when the parent doesn't pass a tab. Tabs map:
- *   server  → Traffic Agent Host + Remote SIP Server (incl. TLS / Failover / DNS)
- *   traffic → Extension Pool + Call Traffic + Registration & SIP Timers
- *   media   → Media (RTP). The AdvancedSettings card is rendered separately
- *             by the parent (VMPairBook) inside the same Media & QoS tab.
+ *   server    → Traffic Agent Host + Remote SIP Server (incl. TLS / Failover / DNS)
+ *   signaling → Registration & SIP Timers (REGISTER/SUBSCRIBE expires + cadence,
+ *               RFC 3261 timers, TCP keepalive, 100rel toggle).
+ *   traffic   → Extension Pool + Call Traffic (cps, hold time, ramp-up,
+ *               traffic mode, call count / duration / start time).
+ *   media     → Media (RTP) + QoS / RTCP. The AdvancedSettings card is
+ *               rendered separately by the parent (VMPairBook), filtered
+ *               per-tab via its `tab` prop.
  */
-export type VMConfigTab = 'server' | 'traffic' | 'media' | 'all'
+export type VMConfigTab = 'server' | 'signaling' | 'traffic' | 'media' | 'all'
 
 export interface VMConfigPanelProps {
   raw: RawVMFormValues
@@ -107,10 +112,14 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name',
   ],
+  signaling: [
+    'register_expires', 'subscribe_expires', 'register_rate_cps',
+    't1_ms', 'timer_b_seconds',
+  ],
   traffic: [
     'ext_start', 'ext_end',
-    'cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
-    'register_expires', 'subscribe_expires', 'register_rate_cps', 't1_ms', 'timer_b_seconds',
+    'cps', 'hold_time_seconds', 'ramp_up_seconds',
+    'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
   ],
   media: ['media_enabled', 'rtp_codec', 'rtp_ptime'],
 }
@@ -134,7 +143,7 @@ const SECTION_FIELDS = {
                    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
-  call_traffic:   ['cps', 'hold_time_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
+  call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
 
@@ -519,9 +528,10 @@ export function VMConfigPanel({
   // Tab gates — each section renders only when its tab is selected.
   // 'all' (the default) renders every section so the legacy single-page
   // layout still works for any caller that doesn't pass a tab prop.
-  const showServer  = tab === 'all' || tab === 'server'
-  const showTraffic = tab === 'all' || tab === 'traffic'
-  const showMedia   = tab === 'all' || tab === 'media'
+  const showServer    = tab === 'all' || tab === 'server'
+  const showSignaling = tab === 'all' || tab === 'signaling'
+  const showTraffic   = tab === 'all' || tab === 'traffic'
+  const showMedia     = tab === 'all' || tab === 'media'
   const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
   const t = (field: string) => touched.has(field)
@@ -945,8 +955,8 @@ export function VMConfigPanel({
       </div>
       )}
 
-      {/* ── Registration & Subscription (Traffic tab, collapsed default) ─ */}
-      {showTraffic && (() => {
+      {/* ── Registration & SIP Timers (Signaling tab, collapsed default) ─ */}
+      {showSignaling && (() => {
         const regDirty =
           raw.register_expires !== DEFAULTS_REGISTRATION.register_expires ||
           raw.subscribe_expires !== DEFAULTS_REGISTRATION.subscribe_expires ||
@@ -1099,6 +1109,31 @@ export function VMConfigPanel({
           holdError={e('hold_time_seconds')}
           holdWarning={w('hold_time_seconds')}
         />
+
+        {/* Ramp-up duration (wall-clock seconds). Engine ramps cps from
+            0 → configured cps linearly over this window. Set 0 to fire
+            at full cps from t=0. */}
+        <FormRow
+          label="Ramp-Up"
+          hint="Wall-clock seconds to climb from 0 cps to the configured cps. 0 = no ramp (full speed immediately)."
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              max={3600}
+              step={1}
+              value={raw.ramp_up_seconds}
+              onChange={(ev) => onChange('ramp_up_seconds', ev.target.value)}
+              onBlur={() => onBlur('ramp_up_seconds')}
+              placeholder="30"
+              className="w-20 font-mono"
+              aria-invalid={t('ramp_up_seconds') && !!errors.ramp_up_seconds ? true : undefined}
+            />
+            <span className="text-xs text-slate-400">s</span>
+          </div>
+          {e('ramp_up_seconds') && <FieldError error={e('ramp_up_seconds')} />}
+        </FormRow>
 
         {/* Traffic mode: smoke / timed / unlimited */}
         <div className="space-y-2 pt-1">

@@ -81,6 +81,7 @@ export const MOCK_UAC_METRICS: TrafficMetrics = {
 export const MOCK_AGGREGATE: AggregateMetrics = {
   total_attempted: 20,
   total_answered: 19,
+  total_acknowledged: 19,
   total_completed: 18,
   total_failed: 2,
   aggregate_asr: 90.0,

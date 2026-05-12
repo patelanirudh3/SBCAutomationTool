@@ -9,23 +9,43 @@ const PAGE_SIZE = 10
 
 interface FailedCallsTableProps {
   events: CallEvent[]
+  /** Optional engine-reported failure count. When provided AND larger than
+   *  the per-call records list, the table renders an explanatory
+   *  placeholder so the operator can see the discrepancy instead of the
+   *  misleading "No failed calls" message. */
+  reportedFailedCount?: number
 }
 
-export function FailedCallsTable({ events }: FailedCallsTableProps) {
-  const failed = events.filter((e) => e.result === 'FAILED')
+export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTableProps) {
+  // Filter to UAC-only so each call session shows up once (the events list
+  // contains both UAC and UAS legs from /api/calls — kept for spine
+  // correlation, but the failure UI counts sessions, not legs).
+  const failed = events.filter((e) => e.direction !== 'uas' && e.result === 'FAILED')
   const [open, setOpen]       = useState(false)
   const [page, setPage]       = useState(1)
 
   const totalPages = Math.max(1, Math.ceil(failed.length / PAGE_SIZE))
   const pageItems  = failed.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
-  // Auto-expand when failures appear
-  const autoExpand = failed.length > 0 && !open
+  // Discrepancy detector: engine counters say there were failures but the
+  // per-call records list is empty. Most often happens when the engine
+  // exits before flushing call records (e.g. abrupt shutdown).
+  const hasReportedButEmpty =
+    failed.length === 0 &&
+    typeof reportedFailedCount === 'number' &&
+    reportedFailedCount > 0
+
+  // Auto-expand when failures appear OR when the discrepancy hint applies
+  const autoExpand = (failed.length > 0 || hasReportedButEmpty) && !open
+
+  // The header pill prefers the engine-reported count when records are
+  // missing so the badge stays consistent with the AggregatePanel.
+  const headerCount = failed.length > 0 ? failed.length : (reportedFailedCount ?? 0)
 
   return (
     <div className={cn(
       'rounded-xl border transition-colors',
-      failed.length > 0 ? 'border-rose-500/30 bg-rose-950/10' : 'border-border bg-card',
+      headerCount > 0 ? 'border-rose-500/30 bg-rose-950/10' : 'border-border bg-card',
     )}>
 
       {/* Header / toggle */}
@@ -34,16 +54,16 @@ export function FailedCallsTable({ events }: FailedCallsTableProps) {
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 px-4 py-3 text-left"
       >
-        <XCircle className={cn('size-4 shrink-0', failed.length > 0 ? 'text-rose-400' : 'text-muted-foreground')} />
+        <XCircle className={cn('size-4 shrink-0', headerCount > 0 ? 'text-rose-400' : 'text-muted-foreground')} />
         <span className={cn(
           'font-semibold text-sm',
-          failed.length > 0 ? 'text-rose-300' : 'text-muted-foreground',
+          headerCount > 0 ? 'text-rose-300' : 'text-muted-foreground',
         )}>
           Failed Calls
         </span>
-        {failed.length > 0 && (
+        {headerCount > 0 && (
           <span className="ml-1 rounded-full bg-rose-500/20 px-2 py-0.5 text-[11px] font-bold text-rose-400">
-            {failed.length.toLocaleString()}
+            {headerCount.toLocaleString()}
           </span>
         )}
         <span className="ml-auto">
@@ -57,7 +77,18 @@ export function FailedCallsTable({ events }: FailedCallsTableProps) {
       {(open || autoExpand) && (
         <div className="border-t border-rose-500/20">
           {failed.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-muted-foreground">No failed calls.</p>
+            hasReportedButEmpty ? (
+              <p className="px-4 py-6 text-center text-sm text-amber-300">
+                {reportedFailedCount!.toLocaleString()} failed calls reported by
+                the engine, but per-call records are unavailable. The engine
+                likely exited before flushing call records — check engine logs
+                for details.
+              </p>
+            ) : (
+              <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                No failed calls.
+              </p>
+            )
           ) : (
             <>
               {/* Table */}
