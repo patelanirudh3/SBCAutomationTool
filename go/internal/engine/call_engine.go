@@ -522,7 +522,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	var raw200 string
 	got180 := false
 	for !got180 {
-		ev, err := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
+		ev, err := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "100", "180", "183", "401_INVITE", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
@@ -563,6 +563,14 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			raw200 = raw
 			got180 = true
 
+		case code == "401_INVITE":
+			emit("AUTH_401", 401, 0, nil)
+			if err := ag.Handle401Invite(dialog, raw, rtpPort); err != nil {
+				result := fail(fmt.Sprintf("401 handling: %v", err))
+				e.complete(result)
+				return
+			}
+
 		case code == "407_INVITE":
 			emit("AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Invite(dialog, raw, rtpPort); err != nil {
@@ -592,7 +600,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		milestones.PrackSentMs = msSince(callStart)
 		emit("PRACK_SENT", 0, milestones.PrackSentMs, nil)
 
-		prackEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_PRACK", "407_PRACK", "_FINAL_FAIL")
+		prackEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_PRACK", "401_PRACK", "407_PRACK", "_FINAL_FAIL")
 		if err != nil {
 			sendCleanupOnTimeout()
 			result := fail("prack_200 timeout")
@@ -603,10 +611,46 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 		prackCode := prackEv.Code
 		if sip.IsFinalFailureCode(prackCode) {
-			tryHandleFinalFailure(rawPrackResp)
-			result := fail(fmt.Sprintf("Rejected with %s during PRACK", prackCode))
+			if strings.EqualFold(prackEv.CSeqMethod, "INVITE") {
+				ag.SendAckForFailure(dialog, rawPrackResp)
+				emit("CALL_FAILED", atoi(prackCode), 0, map[string]any{"reason": "final failure"})
+				result := fail(fmt.Sprintf("Rejected with %s while awaiting PRACK", prackCode))
+				e.complete(result)
+				return
+			}
+			sendCleanupOnTimeout()
+			result := fail(fmt.Sprintf("PRACK rejected with %s", prackCode))
 			e.complete(result)
 			return
+		}
+		if prackCode == "401_PRACK" {
+			emit("PRACK_AUTH_401", 401, 0, nil)
+			if err := ag.Handle401Prack(dialog, rawPrackResp); err != nil {
+				result := fail(fmt.Sprintf("prack_401_handling: %v", err))
+				e.complete(result)
+				return
+			}
+			prackAuthEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_PRACK", "_FINAL_FAIL")
+			if err != nil {
+				sendCleanupOnTimeout()
+				result := fail("prack_200 timeout after auth")
+				e.complete(result)
+				return
+			}
+			rawPrackAuth := prackAuthEv.Raw
+			if sip.IsFinalFailureCode(prackAuthEv.Code) {
+				if strings.EqualFold(prackAuthEv.CSeqMethod, "INVITE") {
+					if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
+						result := fail(fmt.Sprintf("Rejected with %s during PRACK auth wait", code))
+						e.complete(result)
+						return
+					}
+				}
+				sendCleanupOnTimeout()
+				result := fail(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code))
+				e.complete(result)
+				return
+			}
 		}
 		if prackCode == "407_PRACK" {
 			emit("PRACK_AUTH_407", 407, 0, nil)
@@ -623,8 +667,16 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				return
 			}
 			rawPrackAuth := prackAuthEv.Raw
-			if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
-				result := fail(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code))
+			if sip.IsFinalFailureCode(prackAuthEv.Code) {
+				if strings.EqualFold(prackAuthEv.CSeqMethod, "INVITE") {
+					if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
+						result := fail(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code))
+						e.complete(result)
+						return
+					}
+				}
+				sendCleanupOnTimeout()
+				result := fail(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code))
 				e.complete(result)
 				return
 			}
@@ -635,17 +687,35 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
-	if raw200 == "" {
-		var err error
-		okEv, waitErr := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "200_INVITE", "_FINAL_FAIL")
-		err = waitErr
-		if err != nil {
+	for raw200 == "" {
+		okEv, waitErr := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "200_INVITE", "401_INVITE", "407_INVITE", "_FINAL_FAIL")
+		if waitErr != nil {
 			sendCleanupOnTimeout()
 			result := fail("200_invite timeout")
 			e.complete(result)
 			return
 		}
 		raw200 = okEv.Raw
+		if okEv.Code == "401_INVITE" {
+			emit("AUTH_401", 401, 0, nil)
+			if err := ag.Handle401Invite(dialog, raw200, rtpPort); err != nil {
+				result := fail(fmt.Sprintf("401 handling while awaiting 200 INVITE: %v", err))
+				e.complete(result)
+				return
+			}
+			raw200 = ""
+			continue
+		}
+		if okEv.Code == "407_INVITE" {
+			emit("AUTH_407", 407, 0, nil)
+			if err := ag.Handle407Invite(dialog, raw200, rtpPort); err != nil {
+				result := fail(fmt.Sprintf("407 handling while awaiting 200 INVITE: %v", err))
+				e.complete(result)
+				return
+			}
+			raw200 = ""
+			continue
+		}
 		if code, handled := tryHandleFinalFailure(raw200); handled {
 			result := fail(fmt.Sprintf("Rejected with %s while awaiting 200 INVITE", code))
 			e.complete(result)

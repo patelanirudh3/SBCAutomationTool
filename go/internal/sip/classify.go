@@ -39,6 +39,19 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 				return "200_CANCEL", raw
 			}
 		}
+		if code == "401" {
+			switch method {
+			case "INVITE":
+				slog.Debug("ClassifyMessage", "eventCode", "401_INVITE", "code", code, "method", method)
+				return "401_INVITE", raw
+			case "PRACK":
+				slog.Debug("ClassifyMessage", "eventCode", "401_PRACK", "code", code, "method", method)
+				return "401_PRACK", raw
+			case "BYE":
+				slog.Debug("ClassifyMessage", "eventCode", "401_BYE", "code", code, "method", method)
+				return "401_BYE", raw
+			}
+		}
 		if code == "407" {
 			switch method {
 			case "INVITE":
@@ -78,7 +91,7 @@ func ClassifyMessage(raw string) (eventCode string, rawMsg string) {
 // IsFinalFailureCode returns true for a 3-digit SIP status code that is a
 // non-success final response not covered by an explicit handler — i.e. any
 // 4xx, 5xx, or 6xx response other than 401 and 407, which carry their own
-// dedicated event codes (e.g. "407_INVITE", "407_PRACK", "407_BYE").
+// dedicated event codes (e.g. "401_INVITE", "407_PRACK", "407_BYE").
 //
 // The CallEngine uses this together with the synthetic "_FINAL_FAIL"
 // wildcard event so that final-failure responses are processed via the

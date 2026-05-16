@@ -1011,14 +1011,28 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 	return a.Send(msg, "")
 }
 
-// SendAckForFailure sends ACK for a final failure response (4xx/5xx/6xx).
+// SendAckForFailure sends ACK for a non-2xx final response to INVITE.
+// RFC 3261 §17.1.1.3 requires this ACK to match the original INVITE client
+// transaction: same Request-URI, Call-ID, From, top Via branch, and CSeq number
+// with the method changed to ACK. The To header comes from the final response so
+// any remote tag assigned by the UAS is preserved.
 func (a *ExtensionAgent) SendAckForFailure(dialog *DialogState, rawResponse string) error {
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("ACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	target := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	if dialog.InviteMsg != nil {
+		if uri := dialog.InviteMsg.GetRequestURI(); uri != "" {
+			target = uri
+		}
+	}
+	msg.SetRequestLine(fmt.Sprintf("ACK %s SIP/2.0", target))
 	msg.AddHeader(sip.HdrCallID, dialog.CallID)
+	origVia := fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID())
 	if dialog.InviteMsg != nil {
 		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
 			msg.AddHeader(sip.HdrFrom, fh[0])
+		}
+		if via := dialog.InviteMsg.GetHeader(sip.HdrVia); len(via) > 0 {
+			origVia = via[0]
 		}
 	}
 
@@ -1027,10 +1041,18 @@ func (a *ExtensionAgent) SendAckForFailure(dialog *DialogState, rawResponse stri
 	if toHdrs := resp.GetHeader(sip.HdrTo); len(toHdrs) > 0 {
 		msg.AddHeader(sip.HdrTo, toHdrs[0])
 	}
-	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
+	msg.AddHeader(sip.HdrVia, origVia)
 	msg.AddHeader(sip.HdrMaxForwards, "70")
-	if cseqHdrs := resp.GetHeader(sip.HdrCSeq); len(cseqHdrs) > 0 {
-		msg.AddHeader(sip.HdrCSeq, cseqHdrs[0])
+	inviteCSeq := dialog.InviteCSeq
+	if inviteCSeq == 0 && dialog.InviteMsg != nil {
+		inviteCSeq = dialog.InviteMsg.GetCSeq()
+	}
+	if inviteCSeq == 0 {
+		inviteCSeq = dialog.CSeq
+	}
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d ACK", inviteCSeq))
+	for _, route := range dialog.RouteSet {
+		msg.AddHeader(sip.HdrRoute, route)
 	}
 	msg.AddHeader(sip.HdrContentLength, "0")
 
@@ -1370,19 +1392,31 @@ func (a *ExtensionAgent) DeregisterWildcardListener(ch chan WildcardEvent) {
 // Handle407Prack re-sends PRACK with Proxy-Authorization after a 407 challenge.
 // After SendPrack, dialog.CSeq was incremented once; so the INVITE CSeq used in
 // the original RAck is dialog.CSeq-1. The retry gets a new CSeq (dialog.CSeq++).
+func (a *ExtensionAgent) Handle401Prack(dialog *DialogState, raw401 string) error {
+	return a.handleAuthPrack(dialog, raw401, true)
+}
+
 func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) error {
-	challenge := sip.Parse407Challenge(raw407)
+	return a.handleAuthPrack(dialog, raw407, false)
+}
+
+func (a *ExtensionAgent) handleAuthPrack(dialog *DialogState, rawChallenge string, use401 bool) error {
+	challenge := sip.Parse407Challenge(rawChallenge)
+	if use401 {
+		challenge = sip.Parse401Challenge(rawChallenge)
+	}
 	realm := challenge.Realm
 	if realm == "" {
 		realm = a.Config.Domain
 	}
-	// [FIX-2] Update stored auth state with fresh nonce from this 407.
-	// Reset AuthNonceCount to 0 so the helper-driven nc starts at 1 on
-	// this new nonce per RFC 2617 §3.3.
-	dialog.ProxyAuthEnabled = true
-	dialog.AuthNonce = challenge.Nonce
-	dialog.AuthRealm = realm
-	dialog.AuthOpaque = challenge.Opaque
+	// Cache proxy auth for later in-dialog requests only when the challenge
+	// came from a proxy. WWW-auth credentials are used for this PRACK retry only.
+	if !use401 {
+		dialog.ProxyAuthEnabled = true
+		dialog.AuthNonce = challenge.Nonce
+		dialog.AuthRealm = realm
+		dialog.AuthOpaque = challenge.Opaque
+	}
 	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
@@ -1411,7 +1445,11 @@ func (a *ExtensionAgent) Handle407Prack(dialog *DialogState, raw407 string) erro
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d PRACK", dialog.CSeq))
 	msg.AddHeader(sip.HdrRAck, rackValue)
-	msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	if use401 {
+		msg.AddHeader(sip.HdrAuthorization, authHdr)
+	} else {
+		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	}
 	msg.AddHeader(sip.HdrContentLength, "0")
 
 	return a.Send(msg, "")
@@ -1463,6 +1501,43 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 	msg.AddHeader(sip.HdrContentLength, "0")
 
 	return a.Send(msg, "")
+}
+
+// Handle401Invite re-sends INVITE with Authorization after 401.
+// Like 407 handling, the 401 final response to INVITE must be ACKed before the
+// authenticated retry starts a new INVITE client transaction.
+func (a *ExtensionAgent) Handle401Invite(dialog *DialogState, raw401 string, rtpPort int) error {
+	challenge := sip.Parse401Challenge(raw401)
+	realm := challenge.Realm
+	if realm == "" {
+		realm = a.Config.Domain
+	}
+
+	cnonce := sip.GenCNonce()
+	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth", challenge.Opaque)
+
+	if dialog.InviteMsg != nil {
+		if err := a.SendAckForFailure(dialog, raw401); err != nil {
+			slog.Warn("ACK for 401 INVITE failed (non-fatal)", "ext", a.Ext, "err", err)
+		}
+
+		dialog.CSeq++
+		dialog.InviteCSeq = dialog.CSeq
+		dialog.InviteMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d INVITE", dialog.CSeq))
+		dialog.InviteMsg.RemoveHeader(sip.HdrAuthorization)
+		dialog.InviteMsg.AddHeader(sip.HdrAuthorization, authHdr)
+		dialog.InviteMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
+
+		sdpBody := dialog.InviteSDP
+		if sdpBody == "" {
+			sdpBody = BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
+			dialog.InviteSDP = sdpBody
+		}
+		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
+		return a.Send(dialog.InviteMsg, sdpBody)
+	}
+	return nil
 }
 
 // Handle407Invite re-sends INVITE with Proxy-Authorization after 407.
