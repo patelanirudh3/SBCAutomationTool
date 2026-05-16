@@ -415,6 +415,7 @@ trafficLoop:
 		// gets a fresh duration window).
 		trafficCtx := ctx
 		var trafficCancel context.CancelFunc = func() {}
+		callCtx, callCancel := context.WithCancel(ctx)
 		if cfg.TrafficMode == "timed" && cfg.DurationHours > 0 {
 			deadline := time.Duration(cfg.DurationHours * float64(time.Hour))
 			trafficCtx, trafficCancel = context.WithTimeout(ctx, deadline)
@@ -446,7 +447,7 @@ trafficLoop:
 
 		engineDone := make(chan error, 1)
 		go func() {
-			engineDone <- callEngine.Run(trafficCtx)
+			engineDone <- callEngine.RunWithCallContext(trafficCtx, callCtx)
 		}()
 
 		// Monitor phase-gate channels during traffic
@@ -473,6 +474,7 @@ trafficLoop:
 				case <-pctx.InterruptStopCh:
 					slog.Info("Interrupted stop received — cancelling in-flight calls")
 					trafficCancel()
+					callCancel()
 					callEngine.Stop()
 					<-engineDone
 					goto trafficDone
@@ -493,6 +495,7 @@ trafficLoop:
 
 	trafficDone:
 		trafficCancel()
+		callCancel()
 		collector.SetPhase("STOPPING")
 		collector.SetRunning(false)
 		slog.Info("Traffic phase complete (this iteration)")
@@ -642,7 +645,7 @@ func shutdownCleanup(
 		// Phase was already flipped to CLEANING_UP at the top of this fn.
 		collector.ResetCleanup(len(cleanupAgents))
 
-		slog.Info("Unregistering extensions",
+		slog.Info("Cleaning up extensions",
 			"count", len(cleanupAgents),
 			"concurrency", concurrency,
 			"waves", waves,
@@ -659,11 +662,23 @@ func shutdownCleanup(
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				err := a.Unregister(unregCtx)
-				if err != nil {
-					slog.Debug("Unregister error", "ext", a.Ext, "err", err)
+				unsubSkipped := !a.NeedsUnsubscribe()
+				unsubOK := true
+				if unsubSkipped {
+					slog.Debug("Unsubscribe skipped", "ext", a.Ext, "event", a.SubscriptionEvent())
+				} else {
+					unsubErr := a.Unsubscribe(unregCtx)
+					unsubOK = unsubErr == nil
+					if unsubErr != nil {
+						slog.Debug("Unsubscribe error", "ext", a.Ext, "event", a.SubscriptionEvent(), "err", unsubErr)
+					}
 				}
-				collector.IncrementCleanup(a.Ext, err == nil)
+				collector.IncrementCleanupUnsubscribe(a.Ext, unsubSkipped, unsubOK)
+				unregErr := a.Unregister(unregCtx)
+				if unregErr != nil {
+					slog.Debug("Unregister error", "ext", a.Ext, "err", unregErr)
+				}
+				collector.IncrementCleanupUnregister(a.Ext, unregErr == nil)
 			}(ag)
 		}
 		wg.Wait()
@@ -716,28 +731,34 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 	}
 
 	cfgMap := map[string]any{
-		"vm_id":              cfg.VMID,
-		"ext_start":          cfg.ExtStart,
-		"ext_end":            cfg.ExtEnd,
-		"sbc_host":           cfg.SBCHost,
-		"sbc_port":           cfg.SBCPort,
-		"sip_transport":      cfg.SIPTransport,
-		"domain":             cfg.Domain,
-		"cps":                cfg.CPS,
-		"hold_time_seconds":  cfg.HoldTimeSeconds,
-		"ramp_up_seconds":    cfg.RampUpSeconds,
-		"register_expires":   cfg.RegisterExpires,
-		"subscribe_expires":  cfg.SubscribeExpires,
-		"media_enabled":      cfg.MediaEnabled,
-		"metrics_port":       cfg.MetricsPort,
-		"traffic_mode":       cfg.TrafficMode,
+		"vm_id":             cfg.VMID,
+		"ext_start":         cfg.ExtStart,
+		"ext_end":           cfg.ExtEnd,
+		"sbc_host":          cfg.SBCHost,
+		"sbc_port":          cfg.SBCPort,
+		"sip_transport":     cfg.SIPTransport,
+		"domain":            cfg.Domain,
+		"cps":               cfg.CPS,
+		"hold_time_seconds": cfg.HoldTimeSeconds,
+		"ramp_up_seconds":   cfg.RampUpSeconds,
+		"register_expires":  cfg.RegisterExpires,
+		"subscribe_expires": cfg.SubscribeExpires,
+		"subscribe_events":  cfg.SubscribeEvents,
+		"media_enabled":     cfg.MediaEnabled,
+		"metrics_port":      cfg.MetricsPort,
+		"traffic_mode":      cfg.TrafficMode,
 	}
 
-	cleanupCount, cleanupTotal, cleanupFailed := collector.CleanupSnapshot()
+	cleanupDetails := collector.CleanupDetailsSnapshot()
 	cleanup := map[string]any{
-		"count":             cleanupCount,
-		"total":             cleanupTotal,
-		"failed_extensions": cleanupFailed,
+		"count":                         cleanupDetails.Count,
+		"total":                         cleanupDetails.Total,
+		"failed_extensions":             cleanupDetails.Failed,
+		"unsubscribe_count":             cleanupDetails.UnsubscribeCount,
+		"unsubscribe_skipped":           cleanupDetails.UnsubscribeSkipped,
+		"unsubscribe_failed_extensions": cleanupDetails.UnsubscribeFailed,
+		"unregister_count":              cleanupDetails.UnregisterCount,
+		"unregister_failed_extensions":  cleanupDetails.UnregisterFailed,
 	}
 
 	output := map[string]any{
@@ -788,7 +809,10 @@ func writeTrafficSummary(
 		}
 	}
 
-	type rtpEntry struct{ caller, callee string; port int }
+	type rtpEntry struct {
+		caller, callee string
+		port           int
+	}
 	var rtpPorts []rtpEntry
 	for _, r := range results {
 		if r.RTPLocalPort > 0 && r.RTPLocalPort != 9 {
@@ -1187,16 +1211,16 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 
 func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 	d := metrics.CallResultData{
-		CallID:           r.CallID,
-		Caller:           r.Caller,
-		Callee:           r.Callee,
-		Success:          r.Success,
+		CallID:  r.CallID,
+		Caller:  r.Caller,
+		Callee:  r.Callee,
+		Success: r.Success,
 		// Answered = full INV/200/ACK three-way handshake completed.
 		// UAC leg: ACK was sent after receiving 200 OK (AckSentMs > 0).
 		// UAS leg: ACK was received from the caller (AckReceivedMs > 0).
 		// Either side indicates the call was answered by the called party.
-		Answered:      r.SipMilestones.AckSentMs > 0 || r.SipMilestones.AckReceivedMs > 0,
-		FailureReason: r.FailureReason,
+		Answered:         r.SipMilestones.AckSentMs > 0 || r.SipMilestones.AckReceivedMs > 0,
+		FailureReason:    r.FailureReason,
 		PDDMs:            r.PDDMs,
 		HoldMs:           r.HoldMs,
 		TotalMs:          r.TotalMs,

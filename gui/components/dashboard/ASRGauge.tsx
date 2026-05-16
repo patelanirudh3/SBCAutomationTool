@@ -32,20 +32,30 @@ function asrColor(asr: number): {
 }
 
 interface ASRGaugeProps {
-  asr: number
+  asr?: number
+  value?: number
+  label?: string
+  description?: string
   className?: string
 }
 
-export function ASRGauge({ asr, className }: ASRGaugeProps) {
-  const clampedAsr = Math.max(0, Math.min(100, asr))
+export function ASRGauge({
+  asr,
+  value,
+  label = 'ASR',
+  description = 'Answer Seizure Ratio = Answered / Attempted × 100',
+  className,
+}: ASRGaugeProps) {
+  const rawValue = value ?? asr ?? 0
+  const clampedAsr = Math.max(0, Math.min(100, rawValue))
   const colors = asrColor(clampedAsr)
 
   return (
-    <div className={cn('flex flex-col gap-3', className)}>
+    <div className={cn('flex flex-col gap-3', className)} title={description}>
       {/* Header row: label + number + status badge */}
       <div className="flex items-baseline gap-3">
         <span className="text-sm font-semibold tracking-widest uppercase text-foreground/70">
-          ASR
+          {label}
         </span>
         <span
           className={cn(

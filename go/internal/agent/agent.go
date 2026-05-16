@@ -16,27 +16,27 @@ import (
 
 // DialogState tracks a single SIP dialog for one call leg.
 type DialogState struct {
-	CallID      string
-	LocalTag    string
-	LocalExt    string
-	RemoteExt   string
-	Domain      string
-	Transport   string
-	LocalHost   string
-	LocalPort   int
-	RemoteTag   string
-	CSeq        int
+	CallID    string
+	LocalTag  string
+	LocalExt  string
+	RemoteExt string
+	Domain    string
+	Transport string
+	LocalHost string
+	LocalPort int
+	RemoteTag string
+	CSeq      int
 	// InviteCSeq is the CSeq sequence number of the (last) INVITE that
 	// established this dialog. It is set when the INVITE is sent (or when
 	// re-sent under 407 challenge in Handle407Invite) and is used by
 	// SendAck so the ACK CSeq matches the INVITE per RFC 3261 §13.2.2.4.
 	// Without this field SendAck would use dialog.CSeq, which has been
 	// incremented by intervening PRACK/BYE traffic.
-	InviteCSeq  int
-	RSeq        int
-	RouteSet    []string
-	RemoteTarget string
-	State       string // IDLE, INVITE_SENT, PROVRESP_RCVD, ESTABLISHED, BYE_SENT, COMPLETE
+	InviteCSeq    int
+	RSeq          int
+	RouteSet      []string
+	RemoteTarget  string
+	State         string // IDLE, INVITE_SENT, PROVRESP_RCVD, ESTABLISHED, BYE_SENT, COMPLETE
 	InviteSentMs  float64
 	RingingRecvMs float64
 	AckSentMs     float64
@@ -84,6 +84,20 @@ type WildcardEvent struct {
 	RawMsg    string
 }
 
+// SipEvent is a parsed dispatch event stored in a durable per-dialog queue.
+// It is used by call traffic so back-to-back responses (for example 100 then
+// 407_INVITE) remain ordered and available even after one wait returns.
+type SipEvent struct {
+	Code       string
+	Raw        string
+	CallID     string
+	CSeqNum    int
+	CSeqMethod string
+	Status     int
+	Method     string
+	ReceivedAt time.Time
+}
+
 // earlyResponse holds a SIP message that arrived before any handler was
 // registered for its event code.  The dispatch loop buffers these so that a
 // subsequent WaitForSIPEvent can retrieve them without a timing race.
@@ -101,12 +115,12 @@ type ExtensionAgent struct {
 	Ext    string
 	Config *config.VMConfig
 
-	transport  sip.Transport
-	localPort  int
-	localHost  string
+	transport sip.Transport
+	localPort int
+	localHost string
 
-	Registered chan struct{}
-	Subscribed chan struct{}
+	Registered     chan struct{}
+	Subscribed     chan struct{}
 	registeredOnce sync.Once
 	subscribedOnce sync.Once
 
@@ -117,6 +131,7 @@ type ExtensionAgent struct {
 	handlers       map[string][]chan string
 	wildcards      []chan WildcardEvent
 	earlyResponses []earlyResponse
+	dialogQueues   map[string]chan SipEvent
 	handlerMu      sync.Mutex
 
 	closed atomic.Bool
@@ -127,30 +142,35 @@ type ExtensionAgent struct {
 	// as a caller, re-enabled after the call completes (BYE/200).
 	autoAnswerEnabled atomic.Bool
 
-	regCallID      string
-	regFromTag     string
-	regFromHeader  string
-	regContactHdr  string
-	regNonce       string
-	regRealm       string
-	regOpaque      string // [FIX-4] echo opaque from 401 challenge
-	regCSeq        int
-	regGrantedExp  int // server-granted Expires from REGISTER 200 OK
+	regCallID     string
+	regFromTag    string
+	regFromHeader string
+	regContactHdr string
+	regNonce      string
+	regRealm      string
+	regOpaque     string // [FIX-4] echo opaque from 401 challenge
+	regCSeq       int
+	regGrantedExp int // server-granted Expires from REGISTER 200 OK
 	// regNonceCount tracks the RFC 2617 §3.3 nonce-count for the active
 	// REGISTER nonce. Reset to 0 whenever regNonce is replaced; the
 	// helpers nextRegNC / resetRegNonce ensure increment-and-use semantics.
 	regNonceCount int
 
-	subCallID     string
-	subFromHeader string
-	subToHeader   string
-	subContact    string
-	subNonce      string
-	subRealm      string
-	subOpaque     string
-	subCSeq       int
-	// subNonceCount tracks the RFC 2617 §3.3 nonce-count for SUBSCRIBE.
-	subNonceCount int
+	subscriptions map[string]*SubscriptionState
+}
+
+// SubscriptionState tracks one event-package subscription dialog.
+type SubscriptionState struct {
+	Event      string
+	CallID     string
+	FromHeader string
+	ToHeader   string
+	Contact    string
+	Nonce      string
+	Realm      string
+	Opaque     string
+	CSeq       int
+	NonceCount int
 }
 
 // nextRegNC returns the next nonce-count for REGISTER digest auth as the
@@ -172,20 +192,18 @@ func (a *ExtensionAgent) resetRegNonce(nonce, realm, opaque string) {
 	a.regNonceCount = 0
 }
 
-// nextSubNC returns the next nonce-count for SUBSCRIBE digest auth.
-func (a *ExtensionAgent) nextSubNC() string {
-	a.subNonceCount++
-	return fmt.Sprintf("%08x", a.subNonceCount)
+func (s *SubscriptionState) nextNC() string {
+	s.NonceCount++
+	return fmt.Sprintf("%08x", s.NonceCount)
 }
 
-// resetSubNonce stores a fresh SUBSCRIBE nonce and zeroes the nc counter.
-func (a *ExtensionAgent) resetSubNonce(nonce, realm, opaque string) {
-	a.subNonce = nonce
+func (s *SubscriptionState) resetNonce(nonce, realm, opaque string) {
+	s.Nonce = nonce
 	if realm != "" {
-		a.subRealm = realm
+		s.Realm = realm
 	}
-	a.subOpaque = opaque
-	a.subNonceCount = 0
+	s.Opaque = opaque
+	s.NonceCount = 0
 }
 
 // NewExtensionAgent creates a new agent for the given extension.
@@ -197,6 +215,8 @@ func NewExtensionAgent(ext string, cfg *config.VMConfig) *ExtensionAgent {
 		ActiveDialogs: make(map[string]*DialogState),
 		ZombieDialogs: make(map[string]*DialogState),
 		handlers:      make(map[string][]chan string),
+		dialogQueues:  make(map[string]chan SipEvent),
+		subscriptions: make(map[string]*SubscriptionState),
 		Registered:    make(chan struct{}),
 		Subscribed:    make(chan struct{}),
 	}
@@ -270,6 +290,25 @@ func (a *ExtensionAgent) LocalPort() int { return a.localPort }
 
 // LocalHost returns the local host IP.
 func (a *ExtensionAgent) LocalHost() string { return a.localHost }
+
+// SubscriptionEvent returns a comma-separated list of established subscription
+// event packages for logging.
+func (a *ExtensionAgent) SubscriptionEvent() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	events := make([]string, 0, len(a.subscriptions))
+	for event := range a.subscriptions {
+		events = append(events, event)
+	}
+	return strings.Join(events, ",")
+}
+
+// NeedsUnsubscribe reports whether cleanup should send SUBSCRIBE Expires:0.
+// Unsubscribe policy is intentionally disabled for all events until the SBC
+// event-package-specific behavior is agreed.
+func (a *ExtensionAgent) NeedsUnsubscribe() bool {
+	return false
+}
 
 // Send serializes a SIP message and sends it.
 func (a *ExtensionAgent) Send(msg *sip.SipMessage, body string) error {
@@ -578,38 +617,42 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 	}
 }
 
-// Subscribe performs the SUBSCRIBE flow handling both 407 (Proxy-Auth) and
-// 401 (WWW-Auth) challenges. Avaya Session Manager issues 401 for SUBSCRIBE.
-// On success it saves dialog state so Resubscribe can issue in-dialog refreshes.
+// Subscribe performs the configured SUBSCRIBE flows handling both 407
+// (Proxy-Auth) and 401 (WWW-Auth) challenges. All configured events must
+// succeed for the agent to be considered subscribed.
 func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+	events := a.Config.SubscribeEvents
+	if len(events) == 0 {
+		events = []string{"dialog"}
+	}
+	for _, event := range events {
+		if err := a.SubscribeEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+	a.subscribedOnce.Do(func() { close(a.Subscribed) })
+	return nil
+}
+
+// SubscribeEvent establishes one event-package subscription and stores the
+// resulting dialog/auth state independently from other subscriptions.
+func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error {
 	a.syncLocalPort()
-	callID := sip.CreateCallID()
-	fromTag := sip.CreateFromTag()
-	cseq := 1
+	event = strings.ToLower(strings.TrimSpace(event))
+	if event == "" {
+		event = "dialog"
+	}
 
-	fromHdr := fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag)
-	toHdr := fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain)
-	contactHdr := fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport)
-	expiresVal := fmt.Sprintf("%d", a.Config.SubscribeExpires)
+	st := &SubscriptionState{
+		Event:      event,
+		CallID:     sip.CreateCallID(),
+		FromHeader: fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, sip.CreateFromTag()),
+		ToHeader:   fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain),
+		Contact:    fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport),
+		CSeq:       1,
+	}
 
-	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
-	msg.AddHeader(sip.HdrCallID, callID)
-	msg.AddHeader(sip.HdrFrom, fromHdr)
-	msg.AddHeader(sip.HdrTo, toHdr)
-	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, contactHdr)
-	msg.AddHeader(sip.HdrMaxForwards, "70")
-	msg.AddHeader(sip.HdrExpires, expiresVal)
-	msg.AddHeader(sip.HdrEvent, "dialog")
-	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", cseq))
-	msg.AddHeader(sip.HdrContentLength, "0")
-	msg.AddHeader(sip.HdrSupported, "100rel")
-	// RFC 3265 §3.1.1: SUBSCRIBE SHOULD include Accept listing acceptable
-	// NOTIFY body content types. For the "dialog" event package the
-	// expected body type is application/dialog-info+xml (RFC 4235).
-	msg.AddHeader("Accept", "application/dialog-info+xml")
-
+	msg := a.buildSubscribeMessage(st, a.Config.SubscribeExpires)
 	ch407 := a.waitForEvent("407")
 	ch401 := a.waitForEvent("401")
 	ch200 := a.waitForEvent("200")
@@ -626,113 +669,81 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
 	defer cancel()
 
-	// sendAuthRetry builds a re-SUBSCRIBE with the appropriate auth header.
-	// use401=true → WWW-Authenticate challenge → Authorization header (SM/401)
-	// use401=false → Proxy-Authenticate challenge → Proxy-Authorization header (SBC/407)
 	sendAuthRetry := func(rawChallenge string, use401 bool) error {
-		var realm, nonce, opaque string
-		if use401 {
-			ch := sip.Parse401Challenge(rawChallenge)
-			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
-		} else {
-			ch := sip.Parse407Challenge(rawChallenge)
-			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
-		}
-		if realm == "" {
-			realm = a.Config.Domain
-		}
-		a.resetSubNonce(nonce, realm, opaque)
-
-		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", opaque)
-
-		cseq++
-		retryMsg := sip.CloneSipMessage(msg)
-		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", cseq))
-		if use401 {
-			retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
-		} else {
-			retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
-		}
-		return a.Send(retryMsg, "")
+		return a.sendSubscribeAuthRetry(msg, st, rawChallenge, use401)
 	}
 
+	var finalRaw string
 	select {
 	case raw407 := <-ch407:
 		if err := sendAuthRetry(raw407, false); err != nil {
 			return err
 		}
 		select {
-		case <-ch200:
-		case <-ch202:
+		case finalRaw = <-ch200:
+		case finalRaw = <-ch202:
 		case <-tCtx.Done():
 			return tCtx.Err()
 		}
-
 	case raw401 := <-ch401:
 		if err := sendAuthRetry(raw401, true); err != nil {
 			return err
 		}
 		select {
-		case <-ch200:
-		case <-ch202:
+		case finalRaw = <-ch200:
+		case finalRaw = <-ch202:
 		case <-tCtx.Done():
 			return tCtx.Err()
 		}
-
-	case <-ch200:
-	case <-ch202:
+	case finalRaw = <-ch200:
+	case finalRaw = <-ch202:
 	case <-tCtx.Done():
 		return tCtx.Err()
 	}
 
-	// Save dialog state for in-dialog refresh via Resubscribe.
-	a.subCallID = callID
-	a.subFromHeader = fromHdr
-	a.subToHeader = toHdr
-	a.subContact = contactHdr
-	a.subCSeq = cseq
+	if finalRaw != "" {
+		parsed := sip.ParseHeaders(strings.SplitN(finalRaw, "\r\n\r\n", 2)[0])
+		if toResp := parsed.GetHeader(sip.HdrTo); len(toResp) > 0 {
+			st.ToHeader = toResp[0]
+		}
+	}
 
-	slog.Info("subscribed", "ext", a.Ext)
-	a.subscribedOnce.Do(func() { close(a.Subscribed) })
+	a.mu.Lock()
+	a.subscriptions[event] = st
+	a.mu.Unlock()
+	slog.Info("subscribed", "ext", a.Ext, "event", event)
 	return nil
 }
 
-// Resubscribe sends an in-dialog SUBSCRIBE refresh using the state saved from
-// the initial Subscribe call. It reuses the same Call-ID and From tag (keeping
-// the subscription dialog alive) and increments CSeq. A fresh auth challenge
-// is handled if the server issues a new 401/407.
+// Resubscribe refreshes every successfully established subscription.
 func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 	a.syncLocalPort()
-	if a.subCallID == "" {
+	a.mu.RLock()
+	states := make([]*SubscriptionState, 0, len(a.subscriptions))
+	for _, st := range a.subscriptions {
+		cp := *st
+		states = append(states, &cp)
+	}
+	a.mu.RUnlock()
+	if len(states) == 0 {
 		return fmt.Errorf("ext=%s: no subscription state; Subscribe must be called first", a.Ext)
 	}
 
-	a.subCSeq++
-	expiresVal := fmt.Sprintf("%d", a.Config.SubscribeExpires)
+	for _, st := range states {
+		if err := a.resubscribeEvent(ctx, st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
-	msg.AddHeader(sip.HdrCallID, a.subCallID)
-	msg.AddHeader(sip.HdrFrom, a.subFromHeader)
-	msg.AddHeader(sip.HdrTo, a.subToHeader)
-	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, a.subContact)
-	msg.AddHeader(sip.HdrMaxForwards, "70")
-	msg.AddHeader(sip.HdrExpires, expiresVal)
-	msg.AddHeader(sip.HdrEvent, "dialog")
-	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", a.subCSeq))
-	msg.AddHeader(sip.HdrContentLength, "0")
-	// RFC 3265 §3.1.1: SUBSCRIBE SHOULD include Accept on every refresh.
-	msg.AddHeader("Accept", "application/dialog-info+xml")
-
-	// Include cached credentials proactively if we have them.
-	if a.subNonce != "" {
+func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionState) error {
+	st.CSeq++
+	msg := a.buildSubscribeMessage(st, a.Config.SubscribeExpires)
+	if st.Nonce != "" {
 		cnonce := sip.GenCNonce()
 		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.subRealm, a.subNonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", a.subOpaque)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, st.Realm, st.Nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", st.Opaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
@@ -752,41 +763,9 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
 	defer cancel()
 
-	sendAuthRetry := func(rawChallenge string, use401 bool) error {
-		var realm, nonce, opaque string
-		if use401 {
-			ch := sip.Parse401Challenge(rawChallenge)
-			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
-		} else {
-			ch := sip.Parse407Challenge(rawChallenge)
-			realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
-		}
-		if realm == "" {
-			realm = a.Config.Domain
-		}
-		a.resetSubNonce(nonce, realm, opaque)
-
-		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
-		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, a.nextSubNC(), "auth", opaque)
-
-		a.subCSeq++
-		retryMsg := sip.CloneSipMessage(msg)
-		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", a.subCSeq))
-		retryMsg.RemoveHeader(sip.HdrAuthorization)
-		retryMsg.RemoveHeader(sip.HdrProxyAuthorization)
-		if use401 {
-			retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
-		} else {
-			retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
-		}
-		return a.Send(retryMsg, "")
-	}
-
 	select {
 	case raw401 := <-ch401:
-		if err := sendAuthRetry(raw401, true); err != nil {
+		if err := a.sendSubscribeAuthRetry(msg, st, raw401, true); err != nil {
 			return err
 		}
 		select {
@@ -796,7 +775,7 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 			return tCtx.Err()
 		}
 	case raw407 := <-ch407:
-		if err := sendAuthRetry(raw407, false); err != nil {
+		if err := a.sendSubscribeAuthRetry(msg, st, raw407, false); err != nil {
 			return err
 		}
 		select {
@@ -811,8 +790,72 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 		return tCtx.Err()
 	}
 
-	slog.Debug("resubscribed", "ext", a.Ext, "expires", a.Config.SubscribeExpires)
+	a.mu.Lock()
+	a.subscriptions[st.Event] = st
+	a.mu.Unlock()
+	slog.Debug("resubscribed", "ext", a.Ext, "event", st.Event, "expires", a.Config.SubscribeExpires)
 	return nil
+}
+
+// Unsubscribe is intentionally a no-op for now. Event-package-specific
+// unsubscribe policy will be added later; cleanup currently only unregisters.
+func (a *ExtensionAgent) Unsubscribe(ctx context.Context) error {
+	return nil
+}
+
+func (a *ExtensionAgent) buildSubscribeMessage(st *SubscriptionState, expires int) *sip.SipMessage {
+	if expires <= 0 {
+		expires = a.Config.SubscribeExpires
+	}
+	msg := sip.NewSipMessage()
+	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
+	msg.AddHeader(sip.HdrCallID, st.CallID)
+	msg.AddHeader(sip.HdrFrom, st.FromHeader)
+	msg.AddHeader(sip.HdrTo, st.ToHeader)
+	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
+	msg.AddHeader(sip.HdrContact, st.Contact)
+	msg.AddHeader(sip.HdrMaxForwards, "70")
+	msg.AddHeader(sip.HdrExpires, fmt.Sprintf("%d", expires))
+	msg.AddHeader(sip.HdrEvent, st.Event)
+	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", st.CSeq))
+	msg.AddHeader(sip.HdrContentLength, "0")
+	msg.AddHeader(sip.HdrSupported, "100rel")
+	if strings.EqualFold(st.Event, "dialog") {
+		msg.AddHeader("Accept", "application/dialog-info+xml")
+	}
+	return msg
+}
+
+func (a *ExtensionAgent) sendSubscribeAuthRetry(msg *sip.SipMessage, st *SubscriptionState, rawChallenge string, use401 bool) error {
+	var realm, nonce, opaque string
+	if use401 {
+		ch := sip.Parse401Challenge(rawChallenge)
+		realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
+	} else {
+		ch := sip.Parse407Challenge(rawChallenge)
+		realm, nonce, opaque = ch.Realm, ch.Nonce, ch.Opaque
+	}
+	if realm == "" {
+		realm = a.Config.Domain
+	}
+	st.resetNonce(nonce, realm, opaque)
+
+	cnonce := sip.GenCNonce()
+	uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", opaque)
+
+	st.CSeq++
+	retryMsg := sip.CloneSipMessage(msg)
+	retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
+	retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", st.CSeq))
+	retryMsg.RemoveHeader(sip.HdrAuthorization)
+	retryMsg.RemoveHeader(sip.HdrProxyAuthorization)
+	if use401 {
+		retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
+	} else {
+		retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	}
+	return a.Send(retryMsg, "")
 }
 
 // SendInvite builds and sends an INVITE with SDP.
@@ -856,8 +899,10 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	a.mu.Lock()
 	a.ActiveDialogs[callID] = dialog
 	a.mu.Unlock()
+	a.RegisterDialogQueue(callID)
 
 	if err := a.Send(msg, sdpBody); err != nil {
+		a.RemoveDialogQueue(callID)
 		return nil, err
 	}
 	return dialog, nil
@@ -1519,11 +1564,17 @@ func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error
 	return a.Send(ack, "")
 }
 
-
 // Internal helpers
 
+func (a *ExtensionAgent) bufferEarlyResponseLocked(code, raw string) {
+	if len(a.earlyResponses) >= maxEarlyResponses {
+		a.earlyResponses = a.earlyResponses[1:]
+	}
+	a.earlyResponses = append(a.earlyResponses, earlyResponse{code: code, raw: raw})
+}
+
 func (a *ExtensionAgent) waitForEvent(codes ...string) chan string {
-	ch := make(chan string, 1)
+	ch := make(chan string, 8)
 	a.handlerMu.Lock()
 	for _, code := range codes {
 		a.handlers[code] = append(a.handlers[code], ch)
@@ -1544,6 +1595,65 @@ func (a *ExtensionAgent) deregisterCh(ch chan string, codes ...string) {
 			}
 		}
 	}
+	for {
+		select {
+		case raw := <-ch:
+			code, _ := sip.ClassifyMessage(raw)
+			a.bufferEarlyResponseLocked(code, raw)
+			slog.Debug("deregisterCh: drained stale event into earlyResponses",
+				"ext", a.Ext, "eventCode", code, "earlyBufLen", len(a.earlyResponses))
+		default:
+			return
+		}
+	}
+}
+
+// RegisterDialogQueue creates a durable FIFO queue for a call/dialog. Call
+// traffic registers this before sending INVITE so responses that arrive
+// back-to-back remain available to the call state machine.
+func (a *ExtensionAgent) RegisterDialogQueue(callID string) chan SipEvent {
+	q := make(chan SipEvent, 32)
+	a.handlerMu.Lock()
+	a.dialogQueues[callID] = q
+	a.handlerMu.Unlock()
+	return q
+}
+
+// RemoveDialogQueue removes the durable queue for a finished call/dialog.
+func (a *ExtensionAgent) RemoveDialogQueue(callID string) {
+	a.handlerMu.Lock()
+	delete(a.dialogQueues, callID)
+	a.handlerMu.Unlock()
+}
+
+// WaitForDialogEvent waits on a durable per-dialog FIFO queue. Unlike
+// WaitForSIPEvent, the queue outlives each individual wait, so events that
+// arrive back-to-back (100 followed by 407_INVITE) are consumed in order.
+func (a *ExtensionAgent) WaitForDialogEvent(ctx context.Context, callID string, timeout time.Duration, codes ...string) (SipEvent, error) {
+	a.handlerMu.Lock()
+	q := a.dialogQueues[callID]
+	a.handlerMu.Unlock()
+	if q == nil {
+		return SipEvent{}, fmt.Errorf("dialog queue not registered for call_id=%s", callID)
+	}
+
+	tCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		select {
+		case ev := <-q:
+			for _, code := range codes {
+				if ev.Code == code ||
+					(code == "_FINAL_FAIL" && sip.IsFinalFailureCode(ev.Code)) {
+					return ev, nil
+				}
+			}
+			slog.Debug("WaitForDialogEvent: skipped unmatched event",
+				"ext", a.Ext, "callID", callID, "eventCode", ev.Code)
+		case <-tCtx.Done():
+			return SipEvent{}, tCtx.Err()
+		}
+	}
 }
 
 func (a *ExtensionAgent) dispatchLoop() {
@@ -1555,8 +1665,13 @@ func (a *ExtensionAgent) dispatchLoop() {
 				return
 			}
 			eventCode, _ := sip.ClassifyMessage(raw)
+			sipEvent := buildSipEvent(eventCode, raw)
 
 			a.handlerMu.Lock()
+			var dialogQ chan SipEvent
+			if sipEvent.CallID != "" {
+				dialogQ = a.dialogQueues[sipEvent.CallID]
+			}
 			queues := make([]chan string, len(a.handlers[eventCode]))
 			copy(queues, a.handlers[eventCode])
 			// Fan out to "_FINAL_FAIL" listeners for any 4xx/5xx/6xx
@@ -1566,11 +1681,8 @@ func (a *ExtensionAgent) dispatchLoop() {
 			if sip.IsFinalFailureCode(eventCode) {
 				queues = append(queues, a.handlers["_FINAL_FAIL"]...)
 			}
-			if len(queues) == 0 {
-				if len(a.earlyResponses) >= maxEarlyResponses {
-					a.earlyResponses = a.earlyResponses[1:]
-				}
-				a.earlyResponses = append(a.earlyResponses, earlyResponse{code: eventCode, raw: raw})
+			if len(queues) == 0 && dialogQ == nil {
+				a.bufferEarlyResponseLocked(eventCode, raw)
 				slog.Debug("dispatchLoop: no handler, buffered as earlyResponse",
 					"ext", a.Ext, "eventCode", eventCode, "earlyBufLen", len(a.earlyResponses))
 			} else {
@@ -1581,11 +1693,33 @@ func (a *ExtensionAgent) dispatchLoop() {
 			copy(wcs, a.wildcards)
 			a.handlerMu.Unlock()
 
+			deliveredToDialog := false
+			if dialogQ != nil {
+				select {
+				case dialogQ <- sipEvent:
+					deliveredToDialog = true
+					slog.Debug("dispatchLoop: queued dialog event",
+						"ext", a.Ext, "callID", sipEvent.CallID, "eventCode", eventCode)
+				default:
+					slog.Warn("dispatchLoop: dialog queue full, dropping event",
+						"ext", a.Ext, "callID", sipEvent.CallID, "eventCode", eventCode)
+				}
+			}
+
+			anyDelivered := false
 			for _, q := range queues {
 				select {
 				case q <- raw:
+					anyDelivered = true
 				default:
 				}
+			}
+			if len(queues) > 0 && !anyDelivered && !deliveredToDialog {
+				a.handlerMu.Lock()
+				a.bufferEarlyResponseLocked(eventCode, raw)
+				slog.Debug("dispatchLoop: handler channel full, buffered as earlyResponse",
+					"ext", a.Ext, "eventCode", eventCode, "earlyBufLen", len(a.earlyResponses))
+				a.handlerMu.Unlock()
 			}
 			for _, wc := range wcs {
 				select {
@@ -1668,6 +1802,39 @@ func (a *ExtensionAgent) respond481ToRequest(raw string) {
 	_ = a.Send(resp, "")
 }
 
+func buildSipEvent(eventCode, raw string) SipEvent {
+	parts := strings.SplitN(raw, "\r\n\r\n", 2)
+	msg := sip.ParseHeaders(parts[0])
+	ev := SipEvent{
+		Code:       eventCode,
+		Raw:        raw,
+		CallID:     msg.GetCallID(),
+		CSeqNum:    msg.GetCSeq(),
+		CSeqMethod: msg.GetMethod(),
+		ReceivedAt: time.Now(),
+	}
+	if msg.GetRequestLine() != "" {
+		fields := strings.Fields(msg.GetRequestLine())
+		if len(fields) > 0 {
+			ev.Method = fields[0]
+		}
+	}
+	if msg.GetResponseLine() != "" {
+		fields := strings.Fields(msg.GetResponseLine())
+		if len(fields) >= 2 {
+			fmt.Sscanf(fields[1], "%d", &ev.Status)
+		}
+	}
+	return ev
+}
+
+func firstLine(raw string) string {
+	if idx := strings.Index(raw, "\r\n"); idx >= 0 {
+		return raw[:idx]
+	}
+	return raw
+}
+
 func extractCallID(raw string) string {
 	for _, line := range strings.Split(raw, "\r\n") {
 		lower := strings.ToLower(line)
@@ -1695,6 +1862,7 @@ func (a *ExtensionAgent) RemoveDialog(callID string) {
 	a.mu.Lock()
 	delete(a.ActiveDialogs, callID)
 	a.mu.Unlock()
+	a.RemoveDialogQueue(callID)
 	a.ClearEarlyResponses()
 }
 

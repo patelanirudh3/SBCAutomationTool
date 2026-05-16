@@ -116,13 +116,13 @@ export function FinalReport({
   const subTotal = prePhaseStatus?.subscribe_total ?? extCount
 
   // Call traffic summary
-  // inviteSent = total INVITEs we transmitted (loose upper bound).
-  // attempted  = INVITEs the SBC accepted (received a 100 Trying back).
-  // The gap inviteSent − attempted is diagnostic of network/SBC-reachability
-  // problems — surfaced as a separate StatCard so failures of "we couldn't
-  // even reach the SBC" are visible distinct from "the SBC took the call
-  // but didn't answer".
-  const inviteSent = uacMetrics?.calls_invite_sent ?? 0
+  // attempted = OOD INVITEs that received 100 Trying from the remote server.
+  // No-response INVITEs are diagnostic only and require newer backend builds
+  // that emit calls_invite_sent.
+  const noResponseInvites =
+    typeof uacMetrics?.calls_invite_sent === 'number'
+      ? Math.max(uacMetrics.calls_invite_sent - (uacMetrics.calls_attempted ?? 0), 0)
+      : null
   const attempted  = aggregate?.total_attempted  ?? uacMetrics?.calls_attempted  ?? 0
   // Prefer aggregate, fall back to live metric, then derive from event list
   // as a last resort. UAC-only filtering keeps the totals correct (events
@@ -135,12 +135,18 @@ export function FinalReport({
   const answered     = aggregate?.total_answered
                     ?? uacMetrics?.calls_answered
                     ?? callEvents.filter((e) => e.direction !== 'uas' && e.answered === true).length
+  const hasAckMetric = typeof uacMetrics?.calls_acknowledged === 'number'
+  const hasAckEvents = callEvents.some((e) => e.direction !== 'uas' && typeof e.acknowledged === 'boolean')
+  const completed  = aggregate?.total_completed  ?? uacMetrics?.calls_completed  ?? 0
   const acknowledged = aggregate?.total_acknowledged
                     ?? uacMetrics?.calls_acknowledged
-                    ?? callEvents.filter((e) => e.direction !== 'uas' && e.acknowledged === true).length
-  const completed  = aggregate?.total_completed  ?? uacMetrics?.calls_completed  ?? 0
+                    ?? (hasAckEvents
+                      ? callEvents.filter((e) => e.direction !== 'uas' && e.acknowledged === true).length
+                      : completed)
   const failed     = aggregate?.total_failed     ?? uacMetrics?.calls_failed     ?? 0
   const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
+  const csr        = uacMetrics?.csr
+                    ?? (attempted > 0 ? Math.round((completed / attempted) * 10000) / 100 : 0)
   const avgPdd     = uacMetrics?.avg_pdd_ms      ?? null
   const avgHold    = uacMetrics?.avg_hold_ms     ?? null
 
@@ -252,15 +258,16 @@ export function FinalReport({
             • Answered − Acknowledged = ACK didn't reach the UAS
             • Acknowledged − Completed = BYE didn't complete */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
-          <StatCard icon={Phone}          label="INVITEs Sent"               value={inviteSent.toLocaleString()}    color="default" sub="all transmitted" />
+          <StatCard icon={Phone}          label="No Response INVITEs"         value={noResponseInvites == null ? '—' : noResponseInvites.toLocaleString()} color={noResponseInvites && noResponseInvites > 0 ? 'warning' : 'default'} sub={noResponseInvites == null ? 'unavailable' : 'no 100 Trying'} />
           <StatCard icon={Phone}          label="Attempted"                  value={attempted.toLocaleString()}     color="info"    sub="got 100 Trying" />
           <StatCard icon={PhoneIncoming}  label="Answered (INV/200)"         value={answered.toLocaleString()}      color={answered > 0 ? 'success' : 'default'} />
-          <StatCard icon={PhoneCall}      label="Acknowledged (INV/200/ACK)" value={acknowledged.toLocaleString()}  color={acknowledged > 0 ? 'success' : 'default'} />
+          <StatCard icon={PhoneCall}      label="Acknowledged (INV/200/ACK)" value={hasAckMetric || hasAckEvents ? acknowledged.toLocaleString() : `${acknowledged.toLocaleString()}+`}  color={acknowledged > 0 ? 'success' : 'default'} sub={hasAckMetric || hasAckEvents ? undefined : 'lower bound'} />
           <StatCard icon={CheckCircle2}   label="Completed (BYE/200)"        value={completed.toLocaleString()}     color="success" />
           <StatCard icon={PhoneMissed}    label="Failed"                     value={failed.toLocaleString()}        color={failed > 0 ? 'danger' : 'default'} />
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard icon={Zap}        label="ASR"            value={`${asr.toFixed(1)}%`}         color={asr >= 95 ? 'success' : asr >= 80 ? 'warning' : 'danger'} />
+          <StatCard icon={Zap}        label="ASR"            value={`${asr.toFixed(1)}%`}         color={asr >= 95 ? 'success' : asr >= 80 ? 'warning' : 'danger'} sub="Answered / Attempted" />
+          <StatCard icon={CheckCircle2} label="CSR"          value={`${csr.toFixed(1)}%`}         color={csr >= 95 ? 'success' : csr >= 80 ? 'warning' : 'danger'} sub="Completed / Attempted" />
           <StatCard icon={Clock}      label="Avg PDD"        value={avgPdd != null ? `${avgPdd.toFixed(0)} ms` : '—'}  color="default" />
           <StatCard icon={PhoneOff}   label="Avg Hold"       value={avgHold != null ? `${(avgHold / 1000).toFixed(1)} s` : '—'} color="default" />
           <StatCard icon={Clock}      label="Total Duration" value={durationLabel} color="default" />

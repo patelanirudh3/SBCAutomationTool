@@ -6,23 +6,32 @@ import { motion } from 'framer-motion'
 interface ConcurrentCallsBarProps {
   concurrent: number
   ceiling: number
+  configuredCeiling?: number
+  poolCapacity?: number
   className?: string
 }
 
 export function ConcurrentCallsBar({
   concurrent,
   ceiling,
+  configuredCeiling,
+  poolCapacity,
   className,
 }: ConcurrentCallsBarProps) {
   const pct = ceiling > 0 ? Math.min((concurrent / ceiling) * 100, 100) : 0
   const isAlarm = pct > 95
+  const isPoolLimited =
+    typeof configuredCeiling === 'number' &&
+    typeof poolCapacity === 'number' &&
+    poolCapacity > 0 &&
+    poolCapacity < configuredCeiling
 
   return (
     <div className={cn('flex flex-col gap-2', className)}>
       <div className="flex items-center justify-between">
         <span
           className="text-xs font-semibold uppercase tracking-widest text-foreground/75"
-          title="Calls in the established (post-ACK / pre-BYE-completion) state. Calls in the INVITE→ACK setup window or in failure timeouts are NOT counted here."
+          title="Calls in the established (post-ACK / pre-BYE-completion) state. In single-pool mode each call consumes two UAs, so effective capacity is min(configured target, floor(registered UAs / 2))."
         >
           Concurrent Calls
         </span>
@@ -33,6 +42,11 @@ export function ConcurrentCallsBar({
           <span className="text-foreground/55"> / {ceiling.toLocaleString()}</span>
         </span>
       </div>
+      {isPoolLimited && (
+        <span className="text-[10px] font-medium text-amber-400">
+          Pool-limited: configured target {configuredCeiling.toLocaleString()}, single-pool capacity {poolCapacity.toLocaleString()}
+        </span>
+      )}
 
       {/* Bar track */}
       <div

@@ -34,6 +34,7 @@ export type RawVMFormValues = {
   // Registration / subscription
   register_expires: string
   subscribe_expires: string
+  subscribe_events: string[]
   register_rate_cps: string
   // RFC 3261 INVITE client-transaction timers (UAC). Empty -> backend uses RFC defaults.
   t1_ms: string
@@ -89,7 +90,7 @@ export type VMConfigTab = 'server' | 'signaling' | 'traffic' | 'media' | 'all'
 
 export interface VMConfigPanelProps {
   raw: RawVMFormValues
-  onChange: (field: keyof RawVMFormValues, value: string | boolean) => void
+  onChange: (field: keyof RawVMFormValues, value: string | string[] | boolean) => void
   touched: Set<string>
   onBlur: (field: string) => void
   errors: Record<string, string>
@@ -113,7 +114,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name',
   ],
   signaling: [
-    'register_expires', 'subscribe_expires', 'register_rate_cps',
+    'register_expires', 'subscribe_expires', 'subscribe_events', 'register_rate_cps',
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
@@ -129,10 +130,13 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
 const DEFAULTS_REGISTRATION = {
   register_expires:  '3600',
   subscribe_expires: '3600',
+  subscribe_events:  ['dialog'],
   register_rate_cps: '10',
   t1_ms:             '500',
   timer_b_seconds:   '32',
 }
+
+const SUBSCRIBE_EVENT_OPTIONS = ['reg', 'dialog', 'message-summary', 'presence', 'cci-info'] as const
 
 // Fields belonging to each logical section — used by per-section Reset buttons
 const SECTION_FIELDS = {
@@ -142,7 +146,7 @@ const SECTION_FIELDS = {
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
                    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
-  registration:   ['register_expires', 'subscribe_expires', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
@@ -960,6 +964,7 @@ export function VMConfigPanel({
         const regDirty =
           raw.register_expires !== DEFAULTS_REGISTRATION.register_expires ||
           raw.subscribe_expires !== DEFAULTS_REGISTRATION.subscribe_expires ||
+          raw.subscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_events.join(',') ||
           raw.register_rate_cps !== DEFAULTS_REGISTRATION.register_rate_cps ||
           raw.t1_ms !== DEFAULTS_REGISTRATION.t1_ms ||
           raw.timer_b_seconds !== DEFAULTS_REGISTRATION.timer_b_seconds
@@ -1038,6 +1043,40 @@ export function VMConfigPanel({
                   {e('register_rate_cps')  && <FieldError error={e('register_rate_cps')} />}
                 </>
               )}
+            </FormRow>
+
+            <FormRow
+              label="SUBSCRIBE Events"
+              hint="Event packages to subscribe after REGISTER. Default: dialog. Cleanup currently skips unsubscribe for all event packages and only unregisters."
+            >
+              <div className="flex flex-wrap gap-2">
+                {SUBSCRIBE_EVENT_OPTIONS.map((event) => {
+                  const selected = raw.subscribe_events.includes(event)
+                  return (
+                    <button
+                      key={event}
+                      type="button"
+                      onClick={() => {
+                        const next = selected
+                          ? raw.subscribe_events.filter((v) => v !== event)
+                          : [...raw.subscribe_events, event]
+                        onChange('subscribe_events', next.length > 0 ? next : ['dialog'])
+                        onBlur('subscribe_events')
+                      }}
+                      className={cn(
+                        'rounded-md border px-2.5 py-1 text-xs font-semibold transition-colors',
+                        selected
+                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                          : 'border-slate-700 bg-slate-900/40 text-slate-400 hover:border-slate-500 hover:text-slate-200',
+                      )}
+                      aria-pressed={selected}
+                    >
+                      {event}
+                    </button>
+                  )
+                })}
+              </div>
+              {e('subscribe_events') && <FieldError error={e('subscribe_events')} />}
             </FormRow>
 
             {/* SIP Timers — T1 and Timer-B with explicit per-input labels. */}

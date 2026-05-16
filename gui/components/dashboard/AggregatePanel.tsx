@@ -10,90 +10,172 @@ interface AggregatePanelProps {
 
 export function AggregatePanel({ uacMetrics, className }: AggregatePanelProps) {
   const asr = uacMetrics.asr
+  const csr = uacMetrics.csr ?? (
+    uacMetrics.calls_attempted > 0
+      ? Math.round((uacMetrics.calls_completed / uacMetrics.calls_attempted) * 10000) / 100
+      : 0
+  )
   const asrColor =
     asr > 90 ? 'text-emerald-400' : asr >= 80 ? 'text-amber-400' : 'text-rose-500'
+  const csrColor =
+    csr > 90 ? 'text-emerald-400' : csr >= 80 ? 'text-amber-400' : 'text-rose-500'
 
-  const inviteSent = uacMetrics.calls_invite_sent ?? 0
+  const hasInviteSent = typeof uacMetrics.calls_invite_sent === 'number'
+  const noResponseInvites = hasInviteSent
+    ? Math.max((uacMetrics.calls_invite_sent ?? 0) - uacMetrics.calls_attempted, 0)
+    : null
   const answered = uacMetrics.calls_answered ?? 0
-  const acknowledged = uacMetrics.calls_acknowledged ?? 0
+  const hasAcknowledged = typeof uacMetrics.calls_acknowledged === 'number'
+  const acknowledged = hasAcknowledged
+    ? uacMetrics.calls_acknowledged!
+    : uacMetrics.calls_completed
 
   // Drop-rate diagnostic: INVITEs the SBC never answered with 100 Trying.
   // A non-zero value here points to network-layer / SBC-reachability
   // issues (the request never reached the SBC's transaction layer).
-  const noResponseDrops = Math.max(inviteSent - uacMetrics.calls_attempted, 0)
+  const noResponseDrops = noResponseInvites ?? 0
 
   return (
     <div
       className={cn(
-        'flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border border-border bg-card px-5 py-3',
+        'space-y-3 rounded-lg border border-border bg-card px-5 py-3',
         className
       )}
     >
-      <Stat
-        label="INVITEs Sent"
-        title="Total INVITEs we transmitted, regardless of whether the SBC ever responded. Compare with Attempted to see how many went unanswered."
-        value={inviteSent.toLocaleString()}
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat
-        label="Total Attempted (got 100 Trying)"
-        title="INVITEs that the SBC accepted (received a 100 Trying back). The gap from INVITEs Sent reflects requests the SBC never saw or never acknowledged."
-        value={uacMetrics.calls_attempted.toLocaleString()}
-        valueClass={noResponseDrops > 0 ? 'text-amber-400' : undefined}
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat
-        label="Total Answered (INV/200)"
-        title="INVITEs that received a 200 OK from the UAS. Independent of whether ACK followed — high Answered + low Acknowledged means the UAS answered but the UAC never confirmed."
-        value={answered.toLocaleString()}
-        valueClass={answered > 0 ? 'text-sky-400' : undefined}
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat
-        label="Total Acknowledged (INV/200/ACK)"
-        title="Calls that completed the full INVITE / 200 OK / ACK three-way handshake. These are dialogs that fully reached the established (post-ACK) state."
-        value={acknowledged.toLocaleString()}
-        valueClass={acknowledged > 0 ? 'text-sky-400' : undefined}
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat
-        label="Total Completed (BYE/200)"
-        title="Calls that completed the full BYE / 200 OK teardown handshake — fully successful end-to-end."
-        value={uacMetrics.calls_completed.toLocaleString()}
-        valueClass="text-emerald-400"
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat
-        label="Failed"
-        title="Total failed calls (any reason). Equals INVITEs Sent − Completed."
-        value={uacMetrics.calls_failed.toLocaleString()}
-        valueClass={uacMetrics.calls_failed > 0 ? 'text-rose-500' : undefined}
-      />
-      <div className="h-6 w-px bg-border" />
-      <Stat label="Aggregate ASR" value={`${asr.toFixed(1)}%`} valueClass={asrColor} />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <Stat
+          label="No Response"
+          sub="(INV/no 100)"
+          title="INVITEs transmitted but never answered with 100 Trying. Unavailable on older backend builds that do not emit calls_invite_sent."
+          value={noResponseInvites == null ? '—' : noResponseInvites.toLocaleString()}
+          valueClass={noResponseDrops > 0 ? 'text-amber-400' : undefined}
+        />
+        <Stat
+          label="Attempted Call"
+          sub="(INV/100)"
+          title="Calls where the outbound INVITE received 100 Trying from the remote server."
+          value={uacMetrics.calls_attempted.toLocaleString()}
+          valueClass={noResponseDrops > 0 ? 'text-amber-400' : undefined}
+        />
+        <Stat
+          label="Answered Call"
+          sub="(INV/.../200)"
+          title="Calls where UAC received 200 OK for INVITE."
+          value={answered.toLocaleString()}
+          valueClass={answered > 0 ? 'text-sky-400' : undefined}
+        />
+        <Stat
+          label="Acknowledged Call"
+          sub="(INV/.../ACK)"
+          title={hasAcknowledged
+            ? 'Calls where the UAS received ACK.'
+            : 'Backend does not emit calls_acknowledged; showing completed calls as a conservative lower-bound ACK count.'}
+          value={hasAcknowledged ? acknowledged.toLocaleString() : `${acknowledged.toLocaleString()}+`}
+          valueClass={acknowledged > 0 ? 'text-sky-400' : undefined}
+        />
+        <Stat
+          label="Completed Call"
+          sub="(BYE/200)"
+          title="Calls where UAC received 200 OK for BYE."
+          value={uacMetrics.calls_completed.toLocaleString()}
+          valueClass="text-emerald-400"
+        />
+        <Stat
+          label="Failed Call"
+          sub="(explicit fail)"
+          title="Calls that explicitly failed due to timeout, final failure response, or call-flow error."
+          value={uacMetrics.calls_failed.toLocaleString()}
+          valueClass={uacMetrics.calls_failed > 0 ? 'text-rose-500' : undefined}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 border-t border-border pt-3 md:grid-cols-2">
+        <RatioStat
+          label="ASR"
+          sub="Answered / Attempted"
+          title="ASR (Answer Seizure Ratio) = Answered / Attempted × 100. Attempted means received 100 Trying; Answered means UAC received 200 OK for INVITE."
+          value={asr}
+          valueClass={asrColor}
+        />
+        <RatioStat
+          label="CSR"
+          sub="Completed / Attempted"
+          title="CSR (Call Success Ratio) = Completed / Attempted × 100. Completed means UAC received 200 OK for BYE. During active traffic CSR can lag ASR while calls are still in hold."
+          value={csr}
+          valueClass={csrColor}
+        />
+      </div>
     </div>
   )
 }
 
 function Stat({
   label,
+  sub,
   value,
   valueClass,
   title,
 }: {
   label: string
+  sub?: string
   value: string
   valueClass?: string
   title?: string
 }) {
   return (
-    <div className="flex flex-col gap-0.5" title={title}>
-      <span className="text-xs font-medium uppercase tracking-widest text-foreground/65">
+    <div className="flex min-w-0 flex-col items-center gap-0.5 rounded-md bg-secondary/20 px-2 py-2 text-center" title={title}>
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-foreground/70">
         {label}
       </span>
-      <span className={cn('font-mono text-base font-semibold tabular-nums', valueClass)}>
+      {sub && (
+        <span className="text-[10px] font-medium leading-none text-foreground/45">
+          {sub}
+        </span>
+      )}
+      <span className={cn('font-mono text-lg font-semibold tabular-nums', valueClass)}>
         {value}
       </span>
+    </div>
+  )
+}
+
+function RatioStat({
+  label,
+  sub,
+  value,
+  valueClass,
+  title,
+}: {
+  label: string
+  sub: string
+  value: number
+  valueClass?: string
+  title?: string
+}) {
+  const clamped = Math.max(0, Math.min(100, value))
+
+  return (
+    <div className="rounded-md bg-secondary/20 px-3 py-2" title={title}>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-foreground/70">
+            {label}
+          </p>
+          <p className="text-[10px] font-medium text-foreground/45">{sub}</p>
+        </div>
+        <span className={cn('font-mono text-xl font-semibold tabular-nums', valueClass)}>
+          {value.toFixed(1)}%
+        </span>
+      </div>
+      <div className="mt-2 h-2 overflow-hidden rounded-full bg-secondary">
+        <div
+          className={cn(
+            'h-full rounded-full transition-[width] duration-500',
+            clamped > 90 ? 'bg-emerald-400' : clamped >= 80 ? 'bg-amber-400' : 'bg-rose-500',
+          )}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
     </div>
   )
 }

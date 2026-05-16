@@ -39,6 +39,7 @@ const DEFAULTS: RawVMFormValues = {
   ext_count: '10',
   register_expires: '3600',
   subscribe_expires: '3600',
+  subscribe_events: ['dialog'],
   register_rate_cps: '10',
   t1_ms: '500',
   timer_b_seconds: '32',
@@ -96,6 +97,7 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     ext_count:          String(Math.max(extEnd - extStart + 1, 0)),
     register_expires:   String(u.register_expires   ?? parseInt(DEFAULTS.register_expires)),
     subscribe_expires:  String(u.subscribe_expires  ?? parseInt(DEFAULTS.subscribe_expires)),
+    subscribe_events:   u.subscribe_events?.length ? u.subscribe_events : (u.subscribe_event ? [u.subscribe_event] : ['dialog']),
     register_rate_cps:  String(u.register_rate_cps  ?? parseFloat(DEFAULTS.register_rate_cps)),
     t1_ms:              String(u.t1_ms              ?? parseInt(DEFAULTS.t1_ms)),
     timer_b_seconds:    String(u.timer_b_seconds    ?? parseInt(DEFAULTS.timer_b_seconds)),
@@ -157,6 +159,7 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     tls_server_name: raw.sip_transport === 'TLS' ? (raw.tls_server_name || undefined) : undefined,
     register_expires: raw.register_expires ? parseInt(raw.register_expires) : undefined,
     subscribe_expires: raw.subscribe_expires ? parseInt(raw.subscribe_expires) : undefined,
+    subscribe_events: raw.subscribe_events,
     register_rate_cps: raw.register_rate_cps ? parseFloat(raw.register_rate_cps) : undefined,
     t1_ms: raw.t1_ms ? parseInt(raw.t1_ms) : undefined,
     timer_b_seconds: raw.timer_b_seconds ? parseInt(raw.timer_b_seconds) : undefined,
@@ -416,7 +419,7 @@ export function VMPairBook() {
   }, [])
 
   const handleChange = useCallback(
-    (field: keyof RawVMFormValues, value: string | boolean) => {
+    (field: keyof RawVMFormValues, value: string | string[] | boolean) => {
       setRaw((prev) => ({ ...prev, [field]: value }))
       setValidationPassed(false)
     },

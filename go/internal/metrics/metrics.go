@@ -25,34 +25,37 @@ import (
 // TrafficMetrics is the snapshot of traffic metrics for one VM at one point in time.
 // JSON field names must match the Python version exactly — the Next.js GUI depends on them.
 type TrafficMetrics struct {
-	Timestamp        float64            `json:"timestamp"`
-	VMID             string             `json:"vm_id"`
-	Phase            string             `json:"phase"`
-	CPSActual        float64            `json:"cps_actual"`
-	ConcurrentCalls  int                `json:"concurrent_calls"`
-	CallsAttempted   int                `json:"calls_attempted"`
-	CallsAnswered    int                `json:"calls_answered"`
-	CallsCompleted   int                `json:"calls_completed"`
-	CallsFailed      int                `json:"calls_failed"`
-	ASR              float64            `json:"asr"`
-	AvgPDDMs         float64            `json:"avg_pdd_ms"`
-	MinPDDMs         float64            `json:"min_pdd_ms"`
-	MaxPDDMs         float64            `json:"max_pdd_ms"`
-	AvgHoldMs        float64            `json:"avg_hold_ms"`
-	AvgTotalMs       float64            `json:"avg_total_ms"`
-	SocketCount      int                `json:"socket_count"`
-	RegisteredCount  int                `json:"registered_count"`
-	RegisteredTotal  int                `json:"registered_total"`
-	SubscribedCount  int                `json:"subscribed_count"`
-	SubscribedTotal  int                `json:"subscribed_total"`
+	Timestamp         float64 `json:"timestamp"`
+	VMID              string  `json:"vm_id"`
+	Phase             string  `json:"phase"`
+	CPSActual         float64 `json:"cps_actual"`
+	ConcurrentCalls   int     `json:"concurrent_calls"`
+	CallsInviteSent   int     `json:"calls_invite_sent"`
+	CallsAttempted    int     `json:"calls_attempted"`
+	CallsAnswered     int     `json:"calls_answered"`
+	CallsAcknowledged int     `json:"calls_acknowledged"`
+	CallsCompleted    int     `json:"calls_completed"`
+	CallsFailed       int     `json:"calls_failed"`
+	ASR               float64 `json:"asr"`
+	CSR               float64 `json:"csr"`
+	AvgPDDMs          float64 `json:"avg_pdd_ms"`
+	MinPDDMs          float64 `json:"min_pdd_ms"`
+	MaxPDDMs          float64 `json:"max_pdd_ms"`
+	AvgHoldMs         float64 `json:"avg_hold_ms"`
+	AvgTotalMs        float64 `json:"avg_total_ms"`
+	SocketCount       int     `json:"socket_count"`
+	RegisteredCount   int     `json:"registered_count"`
+	RegisteredTotal   int     `json:"registered_total"`
+	SubscribedCount   int     `json:"subscribed_count"`
+	SubscribedTotal   int     `json:"subscribed_total"`
 	// PrepStatus tracks the optional async unregister-flush invoked by the
 	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
 	// | "failed". The GUI reads this to drive the corner-button visual state
 	// and to disable Start Reg/Sub while running.
-	PrepStatus       string             `json:"prep_status"`
-	RunElapsedSec    float64            `json:"run_elapsed_seconds"`
-	Running          bool               `json:"running"`
-	RTPHealth        map[string]int     `json:"rtp_health"`
+	PrepStatus    string         `json:"prep_status"`
+	RunElapsedSec float64        `json:"run_elapsed_seconds"`
+	Running       bool           `json:"running"`
+	RTPHealth     map[string]int `json:"rtp_health"`
 	// Single-pool agent counts (new model)
 	IdleCount    int `json:"idle_count"`
 	NonIdleCount int `json:"non_idle_count"`
@@ -63,9 +66,16 @@ type TrafficMetrics struct {
 	// Cleanup (unregister/unsubscribe) progress. Populated during the
 	// CLEANING_UP phase and frozen at completion so the GUI can render the
 	// final result strip after the engine moves to DONE.
-	CleanupCount    int      `json:"cleanup_count"`
-	CleanupTotal    int      `json:"cleanup_total"`
-	CleanupFailed   []string `json:"cleanup_failed,omitempty"`
+	CleanupCount  int      `json:"cleanup_count"`
+	CleanupTotal  int      `json:"cleanup_total"`
+	CleanupFailed []string `json:"cleanup_failed,omitempty"`
+	// Split cleanup results let the GUI distinguish subscription cleanup from
+	// registration cleanup. Legacy cleanup_* fields remain unregister-focused.
+	CleanupUnsubscribeCount   int      `json:"cleanup_unsubscribe_count"`
+	CleanupUnsubscribeSkipped int      `json:"cleanup_unsubscribe_skipped"`
+	CleanupUnsubscribeFailed  []string `json:"cleanup_unsubscribe_failed,omitempty"`
+	CleanupUnregisterCount    int      `json:"cleanup_unregister_count"`
+	CleanupUnregisterFailed   []string `json:"cleanup_unregister_failed,omitempty"`
 
 	// QoS / Media aggregate metrics (Phase 1).
 	// AvgJitterMs / AvgMOSScore are simple means over calls that produced
@@ -88,17 +98,17 @@ type TrafficMetrics struct {
 
 // CallResultData carries the outcome of a single call fed into the collector.
 type CallResultData struct {
-	CallID           string
-	Caller           string
-	Callee           string
-	Success          bool
+	CallID  string
+	Caller  string
+	Callee  string
+	Success bool
 	// Answered indicates the full INV/200/ACK three-way handshake completed:
 	// for UAC legs, ACK was sent after receiving 200 OK; for UAS legs, ACK
 	// was received from the caller. A call can be Answered=true and
 	// Success=false if the call was answered but media or BYE handshake
 	// failed afterwards.
-	Answered      bool
-	FailureReason string
+	Answered         bool
+	FailureReason    string
 	PDDMs            float64
 	HoldMs           float64
 	TotalMs          float64
@@ -139,6 +149,15 @@ type CallResultData struct {
 	ByeCompletionMs     float64
 }
 
+type callMilestoneState struct {
+	InviteSent   bool
+	Attempted    bool
+	Answered     bool
+	Acknowledged bool
+	Completed    bool
+	Failed       bool
+}
+
 // ---------------------------------------------------------------------------
 // MetricsCollector
 // ---------------------------------------------------------------------------
@@ -151,10 +170,12 @@ type MetricsCollector struct {
 	vmID     string
 	interval time.Duration
 
-	callsAttempted int
-	callsAnswered  int
-	callsCompleted int
-	callsFailed    int
+	callsInviteSent   int
+	callsAttempted    int
+	callsAnswered     int
+	callsAcknowledged int
+	callsCompleted    int
+	callsFailed       int
 
 	pddSamples   []float64
 	holdSamples  []float64
@@ -180,6 +201,7 @@ type MetricsCollector struct {
 	callResults        []CallResultData
 	rawEvents          []map[string]any
 	callSpines         []json.RawMessage
+	callMilestones     map[string]*callMilestoneState
 	concurrentProvider func() int
 	poolCountsProvider func() (idle, nonIdle, regOnly int)
 
@@ -188,17 +210,22 @@ type MetricsCollector struct {
 	// QoS aggregate state (Phase 1+2).
 	// Sample slices are appended only when the per-call value is non-zero
 	// so calls that didn't produce media don't drag the average down.
-	jitterSamples       []float64
-	mosSamples          []float64
-	packetLossSamples   []float64
-	rttSamples          []float64
-	mediaQualityCounts  map[string]int
+	jitterSamples      []float64
+	mosSamples         []float64
+	packetLossSamples  []float64
+	rttSamples         []float64
+	mediaQualityCounts map[string]int
 
-	// Cleanup (unregister) progress, populated during shutdownCleanup so
-	// the GUI can render a live progress card and final failure list.
-	cleanupCount  int
-	cleanupTotal  int
-	cleanupFailed []string
+	// Cleanup progress, populated during shutdownCleanup so the GUI can render
+	// split unsubscribe/unregister status and final failure lists.
+	cleanupCount              int
+	cleanupTotal              int
+	cleanupFailed             []string
+	cleanupUnsubscribeCount   int
+	cleanupUnsubscribeSkipped int
+	cleanupUnsubscribeFailed  []string
+	cleanupUnregisterCount    int
+	cleanupUnregisterFailed   []string
 
 	// SIP message counters — UAC side
 	invitesSent       int
@@ -213,8 +240,8 @@ type MetricsCollector struct {
 	bye200Sent      int
 
 	// WebSocket subscribers
-	wsMu        sync.Mutex
-	wsClients   map[*websocket.Conn]struct{}
+	wsMu      sync.Mutex
+	wsClients map[*websocket.Conn]struct{}
 }
 
 // NewMetricsCollector creates a new collector for the given VM.
@@ -231,6 +258,7 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		latest:             TrafficMetrics{VMID: vmID, Phase: "IDLE", PrepStatus: "idle", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
 		rtpHealthCounts:    map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
 		mediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
+		callMilestones:     make(map[string]*callMilestoneState),
 		wsClients:          make(map[*websocket.Conn]struct{}),
 	}
 }
@@ -273,6 +301,62 @@ func (c *MetricsCollector) RecordRawEvent(payload map[string]any) {
 	if len(c.rawEvents) > 10000 {
 		c.rawEvents = c.rawEvents[len(c.rawEvents)-10000:]
 	}
+	c.recordMilestoneLocked(payload)
+}
+
+func (c *MetricsCollector) recordMilestoneLocked(payload map[string]any) {
+	event, _ := payload["event"].(string)
+	direction, _ := payload["direction"].(string)
+	callID, _ := payload["call_id"].(string)
+	if event == "" || callID == "" {
+		return
+	}
+
+	// The UAS side can have a different Call-ID because the SBC/SM acts as a
+	// B2BUA. That is fine for aggregate counters: each UAS_ACK_RECEIVED maps
+	// to one session-level acknowledged call and is deduped by its UAS leg ID.
+	key := direction + ":" + callID
+	state := c.callMilestones[key]
+	if state == nil {
+		state = &callMilestoneState{}
+		c.callMilestones[key] = state
+	}
+
+	switch event {
+	case "INVITE_SENT":
+		if direction == "uac" {
+			if !state.InviteSent {
+				c.callsInviteSent++
+			}
+			state.InviteSent = true
+		}
+	case "TRYING_100":
+		if direction == "uac" && !state.Attempted {
+			state.Attempted = true
+			c.callsAttempted++
+			c.windowAttempts++
+		}
+	case "OK_200_INVITE":
+		if direction == "uac" && !state.Answered {
+			state.Answered = true
+			c.callsAnswered++
+		}
+	case "UAS_ACK_RECEIVED":
+		if direction == "uas" && !state.Acknowledged {
+			state.Acknowledged = true
+			c.callsAcknowledged++
+		}
+	case "BYE_200":
+		if direction == "uac" && !state.Completed {
+			state.Completed = true
+			c.callsCompleted++
+		}
+	case "CALL_FAILED", "CALL_TIMEOUT":
+		if direction == "uac" && !state.Failed {
+			state.Failed = true
+			c.callsFailed++
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -294,15 +378,37 @@ func (c *MetricsCollector) ResetCleanup(total int) {
 	c.cleanupCount = 0
 	c.cleanupTotal = total
 	c.cleanupFailed = nil
+	c.cleanupUnsubscribeCount = 0
+	c.cleanupUnsubscribeSkipped = 0
+	c.cleanupUnsubscribeFailed = nil
+	c.cleanupUnregisterCount = 0
+	c.cleanupUnregisterFailed = nil
 	c.mu.Unlock()
 }
 
-// IncrementCleanup records the result of a single Unregister attempt. ext is
-// the extension identifier used for the failed-list when ok is false.
-func (c *MetricsCollector) IncrementCleanup(ext string, ok bool) {
+// IncrementCleanupUnsubscribe records the result of one subscription cleanup
+// attempt. skipped means no SUBSCRIBE Expires:0 was required for that agent.
+func (c *MetricsCollector) IncrementCleanupUnsubscribe(ext string, skipped, ok bool) {
 	c.mu.Lock()
-	c.cleanupCount++
+	if skipped {
+		c.cleanupUnsubscribeSkipped++
+	} else {
+		c.cleanupUnsubscribeCount++
+		if !ok {
+			c.cleanupUnsubscribeFailed = append(c.cleanupUnsubscribeFailed, ext)
+		}
+	}
+	c.mu.Unlock()
+}
+
+// IncrementCleanupUnregister records the result of a single Unregister attempt.
+// The legacy cleanup_count/cleanup_failed fields intentionally mirror unregister.
+func (c *MetricsCollector) IncrementCleanupUnregister(ext string, ok bool) {
+	c.mu.Lock()
+	c.cleanupUnregisterCount++
+	c.cleanupCount = c.cleanupUnregisterCount
 	if !ok {
+		c.cleanupUnregisterFailed = append(c.cleanupUnregisterFailed, ext)
 		c.cleanupFailed = append(c.cleanupFailed, ext)
 	}
 	c.mu.Unlock()
@@ -315,6 +421,33 @@ func (c *MetricsCollector) CleanupSnapshot() (count, total int, failed []string)
 	out := make([]string, len(c.cleanupFailed))
 	copy(out, c.cleanupFailed)
 	return c.cleanupCount, c.cleanupTotal, out
+}
+
+type CleanupDetails struct {
+	Count              int
+	Total              int
+	Failed             []string
+	UnsubscribeCount   int
+	UnsubscribeSkipped int
+	UnsubscribeFailed  []string
+	UnregisterCount    int
+	UnregisterFailed   []string
+}
+
+// CleanupDetailsSnapshot returns split cleanup progress for status/reporting.
+func (c *MetricsCollector) CleanupDetailsSnapshot() CleanupDetails {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return CleanupDetails{
+		Count:              c.cleanupCount,
+		Total:              c.cleanupTotal,
+		Failed:             append([]string(nil), c.cleanupFailed...),
+		UnsubscribeCount:   c.cleanupUnsubscribeCount,
+		UnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
+		UnsubscribeFailed:  append([]string(nil), c.cleanupUnsubscribeFailed...),
+		UnregisterCount:    c.cleanupUnregisterCount,
+		UnregisterFailed:   append([]string(nil), c.cleanupUnregisterFailed...),
+	}
 }
 
 // SetRunning updates the running flag and records the run start time.
@@ -417,14 +550,8 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 	defer c.mu.Unlock()
 
 	c.callResults = append(c.callResults, result)
-	c.callsAttempted++
-
-	if result.Answered {
-		c.callsAnswered++
-	}
 
 	if result.Success {
-		c.callsCompleted++
 		if result.PDDMs > 0 {
 			c.pddSamples = append(c.pddSamples, result.PDDMs)
 		}
@@ -434,8 +561,6 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 		if result.TotalMs > 0 {
 			c.totalSamples = append(c.totalSamples, result.TotalMs)
 		}
-	} else {
-		c.callsFailed++
 	}
 
 	if result.RTPAsymmetryFlag != "" {
@@ -469,9 +594,9 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 
 // RecordAttempt increments the windowed attempt counter (for CPS calculation).
 func (c *MetricsCollector) RecordAttempt() {
-	c.mu.Lock()
-	c.windowAttempts++
-	c.mu.Unlock()
+	// Kept for compatibility with older callers. Live attempted/CPS accounting
+	// is now event-driven from TRYING_100 in RecordRawEvent, so this method is
+	// intentionally a no-op to avoid counting INVITE launches as attempts.
 }
 
 // ---------------------------------------------------------------------------
@@ -487,24 +612,25 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 	for _, r := range c.callResults {
 		m := map[string]any{
 			"call_id":              r.CallID,
-			"caller":              r.Caller,
-			"callee":              r.Callee,
-			"success":             r.Success,
-			"answered":            r.Answered,
-			"failure_reason":      r.FailureReason,
-			"pdd_ms":             r.PDDMs,
-			"hold_ms":            r.HoldMs,
-			"total_ms":           r.TotalMs,
-			"rtp_tx_pkts":        r.RTPTxPkts,
-			"rtp_rx_pkts":        r.RTPRxPkts,
-			"media_verified":     r.MediaVerified,
-			"rtp_local_port":     r.RTPLocalPort,
-			"pool_wrap_index":    r.PoolWrapIndex,
-			"peer_ext":           r.PeerExt,
-			"ts_utc":             r.TsUTC,
-			"direction":          r.Direction,
-			"sbc_rtp_relay_ip":   r.SBCRTPRelayIP,
-			"sbc_rtp_relay_port": r.SBCRTPRelayPort,
+			"caller":               r.Caller,
+			"callee":               r.Callee,
+			"success":              r.Success,
+			"answered":             r.Answered,
+			"acknowledged":         r.Answered,
+			"failure_reason":       r.FailureReason,
+			"pdd_ms":               r.PDDMs,
+			"hold_ms":              r.HoldMs,
+			"total_ms":             r.TotalMs,
+			"rtp_tx_pkts":          r.RTPTxPkts,
+			"rtp_rx_pkts":          r.RTPRxPkts,
+			"media_verified":       r.MediaVerified,
+			"rtp_local_port":       r.RTPLocalPort,
+			"pool_wrap_index":      r.PoolWrapIndex,
+			"peer_ext":             r.PeerExt,
+			"ts_utc":               r.TsUTC,
+			"direction":            r.Direction,
+			"sbc_rtp_relay_ip":     r.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":   r.SBCRTPRelayPort,
 			"rtp_rx_from_sbc_pkts": r.RTPRxFromSBCPkts,
 			"rtp_rx_other_pkts":    r.RTPRxOtherPkts,
 			"rtcp_rx_pkts":         r.RTCPRxPkts,
@@ -513,19 +639,19 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"markers_received":     r.MarkersReceived,
 			"scenario":             r.Scenario,
 			// Phase-1 QoS fields
-			"jitter_ms":            r.JitterMs,
-			"packet_loss_pct":      r.PacketLossPct,
-			"lost_packets":         r.LostPackets,
-			"ooo_packets":          r.OOOPackets,
-			"rtt_ms":               r.RTTMs,
-			"remote_jitter_ms":     r.RemoteJitterMs,
-			"remote_loss_pct":      r.RemoteLossPct,
-			"mos_score":            r.MOSScore,
-			"media_quality_flag":   r.MediaQualityFlag,
-			"call_setup_ms":        r.CallSetupMs,
-			"prack_rtt_ms":         r.PrackRTTMs,
-			"sip_txn_rtt_ms":       r.SipTransactionRTTMs,
-			"bye_completion_ms":    r.ByeCompletionMs,
+			"jitter_ms":          r.JitterMs,
+			"packet_loss_pct":    r.PacketLossPct,
+			"lost_packets":       r.LostPackets,
+			"ooo_packets":        r.OOOPackets,
+			"rtt_ms":             r.RTTMs,
+			"remote_jitter_ms":   r.RemoteJitterMs,
+			"remote_loss_pct":    r.RemoteLossPct,
+			"mos_score":          r.MOSScore,
+			"media_quality_flag": r.MediaQualityFlag,
+			"call_setup_ms":      r.CallSetupMs,
+			"prack_rtt_ms":       r.PrackRTTMs,
+			"sip_txn_rtt_ms":     r.SipTransactionRTTMs,
+			"bye_completion_ms":  r.ByeCompletionMs,
 		}
 		if len(r.SipMilestones) > 0 {
 			m["sip_milestones"] = r.SipMilestones // json.RawMessage embeds as-is, preserving field order
@@ -573,19 +699,20 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 
 		m := map[string]any{
 			"call_id":              callID,
-			"uac_ext":             caller,
-			"uas_ext":             callee,
-			"ext":                 ext,
-			"peer_ext":            cr.PeerExt,
-			"direction":           direction,
-			"result":              ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-			"answered":           cr.Answered,
-			"failure_reason":      nilIfEmpty(cr.FailureReason),
-			"pdd_ms":             cr.PDDMs,
-			"hold_ms":            cr.HoldMs,
-			"media_status":       media,
-			"rtp_tx_pkts":        cr.RTPTxPkts,
-			"rtp_rx_pkts":        cr.RTPRxPkts,
+			"uac_ext":              caller,
+			"uas_ext":              callee,
+			"ext":                  ext,
+			"peer_ext":             cr.PeerExt,
+			"direction":            direction,
+			"result":               ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+			"answered":             cr.Answered,
+			"acknowledged":         cr.Answered,
+			"failure_reason":       nilIfEmpty(cr.FailureReason),
+			"pdd_ms":               cr.PDDMs,
+			"hold_ms":              cr.HoldMs,
+			"media_status":         media,
+			"rtp_tx_pkts":          cr.RTPTxPkts,
+			"rtp_rx_pkts":          cr.RTPRxPkts,
 			"rtp_rx_from_sbc_pkts": cr.RTPRxFromSBCPkts,
 			"rtp_rx_other_pkts":    cr.RTPRxOtherPkts,
 			"rtp_asymmetry_flag":   cr.RTPAsymmetryFlag,
@@ -594,22 +721,22 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"markers_received":     cr.MarkersReceived,
 			"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
 			"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
-			"ts_utc":              ts,
-			"timestamp":           ts,
+			"ts_utc":               ts,
+			"timestamp":            ts,
 			// Phase-1 QoS fields
-			"jitter_ms":            cr.JitterMs,
-			"packet_loss_pct":      cr.PacketLossPct,
-			"lost_packets":         cr.LostPackets,
-			"ooo_packets":          cr.OOOPackets,
-			"rtt_ms":               cr.RTTMs,
-			"remote_jitter_ms":     cr.RemoteJitterMs,
-			"remote_loss_pct":      cr.RemoteLossPct,
-			"mos_score":            cr.MOSScore,
-			"media_quality_flag":   cr.MediaQualityFlag,
-			"call_setup_ms":        cr.CallSetupMs,
-			"prack_rtt_ms":         cr.PrackRTTMs,
-			"sip_txn_rtt_ms":       cr.SipTransactionRTTMs,
-			"bye_completion_ms":    cr.ByeCompletionMs,
+			"jitter_ms":          cr.JitterMs,
+			"packet_loss_pct":    cr.PacketLossPct,
+			"lost_packets":       cr.LostPackets,
+			"ooo_packets":        cr.OOOPackets,
+			"rtt_ms":             cr.RTTMs,
+			"remote_jitter_ms":   cr.RemoteJitterMs,
+			"remote_loss_pct":    cr.RemoteLossPct,
+			"mos_score":          cr.MOSScore,
+			"media_quality_flag": cr.MediaQualityFlag,
+			"call_setup_ms":      cr.CallSetupMs,
+			"prack_rtt_ms":       cr.PrackRTTMs,
+			"sip_txn_rtt_ms":     cr.SipTransactionRTTMs,
+			"bye_completion_ms":  cr.ByeCompletionMs,
 		}
 		out = append(out, m)
 	}
@@ -712,7 +839,9 @@ func (c *MetricsCollector) Reset() {
 	defer c.mu.Unlock()
 
 	c.callsAttempted = 0
+	c.callsInviteSent = 0
 	c.callsAnswered = 0
+	c.callsAcknowledged = 0
 	c.callsCompleted = 0
 	c.callsFailed = 0
 	c.pddSamples = nil
@@ -734,6 +863,7 @@ func (c *MetricsCollector) Reset() {
 	c.callResults = nil
 	c.rawEvents = nil
 	c.callSpines = nil
+	c.callMilestones = make(map[string]*callMilestoneState)
 	c.concurrentProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
 	c.mediaQualityCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}
@@ -753,6 +883,11 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupCount = 0
 	c.cleanupTotal = 0
 	c.cleanupFailed = nil
+	c.cleanupUnsubscribeCount = 0
+	c.cleanupUnsubscribeSkipped = 0
+	c.cleanupUnsubscribeFailed = nil
+	c.cleanupUnregisterCount = 0
+	c.cleanupUnregisterFailed = nil
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
@@ -792,8 +927,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	c.windowAttempts = 0
 
 	var asr float64
+	var csr float64
 	if c.callsAttempted > 0 {
-		asr = float64(c.callsCompleted) / float64(c.callsAttempted) * 100
+		asr = float64(c.callsAnswered) / float64(c.callsAttempted) * 100
+		csr = float64(c.callsCompleted) / float64(c.callsAttempted) * 100
 	}
 
 	concurrent := c.concurrentCalls
@@ -812,40 +949,46 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	}
 
 	snap := TrafficMetrics{
-		Timestamp:       float64(time.Now().UnixMilli()) / 1000.0,
-		VMID:            c.vmID,
-		Phase:           c.phase,
-		CPSActual:       math.Round(cpsActual*1000) / 1000,
-		ConcurrentCalls: concurrent,
-		CallsAttempted:  c.callsAttempted,
-		CallsAnswered:   c.callsAnswered,
-		CallsCompleted:  c.callsCompleted,
-		CallsFailed:     c.callsFailed,
-		ASR:             math.Round(asr*100) / 100,
-		AvgPDDMs:        roundAvg(c.pddSamples),
-		MinPDDMs:        roundMin(c.pddSamples),
-		MaxPDDMs:        roundMax(c.pddSamples),
-		AvgHoldMs:       roundAvg(c.holdSamples),
-		AvgTotalMs:      roundAvg(c.totalSamples),
-		SocketCount:     c.socketCount,
-		RegisteredCount: c.registeredCount,
-		RegisteredTotal: c.registeredTotal,
-		SubscribedCount: c.subscribedCount,
-		SubscribedTotal: c.subscribedTotal,
-		PrepStatus:      c.prepStatus,
-		RunElapsedSec:   runElapsed,
-		Running:         c.running,
+		Timestamp:         float64(time.Now().UnixMilli()) / 1000.0,
+		VMID:              c.vmID,
+		Phase:             c.phase,
+		CPSActual:         math.Round(cpsActual*1000) / 1000,
+		ConcurrentCalls:   concurrent,
+		CallsInviteSent:   c.callsInviteSent,
+		CallsAttempted:    c.callsAttempted,
+		CallsAnswered:     c.callsAnswered,
+		CallsAcknowledged: c.callsAcknowledged,
+		CallsCompleted:    c.callsCompleted,
+		CallsFailed:       c.callsFailed,
+		ASR:               math.Round(asr*100) / 100,
+		CSR:               math.Round(csr*100) / 100,
+		AvgPDDMs:          roundAvg(c.pddSamples),
+		MinPDDMs:          roundMin(c.pddSamples),
+		MaxPDDMs:          roundMax(c.pddSamples),
+		AvgHoldMs:         roundAvg(c.holdSamples),
+		AvgTotalMs:        roundAvg(c.totalSamples),
+		SocketCount:       c.socketCount,
+		RegisteredCount:   c.registeredCount,
+		RegisteredTotal:   c.registeredTotal,
+		SubscribedCount:   c.subscribedCount,
+		SubscribedTotal:   c.subscribedTotal,
+		PrepStatus:        c.prepStatus,
+		RunElapsedSec:     runElapsed,
+		Running:           c.running,
 		RTPHealth: map[string]int{
 			"OK":       c.rtpHealthCounts["OK"],
 			"WARNING":  c.rtpHealthCounts["WARNING"],
 			"CRITICAL": c.rtpHealthCounts["CRITICAL"],
 		},
-		IdleCount:         idleCount,
-		NonIdleCount:      nonIdleCount,
-		RegOnlyCount:      regOnlyCount,
-		InviteRetransmits: c.inviteRetransmits,
-		CleanupCount:      c.cleanupCount,
-		CleanupTotal:      c.cleanupTotal,
+		IdleCount:                 idleCount,
+		NonIdleCount:              nonIdleCount,
+		RegOnlyCount:              regOnlyCount,
+		InviteRetransmits:         c.inviteRetransmits,
+		CleanupCount:              c.cleanupCount,
+		CleanupTotal:              c.cleanupTotal,
+		CleanupUnsubscribeCount:   c.cleanupUnsubscribeCount,
+		CleanupUnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
+		CleanupUnregisterCount:    c.cleanupUnregisterCount,
 
 		AvgJitterMs:      roundAvg(c.jitterSamples),
 		AvgMOSScore:      roundAvg(c.mosSamples),
@@ -861,6 +1004,14 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	if len(c.cleanupFailed) > 0 {
 		snap.CleanupFailed = make([]string, len(c.cleanupFailed))
 		copy(snap.CleanupFailed, c.cleanupFailed)
+	}
+	if len(c.cleanupUnsubscribeFailed) > 0 {
+		snap.CleanupUnsubscribeFailed = make([]string, len(c.cleanupUnsubscribeFailed))
+		copy(snap.CleanupUnsubscribeFailed, c.cleanupUnsubscribeFailed)
+	}
+	if len(c.cleanupUnregisterFailed) > 0 {
+		snap.CleanupUnregisterFailed = make([]string, len(c.cleanupUnregisterFailed))
+		copy(snap.CleanupUnregisterFailed, c.cleanupUnregisterFailed)
 	}
 	c.latest = snap
 	return snap
@@ -977,7 +1128,7 @@ type ProcessContext struct {
 	StopEvent   chan struct{}
 	ProcessExit chan struct{}
 	Port        int
-	Config      any    // parsed *config.VMConfig (stored as any to avoid import cycle)
+	Config      any // parsed *config.VMConfig (stored as any to avoid import cycle)
 	RawConfig   map[string]any
 	State       string
 	VMID        string // set by PUT /api/config; used by effectiveVMID
@@ -1555,19 +1706,20 @@ func BuildMux(
 
 			out = append(out, map[string]any{
 				"call_id":              callID,
-				"uac_ext":             caller,
-				"uas_ext":             callee,
-				"ext":                 ext,
-				"peer_ext":            cr.PeerExt,
-				"direction":           direction,
-				"result":              ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-				"answered":           cr.Answered,
-				"failure_reason":      nilIfEmpty(cr.FailureReason),
-				"pdd_ms":             cr.PDDMs,
-				"hold_ms":            cr.HoldMs,
-				"media_status":       media,
-				"rtp_tx_pkts":        cr.RTPTxPkts,
-				"rtp_rx_pkts":        cr.RTPRxPkts,
+				"uac_ext":              caller,
+				"uas_ext":              callee,
+				"ext":                  ext,
+				"peer_ext":             cr.PeerExt,
+				"direction":            direction,
+				"result":               ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+				"answered":             cr.Answered,
+				"acknowledged":         cr.Answered,
+				"failure_reason":       nilIfEmpty(cr.FailureReason),
+				"pdd_ms":               cr.PDDMs,
+				"hold_ms":              cr.HoldMs,
+				"media_status":         media,
+				"rtp_tx_pkts":          cr.RTPTxPkts,
+				"rtp_rx_pkts":          cr.RTPRxPkts,
 				"rtp_rx_from_sbc_pkts": cr.RTPRxFromSBCPkts,
 				"rtp_rx_other_pkts":    cr.RTPRxOtherPkts,
 				"rtp_asymmetry_flag":   cr.RTPAsymmetryFlag,
@@ -1576,22 +1728,22 @@ func BuildMux(
 				"markers_received":     cr.MarkersReceived,
 				"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
 				"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
-				"ts_utc":              ts,
-				"timestamp":           ts,
+				"ts_utc":               ts,
+				"timestamp":            ts,
 				// Phase-1 QoS fields
-				"jitter_ms":            cr.JitterMs,
-				"packet_loss_pct":      cr.PacketLossPct,
-				"lost_packets":         cr.LostPackets,
-				"ooo_packets":          cr.OOOPackets,
-				"rtt_ms":               cr.RTTMs,
-				"remote_jitter_ms":     cr.RemoteJitterMs,
-				"remote_loss_pct":      cr.RemoteLossPct,
-				"mos_score":            cr.MOSScore,
-				"media_quality_flag":   cr.MediaQualityFlag,
-				"call_setup_ms":        cr.CallSetupMs,
-				"prack_rtt_ms":         cr.PrackRTTMs,
-				"sip_txn_rtt_ms":       cr.SipTransactionRTTMs,
-				"bye_completion_ms":    cr.ByeCompletionMs,
+				"jitter_ms":          cr.JitterMs,
+				"packet_loss_pct":    cr.PacketLossPct,
+				"lost_packets":       cr.LostPackets,
+				"ooo_packets":        cr.OOOPackets,
+				"rtt_ms":             cr.RTTMs,
+				"remote_jitter_ms":   cr.RemoteJitterMs,
+				"remote_loss_pct":    cr.RemoteLossPct,
+				"mos_score":          cr.MOSScore,
+				"media_quality_flag": cr.MediaQualityFlag,
+				"call_setup_ms":      cr.CallSetupMs,
+				"prack_rtt_ms":       cr.PrackRTTMs,
+				"sip_txn_rtt_ms":     cr.SipTransactionRTTMs,
+				"bye_completion_ms":  cr.ByeCompletionMs,
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -1814,15 +1966,20 @@ func BuildMux(
 	// Phase semantics: CLEANING_UP → in progress; DONE/COMPLETE/FAILED with
 	// total > 0 → finished (failed array is the source of truth for retry).
 	mux.HandleFunc("GET /api/cleanup/status", func(w http.ResponseWriter, r *http.Request) {
-		count, total, failed := collector.CleanupSnapshot()
+		details := collector.CleanupDetailsSnapshot()
 		latest := collector.Latest()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"phase":             latest.Phase,
-			"count":             count,
-			"total":             total,
-			"failed_extensions": failed,
-			"in_progress":       latest.Phase == "CLEANING_UP",
-			"complete":          total > 0 && count >= total,
+			"phase":                         latest.Phase,
+			"count":                         details.Count,
+			"total":                         details.Total,
+			"failed_extensions":             details.Failed,
+			"unsubscribe_count":             details.UnsubscribeCount,
+			"unsubscribe_skipped":           details.UnsubscribeSkipped,
+			"unsubscribe_failed_extensions": details.UnsubscribeFailed,
+			"unregister_count":              details.UnregisterCount,
+			"unregister_failed_extensions":  details.UnregisterFailed,
+			"in_progress":                   latest.Phase == "CLEANING_UP",
+			"complete":                      details.Total > 0 && details.Count >= details.Total,
 		})
 	})
 

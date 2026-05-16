@@ -85,11 +85,11 @@ type CallEngine struct {
 
 	StopEvent chan struct{}
 
-	activeCalls    sync.Map // call_id → struct{}
-	activeCount    atomic.Int32
-	callsAttempted atomic.Int32
-	callsCompleted atomic.Int32
-	callsFailed    atomic.Int32
+	activeCalls     sync.Map // call_id → struct{}
+	activeCount     atomic.Int32
+	callsAttempted  atomic.Int32
+	callsCompleted  atomic.Int32
+	callsFailed     atomic.Int32
 	peakActiveCalls int32
 
 	metrics MetricsRecorder
@@ -174,6 +174,14 @@ func (e *CallEngine) stopped() bool {
 // from the PoolEngine. It blocks until the engine is stopped or the
 // context is cancelled.
 func (e *CallEngine) Run(ctx context.Context) error {
+	return e.RunWithCallContext(ctx, ctx)
+}
+
+// RunWithCallContext separates the launch-loop context from the per-call
+// lifecycle context. Timed traffic uses this so duration expiry stops new
+// INVITEs but does not cancel already-established calls while they are waiting
+// for hold/RTP/BYE/200 completion.
+func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) error {
 	cfg := e.config
 	fullInterval := time.Duration(float64(time.Second) / float64(cfg.CPS))
 	rampSteps := int(math.Max(float64(cfg.RampUpSeconds*cfg.CPS), 1))
@@ -191,9 +199,24 @@ func (e *CallEngine) Run(ctx context.Context) error {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-launchCtx.Done():
+			slog.Info("call launch context done — draining in-flight calls",
+				"active", e.activeCount.Load(),
+			)
+			drainTimeout := time.Duration(cfg.HoldTimeSeconds+cfg.RegisterTimeout*2+5) * time.Second
+			deadline := time.After(drainTimeout)
+		drainOnContextDone:
+			for e.activeCount.Load() > 0 {
+				select {
+				case <-deadline:
+					slog.Warn("timed-mode drain timed out", "active", e.activeCount.Load())
+					break drainOnContextDone
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			e.Stop()
 			wg.Wait()
-			return ctx.Err()
+			return nil
 		case <-e.StopEvent:
 			wg.Wait()
 			return nil
@@ -264,7 +287,7 @@ func (e *CallEngine) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(ag *agent.ExtensionAgent, calleeAg *agent.ExtensionAgent) {
 			defer wg.Done()
-			e.executeCall(ctx, ag, calleeAg)
+			e.executeCall(callCtx, ag, calleeAg)
 		}(caller, callee)
 
 		time.Sleep(interval)
@@ -499,7 +522,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	var raw200 string
 	got180 := false
 	for !got180 {
-		raw, err := ag.WaitForSIPEvent(ctx, remainingTimerB(), "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
+		ev, err := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "100", "180", "183", "407_INVITE", "200_INVITE", "_FINAL_FAIL")
 		if err != nil {
 			e.callsFailed.Add(1)
 			emit("CALL_TIMEOUT", 0, 0, nil)
@@ -507,9 +530,9 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			result := CallResult{
 				CallID: callID, Caller: ag.Ext, Callee: callee,
 				Success: false, FailureReason: "timeout",
-				TotalMs:       msSince(callStart),
-				RTPLocalPort:  rtpLocalPort(rtpEP),
-				PeerExt: callee, TsUTC: inviteTsUTC, Direction: "uac",
+				TotalMs:      msSince(callStart),
+				RTPLocalPort: rtpLocalPort(rtpEP),
+				PeerExt:      callee, TsUTC: inviteTsUTC, Direction: "uac",
 				SipMilestones: milestones,
 			}
 			e.complete(result)
@@ -519,7 +542,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		// RFC 3261 §17.1.1.2: stop Timer A on first response (1xx or final).
 		stopTimerA()
 
-		code, _ := sip.ClassifyMessage(raw)
+		raw := ev.Raw
+		code := ev.Code
 
 		switch {
 		case code == "100":
@@ -568,15 +592,16 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		milestones.PrackSentMs = msSince(callStart)
 		emit("PRACK_SENT", 0, milestones.PrackSentMs, nil)
 
-		rawPrackResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "407_PRACK", "_FINAL_FAIL")
+		prackEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_PRACK", "407_PRACK", "_FINAL_FAIL")
 		if err != nil {
 			sendCleanupOnTimeout()
 			result := fail("prack_200 timeout")
 			e.complete(result)
 			return
 		}
+		rawPrackResp := prackEv.Raw
 
-		prackCode, _ := sip.ClassifyMessage(rawPrackResp)
+		prackCode := prackEv.Code
 		if sip.IsFinalFailureCode(prackCode) {
 			tryHandleFinalFailure(rawPrackResp)
 			result := fail(fmt.Sprintf("Rejected with %s during PRACK", prackCode))
@@ -590,13 +615,14 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				e.complete(result)
 				return
 			}
-			rawPrackAuth, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_PRACK", "_FINAL_FAIL")
+			prackAuthEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_PRACK", "_FINAL_FAIL")
 			if err != nil {
 				sendCleanupOnTimeout()
 				result := fail("prack_200 timeout after auth")
 				e.complete(result)
 				return
 			}
+			rawPrackAuth := prackAuthEv.Raw
 			if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
 				result := fail(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code))
 				e.complete(result)
@@ -611,13 +637,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	// ── 200 OK to INVITE ───────────────────────────────────────────
 	if raw200 == "" {
 		var err error
-		raw200, err = ag.WaitForSIPEvent(ctx, remainingTimerB(), "200_INVITE", "_FINAL_FAIL")
+		okEv, waitErr := ag.WaitForDialogEvent(ctx, callID, remainingTimerB(), "200_INVITE", "_FINAL_FAIL")
+		err = waitErr
 		if err != nil {
 			sendCleanupOnTimeout()
 			result := fail("200_invite timeout")
 			e.complete(result)
 			return
 		}
+		raw200 = okEv.Raw
 		if code, handled := tryHandleFinalFailure(raw200); handled {
 			result := fail(fmt.Sprintf("Rejected with %s while awaiting 200 INVITE", code))
 			e.complete(result)
@@ -688,20 +716,21 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("BYE_SENT", 0, milestones.ByeSentMs, nil)
 
-	byeResp, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE", "407_BYE")
+	byeEv, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_BYE", "407_BYE")
 	if err != nil {
 		result := fail("bye_200 timeout")
 		e.complete(result)
 		return
 	}
-	if byeCode, _ := sip.ClassifyMessage(byeResp); byeCode == "407_BYE" {
+	byeResp := byeEv.Raw
+	if byeCode := byeEv.Code; byeCode == "407_BYE" {
 		emit("BYE_AUTH_407", 407, 0, nil)
 		if err := ag.Handle407Bye(dialog, byeResp); err != nil {
 			result := fail(fmt.Sprintf("bye_407_handling: %v", err))
 			e.complete(result)
 			return
 		}
-		if _, err := ag.WaitForSIPEvent(ctx, sipTimeout, "200_BYE"); err != nil {
+		if _, err := ag.WaitForDialogEvent(ctx, callID, sipTimeout, "200_BYE"); err != nil {
 			result := fail("bye_200 timeout after auth")
 			e.complete(result)
 			return

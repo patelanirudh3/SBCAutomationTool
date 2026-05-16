@@ -94,7 +94,12 @@ export function UnregisterProgressCard({
   const [copied, setCopied] = useState(false)
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(failed.join('\n'))
+      const unregisterFailed = cleanupStatus?.unregister_failed_extensions ?? failed
+      const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
+      await navigator.clipboard.writeText([
+        ...unregisterFailed.map((ext) => `unregister: ${ext}`),
+        ...unsubscribeFailed.map((ext) => `unsubscribe: ${ext}`),
+      ].join('\n'))
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch { /* clipboard unavailable */ }
@@ -180,18 +185,36 @@ export function UnregisterProgressCard({
   // Render — DONE (result strip)
   // ───────────────────────────────────────────────────────────────────
   if (isDone) {
-    const allClean = failed.length === 0 && count >= total && total > 0
-    const totalFailed = failed.length === total
+    const unregisterFailed = cleanupStatus?.unregister_failed_extensions ?? failed
+    const unregisterCount = cleanupStatus?.unregister_count ?? count
+    const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
+    const unsubscribeCount = cleanupStatus?.unsubscribe_count ?? 0
+    const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
+    const unregisterOk = Math.max(0, unregisterCount - unregisterFailed.length)
+    const unsubscribeOk = Math.max(0, unsubscribeCount - unsubscribeFailed.length)
+    const allUnregistered = unregisterFailed.length === 0 && unregisterCount >= total && total > 0
+    const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailed.length > 0
+    const allClean = allUnregistered && unsubscribeFailed.length === 0
+    const totalFailed = unregisterFailed.length === total
     const elapsedLabel = cleanupStatus?.elapsed_seconds != null
       ? ` (${fmtElapsed(cleanupStatus.elapsed_seconds)})`
       : ''
 
     if (allClean) {
       return (
-        <span className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-400">
-          <CheckCircle2 className="size-3.5" />
-          Unregistered {count.toLocaleString()} / {total.toLocaleString()}{elapsedLabel}
-        </span>
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-400">
+          <div className="flex items-center gap-1.5">
+            <CheckCircle2 className="size-3.5" />
+            Unregistered {unregisterOk.toLocaleString()} / {total.toLocaleString()}{elapsedLabel}
+          </div>
+          {hasUnsubscribeWork && (
+            <div className="mt-1 font-mono text-[11px] text-emerald-300/80">
+              {unsubscribeSkipped > 0
+                ? `Unsubscribe skipped ${unsubscribeSkipped.toLocaleString()} / ${total.toLocaleString()} (not enabled)`
+                : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${total.toLocaleString()}`}
+            </div>
+          )}
+        </div>
       )
     }
 
@@ -211,7 +234,7 @@ export function UnregisterProgressCard({
           {onRetryFailed && (
             <button
               type="button"
-              onClick={() => onRetryFailed(failed)}
+              onClick={() => onRetryFailed(unregisterFailed)}
               disabled={disabled}
               className={cn(
                 'mt-1 flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold',
@@ -220,7 +243,7 @@ export function UnregisterProgressCard({
                 'disabled:cursor-not-allowed disabled:opacity-50',
               )}
             >
-              Retry all ({failed.length})
+              Retry all ({unregisterFailed.length})
             </button>
           )}
         </div>
@@ -238,28 +261,44 @@ export function UnregisterProgressCard({
           <div className="flex items-center gap-2">
             <AlertTriangle className="size-4 text-amber-400" />
             <span className="text-sm font-semibold text-amber-200">
-              Unregistered {count - failed.length} / {total}
+              Unregistered {unregisterOk} / {total}
               {elapsedLabel}
             </span>
           </div>
-          <span className="font-mono text-xs text-rose-400 tabular-nums">
-            {failed.length} failed
-          </span>
+          {unregisterFailed.length > 0 && (
+            <span className="font-mono text-xs text-rose-400 tabular-nums">
+              {unregisterFailed.length} unregister failed
+            </span>
+          )}
         </div>
 
+        {hasUnsubscribeWork && (
+          <div className="rounded-md border border-amber-500/20 bg-slate-900/30 px-2.5 py-2 font-mono text-[11px] text-amber-100/90">
+            <div>Unsubscribed {unsubscribeOk.toLocaleString()} / {total.toLocaleString()}</div>
+            {unsubscribeSkipped > 0 && (
+              <div>Unsubscribe skipped {unsubscribeSkipped.toLocaleString()} / {total.toLocaleString()} (not enabled)</div>
+            )}
+            {unsubscribeFailed.length > 0 && (
+              <div className="text-rose-300">Unsubscribe failed {unsubscribeFailed.length.toLocaleString()} / {total.toLocaleString()}</div>
+            )}
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowFailed((v) => !v)}
-            className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/20"
-          >
-            {showFailed ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-            {showFailed ? 'Hide' : 'Show'} failed extensions ({failed.length})
-          </button>
-          {onRetryFailed && (
+          {(unregisterFailed.length > 0 || unsubscribeFailed.length > 0) && (
             <button
               type="button"
-              onClick={() => onRetryFailed(failed)}
+              onClick={() => setShowFailed((v) => !v)}
+              className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/20"
+            >
+              {showFailed ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+              {showFailed ? 'Hide' : 'Show'} failed extensions ({unregisterFailed.length + unsubscribeFailed.length})
+            </button>
+          )}
+          {onRetryFailed && unregisterFailed.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onRetryFailed(unregisterFailed)}
               disabled={disabled}
               className={cn(
                 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold',
@@ -268,7 +307,7 @@ export function UnregisterProgressCard({
                 'disabled:cursor-not-allowed disabled:opacity-50',
               )}
             >
-              Retry failed ({failed.length})
+              Retry unregister failed ({unregisterFailed.length})
             </button>
           )}
         </div>
@@ -276,8 +315,11 @@ export function UnregisterProgressCard({
         {showFailed && (
           <div className="space-y-2">
             <div className="max-h-40 overflow-y-auto rounded-md border border-amber-500/20 bg-slate-900/40 p-2 font-mono text-[11px] text-amber-100/90">
-              {failed.map((ext) => (
-                <div key={ext}>{ext}</div>
+              {unregisterFailed.map((ext) => (
+                <div key={`unreg-${ext}`}>unregister: {ext}</div>
+              ))}
+              {unsubscribeFailed.map((ext) => (
+                <div key={`unsub-${ext}`}>unsubscribe: {ext}</div>
               ))}
             </div>
             <button

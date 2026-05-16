@@ -9,9 +9,7 @@ import { Navbar } from '@/components/layout/Navbar'
 import { StepIndicator } from '@/components/layout/StepIndicator'
 import { HomeGuardButton } from '@/components/shared/HomeGuardButton'
 import { ChatPanel } from '@/components/agent/ChatPanel'
-import { ASRGauge } from '@/components/dashboard/ASRGauge'
 import { RunTimer } from '@/components/dashboard/RunTimer'
-import { VMMetricsCard } from '@/components/dashboard/VMMetricsCard'
 import { LiveChart } from '@/components/dashboard/LiveChart'
 import { ConcurrentCallsBar } from '@/components/dashboard/ConcurrentCallsBar'
 import { GraceTimer } from '@/components/dashboard/GraceTimer'
@@ -63,6 +61,7 @@ function LiveDashboard({
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const idleCount         = useTrafficStore((s) => s.idleCount)
+  const nonIdleCount      = useTrafficStore((s) => s.nonIdleCount)
   const settingUpCount    = useTrafficStore((s) => s.settingUpCount)
   const establishedCount  = useTrafficStore((s) => s.establishedCount)
   const regOnlyCount      = useTrafficStore((s) => s.regOnlyCount)
@@ -71,14 +70,11 @@ function LiveDashboard({
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
 
   const pair = pairs[activePairIndex]
-  const configuredCps = pair?.uac.cps ?? 2
-
-  // Theoretical steady-state concurrency = max_concurrent_calls when set,
-  // otherwise CPS × HoldTimeSeconds. Mirrors backend
-  // VMConfig.EffectiveMaxConcurrent() in go/internal/config/config.go.
-  // NOTE: this is intentionally NOT the registered-extension count — that
-  // would render a misleading ceiling (e.g. 401 when steady-state is 180).
-  const maxConcurrent = pair
+  // Configured steady-state concurrency = max_concurrent_calls when set,
+  // otherwise CPS × HoldTimeSeconds. In the unified single-pool model each
+  // active call consumes two UAs, so the effective ceiling is also limited by
+  // floor(registered/subscribed pool size / 2).
+  const configuredMaxConcurrent = pair
     ? (() => {
         const explicit = pair.uac.max_concurrent_calls
         if (explicit && explicit > 0) return explicit
@@ -99,19 +95,23 @@ function LiveDashboard({
     )
   }
 
+  const configuredExtCount = pair?.uac
+    ? pair.uac.ext_end - pair.uac.ext_start + 1
+    : 0
+  const registeredTotal = uacMetrics.registered_total ?? configuredExtCount
+  const poolCapacity = registeredTotal > 0
+    ? Math.floor(registeredTotal / 2)
+    : configuredMaxConcurrent
+  const effectiveMaxConcurrent = Math.max(1, Math.min(configuredMaxConcurrent, poolCapacity || configuredMaxConcurrent))
+  const extensionsInUse = nonIdleCount || (uacMetrics.concurrent_calls * 2)
   const isTrafficPhase = phase === 'TRAFFIC'
   const isStopping     = phase === 'STOPPING'
 
   return (
     <div className="flex flex-col gap-4 p-4 max-w-6xl mx-auto w-full">
-      {/* Row 1 — Hero: ASR + RunTimer/GraceTimer + Stop buttons.
-          The Run Timer and Graceful Drain Timer are mutually exclusive —
-          when the timed-mode deadline fires (or the operator clicks
-          Graceful Stop), the backend freezes run_elapsed_seconds and sets
-          graceful_drain_active=true, at which point we swap the live Run
-          Timer for the countdown Graceful Drain Timer. */}
-      <div className="rounded-lg border border-border bg-card p-5 flex items-center gap-6">
-        <ASRGauge asr={uacMetrics.asr} className="flex-1 min-w-0" />
+      {/* Traffic controls + timer. Ratios and funnel live in AggregatePanel so
+          they can stack safely at all screen widths. */}
+      <div className="rounded-lg border border-border bg-card p-4 flex flex-wrap items-center justify-between gap-4">
         {uacMetrics.graceful_drain_active ? (
           <GraceTimer
             totalSeconds={uacMetrics.graceful_drain_total_seconds ?? 0}
@@ -125,10 +125,8 @@ function LiveDashboard({
           />
         )}
 
-        {/* Stop controls — shown during active traffic */}
         {(isTrafficPhase || isStopping) && (
-          <div className="flex shrink-0 flex-col gap-2">
-            {/* Graceful Stop */}
+          <div className="flex shrink-0 flex-wrap gap-2">
             <button
               onClick={onGracefulStop}
               disabled={stopping || isStopping}
@@ -146,7 +144,6 @@ function LiveDashboard({
               )}
               Graceful Stop
             </button>
-            {/* Force Stop (interrupt) */}
             <button
               onClick={onInterruptStop}
               disabled={stopping}
@@ -162,8 +159,9 @@ function LiveDashboard({
             </button>
           </div>
         )}
-
       </div>
+
+      <AggregatePanel uacMetrics={uacMetrics} />
 
       {/* Pool counts row — shown whenever we have non-zero counts.
           The 4th tile (Setting Up) is shown only when non-zero because in
@@ -172,7 +170,7 @@ function LiveDashboard({
           numbers. When traffic is intense or the SBC is slow, the count
           becomes visible and tells operators "calls are in INVITE/PRACK
           phase, not yet ACK'd". */}
-      {(idleCount > 0 || settingUpCount > 0 || establishedCount > 0 || regOnlyCount > 0) && (
+      {(idleCount > 0 || settingUpCount > 0 || extensionsInUse > 0 || regOnlyCount > 0) && (
         <div className={settingUpCount > 0 ? 'grid grid-cols-4 gap-3' : 'grid grid-cols-3 gap-3'}>
           <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3 text-center">
             <p className="text-2xl font-bold font-mono text-emerald-400">{idleCount}</p>
@@ -189,14 +187,16 @@ function LiveDashboard({
             </div>
           )}
           <div className="rounded-lg border border-blue-500/25 bg-blue-500/5 p-3 text-center">
-            <p className="text-2xl font-bold font-mono text-blue-400">{establishedCount}</p>
+            <p className="text-2xl font-bold font-mono text-blue-400">{extensionsInUse}</p>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              (Extensions currently in call)
+              (Extensions in use)
             </p>
           </div>
           <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-center">
             <p className="text-2xl font-bold font-mono text-amber-400">{regOnlyCount}</p>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">Reg-only</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground" title="Registered but not subscribed; this is not the idle count.">
+              Reg-only
+            </p>
           </div>
         </div>
       )}
@@ -227,52 +227,28 @@ function LiveDashboard({
         </div>
       )}
 
-      {/* Aggregate totals bar */}
-      <AggregatePanel uacMetrics={uacMetrics} />
-
-      {/* Row 2 — VM Metrics Card (single engine) */}
-      <div className="grid grid-cols-1 gap-4">
-        <VMMetricsCard
-          role="UAC"
-          metrics={uacMetrics}
-          configuredCps={configuredCps}
-        />
+      {/* Runtime signals — non-duplicated engine health values. */}
+      <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-4 md:grid-cols-4">
+        <RuntimeStat label="Actual CPS" value={uacMetrics.cps_actual.toFixed(2)} />
+        <RuntimeStat label="Avg PDD" value={`${uacMetrics.avg_pdd_ms.toFixed(0)} ms`} />
+        <RuntimeStat label="Avg Hold" value={`${(uacMetrics.avg_hold_ms / 1000).toFixed(1)} s`} />
+        <RuntimeStat label="Sockets" value={uacMetrics.socket_count.toLocaleString()} />
       </div>
 
-      {/* Row 3 — Charts */}
+      {/* Charts / trend history */}
       <div className="grid grid-cols-3 gap-4">
         <LiveChart className="col-span-2" />
         <div className="rounded-lg border border-border bg-card p-4 flex flex-col justify-center">
           <ConcurrentCallsBar
             concurrent={uacMetrics.concurrent_calls}
-            ceiling={maxConcurrent}
+            ceiling={effectiveMaxConcurrent}
+            configuredCeiling={configuredMaxConcurrent}
+            poolCapacity={poolCapacity}
           />
         </div>
       </div>
 
-      {/* Row 4 — Live call stats: successful / completed / failed */}
-      <div className="grid grid-cols-3 gap-3">
-        <div className="rounded-lg border border-sky-500/25 bg-sky-500/5 p-3 text-center">
-          <p className="text-2xl font-bold font-mono text-sky-400">
-            {uacMetrics.concurrent_calls.toLocaleString()}
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">In-Call (INV/200/ACK)</p>
-        </div>
-        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3 text-center">
-          <p className="text-2xl font-bold font-mono text-emerald-400">
-            {uacMetrics.calls_completed.toLocaleString()}
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">Completed (BYE/200)</p>
-        </div>
-        <div className="rounded-lg border border-rose-500/25 bg-rose-500/5 p-3 text-center">
-          <p className="text-2xl font-bold font-mono text-rose-400">
-            {uacMetrics.calls_failed.toLocaleString()}
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">Failed</p>
-        </div>
-      </div>
-
-      {/* Row 5 — Failed calls table */}
+      {/* Failed calls table */}
       <FailedCallsTable
         events={callEvents}
         reportedFailedCount={uacMetrics.calls_failed}
@@ -291,6 +267,19 @@ function LiveDashboard({
         rttMs={uacMetrics.avg_rtt_ms ?? null}
         rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
       />
+    </div>
+  )
+}
+
+function RuntimeStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md bg-secondary/20 px-3 py-2 text-center">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-foreground/65">
+        {label}
+      </p>
+      <p className="mt-1 font-mono text-xl font-semibold tabular-nums text-foreground">
+        {value}
+      </p>
     </div>
   )
 }
@@ -339,7 +328,7 @@ function buildAggregateFromStore(): void {
   setAggregate({
     total_attempted: uacMetrics.calls_attempted,
     total_answered: uacMetrics.calls_answered,
-    total_acknowledged: uacMetrics.calls_acknowledged,
+    total_acknowledged: uacMetrics.calls_acknowledged ?? uacMetrics.calls_completed,
     total_completed: uacMetrics.calls_completed,
     total_failed: uacMetrics.calls_failed,
     aggregate_asr: uacMetrics.asr,
@@ -491,7 +480,7 @@ export default function RunPage() {
           total_failed: totalFailed,
           aggregate_asr:
             totalAttempted > 0
-              ? Math.round((totalCompleted / totalAttempted) * 1000) / 10
+              ? Math.round(((mockUacRef.current.calls_answered ?? 0) / totalAttempted) * 1000) / 10
               : 0,
           ended_at: new Date().toISOString(),
         })

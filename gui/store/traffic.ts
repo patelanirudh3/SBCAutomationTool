@@ -52,6 +52,7 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     ext_end: 4001009,
     register_expires: 3600,
     subscribe_expires: 3600,
+    subscribe_events: ['dialog'],
     register_rate_cps: 10,
     t1_ms: 500,
     timer_b_seconds: 32,
@@ -242,13 +243,28 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
       // is responsive even before the backend trips its own complete flag.
       let cleanupStatus = state.cleanupStatus
       const total = m.cleanup_total ?? 0
-      const count = m.cleanup_count ?? 0
-      if (total > 0 || count > 0 || (m.cleanup_failed?.length ?? 0) > 0) {
-        const failed = m.cleanup_failed ?? cleanupStatus?.failed_extensions ?? []
+      const count = m.cleanup_unregister_count ?? m.cleanup_count ?? 0
+      const unregisterFailed = m.cleanup_unregister_failed ?? m.cleanup_failed ?? cleanupStatus?.unregister_failed_extensions ?? cleanupStatus?.failed_extensions ?? []
+      const unsubscribeFailed = m.cleanup_unsubscribe_failed ?? cleanupStatus?.unsubscribe_failed_extensions ?? []
+      const unsubscribeCount = m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
+      const unsubscribeSkipped = m.cleanup_unsubscribe_skipped ?? cleanupStatus?.unsubscribe_skipped ?? 0
+      if (
+        total > 0 ||
+        count > 0 ||
+        unsubscribeCount > 0 ||
+        unsubscribeSkipped > 0 ||
+        unregisterFailed.length > 0 ||
+        unsubscribeFailed.length > 0
+      ) {
         cleanupStatus = {
           count,
           total: Math.max(total, cleanupStatus?.total ?? 0),
-          failed_extensions: failed,
+          failed_extensions: unregisterFailed,
+          unsubscribe_count: unsubscribeCount,
+          unsubscribe_skipped: unsubscribeSkipped,
+          unsubscribe_failed_extensions: unsubscribeFailed,
+          unregister_count: count,
+          unregister_failed_extensions: unregisterFailed,
           in_progress: mappedPhase === 'CLEANING_UP',
           complete: total > 0 && count >= total,
           elapsed_seconds: cleanupStatus?.elapsed_seconds,
@@ -260,8 +276,11 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
         phase: mappedPhase,
         idleCount: m.idle_count ?? state.idleCount,
         nonIdleCount: m.non_idle_count ?? state.nonIdleCount,
-        settingUpCount: m.setting_up_count ?? state.settingUpCount,
-        establishedCount: m.established_count ?? state.establishedCount,
+        settingUpCount: m.setting_up_count ?? 0,
+        // Backed-out backend builds do not emit established_count. In that
+        // schema, concurrent_calls already represents established in-call
+        // sessions, so use it as the compatibility source for the tile.
+        establishedCount: m.established_count ?? m.concurrent_calls ?? state.establishedCount,
         regOnlyCount: m.reg_only_count ?? state.regOnlyCount,
         cleanupStatus,
         metricsHistory: [

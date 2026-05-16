@@ -254,9 +254,15 @@ export function buildAggregate(
   const uacOnly = allEvents.filter((e) => e.direction !== 'uas')
   const attempted = uacOnly.length
   const answered = uacOnly.filter((e) => e.answered === true).length
-  const acknowledged = uacOnly.filter((e) => e.acknowledged === true).length
+  const hasAcknowledgedField = uacOnly.some((e) => typeof e.acknowledged === 'boolean')
   const completed = uacOnly.filter((e) => e.result === 'COMPLETED').length
-  const failed = attempted - completed
+  // Older/backed-out backend builds do not include the per-call
+  // `acknowledged` flag. A completed call necessarily reached INV/200/ACK
+  // before RTP and BYE/200, so completed is the safest lower-bound fallback.
+  const acknowledged = hasAcknowledgedField
+    ? uacOnly.filter((e) => e.acknowledged === true).length
+    : completed
+  const failed = uacOnly.filter((e) => e.result === 'FAILED').length
   return {
     run_id: runId,
     started_at: startedAt,
@@ -266,7 +272,7 @@ export function buildAggregate(
     total_acknowledged: acknowledged,
     total_completed: completed,
     total_failed: failed,
-    aggregate_asr: attempted > 0 ? Math.round((completed / attempted) * 1000) / 10 : 0,
+    aggregate_asr: attempted > 0 ? Math.round((answered / attempted) * 1000) / 10 : 0,
   }
 }
 

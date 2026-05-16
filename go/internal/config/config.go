@@ -17,11 +17,11 @@ import (
 // VMConfig holds all configuration for a single-pool traffic run.
 // The dual UAC/UAS role model has been replaced with a unified user pool.
 type VMConfig struct {
-	VMID      string `yaml:"vm_id" json:"vm_id"`
-	ExtStart  int    `yaml:"ext_start" json:"ext_start"`
-	ExtEnd    int    `yaml:"ext_end" json:"ext_end"`
-	SBCHost   string `yaml:"sbc_host" json:"sbc_host"`
-	SBCPort   int    `yaml:"sbc_port" json:"sbc_port"`
+	VMID     string `yaml:"vm_id" json:"vm_id"`
+	ExtStart int    `yaml:"ext_start" json:"ext_start"`
+	ExtEnd   int    `yaml:"ext_end" json:"ext_end"`
+	SBCHost  string `yaml:"sbc_host" json:"sbc_host"`
+	SBCPort  int    `yaml:"sbc_port" json:"sbc_port"`
 	// TODO(failover): SecondaryHost/Port are stored and validated but not yet
 	// wired into the engine. When failover_enabled is true, the forking model
 	// requires: (1) REGISTER on both primary and secondary during pre-phase,
@@ -55,13 +55,15 @@ type VMConfig struct {
 	MetricsInterval int `yaml:"metrics_interval" json:"metrics_interval"`
 	MetricsPort     int `yaml:"metrics_port" json:"metrics_port"`
 
-	RegisterBatchSize    int `yaml:"register_batch_size" json:"register_batch_size"`
-	RegisterBatchDelayMs int `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
-	RegisterExpires      int `yaml:"register_expires" json:"register_expires"`
-	RegisterRetry        int `yaml:"register_retry" json:"register_retry"`
-	RegisterTimeout      int `yaml:"register_timeout" json:"register_timeout"`
-	SubscribeConcurrency int `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
-	SubscribeExpires     int `yaml:"subscribe_expires" json:"subscribe_expires"`
+	RegisterBatchSize    int      `yaml:"register_batch_size" json:"register_batch_size"`
+	RegisterBatchDelayMs int      `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
+	RegisterExpires      int      `yaml:"register_expires" json:"register_expires"`
+	RegisterRetry        int      `yaml:"register_retry" json:"register_retry"`
+	RegisterTimeout      int      `yaml:"register_timeout" json:"register_timeout"`
+	SubscribeConcurrency int      `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
+	SubscribeExpires     int      `yaml:"subscribe_expires" json:"subscribe_expires"`
+	SubscribeEvent       string   `yaml:"subscribe_event,omitempty" json:"subscribe_event,omitempty"` // legacy single-event alias
+	SubscribeEvents      []string `yaml:"subscribe_events" json:"subscribe_events"`
 
 	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
 	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
@@ -74,9 +76,9 @@ type VMConfig struct {
 	LocalHost          string `yaml:"local_host" json:"local_host"`
 	LocalPort          int    `yaml:"local_port" json:"local_port"`
 
-	RTPBurstSeconds      int `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
-	RTPBurstPPS          int `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
-	RTPKeepaliveInterval int `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
+	RTPBurstSeconds      int    `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
+	RTPBurstPPS          int    `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
+	RTPKeepaliveInterval int    `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
 	MediaEnabled         bool   `yaml:"media_enabled" json:"media_enabled"`
 	RTPMode              string `yaml:"rtp_mode" json:"rtp_mode"`
 	RTPPtime             int    `yaml:"rtp_ptime" json:"rtp_ptime"`
@@ -297,6 +299,10 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.SubscribeExpires == 0 {
 		cfg.SubscribeExpires = 3600
 	}
+	cfg.SubscribeEvents = normalizeSubscribeEvents(cfg.SubscribeEvents, cfg.SubscribeEvent)
+	if len(cfg.SubscribeEvents) == 1 {
+		cfg.SubscribeEvent = cfg.SubscribeEvents[0]
+	}
 	if cfg.RegisterRetry == 0 {
 		cfg.RegisterRetry = 3
 	}
@@ -374,6 +380,41 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RTCPSRIntervalSeconds == 0 {
 		cfg.RTCPSRIntervalSeconds = 5
 	}
+}
+
+var allowedSubscribeEvents = map[string]struct{}{
+	"reg":             {},
+	"dialog":          {},
+	"message-summary": {},
+	"presence":        {},
+	"cci-info":        {},
+}
+
+func normalizeSubscribeEvents(events []string, legacy string) []string {
+	if len(events) == 0 && legacy != "" {
+		events = []string{legacy}
+	}
+	if len(events) == 0 {
+		events = []string{"dialog"}
+	}
+
+	seen := make(map[string]struct{}, len(events))
+	out := make([]string, 0, len(events))
+	for _, event := range events {
+		event = strings.ToLower(strings.TrimSpace(event))
+		if event == "" {
+			continue
+		}
+		if _, dup := seen[event]; dup {
+			continue
+		}
+		seen[event] = struct{}{}
+		out = append(out, event)
+	}
+	if len(out) == 0 {
+		return []string{"dialog"}
+	}
+	return out
 }
 
 // Validate checks that a VMConfig has all required fields set and that
@@ -479,6 +520,11 @@ func Validate(cfg *VMConfig) error {
 	if cfg.RTCPSRIntervalSeconds < 1 || cfg.RTCPSRIntervalSeconds > 60 {
 		errs = append(errs, fmt.Sprintf("rtcp_sr_interval_seconds must be 1..60 s, got %d", cfg.RTCPSRIntervalSeconds))
 	}
+	for _, event := range cfg.SubscribeEvents {
+		if _, ok := allowedSubscribeEvents[event]; !ok {
+			errs = append(errs, fmt.Sprintf("subscribe_events contains unsupported event %q", event))
+		}
+	}
 	if cfg.TrafficMode == "smoke" && cfg.CallCount <= 0 {
 		errs = append(errs, "traffic_mode='smoke' requires call_count > 0")
 	}
@@ -505,6 +551,7 @@ func Validate(cfg *VMConfig) error {
 		"concurrent_estimate", cfg.EffectiveMaxConcurrent(),
 		"register_expires", cfg.RegisterExpires,
 		"subscribe_expires", cfg.SubscribeExpires,
+		"subscribe_events", cfg.SubscribeEvents,
 		"register_batch_size", cfg.RegisterBatchSize,
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,

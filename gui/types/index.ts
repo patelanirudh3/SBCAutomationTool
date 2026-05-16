@@ -124,6 +124,8 @@ export interface VMConfig {
   // Registration / Subscription
   register_expires?: number        // default: 3600 (seconds)
   subscribe_expires?: number       // default: 3600 (seconds)
+  subscribe_event?: string         // legacy single-event alias
+  subscribe_events?: string[]      // default: ['dialog']
   register_rate_cps?: number       // default: 10 — REGISTERs per second
 
   // SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
@@ -217,7 +219,10 @@ export interface TrafficMetrics {
   calls_acknowledged?: number
   calls_completed: number
   calls_failed: number
+  // asr: Answer Seizure Ratio = calls_answered / calls_attempted * 100.
   asr: number
+  // csr: Call Success Ratio = calls_completed / calls_attempted * 100.
+  csr?: number
   avg_pdd_ms: number
   min_pdd_ms: number
   max_pdd_ms: number
@@ -247,6 +252,11 @@ export interface TrafficMetrics {
   cleanup_count?: number
   cleanup_total?: number
   cleanup_failed?: string[]
+  cleanup_unsubscribe_count?: number
+  cleanup_unsubscribe_skipped?: number
+  cleanup_unsubscribe_failed?: string[]
+  cleanup_unregister_count?: number
+  cleanup_unregister_failed?: string[]
 
   // QoS / Media aggregates (Phase 1) — averages over calls that produced
   // non-zero values; media_quality_counts is a 4-bucket histogram analogous
@@ -304,6 +314,11 @@ export interface CleanupStatus {
   count: number
   total: number
   failed_extensions: string[]
+  unsubscribe_count?: number
+  unsubscribe_skipped?: number
+  unsubscribe_failed_extensions?: string[]
+  unregister_count?: number
+  unregister_failed_extensions?: string[]
   in_progress: boolean
   complete: boolean
   // Wall-clock seconds the cleanup took. Set by the GUI when it observes
@@ -386,6 +401,7 @@ export interface AggregateMetrics {
   total_acknowledged?: number
   total_completed: number
   total_failed: number
+  // aggregate_asr: Answer Seizure Ratio = total_answered / total_attempted * 100.
   aggregate_asr: number
   run_id: string
   started_at: string
