@@ -17,7 +17,7 @@ import { AggregatePanel } from '@/components/dashboard/AggregatePanel'
 import { PrePhaseReport } from '@/components/dashboard/PrePhaseReport'
 import { PrePhaseSummaryModal } from '@/components/dashboard/PrePhaseSummaryModal'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
-import { MediaQosPanel } from '@/components/dashboard/MediaQosPanel'
+import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
 import { FinalReport } from '@/components/postrun/FinalReport'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
@@ -260,6 +260,24 @@ function LiveDashboard({
         })()}
         rttMs={uacMetrics.avg_rtt_ms ?? null}
         rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
+        rtpFlow={{
+          configuredPacketsPerDirection: computeConfiguredRtpPacketsPerDirection(
+            pair?.uac.hold_time_seconds,
+            pair?.uac.rtp_ptime,
+            pair?.advancedSettings,
+          ),
+          avgTxPackets: uacMetrics.avg_rtp_tx_pkts ?? null,
+          avgRxFromSbcPackets: uacMetrics.avg_rtp_rx_from_sbc_pkts ?? null,
+          totalTxPackets: uacMetrics.total_rtp_tx_pkts ?? null,
+          totalRxPackets: uacMetrics.total_rtp_rx_pkts ?? null,
+          totalRxFromSbcPackets: uacMetrics.total_rtp_rx_from_sbc_pkts ?? null,
+          totalExpectedPackets: uacMetrics.total_rtp_expected_pkts ?? null,
+          totalLostPackets: uacMetrics.total_rtp_lost_pkts ?? null,
+          totalSsrcCount: uacMetrics.total_rtp_ssrc_count ?? null,
+          lossPct: uacMetrics.rtp_loss_pct ?? uacMetrics.avg_packet_loss_pct ?? null,
+          asymmetryPct: uacMetrics.rtp_asymmetry_pct ?? null,
+          asymmetryFlag: uacMetrics.rtp_asymmetry_flag ?? null,
+        }}
       />
     </div>
   )

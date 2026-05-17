@@ -1240,6 +1240,8 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		RTPAsymmetryFlag: r.RTPAsymmetryFlag,
 		MarkersSent:      r.MarkersSent,
 		MarkersReceived:  r.MarkersReceived,
+		RTPExpectedPkts:  r.RTPExpectedPkts,
+		RTPSSRCCount:     r.RTPSSRCCount,
 		Scenario:         r.Scenario,
 
 		// Phase-1 QoS metrics

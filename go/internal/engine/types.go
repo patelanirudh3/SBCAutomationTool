@@ -29,16 +29,16 @@ type SipMilestones struct {
 	InviteTsUTC     string  `json:"invite_ts_utc"`
 
 	// UAS side
-	InviteReceivedMs  float64 `json:"invite_received_ms"`
-	Trying100SentMs   float64 `json:"trying_100_sent_ms"`
-	Ringing180SentMs  float64 `json:"ringing_180_sent_ms"`
-	PrackReceivedMs   float64 `json:"prack_received_ms"`
-	Prack200SentMs    float64 `json:"prack_200_sent_ms"`
-	Ok200SentMs       float64 `json:"ok_200_sent_ms"`
-	AckReceivedMs     float64 `json:"ack_received_ms"`
-	ByeReceivedMs     float64 `json:"bye_received_ms"`
-	Bye200SentMs      float64 `json:"bye_200_sent_ms"`
-	UASInviteTsUTC    string  `json:"uas_invite_ts_utc"`
+	InviteReceivedMs float64 `json:"invite_received_ms"`
+	Trying100SentMs  float64 `json:"trying_100_sent_ms"`
+	Ringing180SentMs float64 `json:"ringing_180_sent_ms"`
+	PrackReceivedMs  float64 `json:"prack_received_ms"`
+	Prack200SentMs   float64 `json:"prack_200_sent_ms"`
+	Ok200SentMs      float64 `json:"ok_200_sent_ms"`
+	AckReceivedMs    float64 `json:"ack_received_ms"`
+	ByeReceivedMs    float64 `json:"bye_received_ms"`
+	Bye200SentMs     float64 `json:"bye_200_sent_ms"`
+	UASInviteTsUTC   string  `json:"uas_invite_ts_utc"`
 }
 
 // CallResult carries the outcome of a single call (UAC or UAS) and is fed
@@ -70,6 +70,8 @@ type CallResult struct {
 	RTPAsymmetryFlag string `json:"rtp_asymmetry_flag"`
 	MarkersSent      int    `json:"markers_sent"`
 	MarkersReceived  int    `json:"markers_received"`
+	RTPExpectedPkts  int    `json:"rtp_expected_pkts"`
+	RTPSSRCCount     int    `json:"rtp_ssrc_count"`
 	Scenario         string `json:"scenario"`
 
 	// QoS / Media metrics (Phase 1 — read-only).
@@ -80,17 +82,17 @@ type CallResult struct {
 	PacketLossPct    float64 `json:"packet_loss_pct"`
 	LostPackets      int     `json:"lost_packets"`
 	OOOPackets       int     `json:"ooo_packets"`
-	RTTMs            float64 `json:"rtt_ms"`           // from RTCP RR (LSR/DLSR), 0 if not available
-	RemoteJitterMs   float64 `json:"remote_jitter_ms"` // from RTCP RR
-	RemoteLossPct    float64 `json:"remote_loss_pct"`  // from RTCP RR fraction-lost
-	MOSScore         float64 `json:"mos_score"`        // 0 if MOS estimation disabled
+	RTTMs            float64 `json:"rtt_ms"`             // from RTCP RR (LSR/DLSR), 0 if not available
+	RemoteJitterMs   float64 `json:"remote_jitter_ms"`   // from RTCP RR
+	RemoteLossPct    float64 `json:"remote_loss_pct"`    // from RTCP RR fraction-lost
+	MOSScore         float64 `json:"mos_score"`          // 0 if MOS estimation disabled
 	MediaQualityFlag string  `json:"media_quality_flag"` // OK / WARNING / CRITICAL / UNKNOWN
 
 	// SIP-derived shortcuts computed from SipMilestones for direct GUI consumption.
-	CallSetupMs         float64 `json:"call_setup_ms"`         // Ok200Ms - InviteSentMs
-	PrackRTTMs          float64 `json:"prack_rtt_ms"`          // Prack200Ms - PrackSentMs
-	SipTransactionRTTMs float64 `json:"sip_txn_rtt_ms"`        // Trying100Ms - InviteSentMs (UAC path latency)
-	ByeCompletionMs     float64 `json:"bye_completion_ms"`     // Bye200Ms - ByeSentMs
+	CallSetupMs         float64 `json:"call_setup_ms"`     // Ok200Ms - InviteSentMs
+	PrackRTTMs          float64 `json:"prack_rtt_ms"`      // Prack200Ms - PrackSentMs
+	SipTransactionRTTMs float64 `json:"sip_txn_rtt_ms"`    // Trying100Ms - InviteSentMs (UAC path latency)
+	ByeCompletionMs     float64 `json:"bye_completion_ms"` // Bye200Ms - ByeSentMs
 }
 
 // ClassifyMedia determines talk-path verification result from RTP receive
@@ -173,8 +175,10 @@ const (
 // ComputeMOS returns an estimated Mean Opinion Score using the simplified
 // ITU-T G.107 E-Model. The formula assumes a G.711 narrowband codec.
 // Inputs:
-//   packetLossFraction — 0.0 to 1.0 (NOT percentage)
-//   jitterMs           — interarrival jitter in milliseconds (RFC 3550)
+//
+//	packetLossFraction — 0.0 to 1.0 (NOT percentage)
+//	jitterMs           — interarrival jitter in milliseconds (RFC 3550)
+//
 // Returns a MOS value clamped to [1.0, 4.5].
 //
 // This is an approximation; for production-grade reporting use a dedicated

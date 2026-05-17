@@ -376,6 +376,8 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		rtcpRx                int
 		markersSent           int
 		markersRecv           int
+		rtpExpected           int
+		rtpSSRCCount          int
 		mediaOK               bool
 
 		jitterMs     float64
@@ -396,6 +398,8 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		rtcpRx = st.RTCPRxPkts
 		markersSent = rtpEP.MarkersSent()
 		markersRecv = st.MarkersReceived
+		rtpExpected = st.ExpectedPackets
+		rtpSSRCCount = st.SSRCCount
 		mediaOK = rtpRx > 0
 
 		jitterMs = math.Round(st.JitterMs*100) / 100
@@ -418,6 +422,8 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 			"rtcp_rx_pkts":         rtcpRx,
 			"markers_sent":         markersSent,
 			"markers_received":     markersRecv,
+			"rtp_expected_pkts":    rtpExpected,
+			"rtp_ssrc_count":       rtpSSRCCount,
 			"jitter_ms":            jitterMs,
 			"packet_loss_pct":      packetLoss,
 			"mos_score":            mosScore,
@@ -454,6 +460,8 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
 		MarkersSent:      markersSent,
 		MarkersReceived:  markersRecv,
+		RTPExpectedPkts:  rtpExpected,
+		RTPSSRCCount:     rtpSSRCCount,
 
 		JitterMs:            jitterMs,
 		PacketLossPct:       packetLoss,
@@ -499,6 +507,8 @@ func (u *UasAutoAnswer) handleTimeout(
 		rtcpRx                int
 		markersSent           int
 		markersRecv           int
+		rtpExpected           int
+		rtpSSRCCount          int
 		mediaOK               bool
 
 		jitterMs     float64
@@ -519,6 +529,8 @@ func (u *UasAutoAnswer) handleTimeout(
 		rtcpRx = st.RTCPRxPkts
 		markersSent = rtpEP.MarkersSent()
 		markersRecv = st.MarkersReceived
+		rtpExpected = st.ExpectedPackets
+		rtpSSRCCount = st.SSRCCount
 		mediaOK = rtpRx > 0
 		jitterMs = math.Round(st.JitterMs*100) / 100
 		packetLoss = math.Round(st.PacketLossPct*100) / 100
@@ -555,6 +567,8 @@ func (u *UasAutoAnswer) handleTimeout(
 		RTCPRxPkts:       rtcpRx,
 		MarkersSent:      markersSent,
 		MarkersReceived:  markersRecv,
+		RTPExpectedPkts:  rtpExpected,
+		RTPSSRCCount:     rtpSSRCCount,
 		SBCRTPRelayIP:    sbcRelayIP,
 		SBCRTPRelayPort:  sbcRelayPort,
 		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),

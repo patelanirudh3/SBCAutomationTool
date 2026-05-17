@@ -285,6 +285,17 @@ export interface TrafficMetrics {
   avg_jitter_ms?: number
   avg_mos_score?: number
   avg_packet_loss_pct?: number
+  total_rtp_tx_pkts?: number
+  total_rtp_rx_pkts?: number
+  total_rtp_rx_from_sbc_pkts?: number
+  total_rtp_expected_pkts?: number
+  total_rtp_lost_pkts?: number
+  total_rtp_ssrc_count?: number
+  avg_rtp_tx_pkts?: number
+  avg_rtp_rx_from_sbc_pkts?: number
+  rtp_loss_pct?: number
+  rtp_asymmetry_pct?: number
+  rtp_asymmetry_flag?: 'OK' | 'WARNING' | 'CRITICAL'
   media_quality_counts?: {
     OK: number
     WARNING: number
@@ -388,6 +399,8 @@ export interface CallEvent {
   rtp_rx_from_sbc_pkts?: number
   rtp_rx_other_pkts?: number
   rtp_asymmetry_flag?: string
+  rtp_expected_pkts?: number
+  rtp_ssrc_count?: number
   rtcp_rx_pkts?: number
   markers_sent?: number
   markers_received?: number
@@ -424,6 +437,17 @@ export interface AggregateMetrics {
   total_failed: number
   // aggregate_asr: Answer Seizure Ratio = total_answered / total_attempted * 100.
   aggregate_asr: number
+  total_rtp_tx_pkts?: number
+  total_rtp_rx_pkts?: number
+  total_rtp_rx_from_sbc_pkts?: number
+  total_rtp_expected_pkts?: number
+  total_rtp_lost_pkts?: number
+  total_rtp_ssrc_count?: number
+  avg_rtp_tx_pkts?: number
+  avg_rtp_rx_from_sbc_pkts?: number
+  rtp_loss_pct?: number
+  rtp_asymmetry_pct?: number
+  rtp_asymmetry_flag?: 'OK' | 'WARNING' | 'CRITICAL'
   run_id: string
   started_at: string
   ended_at?: string

@@ -85,6 +85,17 @@ type TrafficMetrics struct {
 	AvgMOSScore        float64        `json:"avg_mos_score"`
 	AvgPacketLossPct   float64        `json:"avg_packet_loss_pct"`
 	MediaQualityCounts map[string]int `json:"media_quality_counts"`
+	TotalRTPTxPkts     int            `json:"total_rtp_tx_pkts"`
+	TotalRTPRxPkts     int            `json:"total_rtp_rx_pkts"`
+	TotalRTPRxFromSBC  int            `json:"total_rtp_rx_from_sbc_pkts"`
+	TotalRTPExpected   int            `json:"total_rtp_expected_pkts"`
+	TotalRTPLostPkts   int            `json:"total_rtp_lost_pkts"`
+	TotalRTPSSRCCount  int            `json:"total_rtp_ssrc_count"`
+	AvgRTPTxPkts       float64        `json:"avg_rtp_tx_pkts"`
+	AvgRTPRxFromSBC    float64        `json:"avg_rtp_rx_from_sbc_pkts"`
+	RTPLossPct         float64        `json:"rtp_loss_pct"`
+	RTPAsymmetryPct    float64        `json:"rtp_asymmetry_pct"`
+	RTPAsymmetryFlag   string         `json:"rtp_asymmetry_flag"`
 
 	// AvgRTTMs (Phase 2) — averaged across calls that produced a non-zero
 	// RTT sample. Always 0 when rtcp_sr_enabled is false (no SR sent → no
@@ -128,6 +139,8 @@ type CallResultData struct {
 	RTPAsymmetryFlag string
 	MarkersSent      int
 	MarkersReceived  int
+	RTPExpectedPkts  int
+	RTPSSRCCount     int
 	Scenario         string
 	SipMilestones    json.RawMessage
 
@@ -637,6 +650,8 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"rtp_asymmetry_flag":   r.RTPAsymmetryFlag,
 			"markers_sent":         r.MarkersSent,
 			"markers_received":     r.MarkersReceived,
+			"rtp_expected_pkts":    r.RTPExpectedPkts,
+			"rtp_ssrc_count":       r.RTPSSRCCount,
 			"scenario":             r.Scenario,
 			// Phase-1 QoS fields
 			"jitter_ms":          r.JitterMs,
@@ -719,6 +734,8 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"rtcp_rx_pkts":         cr.RTCPRxPkts,
 			"markers_sent":         cr.MarkersSent,
 			"markers_received":     cr.MarkersReceived,
+			"rtp_expected_pkts":    cr.RTPExpectedPkts,
+			"rtp_ssrc_count":       cr.RTPSSRCCount,
 			"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
 			"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
 			"ts_utc":               ts,
@@ -948,6 +965,50 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		idleCount, nonIdleCount, regOnlyCount = c.poolCountsProvider()
 	}
 
+	var totalRTPTx, totalRTPRx, totalRTPRxFromSBC, totalRTPExpected, totalRTPLost, totalRTPSSRCCount, rtpSampleCount int
+	for _, r := range c.callResults {
+		totalRTPTx += r.RTPTxPkts
+		totalRTPRx += r.RTPRxPkts
+		totalRTPRxFromSBC += r.RTPRxFromSBCPkts
+		totalRTPExpected += r.RTPExpectedPkts
+		totalRTPLost += r.LostPackets
+		totalRTPSSRCCount += r.RTPSSRCCount
+		if r.RTPTxPkts > 0 || r.RTPRxPkts > 0 || r.LostPackets > 0 {
+			rtpSampleCount++
+		}
+	}
+	avgRTPTx, avgRTPRxFromSBC := 0.0, 0.0
+	if rtpSampleCount > 0 {
+		avgRTPTx = math.Round(float64(totalRTPTx)/float64(rtpSampleCount)*100) / 100
+		avgRTPRxFromSBC = math.Round(float64(totalRTPRxFromSBC)/float64(rtpSampleCount)*100) / 100
+	}
+	rtpLossPct := 0.0
+	if totalRTPExpected > 0 {
+		rtpLossPct = math.Round(float64(totalRTPLost)/float64(totalRTPExpected)*10000) / 100
+	} else if totalRTPRxFromSBC+totalRTPLost > 0 {
+		rtpLossPct = math.Round(float64(totalRTPLost)/float64(totalRTPRxFromSBC+totalRTPLost)*10000) / 100
+	}
+	effectiveRx := totalRTPRxFromSBC
+	if effectiveRx == 0 && totalRTPRx > 0 {
+		effectiveRx = totalRTPRx
+	}
+	rtpAsymmetryPct := 0.0
+	rtpAsymmetryFlag := "OK"
+	if totalRTPTx > 0 || effectiveRx > 0 {
+		base := totalRTPTx
+		if effectiveRx > base {
+			base = effectiveRx
+		}
+		if base > 0 {
+			rtpAsymmetryPct = math.Round(math.Abs(float64(totalRTPTx-effectiveRx))/float64(base)*10000) / 100
+			if rtpAsymmetryPct > 15 {
+				rtpAsymmetryFlag = "CRITICAL"
+			} else if rtpAsymmetryPct > 5 {
+				rtpAsymmetryFlag = "WARNING"
+			}
+		}
+	}
+
 	snap := TrafficMetrics{
 		Timestamp:         float64(time.Now().UnixMilli()) / 1000.0,
 		VMID:              c.vmID,
@@ -990,10 +1051,21 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CleanupUnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
 		CleanupUnregisterCount:    c.cleanupUnregisterCount,
 
-		AvgJitterMs:      roundAvg(c.jitterSamples),
-		AvgMOSScore:      roundAvg(c.mosSamples),
-		AvgPacketLossPct: roundAvg(c.packetLossSamples),
-		AvgRTTMs:         roundAvg(c.rttSamples),
+		AvgJitterMs:       roundAvg(c.jitterSamples),
+		AvgMOSScore:       roundAvg(c.mosSamples),
+		AvgPacketLossPct:  roundAvg(c.packetLossSamples),
+		TotalRTPTxPkts:    totalRTPTx,
+		TotalRTPRxPkts:    totalRTPRx,
+		TotalRTPRxFromSBC: totalRTPRxFromSBC,
+		TotalRTPExpected:  totalRTPExpected,
+		TotalRTPLostPkts:  totalRTPLost,
+		TotalRTPSSRCCount: totalRTPSSRCCount,
+		AvgRTPTxPkts:      avgRTPTx,
+		AvgRTPRxFromSBC:   avgRTPRxFromSBC,
+		RTPLossPct:        rtpLossPct,
+		RTPAsymmetryPct:   rtpAsymmetryPct,
+		RTPAsymmetryFlag:  rtpAsymmetryFlag,
+		AvgRTTMs:          roundAvg(c.rttSamples),
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],
@@ -1726,6 +1798,8 @@ func BuildMux(
 				"rtcp_rx_pkts":         cr.RTCPRxPkts,
 				"markers_sent":         cr.MarkersSent,
 				"markers_received":     cr.MarkersReceived,
+				"rtp_expected_pkts":    cr.RTPExpectedPkts,
+				"rtp_ssrc_count":       cr.RTPSSRCCount,
 				"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
 				"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
 				"ts_utc":               ts,

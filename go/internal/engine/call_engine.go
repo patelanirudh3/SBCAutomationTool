@@ -377,7 +377,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		e.callsFailed.Add(1)
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
 
-		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv int
+		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv, rtpExpected, rtpSSRCCount int
 		var lostPkts, oooPkts int
 		var jitterMs, packetLossPct, remoteJitter, remoteLoss, mosScore, rttMs float64
 		var mediaOK bool
@@ -390,6 +390,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			rtcpRx = st.RTCPRxPkts
 			markersSent = rtpEP.MarkersSent()
 			markersRecv = st.MarkersReceived
+			rtpExpected = st.ExpectedPackets
+			rtpSSRCCount = st.SSRCCount
 			mediaOK = rtpRx > 0
 			jitterMs = math.Round(st.JitterMs*100) / 100
 			packetLossPct = math.Round(st.PacketLossPct*100) / 100
@@ -426,6 +428,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			RTCPRxPkts:       rtcpRx,
 			MarkersSent:      markersSent,
 			MarkersReceived:  markersRecv,
+			RTPExpectedPkts:  rtpExpected,
+			RTPSSRCCount:     rtpSSRCCount,
 			SBCRTPRelayIP:    sbcRelayIP,
 			SBCRTPRelayPort:  sbcRelayPort,
 			RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
@@ -846,6 +850,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		rtcpRx                int
 		markersSent           int
 		markersRecv           int
+		rtpExpected           int
+		rtpSSRCCount          int
 		mediaOK               bool
 	)
 	if rtpEP != nil {
@@ -857,6 +863,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		rtcpRx = st.RTCPRxPkts
 		markersSent = rtpEP.MarkersSent()
 		markersRecv = st.MarkersReceived
+		rtpExpected = st.ExpectedPackets
+		rtpSSRCCount = st.SSRCCount
 		mediaOK = rtpRx > 0
 		mediaEvent := ClassifyMedia(st, float64(cfg.HoldTimeSeconds))
 		milestones.MediaVerifiedMs = msSince(callStart)
@@ -868,6 +876,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			"rtcp_rx_pkts":         rtcpRx,
 			"markers_sent":         markersSent,
 			"markers_received":     markersRecv,
+			"rtp_expected_pkts":    rtpExpected,
+			"rtp_ssrc_count":       rtpSSRCCount,
 		})
 	}
 
@@ -937,6 +947,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
 		MarkersSent:      markersSent,
 		MarkersReceived:  markersRecv,
+		RTPExpectedPkts:  rtpExpected,
+		RTPSSRCCount:     rtpSSRCCount,
 
 		JitterMs:         jitterMs,
 		PacketLossPct:    packetLossPct,

@@ -28,6 +28,8 @@ type RtpStats struct {
 	RTPRxOther      int
 	RTCPRxPkts      int
 	MarkersReceived int
+	SSRCCount       int
+	ExpectedPackets int
 	FirstRxMs       *float64
 	LastRxMs        *float64
 
@@ -100,6 +102,7 @@ type RtpEndpoint struct {
 	lostPackets    int
 	oooPackets     int
 	dupPackets     int
+	ssrcRx         map[uint32]*ssrcRxState
 
 	// Last-SSRC-RR snapshot extracted from RTCP RR blocks the SBC sends us.
 	remoteJitterRTP float64 // raw jitter from RR (RTP units)
@@ -137,6 +140,13 @@ type RtpEndpoint struct {
 
 	mu   sync.Mutex
 	pcap *PcapWriter
+}
+
+type ssrcRxState struct {
+	baseSeq  uint16
+	maxSeq   uint16
+	cycles   uint32
+	received int
 }
 
 // CoverageOptions controls coverage-based 3-phase RTP generation.
@@ -202,6 +212,7 @@ func NewRtpEndpointFull(localIP string, ptimeMs int, qosEnabled, rtcpSREnabled b
 		qosEnabled:     qosEnabled,
 		rtcpSREnabled:  rtcpSREnabled,
 		rtcpSRInterval: rtcpSRInterval,
+		ssrcRx:         make(map[uint32]*ssrcRxState),
 	}
 
 	go ep.receiveLoop()
@@ -283,10 +294,23 @@ func (ep *RtpEndpoint) Stats() RtpStats {
 	jitterMs := ep.jitterRTPUnits / float64(SampleRate) * 1000.0
 	remoteJitterMs := ep.remoteJitterRTP / float64(SampleRate) * 1000.0
 
-	totalSeq := ep.packetsReceived + ep.lostPackets
+	expectedPackets := 0
+	ssrcReceived := 0
+	for _, st := range ep.ssrcRx {
+		expectedPackets += st.expected()
+		ssrcReceived += st.received
+	}
+	lostPackets := expectedPackets - ssrcReceived
+	if lostPackets < 0 {
+		lostPackets = 0
+	}
+	if expectedPackets == 0 {
+		lostPackets = ep.lostPackets
+		expectedPackets = ep.packetsReceived + ep.lostPackets
+	}
 	lossPct := 0.0
-	if totalSeq > 0 {
-		lossPct = float64(ep.lostPackets) / float64(totalSeq) * 100.0
+	if expectedPackets > 0 {
+		lossPct = float64(lostPackets) / float64(expectedPackets) * 100.0
 	}
 
 	return RtpStats{
@@ -295,11 +319,13 @@ func (ep *RtpEndpoint) Stats() RtpStats {
 		RTPRxOther:      ep.pktsFromOtherSrc,
 		RTCPRxPkts:      ep.rtcpReceived,
 		MarkersReceived: ep.markersReceived,
+		SSRCCount:       len(ep.ssrcRx),
+		ExpectedPackets: expectedPackets,
 		FirstRxMs:       firstMs,
 		LastRxMs:        lastMs,
 
 		JitterMs:       jitterMs,
-		LostPackets:    ep.lostPackets,
+		LostPackets:    lostPackets,
 		OOOPackets:     ep.oooPackets,
 		DupPackets:     ep.dupPackets,
 		PacketLossPct:  lossPct,
@@ -938,6 +964,8 @@ func (ep *RtpEndpoint) receiveLoop() {
 // contaminate the running average. Packets from other SSRCs still count
 // towards packetsReceived but are excluded from jitter / seq tracking.
 func (ep *RtpEndpoint) updateQoSMetricsLocked(ssrc uint32, seq uint16, rtpTs uint32, nowMs float64) {
+	ep.updateSSRCSeqLocked(ssrc, seq)
+
 	if !ep.dominantSSRCSet {
 		ep.dominantSSRC = ssrc
 		ep.dominantSSRCSet = true
@@ -999,6 +1027,44 @@ func (ep *RtpEndpoint) updateQoSMetricsLocked(ssrc uint32, seq uint16, rtpTs uin
 	}
 }
 
+func (ep *RtpEndpoint) updateSSRCSeqLocked(ssrc uint32, seq uint16) {
+	st := ep.ssrcRx[ssrc]
+	if st == nil {
+		ep.ssrcRx[ssrc] = &ssrcRxState{
+			baseSeq:  seq,
+			maxSeq:   seq,
+			received: 1,
+		}
+		return
+	}
+
+	st.received++
+	const maxDropout = 3000
+	const maxMisorder = 100
+	udelta := seq - st.maxSeq
+	switch {
+	case int(udelta) < maxDropout:
+		if seq < st.maxSeq {
+			st.cycles += 1 << 16
+		}
+		st.maxSeq = seq
+	case int(udelta) <= (1<<16)-maxMisorder:
+		// Probable duplicate, re-ordered packet, or restart. Count it as
+		// received, but do not advance the highest extended sequence.
+	default:
+		// Small negative delta: late/re-ordered packet near maxSeq.
+	}
+}
+
+func (st *ssrcRxState) expected() int {
+	extendedMax := st.cycles + uint32(st.maxSeq)
+	base := uint32(st.baseSeq)
+	if extendedMax < base {
+		return st.received
+	}
+	return int(extendedMax-base) + 1
+}
+
 // parseRTCPPacket walks compound RTCP packets and extracts the most recent
 // RR block targeting our SSRC. RFC 3550 §6.4 / §6.4.1 layouts:
 //
@@ -1048,18 +1114,24 @@ func (ep *RtpEndpoint) parseRTCPPacket(data []byte) {
 				break
 			}
 			// Report-block layout (RFC 3550 §6.4.1):
+			//   bytes 0-3  : SSRC_n — source this report block describes
 			//   byte  4    : fraction lost (numerator over 256)
 			//   bytes 12-15: interarrival jitter (RTP timestamp units)
 			//   bytes 16-19: LSR — middle 32 bits of the NTP ts in the
 			//                last SR we sent, echoed back by the SBC
 			//   bytes 20-23: DLSR — delay since the SBC received the SR,
 			//                in 1/65536 second units
+			reportSSRC := binary.BigEndian.Uint32(data[start : start+4])
 			fractionLost := data[start+4]
 			jitterRTP := binary.BigEndian.Uint32(data[start+12 : start+16])
 			lsr := binary.BigEndian.Uint32(data[start+16 : start+20])
 			dlsr := binary.BigEndian.Uint32(data[start+20 : start+24])
 
 			ep.mu.Lock()
+			if ep.txSSRCSet && reportSSRC != ep.txSSRC {
+				ep.mu.Unlock()
+				continue
+			}
 			ep.remoteJitterRTP = float64(jitterRTP)
 			ep.remoteLossPct = float64(fractionLost) / 256.0 * 100.0
 			// RTT = NTP(now)_mid32 - LSR - DLSR

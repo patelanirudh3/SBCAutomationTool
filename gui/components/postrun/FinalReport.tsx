@@ -6,7 +6,7 @@ import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Pho
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
-import { MediaQosPanel } from '@/components/dashboard/MediaQosPanel'
+import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
 import { DownloadReport } from './DownloadReport'
 import { UnregisterProgressCard } from './UnregisterProgressCard'
 import type { CallEvent } from '@/types'
@@ -172,6 +172,32 @@ export function FinalReport({
     router.push('/config')
   }
 
+  const rtpEvents = callEvents.filter((e) =>
+    (e.rtp_tx_pkts ?? 0) > 0 ||
+    (e.rtp_rx_pkts ?? 0) > 0 ||
+    (e.lost_packets ?? 0) > 0
+  )
+  const eventRtpTx = rtpEvents.reduce((sum, e) => sum + (e.rtp_tx_pkts ?? 0), 0)
+  const eventRtpRx = rtpEvents.reduce((sum, e) => sum + (e.rtp_rx_pkts ?? 0), 0)
+  const eventRtpRxFromSbc = rtpEvents.reduce((sum, e) => sum + (e.rtp_rx_from_sbc_pkts ?? 0), 0)
+  const eventRtpExpected = rtpEvents.reduce((sum, e) => sum + (e.rtp_expected_pkts ?? 0), 0)
+  const eventRtpLost = rtpEvents.reduce((sum, e) => sum + (e.lost_packets ?? 0), 0)
+  const eventRtpSsrcCount = rtpEvents.reduce((sum, e) => sum + (e.rtp_ssrc_count ?? 0), 0)
+  const eventAvgRtpTx = rtpEvents.length > 0 ? Math.round((eventRtpTx / rtpEvents.length) * 100) / 100 : 0
+  const eventAvgRtpRxFromSbc = rtpEvents.length > 0 ? Math.round((eventRtpRxFromSbc / rtpEvents.length) * 100) / 100 : 0
+  const eventLossDenominator = eventRtpExpected > 0 ? eventRtpExpected : eventRtpRxFromSbc + eventRtpLost
+  const eventLossPct = eventLossDenominator > 0
+    ? Math.round((eventRtpLost / eventLossDenominator) * 10000) / 100
+    : 0
+  const eventEffectiveRx = eventRtpRxFromSbc > 0 ? eventRtpRxFromSbc : eventRtpRx
+  const eventAsymBase = Math.max(eventRtpTx, eventEffectiveRx)
+  const eventAsymPct = eventAsymBase > 0
+    ? Math.round((Math.abs(eventRtpTx - eventEffectiveRx) / eventAsymBase) * 10000) / 100
+    : 0
+  const eventAsymFlag = eventAsymPct > 15 ? 'CRITICAL' : eventAsymPct > 5 ? 'WARNING' : 'OK'
+  const mediaCounts = uacMetrics?.media_quality_counts
+  const trackedMedia = mediaCounts ? mediaCounts.OK + mediaCounts.WARNING + mediaCounts.CRITICAL : 0
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 16 }}
@@ -312,7 +338,31 @@ export function FinalReport({
       {/* Media QoS */}
       <div className="space-y-2">
         <SectionLabel>Media &amp; QoS</SectionLabel>
-        <MediaQosPanel />
+        <MediaQosPanel
+          jitterMs={uacMetrics?.avg_jitter_ms ?? null}
+          mosEstimate={uacMetrics?.avg_mos_score ?? null}
+          qosScore={trackedMedia > 0 && mediaCounts ? (mediaCounts.OK / trackedMedia) * 100 : null}
+          rttMs={uacMetrics?.avg_rtt_ms ?? null}
+          rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
+          rtpFlow={{
+            configuredPacketsPerDirection: computeConfiguredRtpPacketsPerDirection(
+              pair?.uac.hold_time_seconds,
+              pair?.uac.rtp_ptime,
+              pair?.advancedSettings,
+            ),
+            avgTxPackets: uacMetrics?.avg_rtp_tx_pkts ?? aggregate?.avg_rtp_tx_pkts ?? eventAvgRtpTx,
+            avgRxFromSbcPackets: uacMetrics?.avg_rtp_rx_from_sbc_pkts ?? aggregate?.avg_rtp_rx_from_sbc_pkts ?? eventAvgRtpRxFromSbc,
+            totalTxPackets: uacMetrics?.total_rtp_tx_pkts ?? aggregate?.total_rtp_tx_pkts ?? eventRtpTx,
+            totalRxPackets: uacMetrics?.total_rtp_rx_pkts ?? aggregate?.total_rtp_rx_pkts ?? eventRtpRx,
+            totalRxFromSbcPackets: uacMetrics?.total_rtp_rx_from_sbc_pkts ?? aggregate?.total_rtp_rx_from_sbc_pkts ?? eventRtpRxFromSbc,
+            totalExpectedPackets: uacMetrics?.total_rtp_expected_pkts ?? aggregate?.total_rtp_expected_pkts ?? eventRtpExpected,
+            totalLostPackets: uacMetrics?.total_rtp_lost_pkts ?? aggregate?.total_rtp_lost_pkts ?? eventRtpLost,
+            totalSsrcCount: uacMetrics?.total_rtp_ssrc_count ?? aggregate?.total_rtp_ssrc_count ?? eventRtpSsrcCount,
+            lossPct: uacMetrics?.rtp_loss_pct ?? aggregate?.rtp_loss_pct ?? eventLossPct,
+            asymmetryPct: uacMetrics?.rtp_asymmetry_pct ?? aggregate?.rtp_asymmetry_pct ?? eventAsymPct,
+            asymmetryFlag: uacMetrics?.rtp_asymmetry_flag ?? aggregate?.rtp_asymmetry_flag ?? eventAsymFlag,
+          }}
+        />
       </div>
 
       {/* Download */}

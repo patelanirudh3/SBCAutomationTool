@@ -263,6 +263,29 @@ export function buildAggregate(
     ? uacOnly.filter((e) => e.acknowledged === true).length
     : completed
   const failed = uacOnly.filter((e) => e.result === 'FAILED').length
+  const rtpEvents = allEvents.filter((e) =>
+    (e.rtp_tx_pkts ?? 0) > 0 ||
+    (e.rtp_rx_pkts ?? 0) > 0 ||
+    (e.lost_packets ?? 0) > 0
+  )
+  const totalRtpTx = rtpEvents.reduce((sum, e) => sum + (e.rtp_tx_pkts ?? 0), 0)
+  const totalRtpRx = rtpEvents.reduce((sum, e) => sum + (e.rtp_rx_pkts ?? 0), 0)
+  const totalRtpRxFromSbc = rtpEvents.reduce((sum, e) => sum + (e.rtp_rx_from_sbc_pkts ?? 0), 0)
+  const totalRtpExpected = rtpEvents.reduce((sum, e) => sum + (e.rtp_expected_pkts ?? 0), 0)
+  const totalRtpLost = rtpEvents.reduce((sum, e) => sum + (e.lost_packets ?? 0), 0)
+  const totalRtpSsrcCount = rtpEvents.reduce((sum, e) => sum + (e.rtp_ssrc_count ?? 0), 0)
+  const avgRtpTx = rtpEvents.length > 0 ? Math.round((totalRtpTx / rtpEvents.length) * 100) / 100 : 0
+  const avgRtpRxFromSbc = rtpEvents.length > 0 ? Math.round((totalRtpRxFromSbc / rtpEvents.length) * 100) / 100 : 0
+  const rtpLossDenominator = totalRtpExpected > 0 ? totalRtpExpected : totalRtpRxFromSbc + totalRtpLost
+  const rtpLossPct = rtpLossDenominator > 0
+    ? Math.round((totalRtpLost / rtpLossDenominator) * 10000) / 100
+    : 0
+  const effectiveRx = totalRtpRxFromSbc > 0 ? totalRtpRxFromSbc : totalRtpRx
+  const asymmetryBase = Math.max(totalRtpTx, effectiveRx)
+  const rtpAsymmetryPct = asymmetryBase > 0
+    ? Math.round((Math.abs(totalRtpTx - effectiveRx) / asymmetryBase) * 10000) / 100
+    : 0
+  const rtpAsymmetryFlag = rtpAsymmetryPct > 15 ? 'CRITICAL' : rtpAsymmetryPct > 5 ? 'WARNING' : 'OK'
   return {
     run_id: runId,
     started_at: startedAt,
@@ -273,6 +296,17 @@ export function buildAggregate(
     total_completed: completed,
     total_failed: failed,
     aggregate_asr: attempted > 0 ? Math.round((answered / attempted) * 1000) / 10 : 0,
+    total_rtp_tx_pkts: totalRtpTx,
+    total_rtp_rx_pkts: totalRtpRx,
+    total_rtp_rx_from_sbc_pkts: totalRtpRxFromSbc,
+    total_rtp_expected_pkts: totalRtpExpected,
+    total_rtp_lost_pkts: totalRtpLost,
+    total_rtp_ssrc_count: totalRtpSsrcCount,
+    avg_rtp_tx_pkts: avgRtpTx,
+    avg_rtp_rx_from_sbc_pkts: avgRtpRxFromSbc,
+    rtp_loss_pct: rtpLossPct,
+    rtp_asymmetry_pct: rtpAsymmetryPct,
+    rtp_asymmetry_flag: rtpAsymmetryFlag,
   }
 }
 
