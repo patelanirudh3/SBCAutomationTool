@@ -1047,32 +1047,35 @@ export function VMConfigPanel({
 
             <FormRow
               label="SUBSCRIBE Events"
-              hint="Event packages to subscribe after REGISTER. Default: dialog. Cleanup currently skips unsubscribe for all event packages and only unregisters."
+              hint="Event packages to subscribe after REGISTER. Default: dialog. Cleanup sends unsubscribe only for reg and skips unsubscribe for other event packages."
             >
               <div className="flex flex-wrap gap-2">
                 {SUBSCRIBE_EVENT_OPTIONS.map((event) => {
                   const selected = raw.subscribe_events.includes(event)
                   return (
-                    <button
+                    <label
                       key={event}
-                      type="button"
-                      onClick={() => {
-                        const next = selected
-                          ? raw.subscribe_events.filter((v) => v !== event)
-                          : [...raw.subscribe_events, event]
-                        onChange('subscribe_events', next.length > 0 ? next : ['dialog'])
-                        onBlur('subscribe_events')
-                      }}
                       className={cn(
-                        'rounded-md border px-2.5 py-1 text-xs font-semibold transition-colors',
+                        'flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors',
                         selected
-                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-                          : 'border-slate-700 bg-slate-900/40 text-slate-400 hover:border-slate-500 hover:text-slate-200',
+                          ? 'border-emerald-500/50 bg-emerald-500/10 text-slate-100'
+                          : 'border-slate-700 bg-slate-900/30 text-slate-400 hover:border-slate-500 hover:text-slate-200',
                       )}
-                      aria-pressed={selected}
                     >
-                      {event}
-                    </button>
+                      <input
+                        type="checkbox"
+                        checked={selected}
+                        onChange={(ev) => {
+                          const next = ev.target.checked
+                            ? [...raw.subscribe_events, event]
+                            : raw.subscribe_events.filter((v) => v !== event)
+                          onChange('subscribe_events', next)
+                          onBlur('subscribe_events')
+                        }}
+                        className="size-3.5 rounded border-slate-600 bg-slate-950 text-emerald-500 accent-emerald-500"
+                      />
+                      <span>{event}</span>
+                    </label>
                   )
                 })}
               </div>

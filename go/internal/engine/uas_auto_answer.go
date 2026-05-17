@@ -297,16 +297,34 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		safetyCap := float64(cfg.HoldTimeSeconds) * 2
 		go func() {
 			defer close(rtpDone)
-			rtpEP.Run(
-				rtpCtx,
-				dialog.RTPRemoteIP,
-				dialog.RTPRemotePort,
-				safetyCap,
-				float64(cfg.RTPBurstSeconds),
-				cfg.RTPBurstPPS,
-				float64(cfg.RTPKeepaliveInterval),
-				cfg.RTPMode == "continuous",
-			)
+			if cfg.RTPMode == "3phase_coverage" {
+				rtpEP.RunCoverageUntilCancelled(
+					rtpCtx,
+					dialog.RTPRemoteIP,
+					dialog.RTPRemotePort,
+					float64(cfg.HoldTimeSeconds),
+					cfg.RTPBurstPPS,
+					rtp.CoverageOptions{
+						MediaCoveragePct:   cfg.RTPMediaCoveragePct,
+						StartBurstSharePct: cfg.RTPStartBurstSharePct,
+						EndBurstSharePct:   cfg.RTPEndBurstSharePct,
+						MidBurstSeconds:    cfg.RTPMidBurstSeconds,
+						KeepaliveEnabled:   cfg.IsRTPCoverageKeepaliveEnabled(),
+						KeepalivePPS:       cfg.RTPCoverageKeepalivePPS,
+					},
+				)
+			} else {
+				rtpEP.Run(
+					rtpCtx,
+					dialog.RTPRemoteIP,
+					dialog.RTPRemotePort,
+					safetyCap,
+					float64(cfg.RTPBurstSeconds),
+					cfg.RTPBurstPPS,
+					float64(cfg.RTPKeepaliveInterval),
+					cfg.RTPMode == "continuous",
+				)
+			}
 		}()
 	}
 

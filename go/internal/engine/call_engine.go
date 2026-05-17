@@ -744,29 +744,52 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 	// ── RTP ────────────────────────────────────────────────────────
 	isContinuous := cfg.RTPMode == "continuous"
+	isCoverage := cfg.RTPMode == "3phase_coverage"
 	if rtpEP != nil {
 		milestones.RTPStartMs = msSince(callStart)
 		startEvent := "RTP_BURST_START"
 		if isContinuous {
 			startEvent = "RTP_CONTINUOUS_START"
+		} else if isCoverage {
+			startEvent = "RTP_COVERAGE_START"
 		}
 		emit(startEvent, 0, milestones.RTPStartMs, nil)
 
-		rtpEP.Run(
-			ctx,
-			dialog.RTPRemoteIP,
-			dialog.RTPRemotePort,
-			float64(cfg.HoldTimeSeconds),
-			float64(cfg.RTPBurstSeconds),
-			cfg.RTPBurstPPS,
-			float64(cfg.RTPKeepaliveInterval),
-			isContinuous,
-		)
+		if isCoverage {
+			rtpEP.RunCoverage(
+				ctx,
+				dialog.RTPRemoteIP,
+				dialog.RTPRemotePort,
+				float64(cfg.HoldTimeSeconds),
+				cfg.RTPBurstPPS,
+				rtp.CoverageOptions{
+					MediaCoveragePct:   cfg.RTPMediaCoveragePct,
+					StartBurstSharePct: cfg.RTPStartBurstSharePct,
+					EndBurstSharePct:   cfg.RTPEndBurstSharePct,
+					MidBurstSeconds:    cfg.RTPMidBurstSeconds,
+					KeepaliveEnabled:   cfg.IsRTPCoverageKeepaliveEnabled(),
+					KeepalivePPS:       cfg.RTPCoverageKeepalivePPS,
+				},
+			)
+		} else {
+			rtpEP.Run(
+				ctx,
+				dialog.RTPRemoteIP,
+				dialog.RTPRemotePort,
+				float64(cfg.HoldTimeSeconds),
+				float64(cfg.RTPBurstSeconds),
+				cfg.RTPBurstPPS,
+				float64(cfg.RTPKeepaliveInterval),
+				isContinuous,
+			)
+		}
 
 		milestones.RTPEndMs = msSince(callStart)
 		endEvent := "RTP_BURST_END"
 		if isContinuous {
 			endEvent = "RTP_CONTINUOUS_END"
+		} else if isCoverage {
+			endEvent = "RTP_COVERAGE_END"
 		}
 		emit(endEvent, 0, milestones.RTPEndMs, nil)
 	} else {

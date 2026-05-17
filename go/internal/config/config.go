@@ -76,13 +76,19 @@ type VMConfig struct {
 	LocalHost          string `yaml:"local_host" json:"local_host"`
 	LocalPort          int    `yaml:"local_port" json:"local_port"`
 
-	RTPBurstSeconds      int    `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
-	RTPBurstPPS          int    `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
-	RTPKeepaliveInterval int    `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
-	MediaEnabled         bool   `yaml:"media_enabled" json:"media_enabled"`
-	RTPMode              string `yaml:"rtp_mode" json:"rtp_mode"`
-	RTPPtime             int    `yaml:"rtp_ptime" json:"rtp_ptime"`
-	RTPPcap              bool   `yaml:"rtp_pcap" json:"rtp_pcap"`
+	RTPBurstSeconds             int    `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
+	RTPBurstPPS                 int    `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
+	RTPKeepaliveInterval        int    `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
+	MediaEnabled                bool   `yaml:"media_enabled" json:"media_enabled"`
+	RTPMode                     string `yaml:"rtp_mode" json:"rtp_mode"`
+	RTPPtime                    int    `yaml:"rtp_ptime" json:"rtp_ptime"`
+	RTPPcap                     bool   `yaml:"rtp_pcap" json:"rtp_pcap"`
+	RTPMediaCoveragePct         int    `yaml:"rtp_media_coverage_pct" json:"rtp_media_coverage_pct"`
+	RTPStartBurstSharePct       int    `yaml:"rtp_start_burst_share_pct" json:"rtp_start_burst_share_pct"`
+	RTPEndBurstSharePct         int    `yaml:"rtp_end_burst_share_pct" json:"rtp_end_burst_share_pct"`
+	RTPMidBurstSeconds          int    `yaml:"rtp_mid_burst_seconds" json:"rtp_mid_burst_seconds"`
+	RTPCoverageKeepaliveEnabled *bool  `yaml:"rtp_coverage_keepalive_enabled,omitempty" json:"rtp_coverage_keepalive_enabled,omitempty"`
+	RTPCoverageKeepalivePPS     int    `yaml:"rtp_coverage_keepalive_pps" json:"rtp_coverage_keepalive_pps"`
 
 	TrafficMode   string  `yaml:"traffic_mode" json:"traffic_mode"`
 	CallCount     int     `yaml:"call_count" json:"call_count"`
@@ -143,6 +149,12 @@ func (c *VMConfig) IsRTCPSREnabled() bool {
 // RTP socket without negotiating mux).
 func (c *VMConfig) IsRTCPMuxEnabled() bool {
 	return c.RTCPMuxEnabled != nil && *c.RTCPMuxEnabled
+}
+
+// IsRTPCoverageKeepaliveEnabled reports whether 3phase_coverage should emit
+// low-rate RTP during idle gaps between full-rate coverage bursts.
+func (c *VMConfig) IsRTPCoverageKeepaliveEnabled() bool {
+	return c.RTPCoverageKeepaliveEnabled == nil || *c.RTPCoverageKeepaliveEnabled
 }
 
 // ExtCount returns the total number of extensions in the configured range.
@@ -330,6 +342,25 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RTPPtime == 0 {
 		cfg.RTPPtime = 20
 	}
+	if cfg.RTPMediaCoveragePct == 0 {
+		cfg.RTPMediaCoveragePct = 25
+	}
+	if cfg.RTPStartBurstSharePct == 0 {
+		cfg.RTPStartBurstSharePct = 20
+	}
+	if cfg.RTPEndBurstSharePct == 0 {
+		cfg.RTPEndBurstSharePct = 20
+	}
+	if cfg.RTPMidBurstSeconds == 0 {
+		cfg.RTPMidBurstSeconds = 3
+	}
+	if cfg.RTPCoverageKeepaliveEnabled == nil {
+		t := true
+		cfg.RTPCoverageKeepaliveEnabled = &t
+	}
+	if cfg.RTPCoverageKeepalivePPS == 0 {
+		cfg.RTPCoverageKeepalivePPS = 3
+	}
 	if cfg.Scenario == "" {
 		cfg.Scenario = "basic_call"
 	}
@@ -499,11 +530,31 @@ func Validate(cfg *VMConfig) error {
 		errs = append(errs, fmt.Sprintf("rtp_keepalive_interval must be > 0, got %d", cfg.RTPKeepaliveInterval))
 	}
 
-	if cfg.RTPMode != "3phase" && cfg.RTPMode != "continuous" {
-		errs = append(errs, fmt.Sprintf("rtp_mode must be '3phase' or 'continuous', got %q", cfg.RTPMode))
+	if cfg.RTPMode != "3phase" && cfg.RTPMode != "continuous" && cfg.RTPMode != "3phase_coverage" {
+		errs = append(errs, fmt.Sprintf("rtp_mode must be '3phase', '3phase_coverage', or 'continuous', got %q", cfg.RTPMode))
 	}
 	if cfg.RTPPtime != 20 && cfg.RTPPtime != 40 {
 		errs = append(errs, fmt.Sprintf("rtp_ptime must be 20 or 40, got %d", cfg.RTPPtime))
+	}
+	if cfg.RTPMode == "3phase_coverage" {
+		if cfg.RTPMediaCoveragePct < 1 || cfg.RTPMediaCoveragePct > 100 {
+			errs = append(errs, fmt.Sprintf("rtp_media_coverage_pct must be 1..100, got %d", cfg.RTPMediaCoveragePct))
+		}
+		if cfg.RTPStartBurstSharePct < 0 || cfg.RTPStartBurstSharePct > 100 {
+			errs = append(errs, fmt.Sprintf("rtp_start_burst_share_pct must be 0..100, got %d", cfg.RTPStartBurstSharePct))
+		}
+		if cfg.RTPEndBurstSharePct < 0 || cfg.RTPEndBurstSharePct > 100 {
+			errs = append(errs, fmt.Sprintf("rtp_end_burst_share_pct must be 0..100, got %d", cfg.RTPEndBurstSharePct))
+		}
+		if cfg.RTPStartBurstSharePct+cfg.RTPEndBurstSharePct >= 100 {
+			errs = append(errs, "rtp_start_burst_share_pct + rtp_end_burst_share_pct must be less than 100")
+		}
+		if cfg.RTPMidBurstSeconds <= 0 || cfg.RTPMidBurstSeconds > cfg.HoldTimeSeconds {
+			errs = append(errs, fmt.Sprintf("rtp_mid_burst_seconds must be > 0 and <= hold_time_seconds, got %d", cfg.RTPMidBurstSeconds))
+		}
+		if cfg.IsRTPCoverageKeepaliveEnabled() && (cfg.RTPCoverageKeepalivePPS < 1 || cfg.RTPCoverageKeepalivePPS > 5) {
+			errs = append(errs, fmt.Sprintf("rtp_coverage_keepalive_pps must be 1..5 when keepalive is enabled, got %d", cfg.RTPCoverageKeepalivePPS))
+		}
 	}
 
 	if cfg.TrafficMode != "" && cfg.TrafficMode != "smoke" && cfg.TrafficMode != "timed" && cfg.TrafficMode != "unlimited" {

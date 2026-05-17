@@ -94,6 +94,50 @@ function AdvancedField({
   )
 }
 
+function rtpModeLabel(mode: RtpMode | undefined): string {
+  if (mode === 'continuous') return 'continuous'
+  if (mode === '3phase_coverage') return '3-phase coverage'
+  return '3-phase lite'
+}
+
+function computeCoveragePreview(s: AdvancedSettingsType, holdSeconds: number, ptimeMs: number) {
+  const pps = ptimeMs > 0 ? 1000 / ptimeMs : 50
+  const hold = Math.max(holdSeconds, 0)
+  const coverage = Math.min(Math.max(s.rtp_media_coverage_pct || 25, 1), 100) / 100
+  const targetSeconds = hold * coverage
+  const phase1Seconds = targetSeconds * Math.max(s.rtp_start_burst_share_pct || 0, 0) / 100
+  const phase3Seconds = targetSeconds * Math.max(s.rtp_end_burst_share_pct || 0, 0) / 100
+  const phase2Seconds = Math.max(targetSeconds - phase1Seconds - phase3Seconds, 0)
+  const midBurstSeconds = Math.max(s.rtp_mid_burst_seconds || 3, 1)
+  const midBurstCount = phase2Seconds > 0 ? Math.ceil(phase2Seconds / midBurstSeconds) : 0
+  const idleWindow = Math.max(hold - phase1Seconds - phase2Seconds - phase3Seconds, 0)
+  const spacingSeconds = midBurstCount > 0 ? idleWindow / (midBurstCount + 1) : 0
+  const keepaliveEnabled = s.rtp_coverage_keepalive_enabled !== false
+  const keepalivePps = Math.min(Math.max(s.rtp_coverage_keepalive_pps || 3, 1), 5)
+  const keepalivePackets = keepaliveEnabled ? Math.round(idleWindow * keepalivePps) : 0
+  const packets = (seconds: number) => Math.round(seconds * pps)
+  const burstPackets = packets(targetSeconds)
+  const totalPackets = burstPackets + keepalivePackets
+
+  return {
+    pps,
+    fullPackets: packets(hold),
+    targetPackets: burstPackets,
+    keepalivePackets,
+    totalPackets,
+    bidirectionalPackets: totalPackets * 2,
+    phase1Seconds,
+    phase2Seconds,
+    phase3Seconds,
+    phase1Packets: packets(phase1Seconds),
+    phase2Packets: packets(phase2Seconds),
+    phase3Packets: packets(phase3Seconds),
+    midBurstCount,
+    spacingSeconds,
+    maxGapSeconds: keepaliveEnabled ? 1 / keepalivePps : spacingSeconds,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Token row (collapsed read-only summary)
 // ---------------------------------------------------------------------------
@@ -104,7 +148,7 @@ function AdvancedField({
 type AdvancedTab = 'signaling' | 'media' | 'all'
 
 function TokenRow({ s, tab = 'all' }: { s: AdvancedSettingsType; tab?: AdvancedTab }) {
-  const modeLabel = (s.rtp_mode || '3phase') === 'continuous' ? 'continuous' : '3-phase'
+  const modeLabel = rtpModeLabel(s.rtp_mode)
 
   // Signaling-side tokens (REGISTER batching, retries, SUBSCRIBE concurrency,
   // TCP keepalive, 100rel toggle).
@@ -126,8 +170,16 @@ function TokenRow({ s, tab = 'all' }: { s: AdvancedSettingsType; tab?: AdvancedT
 
   const mediaTokens = [
     `rtp: ${modeLabel}`,
-    `burst: ${s.rtp_burst_seconds}s`,
-    `keepalive: ${s.rtp_keepalive_interval}s`,
+    ...(s.rtp_mode === '3phase_coverage'
+      ? [
+          `coverage: ${s.rtp_media_coverage_pct}%`,
+          `mid-burst: ${s.rtp_mid_burst_seconds}s`,
+          `ka: ${s.rtp_coverage_keepalive_enabled === false ? 'off' : `${s.rtp_coverage_keepalive_pps ?? 3}pps`}`,
+        ]
+      : [
+          `burst: ${s.rtp_burst_seconds}s`,
+          `keepalive: ${s.rtp_keepalive_interval}s`,
+        ]),
     `refresh: ${s.metrics_interval}s`,
     ...(s.rtp_pcap ? ['pcap: on'] : []),
     ...qosTokens,
@@ -189,6 +241,10 @@ export function AdvancedSettings({
   const [draft, setDraft] = useState<AdvancedSettingsType>({ ...saved })
   const [errors, setErrors] = useState<Partial<Record<keyof AdvancedSettingsType, string>>>({})
   const panelRef = useRef<HTMLDivElement>(null)
+  const vmConfig = pairs[pairIndex]?.uac
+  const holdSeconds = Number(vmConfig?.hold_time_seconds ?? 0) || 0
+  const ptimeMs = Number(vmConfig?.rtp_ptime ?? 20) || 20
+  const coveragePreview = computeCoveragePreview(draft, holdSeconds, ptimeMs)
 
   useEffect(() => {
     if (!isEditing) setDraft({ ...saved })
@@ -199,16 +255,6 @@ export function AdvancedSettings({
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') handleCancel() }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isEditing])
-
-  useEffect(() => {
-    if (!isEditing) return
-    const onClick = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) handleCancel()
-    }
-    document.addEventListener('mousedown', onClick)
-    return () => document.removeEventListener('mousedown', onClick)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEditing])
 
@@ -235,6 +281,7 @@ export function AdvancedSettings({
       'rtp_mode', 'rtp_pcap',
       'qos_enabled', 'qos_mos_estimation',
       'rtcp_sr_enabled',
+      'rtp_coverage_keepalive_enabled',
       'use_100rel',
     ])
     const newErrors: Partial<Record<keyof AdvancedSettingsType, string>> = {}
@@ -243,6 +290,10 @@ export function AdvancedSettings({
       // RTCP SR interval is only validated when RTCP SR is on; otherwise
       // any value is acceptable (the field is shown but disabled).
       if (key === 'rtcp_sr_interval_seconds' && !draft.rtcp_sr_enabled) continue
+      if (
+        key === 'rtp_coverage_keepalive_pps' &&
+        (draft.rtp_mode !== '3phase_coverage' || draft.rtp_coverage_keepalive_enabled === false)
+      ) continue
       const v = val as number
       if (!Number.isFinite(v)) {
         newErrors[key as keyof AdvancedSettingsType] = 'Must be a number'
@@ -256,7 +307,36 @@ export function AdvancedSettings({
         // wasteful chatter, longer leaves dead sockets undetected past
         // most NAT idle timeouts.
         newErrors[key as keyof AdvancedSettingsType] = 'Must be 0 (disabled) or between 5 and 300 seconds'
+      } else if (draft.rtp_mode === '3phase_coverage' && key === 'rtp_media_coverage_pct' && (v < 1 || v > 100)) {
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be between 1 and 100%'
+      } else if (
+        draft.rtp_mode === '3phase_coverage' &&
+        (key === 'rtp_start_burst_share_pct' || key === 'rtp_end_burst_share_pct') &&
+        (v < 0 || v > 100)
+      ) {
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be between 0 and 100%'
+      } else if (
+        draft.rtp_mode === '3phase_coverage' &&
+        key === 'rtp_mid_burst_seconds' &&
+        (v <= 0 || (holdSeconds > 0 && v > holdSeconds))
+      ) {
+        newErrors[key as keyof AdvancedSettingsType] = holdSeconds > 0
+          ? `Must be > 0 and <= hold time (${holdSeconds}s)`
+          : 'Must be a positive number'
+      } else if (
+        draft.rtp_mode === '3phase_coverage' &&
+        draft.rtp_coverage_keepalive_enabled !== false &&
+        key === 'rtp_coverage_keepalive_pps' &&
+        (v < 1 || v > 5)
+      ) {
+        newErrors[key as keyof AdvancedSettingsType] = 'Must be between 1 and 5 pps'
       }
+    }
+    if (
+      draft.rtp_mode === '3phase_coverage' &&
+      draft.rtp_start_burst_share_pct + draft.rtp_end_burst_share_pct >= 100
+    ) {
+      newErrors.rtp_end_burst_share_pct = 'Start + End shares must be less than 100%'
     }
     if (Object.keys(newErrors).length > 0) { setErrors(newErrors); return }
     setErrors({})
@@ -312,10 +392,20 @@ export function AdvancedSettings({
               Edit
             </button>
           ) : (
-            <Button size="sm" onClick={handleSave} className="h-6 gap-1 px-2.5 text-xs">
-              <Check className="size-3" />
-              Save
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={handleCancel}
+                className="h-6 px-2.5 text-xs text-slate-300 hover:text-slate-100"
+              >
+                Cancel
+              </Button>
+              <Button size="sm" onClick={handleSave} className="h-6 gap-1 px-2.5 text-xs">
+                <Check className="size-3" />
+                Save
+              </Button>
+            </div>
           )}
         </div>
       </div>
@@ -432,7 +522,8 @@ export function AdvancedSettings({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="3phase">3-Phase Burst</SelectItem>
+                        <SelectItem value="3phase">3-Phase Lite</SelectItem>
+                        <SelectItem value="3phase_coverage">3-Phase Coverage</SelectItem>
                         <SelectItem value="continuous">Continuous</SelectItem>
                       </SelectContent>
                     </Select>
@@ -477,7 +568,7 @@ export function AdvancedSettings({
                     </button>
                   </div>
 
-                  {/* 3-Phase-only fields */}
+                  {/* 3-Phase lite fields */}
                   {draft.rtp_mode === '3phase' && (
                     <>
                       <AdvancedField
@@ -497,6 +588,112 @@ export function AdvancedSettings({
                         onChange={set('rtp_keepalive_interval')}
                       />
                     </>
+                  )}
+
+                  {/* Coverage-mode fields */}
+                  {draft.rtp_mode === '3phase_coverage' && (
+                    <div className="space-y-2">
+                      <AdvancedField
+                        label="Media Coverage (%)"
+                        value={draft.rtp_media_coverage_pct}
+                        disabled={disabled}
+                        error={errors.rtp_media_coverage_pct}
+                        tooltip="Percentage of full continuous RTP volume to send during the call."
+                        onChange={set('rtp_media_coverage_pct')}
+                      />
+                      <AdvancedField
+                        label="Start Burst Share (%)"
+                        value={draft.rtp_start_burst_share_pct}
+                        disabled={disabled}
+                        min={0}
+                        error={errors.rtp_start_burst_share_pct}
+                        tooltip="Percentage of the coverage budget sent immediately after ACK."
+                        onChange={set('rtp_start_burst_share_pct')}
+                      />
+                      <AdvancedField
+                        label="End Burst Share (%)"
+                        value={draft.rtp_end_burst_share_pct}
+                        disabled={disabled}
+                        min={0}
+                        error={errors.rtp_end_burst_share_pct}
+                        tooltip="Percentage of the coverage budget sent before BYE."
+                        onChange={set('rtp_end_burst_share_pct')}
+                      />
+                      <AdvancedField
+                        label="Mid Burst (s)"
+                        value={draft.rtp_mid_burst_seconds}
+                        disabled={disabled}
+                        error={errors.rtp_mid_burst_seconds}
+                        tooltip="Duration of each full-rate RTP burst distributed across the middle of the call."
+                        onChange={set('rtp_mid_burst_seconds')}
+                      />
+                      <div className="grid grid-cols-[160px_1fr] items-center gap-3 py-1">
+                        <Label className="text-sm font-semibold text-slate-200/90">Coverage Keepalive</Label>
+                        <button
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => setDraft((prev) => ({
+                            ...prev,
+                            rtp_coverage_keepalive_enabled: prev.rtp_coverage_keepalive_enabled === false,
+                          }))}
+                          className={cn(
+                            'inline-flex w-fit items-center gap-2 rounded-md px-2.5 py-1 text-xs font-semibold border transition-colors',
+                            draft.rtp_coverage_keepalive_enabled !== false
+                              ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                              : 'border-slate-600/50 bg-slate-800/60 text-slate-300 hover:border-indigo-400/40',
+                            disabled && 'opacity-70 cursor-default',
+                          )}
+                        >
+                          <span className={cn(
+                            'inline-block size-3 rounded-sm border-2 transition-colors',
+                            draft.rtp_coverage_keepalive_enabled !== false ? 'border-emerald-400 bg-emerald-400' : 'border-zinc-400 bg-transparent'
+                          )} />
+                          {draft.rtp_coverage_keepalive_enabled !== false ? 'On — RTP flows during gaps' : 'Off'}
+                        </button>
+                      </div>
+                      <AdvancedField
+                        label="Keepalive Rate (pps)"
+                        value={draft.rtp_coverage_keepalive_pps}
+                        disabled={disabled || draft.rtp_coverage_keepalive_enabled === false}
+                        min={1}
+                        error={errors.rtp_coverage_keepalive_pps}
+                        tooltip="Low-rate RTP packets per second sent during coverage-mode idle gaps. Use 3-5 pps for devices that require visible media flow."
+                        onChange={set('rtp_coverage_keepalive_pps')}
+                      />
+
+                      <div className="rounded-md border border-indigo-500/20 bg-slate-900/50 p-3 text-xs text-slate-300">
+                        <div className="mb-2 flex items-center justify-between">
+                          <span className="font-bold uppercase tracking-wide text-indigo-200">Coverage Preview</span>
+                          <span className="font-mono text-slate-400">
+                            {coveragePreview.pps.toFixed(0)} pps · hold {holdSeconds || 0}s
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono">
+                          <span>Full continuous</span>
+                          <span className="text-right text-slate-100">{coveragePreview.fullPackets} pkts / direction</span>
+                          <span>Coverage bursts</span>
+                          <span className="text-right text-emerald-300">{coveragePreview.targetPackets} pkts / direction</span>
+                          <span>Keepalive</span>
+                          <span className="text-right text-sky-300">{coveragePreview.keepalivePackets} pkts / direction</span>
+                          <span>Phase 1</span>
+                          <span className="text-right">{coveragePreview.phase1Seconds.toFixed(1)}s · {coveragePreview.phase1Packets} pkts</span>
+                          <span>Phase 2</span>
+                          <span className="text-right">
+                            {coveragePreview.midBurstCount} bursts · {coveragePreview.phase2Packets} pkts
+                          </span>
+                          <span>Phase 3</span>
+                          <span className="text-right">{coveragePreview.phase3Seconds.toFixed(1)}s · {coveragePreview.phase3Packets} pkts</span>
+                          <span>Mid-call spacing</span>
+                          <span className="text-right text-indigo-200">{coveragePreview.spacingSeconds.toFixed(1)}s auto</span>
+                          <span>Max RTP gap</span>
+                          <span className="text-right text-indigo-200">≤ {coveragePreview.maxGapSeconds.toFixed(1)}s</span>
+                          <span>Total per direction</span>
+                          <span className="text-right text-emerald-300">{coveragePreview.totalPackets} pkts</span>
+                          <span>Bidirectional total</span>
+                          <span className="text-right text-emerald-300">{coveragePreview.bidirectionalPackets} pkts</span>
+                        </div>
+                      </div>
+                    </div>
                   )}
                 </div>
                 )}

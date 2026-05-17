@@ -94,12 +94,26 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
       ]
     : [{ label: 'Media', value: 'Disabled', muted: true }]
 
+  const rtpModeLabel =
+    adv?.rtp_mode === 'continuous' ? 'continuous'
+    : adv?.rtp_mode === '3phase_coverage' ? '3-phase coverage'
+    : '3-phase lite'
+
   const advanced: SummaryItem[] = adv
     ? [
         { label: 'QoS Metrics', value: adv.qos_enabled === false ? 'off' : 'on' },
         { label: 'MOS Estimate', value: adv.qos_mos_estimation === false ? 'off' : 'on' },
         { label: 'RTCP SR', value: adv.rtcp_sr_enabled ? `on (${adv.rtcp_sr_interval_seconds}s)` : 'off' },
-        { label: 'RTP Mode', value: adv.rtp_mode },
+        { label: 'RTP Mode', value: rtpModeLabel },
+        ...(adv.rtp_mode === '3phase_coverage'
+          ? [
+              { label: 'RTP Coverage', value: `${adv.rtp_media_coverage_pct}%` },
+              {
+                label: 'Coverage Keepalive',
+                value: adv.rtp_coverage_keepalive_enabled === false ? 'off' : `${adv.rtp_coverage_keepalive_pps ?? 3} pps`,
+              },
+            ]
+          : []),
         ...(adv.rtp_pcap ? [{ label: 'PCAP', value: 'on' }] : []),
       ]
     : []

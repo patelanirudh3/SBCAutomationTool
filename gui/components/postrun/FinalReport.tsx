@@ -1,7 +1,8 @@
 'use client'
 
+import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, Loader2, RotateCcw, AlertTriangle } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, RotateCcw, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
@@ -94,23 +95,24 @@ export function FinalReport({
   onUnregister,
   unregistering = false,
   onReRun,
-  reRunning = false,
   onRetryFailed,
 }: FinalReportProps) {
+  const router        = useRouter()
   const phase         = useTrafficStore((s) => s.phase)
   const aggregate     = useTrafficStore((s) => s.aggregate)
   const callEvents    = useTrafficStore((s) => s.callEvents) as CallEvent[]
   const uacMetrics    = useTrafficStore((s) => s.uacMetrics)
   const prePhaseStatus = useTrafficStore((s) => s.prePhaseStatus)
+  const cleanupStatus  = useTrafficStore((s) => s.cleanupStatus)
   const pairs          = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
+  const reset           = useTrafficStore((s) => s.reset)
 
   const pair     = pairs[activePairIndex]
   const extCount = pair ? (pair.uac.ext_end - pair.uac.ext_start + 1) : 0
 
   // Registration summary values
   const regDone  = prePhaseStatus?.register_count  ?? 0
-  const regTotal = prePhaseStatus?.register_total  ?? extCount
   const regFail  = prePhaseStatus?.failed_count    ?? 0
   const subDone  = prePhaseStatus?.subscribe_count ?? 0
   const subTotal = prePhaseStatus?.subscribe_total ?? extCount
@@ -157,6 +159,18 @@ export function FinalReport({
     : '—'
 
   const isFailed = phase === 'FAILED'
+  const cleanupSucceeded =
+    cleanupStatus?.complete === true &&
+    (cleanupStatus.total ?? 0) > 0 &&
+    (cleanupStatus.unregister_failed_extensions ?? cleanupStatus.failed_extensions ?? []).length === 0 &&
+    (cleanupStatus.unsubscribe_failed_extensions ?? []).length === 0
+  const newRunDisabled = !cleanupSucceeded || unregistering || phase === 'CLEANING_UP'
+
+  function handleNewRun() {
+    if (newRunDisabled) return
+    reset()
+    router.push('/config')
+  }
 
   return (
     <motion.div
@@ -207,21 +221,18 @@ export function FinalReport({
 
         {/* Quick-action buttons + cleanup card */}
         <div className="flex items-start gap-2 flex-wrap">
-          {/* Re-Run: restart traffic with existing registered extensions */}
+          {/* Re-Run is intentionally disabled until backend restart semantics are safe. */}
           {onReRun && (
             <button
-              onClick={onReRun}
-              disabled={reRunning || unregistering || phase === 'CLEANING_UP'}
+              type="button"
+              disabled
+              title="Re-Run is temporarily disabled. Use Unregister / Unsubscribe first, then New Run."
               className={cn(
                 'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
-                'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
-                'hover:bg-emerald-500/20 hover:text-emerald-200',
-                'disabled:cursor-not-allowed disabled:opacity-50',
+                'cursor-not-allowed border-slate-700 bg-slate-800/40 text-slate-500 opacity-70',
               )}
             >
-              {reRunning
-                ? <Loader2 className="size-4 animate-spin" />
-                : <RotateCcw className="size-4" />}
+              <RotateCcw className="size-4" />
               Re-Run
             </button>
           )}
@@ -230,10 +241,25 @@ export function FinalReport({
               or final result strip depending on phase + cleanupStatus. */}
           <UnregisterProgressCard
             starting={unregistering}
-            disabled={reRunning}
             onUnregister={onUnregister}
             onRetryFailed={onRetryFailed}
           />
+
+          <button
+            type="button"
+            onClick={handleNewRun}
+            disabled={newRunDisabled}
+            title={cleanupSucceeded ? 'Configure a new run' : 'Run Unregister / Unsubscribe successfully before starting a new run'}
+            className={cn(
+              'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
+              !newRunDisabled
+                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 hover:text-emerald-200'
+                : 'cursor-not-allowed border-slate-700 bg-slate-800/40 text-slate-500 opacity-70',
+            )}
+          >
+            <RotateCcw className="size-4" />
+            New Run
+          </button>
         </div>
       </div>
 
@@ -290,7 +316,7 @@ export function FinalReport({
       </div>
 
       {/* Download */}
-      <DownloadReport />
+      <DownloadReport showNewRun={false} />
     </motion.div>
   )
 }

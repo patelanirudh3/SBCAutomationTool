@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"sync"
@@ -34,11 +35,11 @@ type RtpStats struct {
 	// JitterMs is the running interarrival jitter in milliseconds, computed
 	// per dominant SSRC (the first SSRC observed). 0 until at least 2
 	// packets from that SSRC have been received.
-	JitterMs       float64
-	LostPackets    int
-	OOOPackets     int
-	DupPackets     int
-	PacketLossPct  float64 // lost / (received + lost) * 100, 0..100
+	JitterMs      float64
+	LostPackets   int
+	OOOPackets    int
+	DupPackets    int
+	PacketLossPct float64 // lost / (received + lost) * 100, 0..100
 
 	// Remote-side metrics extracted from received RTCP RR blocks
 	// (the SBC's report back to us). Zero when no RR has been parsed.
@@ -138,6 +139,18 @@ type RtpEndpoint struct {
 	pcap *PcapWriter
 }
 
+// CoverageOptions controls coverage-based 3-phase RTP generation.
+// Percentages are validated by config.Validate; this struct is intentionally
+// simple so callers can pass VMConfig values through without translation.
+type CoverageOptions struct {
+	MediaCoveragePct   int
+	StartBurstSharePct int
+	EndBurstSharePct   int
+	MidBurstSeconds    int
+	KeepaliveEnabled   bool
+	KeepalivePPS       int
+}
+
 // NewRtpEndpoint binds a UDP socket on localIP with an OS-assigned port.
 // QoS measurement (jitter, loss, OOO, RTCP RR parsing) is enabled by
 // default; callers needing to opt out should use NewRtpEndpointWithOpts.
@@ -156,7 +169,8 @@ func NewRtpEndpointWithOpts(localIP string, ptimeMs int, qosEnabled bool) (*RtpE
 // qosEnabled       — track jitter / loss / OOO in receive loop (Phase 1)
 // rtcpSREnabled    — transmit RTCP Sender Reports (Phase 2, RISKY)
 // rtcpSRInterval   — interval between SR packets (only used when SR enabled;
-//                    pass 0 to default to 5 s)
+//
+//	pass 0 to default to 5 s)
 //
 // The SR loop goroutine is NOT spawned here; it starts inside Run /
 // RunUntilCancelled when there is a known remote destination to send to.
@@ -444,6 +458,132 @@ func (ep *RtpEndpoint) Run(
 	return nil
 }
 
+// RunCoverage executes the coverage-based 3-phase send loop.
+//
+// Instead of a fixed short burst + sparse keepalive pattern, this mode derives
+// the RTP-active duration from hold time:
+//
+//	active = hold_time * media_coverage_pct / 100
+//
+// It then spends that active time as a start burst, evenly spaced mid-call
+// bursts, and an end burst while preserving normal full-rate RTP pacing.
+func (ep *RtpEndpoint) RunCoverage(
+	ctx context.Context,
+	remoteIP string, remotePort int,
+	durationSeconds float64,
+	burstPPS int,
+	opts CoverageOptions,
+) error {
+	if remotePort <= 0 || remotePort == 9 {
+		select {
+		case <-time.After(time.Duration(durationSeconds * float64(time.Second))):
+		case <-ctx.Done():
+		}
+		return ctx.Err()
+	}
+
+	dest := &net.UDPAddr{IP: net.ParseIP(remoteIP), Port: remotePort}
+	ssrc := rand.Uint32() | 1
+	seq := uint16(rand.Intn(0x10000))
+	ts := rand.Uint32()
+	callDeadline := time.Now().Add(time.Duration(durationSeconds * float64(time.Second)))
+
+	ep.mu.Lock()
+	ep.pinTxStreamLocked(ssrc, ts)
+	srEnabled := ep.rtcpSREnabled
+	ep.mu.Unlock()
+	if srEnabled {
+		go ep.rtcpSRLoop(ctx, dest)
+	}
+
+	coverage := clampFloat(float64(opts.MediaCoveragePct)/100.0, 0.01, 1.0)
+	targetActive := durationSeconds * coverage
+	startShare := clampFloat(float64(opts.StartBurstSharePct)/100.0, 0.0, 1.0)
+	endShare := clampFloat(float64(opts.EndBurstSharePct)/100.0, 0.0, 1.0)
+	if startShare+endShare >= 1.0 {
+		// Validate rejects this, but keep the endpoint robust for direct tests.
+		startShare = 0.2
+		endShare = 0.2
+	}
+
+	phase1Seconds := targetActive * startShare
+	phase3Seconds := targetActive * endShare
+	phase2Seconds := targetActive - phase1Seconds - phase3Seconds
+	if phase2Seconds < 0 {
+		phase2Seconds = 0
+	}
+
+	phase1Deadline := time.Now().Add(time.Duration(phase1Seconds * float64(time.Second)))
+	if phase1Deadline.After(callDeadline) {
+		phase1Deadline = callDeadline
+	}
+	var err error
+	seq, ts, err = ep.sendBurst(ctx, dest, ssrc, seq, ts, phase1Deadline, burstPPS)
+	if err != nil {
+		return err
+	}
+
+	phase3Start := callDeadline.Add(-time.Duration(phase3Seconds * float64(time.Second)))
+	if phase3Start.Before(time.Now()) {
+		phase3Start = time.Now()
+	}
+
+	midBurstSeconds := float64(opts.MidBurstSeconds)
+	if midBurstSeconds <= 0 {
+		midBurstSeconds = 3
+	}
+	midBurstCount := 0
+	if phase2Seconds > 0 {
+		midBurstCount = int(math.Ceil(phase2Seconds / midBurstSeconds))
+	}
+
+	midIdleWindow := phase3Start.Sub(time.Now()).Seconds() - phase2Seconds
+	if midIdleWindow < 0 {
+		midIdleWindow = 0
+	}
+	spacing := 0.0
+	if midBurstCount > 0 {
+		spacing = midIdleWindow / float64(midBurstCount+1)
+	}
+
+	remainingPhase2 := phase2Seconds
+	for i := 0; i < midBurstCount && time.Now().Before(phase3Start); i++ {
+		if spacing > 0 {
+			seq, ts, err = ep.sendCoverageGap(ctx, dest, ssrc, seq, ts, spacing, opts)
+			if err != nil {
+				return err
+			}
+		}
+
+		if remainingPhase2 <= 0 {
+			break
+		}
+		thisBurst := math.Min(midBurstSeconds, remainingPhase2)
+		burstDeadline := time.Now().Add(time.Duration(thisBurst * float64(time.Second)))
+		if burstDeadline.After(phase3Start) {
+			burstDeadline = phase3Start
+		}
+		seq, ts, err = ep.sendBurst(ctx, dest, ssrc, seq, ts, burstDeadline, burstPPS)
+		if err != nil {
+			return err
+		}
+		remainingPhase2 -= thisBurst
+	}
+
+	if sleepFor := time.Until(phase3Start); sleepFor > 0 {
+		seq, ts, err = ep.sendCoverageGap(ctx, dest, ssrc, seq, ts, sleepFor.Seconds(), opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	if time.Now().Before(callDeadline) {
+		_, _, err = ep.sendBurst(ctx, dest, ssrc, seq, ts, callDeadline, burstPPS)
+		return err
+	}
+	return nil
+}
+
 // RunUntilCancelled is the UAS variant that runs until ctx is cancelled.
 func (ep *RtpEndpoint) RunUntilCancelled(
 	ctx context.Context,
@@ -510,6 +650,117 @@ func (ep *RtpEndpoint) RunUntilCancelled(
 	}
 
 	return nil
+}
+
+// RunCoverageUntilCancelled is the UAS coverage-mode variant. The UAS does not
+// know the exact BYE time, so callers pass a safety duration and cancel the
+// context when BYE arrives.
+func (ep *RtpEndpoint) RunCoverageUntilCancelled(
+	ctx context.Context,
+	remoteIP string, remotePort int,
+	durationSeconds float64,
+	burstPPS int,
+	opts CoverageOptions,
+) error {
+	return ep.RunCoverage(ctx, remoteIP, remotePort, durationSeconds, burstPPS, opts)
+}
+
+// sendCoverageGap handles idle windows between coverage bursts. When
+// keepalive is enabled it sends low-rate RTP so SBC/media watchdogs continue
+// seeing media; otherwise it preserves the old silent-sleep behaviour.
+func (ep *RtpEndpoint) sendCoverageGap(
+	ctx context.Context,
+	dest *net.UDPAddr,
+	ssrc uint32, seq uint16, ts uint32,
+	durationSeconds float64,
+	opts CoverageOptions,
+) (uint16, uint32, error) {
+	if durationSeconds <= 0 {
+		return seq, ts, nil
+	}
+	if !opts.KeepaliveEnabled {
+		select {
+		case <-time.After(time.Duration(durationSeconds * float64(time.Second))):
+		case <-ctx.Done():
+			return seq, ts, ctx.Err()
+		}
+		return seq, ts, nil
+	}
+	pps := opts.KeepalivePPS
+	if pps <= 0 {
+		pps = 3
+	}
+	return ep.sendKeepalive(ctx, dest, ssrc, seq, ts, durationSeconds, pps)
+}
+
+// sendKeepalive sends RTP at a low packet rate for the supplied duration while
+// preserving sequence/timestamp continuity for the next full-rate burst.
+func (ep *RtpEndpoint) sendKeepalive(
+	ctx context.Context,
+	dest *net.UDPAddr,
+	ssrc uint32, seq uint16, ts uint32,
+	durationSeconds float64,
+	pps int,
+) (uint16, uint32, error) {
+	interval := time.Duration(float64(time.Second) / float64(pps))
+	deadline := time.Now().Add(time.Duration(durationSeconds * float64(time.Second)))
+	nextSend := time.Now()
+
+	ep.mu.Lock()
+	pw := ep.pcap
+	ep.mu.Unlock()
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return seq, ts, ctx.Err()
+		default:
+		}
+
+		payload := ep.getPayload()
+		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
+		if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
+			remaining := time.Until(deadline)
+			if remaining > 0 {
+				select {
+				case <-time.After(remaining):
+				case <-ctx.Done():
+				}
+			}
+			return seq, ts, nil
+		}
+
+		if pw != nil {
+			pw.WriteTx(pkt, dest.IP.String(), dest.Port)
+		}
+
+		seq++
+		ts += uint32(ep.tsInc)
+
+		nextSend = nextSend.Add(interval)
+		sleepFor := time.Until(nextSend)
+		if untilDeadline := time.Until(deadline); sleepFor > untilDeadline {
+			sleepFor = untilDeadline
+		}
+		if sleepFor > 0 {
+			select {
+			case <-time.After(sleepFor):
+			case <-ctx.Done():
+				return seq, ts, ctx.Err()
+			}
+		}
+	}
+	return seq, ts, nil
+}
+
+func clampFloat(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
 }
 
 // sendBurst sends at pps packets/sec until deadline with drift-correcting pacing.
@@ -751,8 +1002,8 @@ func (ep *RtpEndpoint) updateQoSMetricsLocked(ssrc uint32, seq uint16, rtpTs uin
 // parseRTCPPacket walks compound RTCP packets and extracts the most recent
 // RR block targeting our SSRC. RFC 3550 §6.4 / §6.4.1 layouts:
 //
-//   SR  (PT=200): 4-byte header + 24-byte sender info + N×24-byte RR blocks
-//   RR  (PT=201): 4-byte header + 4-byte reporter SSRC + N×24-byte RR blocks
+//	SR  (PT=200): 4-byte header + 24-byte sender info + N×24-byte RR blocks
+//	RR  (PT=201): 4-byte header + 4-byte reporter SSRC + N×24-byte RR blocks
 //
 // Compound packets stack multiple RTCP records back-to-back; we walk by
 // the length field and parse SR/RR types, ignoring SDES/BYE/APP/etc.
@@ -764,7 +1015,7 @@ func (ep *RtpEndpoint) updateQoSMetricsLocked(ssrc uint32, seq uint16, rtpTs uin
 func (ep *RtpEndpoint) parseRTCPPacket(data []byte) {
 	off := 0
 	for off+4 <= len(data) {
-		if (data[off]>>6) != 2 {
+		if (data[off] >> 6) != 2 {
 			return // not RTCP, malformed
 		}
 		rc := int(data[off] & 0x1F)
@@ -863,9 +1114,9 @@ func getNTPNow() (hi, lo uint32) {
 //	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 func buildRTCPSR(ssrc, ntpHi, ntpLo, rtpTs, pktCount, octCount uint32) []byte {
 	buf := make([]byte, 28)
-	buf[0] = 0x80                                      // V=2, P=0, RC=0
-	buf[1] = 200                                       // PT = SR
-	binary.BigEndian.PutUint16(buf[2:4], 6)            // length = (28/4)-1
+	buf[0] = 0x80                           // V=2, P=0, RC=0
+	buf[1] = 200                            // PT = SR
+	binary.BigEndian.PutUint16(buf[2:4], 6) // length = (28/4)-1
 	binary.BigEndian.PutUint32(buf[4:8], ssrc)
 	binary.BigEndian.PutUint32(buf[8:12], ntpHi)
 	binary.BigEndian.PutUint32(buf[12:16], ntpLo)
@@ -939,8 +1190,8 @@ func (ep *RtpEndpoint) rtcpSRLoop(ctx context.Context, dest *net.UDPAddr) {
 // start of a talkspurt per RFC 3551 §4.1.
 func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte, marker bool) []byte {
 	hdr := make([]byte, 12+len(payload))
-	hdr[0] = 0x80          // V=2, P=0, X=0, CC=0
-	pt := byte(PT_PCMU)    // PT=0 (PCMU)
+	hdr[0] = 0x80       // V=2, P=0, X=0, CC=0
+	pt := byte(PT_PCMU) // PT=0 (PCMU)
 	if marker {
 		pt |= 0x80 // M=1
 	}

@@ -26,7 +26,7 @@ export type RunPhase =
 export type PrepStatus = 'idle' | 'running' | 'done' | 'failed'
 export type RunMode = 'local' | 'multi-vm'
 
-export type RtpMode = '3phase' | 'continuous'
+export type RtpMode = '3phase' | '3phase_coverage' | 'continuous'
 
 export interface AdvancedSettings {
   register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
@@ -37,6 +37,12 @@ export interface AdvancedSettings {
   rtp_mode: RtpMode                    // default: '3phase'
   rtp_burst_seconds: number            // default: 2
   rtp_keepalive_interval: number       // default: 3
+  rtp_media_coverage_pct: number       // default: 25 — coverage-mode RTP volume relative to continuous
+  rtp_start_burst_share_pct: number    // default: 20 — percentage of coverage budget sent after ACK
+  rtp_end_burst_share_pct: number      // default: 20 — percentage of coverage budget sent before BYE
+  rtp_mid_burst_seconds: number        // default: 3 — duration of each mid-call full-rate burst
+  rtp_coverage_keepalive_enabled: boolean // default: true — low-rate RTP during coverage idle gaps
+  rtp_coverage_keepalive_pps: number    // default: 3 — RTP keepalive packets per second during gaps
   metrics_interval: number             // default: 3 — reporting refresh cadence (seconds)
   rtp_pcap: boolean                    // default: false — capture RTP to pcap files
   qos_enabled: boolean                 // default: true — track jitter, packet loss, OOO per call
@@ -70,6 +76,12 @@ export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   rtp_mode: '3phase',
   rtp_burst_seconds: 2,
   rtp_keepalive_interval: 3,
+  rtp_media_coverage_pct: 25,
+  rtp_start_burst_share_pct: 20,
+  rtp_end_burst_share_pct: 20,
+  rtp_mid_burst_seconds: 3,
+  rtp_coverage_keepalive_enabled: true,
+  rtp_coverage_keepalive_pps: 3,
   metrics_interval: 3,
   rtp_pcap: false,
   qos_enabled: true,
@@ -156,6 +168,15 @@ export interface VMConfig {
   // Media
   rtp_codec?: RtpCodec             // default: 'G711_ULAW'
   rtp_ptime?: number               // default: 20 ms
+  rtp_mode?: RtpMode
+  rtp_burst_seconds?: number
+  rtp_keepalive_interval?: number
+  rtp_media_coverage_pct?: number
+  rtp_start_burst_share_pct?: number
+  rtp_end_burst_share_pct?: number
+  rtp_mid_burst_seconds?: number
+  rtp_coverage_keepalive_enabled?: boolean
+  rtp_coverage_keepalive_pps?: number
 
   // Run Control
   traffic_mode?: TrafficMode

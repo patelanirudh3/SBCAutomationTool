@@ -8,9 +8,10 @@ import { cn } from '@/lib/utils'
 
 interface DownloadReportProps {
   className?: string
+  showNewRun?: boolean
 }
 
-export function DownloadReport({ className }: DownloadReportProps) {
+export function DownloadReport({ className, showNewRun = true }: DownloadReportProps) {
   const aggregate = useTrafficStore((s) => s.aggregate)
   const callEvents = useTrafficStore((s) => s.callEvents)
   const callSpines = useTrafficStore((s) => s.callSpines)
@@ -53,16 +54,18 @@ export function DownloadReport({ className }: DownloadReportProps) {
   }
 
   return (
-    <div className={cn('flex items-center justify-between', className)}>
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={handleNewRun}
-        className="gap-2 border-border text-foreground hover:bg-secondary"
-      >
-        <RotateCcw className="size-3.5" />
-        New Run
-      </Button>
+    <div className={cn('flex items-center', showNewRun ? 'justify-between' : 'justify-end', className)}>
+      {showNewRun && (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleNewRun}
+          className="gap-2 border-border text-foreground hover:bg-secondary"
+        >
+          <RotateCcw className="size-3.5" />
+          New Run
+        </Button>
+      )}
       <Button
         variant="outline"
         size="sm"

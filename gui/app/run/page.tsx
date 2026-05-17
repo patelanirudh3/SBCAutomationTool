@@ -19,11 +19,12 @@ import { PrePhaseSummaryModal } from '@/components/dashboard/PrePhaseSummaryModa
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
 import { MediaQosPanel } from '@/components/dashboard/MediaQosPanel'
 import { FinalReport } from '@/components/postrun/FinalReport'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, interruptStopFor, startCleanupFor, resetTestFor, restartTrafficFor } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor, restartTrafficFor } from '@/lib/api'
 import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
 import {
   MOCK_UAC_METRICS,
@@ -52,18 +53,15 @@ const mapBackendPhase = sharedMapBackendPhase
 function LiveDashboard({
   stopping,
   onGracefulStop,
-  onInterruptStop,
 }: {
   stopping: boolean
   onGracefulStop: () => void
-  onInterruptStop: () => void
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const idleCount         = useTrafficStore((s) => s.idleCount)
   const nonIdleCount      = useTrafficStore((s) => s.nonIdleCount)
   const settingUpCount    = useTrafficStore((s) => s.settingUpCount)
-  const establishedCount  = useTrafficStore((s) => s.establishedCount)
   const regOnlyCount      = useTrafficStore((s) => s.regOnlyCount)
   const callEvents  = useTrafficStore((s) => s.callEvents) as CallEvent[]
   const pairs = useTrafficStore((s) => s.pairs)
@@ -127,36 +125,32 @@ function LiveDashboard({
 
         {(isTrafficPhase || isStopping) && (
           <div className="flex shrink-0 flex-wrap gap-2">
-            <button
-              onClick={onGracefulStop}
-              disabled={stopping || isStopping}
-              className={cn(
-                'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
-                'border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs font-semibold',
-                'hover:bg-amber-500/20 hover:text-amber-200 transition-colors',
-                'disabled:cursor-not-allowed disabled:opacity-50',
-              )}
-            >
-              {stopping && !isStopping ? (
-                <Loader2 className="size-3 animate-spin" />
-              ) : (
-                <CheckCircle2 className="size-3" />
-              )}
-              Graceful Stop
-            </button>
-            <button
-              onClick={onInterruptStop}
-              disabled={stopping}
-              className={cn(
-                'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
-                'border-rose-500/40 bg-rose-500/10 text-rose-300 text-xs font-semibold',
-                'hover:bg-rose-500/20 hover:text-rose-200 transition-colors',
-                'disabled:cursor-not-allowed disabled:opacity-50',
-              )}
-            >
-              <AlertOctagon className="size-3" />
-              Force Stop
-            </button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={onGracefulStop}
+                    disabled={stopping || isStopping}
+                    className={cn(
+                      'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
+                      'border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs font-semibold',
+                      'hover:bg-amber-500/20 hover:text-amber-200 transition-colors',
+                      'disabled:cursor-not-allowed disabled:opacity-50',
+                    )}
+                  >
+                    {stopping && !isStopping ? (
+                      <Loader2 className="size-3 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="size-3" />
+                    )}
+                    Stop Traffic
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  Stop Traffic gracefully stops new calls and lets active calls complete before the final report.
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         )}
       </div>
@@ -575,22 +569,6 @@ export default function RunPage() {
     setStopping(false)
   }
 
-  const handleInterruptStop = async () => {
-    setStopping(true)
-    if (IS_MOCK) {
-      setCallEvents(MOCK_CALL_EVENTS)
-      setAggregate({ ...MOCK_AGGREGATE, ended_at: new Date().toISOString() })
-      setPhase('CLEANUP_READY')
-      setStopping(false)
-      return
-    }
-    try {
-      await interruptStopFor(vmIp, vmPort)
-      setPhase('STOPPING')
-    } catch { /* ignore — backend will stop */ }
-    setStopping(false)
-  }
-
   const handleCleanup = async () => {
     setStopping(true)
     cleanupStartedAtRef.current = Date.now()
@@ -874,7 +852,6 @@ export default function RunPage() {
               <LiveDashboard
                 stopping={stopping}
                 onGracefulStop={handleGracefulStop}
-                onInterruptStop={handleInterruptStop}
               />
             </motion.div>
           )}
