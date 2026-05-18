@@ -362,7 +362,7 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 
 	eventCode, _ := sip.ClassifyMessage(raw)
 	if eventCode == "200" {
-		parsed := sip.ParseHeaders(strings.SplitN(raw, "\r\n\r\n", 2)[0])
+		parsed, _, _ := sip.ParseMessage(raw)
 		a.regGrantedExp = parsed.GetGrantedExpiry()
 		slog.Info("registered (no auth)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 		a.registeredOnce.Do(func() { close(a.Registered) })
@@ -397,7 +397,7 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+	parsed, _, _ := sip.ParseMessage(raw200)
 	a.regGrantedExp = parsed.GetGrantedExpiry()
 	slog.Info("registered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 	a.registeredOnce.Do(func() { close(a.Registered) })
@@ -467,7 +467,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 		defer a.deregisterCh(ch200r, "200")
 		select {
 		case raw200 := <-ch200r:
-			parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+			parsed, _, _ := sip.ParseMessage(raw200)
 			a.regGrantedExp = parsed.GetGrantedExpiry()
 			slog.Debug("reregistered (after 401)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 			return nil
@@ -475,7 +475,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 			return tCtx.Err()
 		}
 	case raw200 := <-ch200:
-		parsed := sip.ParseHeaders(strings.SplitN(raw200, "\r\n\r\n", 2)[0])
+		parsed, _, _ := sip.ParseMessage(raw200)
 		a.regGrantedExp = parsed.GetGrantedExpiry()
 		slog.Debug("reregistered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 		return nil
@@ -702,7 +702,7 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error
 	}
 
 	if finalRaw != "" {
-		parsed := sip.ParseHeaders(strings.SplitN(finalRaw, "\r\n\r\n", 2)[0])
+		parsed, _, _ := sip.ParseMessage(finalRaw)
 		if toResp := parsed.GetHeader(sip.HdrTo); len(toResp) > 0 {
 			st.ToHeader = toResp[0]
 		}
@@ -1036,8 +1036,7 @@ func (a *ExtensionAgent) SendAckForFailure(dialog *DialogState, rawResponse stri
 		}
 	}
 
-	parts := strings.SplitN(rawResponse, "\r\n\r\n", 2)
-	resp := sip.ParseHeaders(parts[0])
+	resp, _, _ := sip.ParseMessage(rawResponse)
 	if toHdrs := resp.GetHeader(sip.HdrTo); len(toHdrs) > 0 {
 		msg.AddHeader(sip.HdrTo, toHdrs[0])
 	}
@@ -1136,8 +1135,7 @@ func (a *ExtensionAgent) SendBye(dialog *DialogState) error {
 
 // HandleIncomingInvite processes an inbound INVITE and sends 100+180.
 func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, error) {
-	parts := strings.SplitN(rawMsg, "\r\n\r\n", 2)
-	invite := sip.ParseHeaders(parts[0])
+	invite, body, _ := sip.ParseMessage(rawMsg)
 	callID := invite.GetCallID()
 	remoteTag := invite.GetFromTag()
 	localTag := sip.CreateFromTag()
@@ -1166,12 +1164,8 @@ func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, erro
 	a.ActiveDialogs[callID] = dialog
 	a.mu.Unlock()
 
-	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-		ip, port := ParseSDPMedia(parts[1])
-		if ip != "" && port > 0 {
-			dialog.RTPRemoteIP = ip
-			dialog.RTPRemotePort = port
-		}
+	if strings.TrimSpace(body) != "" {
+		a.applySDPMedia(dialog, body, "INVITE")
 	}
 
 	// 100 Trying
@@ -1222,8 +1216,10 @@ func (a *ExtensionAgent) sendProvisional(invite *sip.SipMessage, code, reason, l
 
 // HandlePrack receives PRACK and sends 200 OK.
 func (a *ExtensionAgent) HandlePrack(rawMsg string, dialog *DialogState) error {
-	parts := strings.SplitN(rawMsg, "\r\n\r\n", 2)
-	prack := sip.ParseHeaders(parts[0])
+	prack, body, _ := sip.ParseMessage(rawMsg)
+	if strings.TrimSpace(body) != "" {
+		a.applySDPMedia(dialog, body, "PRACK")
+	}
 
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
@@ -1249,8 +1245,7 @@ func (a *ExtensionAgent) HandlePrack(rawMsg string, dialog *DialogState) error {
 
 // HandleBye receives BYE and sends 200 OK.
 func (a *ExtensionAgent) HandleBye(rawMsg string, dialog *DialogState) error {
-	parts := strings.SplitN(rawMsg, "\r\n\r\n", 2)
-	byeMsg := sip.ParseHeaders(parts[0])
+	byeMsg, _, _ := sip.ParseMessage(rawMsg)
 
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
@@ -1316,8 +1311,7 @@ func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 
 // ParseProvResponse parses a 180/183 provisional response.
 func (a *ExtensionAgent) ParseProvResponse(rawMsg string, dialog *DialogState) {
-	parts := strings.SplitN(rawMsg, "\r\n\r\n", 2)
-	prov := sip.ParseHeaders(parts[0])
+	prov, body, _ := sip.ParseMessage(rawMsg)
 	dialog.RemoteTag = prov.GetToTag()
 	if dialog.RingingRecvMs == 0 {
 		dialog.RingingRecvMs = float64(time.Now().UnixMilli())
@@ -1325,12 +1319,14 @@ func (a *ExtensionAgent) ParseProvResponse(rawMsg string, dialog *DialogState) {
 	dialog.RSeq = prov.GetRSeq()
 	dialog.ProvMsg = prov
 	dialog.State = "PROVRESP_RCVD"
+	if strings.TrimSpace(body) != "" {
+		a.applySDPMedia(dialog, body, "provisional response")
+	}
 }
 
 // Parse200Invite parses 200 OK to INVITE.
 func (a *ExtensionAgent) Parse200Invite(rawMsg string, dialog *DialogState) {
-	parts := strings.SplitN(rawMsg, "\r\n\r\n", 2)
-	resp := sip.ParseHeaders(parts[0])
+	resp, body, _ := sip.ParseMessage(rawMsg)
 	dialog.RemoteTag = resp.GetToTag()
 	if contactHdrs := resp.GetHeader(sip.HdrContact); len(contactHdrs) > 0 {
 		raw := contactHdrs[0]
@@ -1347,13 +1343,26 @@ func (a *ExtensionAgent) Parse200Invite(rawMsg string, dialog *DialogState) {
 	dialog.RouteSet = resp.GetRecordRoutes(true)
 	dialog.State = "SUCCESSFULRESP_RCVD"
 
-	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-		ip, port := ParseSDPMedia(parts[1])
-		if ip != "" && port > 0 {
-			dialog.RTPRemoteIP = ip
-			dialog.RTPRemotePort = port
-		}
+	if strings.TrimSpace(body) != "" {
+		a.applySDPMedia(dialog, body, "200 OK INVITE")
 	}
+}
+
+func (a *ExtensionAgent) applySDPMedia(dialog *DialogState, body, source string) {
+	ip, port := ParseSDPMedia(body)
+	if ip != "" && port > 0 {
+		dialog.RTPRemoteIP = ip
+		dialog.RTPRemotePort = port
+		return
+	}
+	slog.Warn("SDP did not contain usable audio media address",
+		"ext", a.Ext,
+		"call_id", dialog.CallID,
+		"source", source,
+		"body_len", len(body),
+		"has_audio", strings.Contains(body, "m=audio"),
+		"has_connection", strings.Contains(body, "c=IN "),
+	)
 }
 
 // WaitForEvent registers for specific SIP event codes and waits.
@@ -1601,8 +1610,7 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 // must include the remote tag assigned by the proxy in the 407.
 // Must be called before dialog.CSeq is incremented or InviteMsg.Via is replaced.
 func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error {
-	parts := strings.SplitN(raw407, "\r\n\r\n", 2)
-	resp407 := sip.ParseHeaders(parts[0])
+	resp407, _, _ := sip.ParseMessage(raw407)
 
 	// The Via branch MUST equal the top Via of the original INVITE.
 	origVia := fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID())
@@ -1830,8 +1838,7 @@ func (a *ExtensionAgent) dispatchLoop() {
 }
 
 func (a *ExtensionAgent) respond200ToNotify(raw string) {
-	parts := strings.SplitN(raw, "\r\n\r\n", 2)
-	notify := sip.ParseHeaders(parts[0])
+	notify, _, _ := sip.ParseMessage(raw)
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
 	for _, hdr := range []string{sip.HdrVia, sip.HdrFrom, sip.HdrTo, sip.HdrCallID, sip.HdrCSeq} {
@@ -1846,8 +1853,7 @@ func (a *ExtensionAgent) respond200ToNotify(raw string) {
 }
 
 func (a *ExtensionAgent) respond200ToRequest(raw string) {
-	parts := strings.SplitN(raw, "\r\n\r\n", 2)
-	req := sip.ParseHeaders(parts[0])
+	req, _, _ := sip.ParseMessage(raw)
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
 	for _, hdr := range []string{sip.HdrVia, sip.HdrFrom, sip.HdrTo, sip.HdrCallID, sip.HdrCSeq} {
@@ -1862,8 +1868,7 @@ func (a *ExtensionAgent) respond200ToRequest(raw string) {
 }
 
 func (a *ExtensionAgent) respond481ToRequest(raw string) {
-	parts := strings.SplitN(raw, "\r\n\r\n", 2)
-	req := sip.ParseHeaders(parts[0])
+	req, _, _ := sip.ParseMessage(raw)
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 481 Call/Transaction Does Not Exist")
 	for _, hdr := range []string{sip.HdrVia, sip.HdrFrom, sip.HdrTo, sip.HdrCallID, sip.HdrCSeq} {
@@ -1878,8 +1883,7 @@ func (a *ExtensionAgent) respond481ToRequest(raw string) {
 }
 
 func buildSipEvent(eventCode, raw string) SipEvent {
-	parts := strings.SplitN(raw, "\r\n\r\n", 2)
-	msg := sip.ParseHeaders(parts[0])
+	msg, _, _ := sip.ParseMessage(raw)
 	ev := SipEvent{
 		Code:       eventCode,
 		Raw:        raw,

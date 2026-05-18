@@ -1,0 +1,53 @@
+package sip
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestParseMessagePreservesExactBody(t *testing.T) {
+	body := "v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n"
+	raw := "SIP/2.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: 999\r\n\r\n" + body
+	msg, got, err := ParseMessage(raw)
+	if err != nil {
+		t.Fatalf("ParseMessage err=%v", err)
+	}
+	if msg.GetResponseCode() != "200" {
+		t.Fatalf("code=%q, want 200", msg.GetResponseCode())
+	}
+	if got != body {
+		t.Fatalf("body=%q, want %q", got, body)
+	}
+}
+
+func TestParseHeadersCompactCaseInsensitiveAndFolded(t *testing.T) {
+	msg := ParseHeaders("SIP/2.0 200 OK\r\ncontent-length: 12\r\nc: application/sdp\r\nSupported: replaces,\r\n 100rel\r\n\r\n")
+	if got := msg.GetHeader(HdrContentLength); len(got) != 1 || got[0] != "12" {
+		t.Fatalf("Content-Length=%v", got)
+	}
+	if got := msg.GetHeader(HdrContentType); len(got) != 1 || got[0] != "application/sdp" {
+		t.Fatalf("Content-Type=%v", got)
+	}
+	if got := msg.GetHeader(HdrSupported); len(got) != 1 || got[0] != "replaces, 100rel" {
+		t.Fatalf("Supported=%v", got)
+	}
+}
+
+func TestBuildMessageComputesContentLengthAndPreservesHeaderOrder(t *testing.T) {
+	msg := NewSipMessage()
+	msg.SetResponseLine("SIP/2.0 200 OK")
+	msg.AddHeader(HdrVia, "SIP/2.0/TCP first;branch=1")
+	msg.AddHeader(HdrVia, "SIP/2.0/TCP second;branch=2")
+	msg.AddHeader(HdrContentLength, "999")
+
+	raw := BuildMessage(msg, "v=0\r\n")
+	if strings.Count(raw, "Content-Length:") != 1 {
+		t.Fatalf("unexpected Content-Length count in:\n%s", raw)
+	}
+	if !strings.Contains(raw, "Content-Length: 5\r\n") {
+		t.Fatalf("missing computed Content-Length 5 in:\n%s", raw)
+	}
+	if strings.Index(raw, "first;branch=1") > strings.Index(raw, "second;branch=2") {
+		t.Fatalf("Via order not preserved:\n%s", raw)
+	}
+}

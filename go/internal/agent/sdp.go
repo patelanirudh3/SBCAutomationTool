@@ -48,23 +48,40 @@ func BuildSDP(localHost string, rtpPort int, rtcpMux bool) string {
 
 // ParseSDPMedia extracts the RTP IP and port from an SDP body.
 func ParseSDPMedia(sdpBody string) (ip string, port int) {
+	sessionIP := ""
+	mediaIP := ""
+	inAudio := false
+
 	for _, line := range strings.Split(sdpBody, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "c=IN IP4 ") {
-			parts := strings.Fields(line[9:])
-			if len(parts) > 0 {
-				ip = parts[0]
-			}
-		} else if strings.HasPrefix(line, "m=audio ") {
+		switch {
+		case strings.HasPrefix(line, "c=IN "):
 			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				p, err := strconv.Atoi(parts[1])
-				if err == nil {
+			if len(parts) >= 3 {
+				if inAudio {
+					mediaIP = parts[2]
+				} else {
+					sessionIP = parts[2]
+				}
+			}
+		case strings.HasPrefix(line, "m="):
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				inAudio = false
+				continue
+			}
+			inAudio = strings.TrimPrefix(parts[0], "m=") == "audio"
+			if inAudio {
+				if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
 					port = p
 				}
 			}
-			break
 		}
+	}
+	if mediaIP != "" {
+		ip = mediaIP
+	} else {
+		ip = sessionIP
 	}
 	return
 }

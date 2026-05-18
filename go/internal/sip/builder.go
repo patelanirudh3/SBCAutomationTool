@@ -10,12 +10,14 @@ import (
 // and the body so the original is not mutated.
 func CloneSipMessage(m *SipMessage) *SipMessage {
 	clone := &SipMessage{
-		reqLine:  m.reqLine,
-		respLine: m.respLine,
-		sdpBody:  m.sdpBody,
-		isReq:    m.isReq,
-		headers:  make(map[string][]string, len(m.headers)),
+		reqLine:     m.reqLine,
+		respLine:    m.respLine,
+		sdpBody:     m.sdpBody,
+		isReq:       m.isReq,
+		headers:     make(map[string][]string, len(m.headers)),
+		headerOrder: make([]sipHeader, len(m.headerOrder)),
 	}
+	copy(clone.headerOrder, m.headerOrder)
 	for k, vals := range m.headers {
 		dup := make([]string, len(vals))
 		copy(dup, vals)

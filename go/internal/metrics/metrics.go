@@ -101,6 +101,8 @@ type TrafficMetrics struct {
 	// RTT sample. Always 0 when rtcp_sr_enabled is false (no SR sent → no
 	// RR with usable LSR/DLSR comes back).
 	AvgRTTMs float64 `json:"avg_rtt_ms"`
+
+	HostHealth HostHealth `json:"host_health"`
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,7 @@ type MetricsCollector struct {
 	callMilestones     map[string]*callMilestoneState
 	concurrentProvider func() int
 	poolCountsProvider func() (idle, nonIdle, regOnly int)
+	hostHealth         *HostHealthCollector
 
 	rtpHealthCounts map[string]int
 
@@ -272,6 +275,7 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		rtpHealthCounts:    map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
 		mediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
 		callMilestones:     make(map[string]*callMilestoneState),
+		hostHealth:         NewHostHealthCollector(),
 		wsClients:          make(map[*websocket.Conn]struct{}),
 	}
 }
@@ -964,6 +968,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	if c.poolCountsProvider != nil {
 		idleCount, nonIdleCount, regOnlyCount = c.poolCountsProvider()
 	}
+	hostHealth := HostHealth{}
+	if c.hostHealth != nil {
+		hostHealth = c.hostHealth.Snapshot()
+	}
 
 	var totalRTPTx, totalRTPRx, totalRTPRxFromSBC, totalRTPExpected, totalRTPLost, totalRTPSSRCCount, rtpSampleCount int
 	for _, r := range c.callResults {
@@ -1066,6 +1074,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		RTPAsymmetryPct:   rtpAsymmetryPct,
 		RTPAsymmetryFlag:  rtpAsymmetryFlag,
 		AvgRTTMs:          roundAvg(c.rttSamples),
+		HostHealth:        hostHealth,
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],

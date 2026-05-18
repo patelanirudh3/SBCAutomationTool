@@ -8,11 +8,17 @@ import (
 // SipMessage represents a parsed SIP request or response with ordered headers
 // and an optional SDP body.
 type SipMessage struct {
-	headers  map[string][]string
-	reqLine  string
-	respLine string
-	sdpBody  string
-	isReq    bool
+	headers     map[string][]string
+	headerOrder []sipHeader
+	reqLine     string
+	respLine    string
+	sdpBody     string
+	isReq       bool
+}
+
+type sipHeader struct {
+	name  string
+	value string
 }
 
 // NewSipMessage creates an empty SipMessage defaulting to a request.
@@ -57,12 +63,20 @@ func (m *SipMessage) IsRequest() bool {
 func (m *SipMessage) AddHeader(name, value string) {
 	name = NormalizeHeaderName(name)
 	m.headers[name] = append(m.headers[name], value)
+	m.headerOrder = append(m.headerOrder, sipHeader{name: name, value: value})
 }
 
 // RemoveHeader deletes all values for the given header.
 func (m *SipMessage) RemoveHeader(name string) {
 	name = NormalizeHeaderName(name)
 	delete(m.headers, name)
+	filtered := m.headerOrder[:0]
+	for _, h := range m.headerOrder {
+		if h.name != name {
+			filtered = append(filtered, h)
+		}
+	}
+	m.headerOrder = filtered
 }
 
 // ReplaceHeader removes all existing values for the header then adds the new value.
@@ -80,6 +94,12 @@ func (m *SipMessage) GetHeader(name string) []string {
 // returned map.
 func (m *SipMessage) GetAllHeaders() map[string][]string {
 	return m.headers
+}
+
+func (m *SipMessage) orderedHeaders() []sipHeader {
+	out := make([]sipHeader, len(m.headerOrder))
+	copy(out, m.headerOrder)
+	return out
 }
 
 // GetCallID returns the Call-ID value, or empty string if absent.
@@ -370,7 +390,9 @@ func (m *SipMessage) GetEvent() string {
 // arriving as "v:", "f:", "t:", etc. are stored under the same canonical key
 // as their full-form counterparts.
 func NormalizeHeaderName(name string) string {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	switch lower {
 	case "i":
 		return HdrCallID
 	case "m":
@@ -389,56 +411,56 @@ func NormalizeHeaderName(name string) string {
 		return HdrSupported
 	}
 	switch {
-	case strings.HasPrefix(name, "Call-ID"):
+	case strings.HasPrefix(lower, "call-id"):
 		return HdrCallID
-	case strings.HasPrefix(name, "From"):
+	case strings.HasPrefix(lower, "from"):
 		return HdrFrom
-	case strings.HasPrefix(name, "To"):
+	case strings.HasPrefix(lower, "to"):
 		return HdrTo
-	case strings.HasPrefix(name, "Via"):
+	case strings.HasPrefix(lower, "via"):
 		return HdrVia
-	case strings.HasPrefix(name, "CSeq"):
+	case strings.HasPrefix(lower, "cseq"):
 		return HdrCSeq
-	case strings.HasPrefix(name, "Max-Forwards"):
+	case strings.HasPrefix(lower, "max-forwards"):
 		return HdrMaxForwards
-	case strings.HasPrefix(name, "Contact"):
+	case strings.HasPrefix(lower, "contact"):
 		return HdrContact
-	case strings.HasPrefix(name, "Content-Type"):
+	case strings.HasPrefix(lower, "content-type"):
 		return HdrContentType
-	case strings.HasPrefix(name, "Content-Length"):
+	case strings.HasPrefix(lower, "content-length"):
 		return HdrContentLength
-	case strings.HasPrefix(name, "Supported"):
+	case strings.HasPrefix(lower, "supported"):
 		return HdrSupported
-	case strings.HasPrefix(name, "WWW-Authenticate"):
+	case strings.HasPrefix(lower, "www-authenticate"):
 		return HdrWWWAuthenticate
-	case strings.HasPrefix(name, "Authorization"):
+	case strings.HasPrefix(lower, "authorization"):
 		return HdrAuthorization
-	case strings.HasPrefix(name, "Proxy-Authenticate"):
+	case strings.HasPrefix(lower, "proxy-authenticate"):
 		return HdrProxyAuthenticate
-	case strings.HasPrefix(name, "Proxy-Authorization"):
+	case strings.HasPrefix(lower, "proxy-authorization"):
 		return HdrProxyAuthorization
-	case strings.HasPrefix(name, "Allow"):
+	case strings.HasPrefix(lower, "allow"):
 		return HdrAllow
-	case strings.HasPrefix(name, "Require"):
+	case strings.HasPrefix(lower, "require"):
 		return HdrRequire
-	case strings.HasPrefix(name, "Record-Route"):
+	case strings.HasPrefix(lower, "record-route"):
 		return HdrRecordRoute
-	case strings.HasPrefix(name, "Route"):
+	case strings.HasPrefix(lower, "route"):
 		return HdrRoute
-	case strings.HasPrefix(name, "RSeq"):
+	case strings.HasPrefix(lower, "rseq"):
 		return HdrRSeq
-	case strings.HasPrefix(name, "RAck"):
+	case strings.HasPrefix(lower, "rack"):
 		return HdrRAck
-	case strings.HasPrefix(name, "Event"):
+	case strings.HasPrefix(lower, "event"):
 		return HdrEvent
-	case strings.HasPrefix(name, "Subscription-State"):
+	case strings.HasPrefix(lower, "subscription-state"):
 		return HdrSubscriptionState
-	case strings.HasPrefix(name, "Expires"):
+	case strings.HasPrefix(lower, "expires"):
 		return HdrExpires
-	case strings.HasPrefix(name, "User-Agent"):
+	case strings.HasPrefix(lower, "user-agent"):
 		return HdrUserAgent
-	case strings.HasPrefix(name, "Server"):
+	case strings.HasPrefix(lower, "server"):
 		return HdrServer
 	}
-	return name
+	return trimmed
 }

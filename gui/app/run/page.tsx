@@ -18,6 +18,7 @@ import { PrePhaseReport } from '@/components/dashboard/PrePhaseReport'
 import { PrePhaseSummaryModal } from '@/components/dashboard/PrePhaseSummaryModal'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
 import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
+import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { FinalReport } from '@/components/postrun/FinalReport'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
@@ -279,6 +280,7 @@ function LiveDashboard({
           asymmetryFlag: uacMetrics.rtp_asymmetry_flag ?? null,
         }}
       />
+      <VMHealthPanel health={uacMetrics.host_health ?? null} />
     </div>
   )
 }

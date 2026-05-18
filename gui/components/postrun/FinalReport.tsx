@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
 import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
+import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { DownloadReport } from './DownloadReport'
 import { UnregisterProgressCard } from './UnregisterProgressCard'
 import type { CallEvent } from '@/types'
@@ -363,6 +364,7 @@ export function FinalReport({
             asymmetryFlag: uacMetrics?.rtp_asymmetry_flag ?? aggregate?.rtp_asymmetry_flag ?? eventAsymFlag,
           }}
         />
+        <VMHealthPanel health={uacMetrics?.host_health ?? null} />
       </div>
 
       {/* Download */}
