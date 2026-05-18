@@ -305,6 +305,7 @@ export interface TrafficMetrics {
   // Phase 2 — round-trip time averaged across calls that produced an RTCP
   // SR/RR exchange. Always 0 when rtcp_sr_enabled is false.
   avg_rtt_ms?: number
+  host_health?: HostHealth
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -337,6 +338,35 @@ export interface TrafficMetrics {
     failed: boolean
     stuck_agents?: string[]
   }
+}
+
+export interface HostHealth {
+  cpu_percent?: number
+  load1?: number
+  load5?: number
+  load15?: number
+  mem_total_bytes?: number
+  mem_available_bytes?: number
+  mem_used_percent?: number
+  process_cpu_percent?: number
+  process_rss_bytes?: number
+  process_vms_bytes?: number
+  process_threads?: number
+  process_read_bytes?: number
+  process_write_bytes?: number
+  process_read_syscalls?: number
+  process_write_syscalls?: number
+  disk_total_bytes?: number
+  disk_free_bytes?: number
+  disk_used_percent?: number
+  udp_in_datagrams?: number
+  udp_in_errors?: number
+  udp_rcvbuf_errors?: number
+  net_rx_bytes?: number
+  net_tx_bytes?: number
+  goroutines?: number
+  open_fds?: number
+  uptime_seconds?: number
 }
 
 // CleanupStatus mirrors the backend GET /api/cleanup/status payload and the
