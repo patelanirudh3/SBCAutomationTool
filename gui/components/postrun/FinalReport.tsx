@@ -264,19 +264,19 @@ export function FinalReport({
 
         {/* Quick-action buttons + cleanup card */}
         <div className="flex items-start gap-2 flex-wrap">
-          {/* Re-Run is intentionally disabled until backend restart semantics are safe. */}
+          {/* Run Again is intentionally disabled until backend restart semantics are safe. */}
           {onReRun && (
             <button
               type="button"
               disabled
-              title="Re-Run is temporarily disabled. Use Unregister / Unsubscribe first, then New Run."
+              title="Run Again is temporarily disabled. Use Cleanup first, then Edit Config or start a fresh run."
               className={cn(
                 'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
                 'cursor-not-allowed border-slate-700 bg-slate-800/40 text-slate-500 opacity-70',
               )}
             >
               <RotateCcw className="size-4" />
-              Re-Run
+              Run Again
             </button>
           )}
 
@@ -292,7 +292,7 @@ export function FinalReport({
             type="button"
             onClick={handleNewRun}
             disabled={newRunDisabled}
-            title={cleanupSucceeded ? 'Configure a new run' : 'Run Unregister / Unsubscribe successfully before starting a new run'}
+            title={cleanupSucceeded ? 'Edit configuration for the next run' : 'Run Cleanup successfully before editing the next run'}
             className={cn(
               'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
               !newRunDisabled
@@ -301,7 +301,7 @@ export function FinalReport({
             )}
           >
             <RotateCcw className="size-4" />
-            New Run
+            Edit Config
           </button>
         </div>
       </div>

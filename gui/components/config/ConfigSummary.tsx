@@ -34,7 +34,7 @@ export interface SummaryGroups {
 function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups {
   const extStart = parseInt(raw.ext_start) || 0
   const extEnd = parseInt(raw.ext_end) || 0
-  const extCount = Math.max(extEnd - extStart + 1, 0)
+  const extCount = parseInt(raw.ext_count) || Math.max(extEnd - extStart + 1, 0)
   const cpsNum = parseFloat(raw.cps)
   const bhcc = Number.isFinite(cpsNum) && cpsNum > 0 ? Math.round(cpsNum * 3600) : null
 
@@ -57,7 +57,11 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
 
   const extensions: SummaryItem[] = [
     {
-      label: 'Range',
+      label: 'Starting Extension',
+      value: extStart > 0 ? raw.ext_start : '—',
+    },
+    {
+      label: 'Computed Range',
       value: extCount > 0 ? `${raw.ext_start} → ${raw.ext_end}` : '—',
     },
     { label: 'Count', value: extCount > 0 ? String(extCount) : '—' },

@@ -699,7 +699,7 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) (*Sub
 		return nil, err
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
 	sendAuthRetry := func(rawChallenge string, use401 bool) error {
@@ -804,7 +804,7 @@ func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionS
 		return err
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
 	select {
@@ -904,7 +904,7 @@ func (a *ExtensionAgent) unsubscribeEvent(ctx context.Context, st *SubscriptionS
 		return err
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
 	select {

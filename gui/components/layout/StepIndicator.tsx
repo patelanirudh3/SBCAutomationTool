@@ -2,10 +2,11 @@
 
 import { useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
-import { Check } from 'lucide-react'
+import { Check, Minus } from 'lucide-react'
 import { useTrafficStore } from '@/store/traffic'
 import { cn } from '@/lib/utils'
 import {
+  activeStepForPhase,
   getGuardConfig,
   isStepNavigable,
   STEP_LABELS,
@@ -14,8 +15,8 @@ import {
 } from '@/lib/nav-guard'
 import { NavGuardDialog } from '@/components/shared/NavGuardDialog'
 
-// StepIndicator — top-centre tab strip with four step nodes (Config /
-// Reg-Sub / Running / Complete). Used to be visual-only decoration; now
+// StepIndicator — top-centre tab strip with five step nodes (Config /
+// Reg-Sub / Traffic / Report / Cleanup). Used to be visual-only decoration; now
 // every reachable step is clickable, gated by the same guard logic as
 // HomeGuardButton via the shared NavGuardDialog.
 //
@@ -34,16 +35,14 @@ import { NavGuardDialog } from '@/components/shared/NavGuardDialog'
 //                                                Emergency Cleanup & Reset
 //                                                escape hatch.
 
-const STEP_INDICES: StepIndex[] = [0, 1, 2, 3]
+const STEP_INDICES: StepIndex[] = [0, 1, 2, 3, 4]
 
 function useCurrentStep(): StepIndex {
   const pathname = usePathname()
   const phase = useTrafficStore((s) => s.phase)
 
   if (pathname.startsWith('/run')) {
-    if (phase === 'COMPLETE' || phase === 'FAILED') return 3
-    if (phase === 'CLEANUP_READY' || phase === 'CLEANING_UP') return 3
-    return 2
+    return activeStepForPhase(phase)
   }
   if (pathname.startsWith('/launch')) return 1
   return 0
@@ -53,7 +52,14 @@ export function StepIndicator() {
   const router = useRouter()
   const pathname = usePathname()
   const phase = useTrafficStore((s) => s.phase)
+  const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const currentStep = useCurrentStep()
+  const trafficStarted = Boolean(
+    (uacMetrics?.calls_invite_sent ?? 0) > 0 ||
+    (uacMetrics?.calls_attempted ?? 0) > 0 ||
+    (uacMetrics?.calls_completed ?? 0) > 0
+  )
+  const cleanupReached = phase === 'CLEANING_UP' || phase === 'COMPLETE' || phase === 'DONE'
 
   // Single dialog shared across step clicks — tracks which target the
   // operator wanted, so on confirmation the right href is followed.
@@ -64,8 +70,10 @@ export function StepIndicator() {
 
   const handleStepClick = (target: StepIndex) => {
     const targetRoute = STEP_ROUTES[target]
-    // Already on target route — no-op.
-    if (pathname.startsWith(targetRoute)) return
+    if (cleanupReached && !trafficStarted && (target === 2 || target === 3)) return
+    // Already on target lifecycle step — no-op. Several steps share /run, so
+    // route equality alone is not enough.
+    if (target === currentStep) return
     // Unreachable for current phase — render disabled, ignore click.
     if (!isStepNavigable(phase, target)) return
 
@@ -89,12 +97,14 @@ export function StepIndicator() {
         {STEP_INDICES.map((i) => {
           const step = i
           const label = STEP_LABELS[step]
-          const isCompleted = i < currentStep
-          const isActive = i === currentStep
+          const terminalCleanupComplete = (phase === 'COMPLETE' || phase === 'DONE') && i === 4
+          const isCompleted = i < currentStep || terminalCleanupComplete
+          const isActive = i === currentStep && !terminalCleanupComplete
           const isUpcoming = i > currentStep
+          const isSkipped = cleanupReached && !trafficStarted && (i === 2 || i === 3)
           const navigable = isStepNavigable(phase, step)
-          const isCurrentRoute = pathname.startsWith(STEP_ROUTES[step])
-          const clickable = navigable && !isCurrentRoute
+          const isCurrentStep = step === currentStep
+          const clickable = navigable && !isCurrentStep && !isSkipped
 
           return (
             <div key={label} className="flex items-center">
@@ -117,13 +127,17 @@ export function StepIndicator() {
                 aria-label={
                   clickable
                     ? `Go to ${label}`
-                    : isCurrentRoute
+                    : isCurrentStep
                       ? `${label} (current page)`
-                      : `${label} (not yet available)`
+                      : isSkipped
+                        ? `${label} skipped`
+                        : `${label} (not yet available)`
                 }
                 title={
-                  isCurrentRoute
+                  isCurrentStep
                     ? `${label} (current page)`
+                    : isSkipped
+                      ? `${label} skipped because no traffic run was started`
                     : !navigable
                       ? `${label} — available once you reach a later phase`
                       : `Go to ${label}`
@@ -141,13 +155,16 @@ export function StepIndicator() {
                 <div
                   className={cn(
                     'flex size-6 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300',
-                    isCompleted && 'bg-emerald-400 text-black',
+                    isCompleted && !isSkipped && 'bg-emerald-400 text-black',
+                    isSkipped && 'border border-slate-600 bg-secondary text-slate-400',
                     isActive &&
                       'ring-2 ring-emerald-400 ring-offset-2 ring-offset-background bg-card text-emerald-400',
                     isUpcoming && 'bg-secondary text-muted-foreground'
                   )}
                 >
-                  {isCompleted ? (
+                  {isSkipped ? (
+                    <Minus className="size-3.5" strokeWidth={3} />
+                  ) : isCompleted ? (
                     <Check className="size-3.5" strokeWidth={3} />
                   ) : (
                     <span>{i + 1}</span>
@@ -156,7 +173,7 @@ export function StepIndicator() {
                 <span
                   className={cn(
                     'text-xs font-semibold hidden sm:block transition-colors duration-300',
-                    isActive ? 'text-emerald-400' : isCompleted ? 'text-emerald-300/80' : 'text-slate-400'
+                    isActive ? 'text-emerald-400' : isSkipped ? 'text-slate-500' : isCompleted ? 'text-emerald-300/80' : 'text-slate-400'
                   )}
                 >
                   {label}

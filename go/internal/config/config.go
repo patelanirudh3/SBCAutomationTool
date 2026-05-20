@@ -558,6 +558,16 @@ func (cfg *VMConfig) ShouldUnsubscribeSubscribeEvent(event string) bool {
 	return containsSubscribeEvent(cfg.SubscribeUnsubscribeEvents, event)
 }
 
+// NonInviteTransactionTimeout returns the RFC 3261 Timer F duration for
+// non-INVITE client transactions (REGISTER/SUBSCRIBE class): 64*T1.
+func (cfg *VMConfig) NonInviteTransactionTimeout() time.Duration {
+	t1 := cfg.T1Ms
+	if t1 <= 0 {
+		t1 = 500
+	}
+	return time.Duration(64*t1) * time.Millisecond
+}
+
 // Validate checks that a VMConfig has all required fields set and that
 // value ranges are sane. It normalises SIPTransport to upper case.
 func Validate(cfg *VMConfig) error {

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSubscribeEventsDefaultAndLegacyAlias(t *testing.T) {
 	cfg := &VMConfig{}
@@ -31,6 +34,20 @@ func TestSubscribePolicyEventsCanBeDisabled(t *testing.T) {
 	}
 	if cfg.ShouldUnsubscribeSubscribeEvent("dialog") || !cfg.ShouldUnsubscribeSubscribeEvent("reg") {
 		t.Fatalf("unsubscribe policy mismatch: %v", cfg.SubscribeUnsubscribeEvents)
+	}
+}
+
+func TestNonInviteTransactionTimeoutDerivesFromT1(t *testing.T) {
+	cfg := &VMConfig{}
+	ApplyDefaults(cfg)
+	if got, want := cfg.NonInviteTransactionTimeout(), 32*time.Second; got != want {
+		t.Fatalf("default non-INVITE timeout=%v, want %v", got, want)
+	}
+
+	cfg = &VMConfig{T1Ms: 1000}
+	ApplyDefaults(cfg)
+	if got, want := cfg.NonInviteTransactionTimeout(), 64*time.Second; got != want {
+		t.Fatalf("custom T1 non-INVITE timeout=%v, want %v", got, want)
 	}
 }
 

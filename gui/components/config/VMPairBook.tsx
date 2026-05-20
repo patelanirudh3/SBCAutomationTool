@@ -138,14 +138,21 @@ function pairToRaw(p: VMPair): RawVMFormValues {
 // parseRaw — converts string form values to typed VMConfig
 // ---------------------------------------------------------------------------
 
+function computedExtEnd(raw: RawVMFormValues): number {
+  const start = parseInt(raw.ext_start) || 0
+  const count = parseInt(raw.ext_count) || 0
+  return start > 0 && count > 0 ? start + count - 1 : 0
+}
+
 function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
+  const extEnd = computedExtEnd(raw)
   return {
     vm_id: raw.vm_id,
     vm_ip: raw.vm_ip,
     ssh_user: raw.ssh_user || undefined,
     ssh_key_path: raw.ssh_key_path || undefined,
     ext_start: parseInt(raw.ext_start) || 0,
-    ext_end: parseInt(raw.ext_end) || 0,
+    ext_end: extEnd,
     sbc_host: raw.sbc_host,
     sbc_port: parseInt(raw.sbc_port) || 0,
     secondary_host: raw.failover_enabled ? (raw.secondary_host || undefined) : undefined,
@@ -353,14 +360,19 @@ export function VMPairBook() {
     setValidationPassed(true)
   }, [pairs, activePairIndex])
 
-  // Keep ext_count derived
+  // Keep ext_end derived from Starting Extension + # of Extensions. The
+  // backend still receives ext_start/ext_end; the GUI no longer asks the
+  // operator to calculate the ending extension manually.
   useEffect(() => {
     const start = parseInt(raw.ext_start) || 0
-    const end = parseInt(raw.ext_end) || 0
-    const count = end >= start && start > 0 ? end - start + 1 : 0
-    setRaw((prev) => ({ ...prev, ext_count: count > 0 ? String(count) : '' }))
+    const count = parseInt(raw.ext_count) || 0
+    const end = start > 0 && count > 0 ? start + count - 1 : 0
+    const nextEnd = end > 0 ? String(end) : ''
+    if (raw.ext_end !== nextEnd) {
+      setRaw((prev) => ({ ...prev, ext_end: nextEnd }))
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [raw.ext_start, raw.ext_end])
+  }, [raw.ext_start, raw.ext_count])
 
   // Keep store connection info in sync with live form
   useEffect(() => {

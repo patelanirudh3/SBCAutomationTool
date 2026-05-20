@@ -15,7 +15,6 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { FieldError, FieldSoftWarning } from './ConfigValidator'
 import { TrafficModeSelector } from './TrafficModeSelector'
-import { deriveExtCount } from '@/lib/config-schema'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
@@ -121,7 +120,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
-    'ext_start', 'ext_end',
+    'ext_start', 'ext_count',
     'cps', 'hold_time_seconds', 'ramp_up_seconds',
     'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
   ],
@@ -148,7 +147,7 @@ const SECTION_FIELDS = {
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
                    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
-  extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
+  extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
@@ -543,7 +542,7 @@ export function VMConfigPanel({
   const w = (field: string) => (touched.has(field) ? warnings[field] : undefined)
   const t = (field: string) => touched.has(field)
 
-  const extCount = deriveExtCount(parseInt(raw.ext_start), parseInt(raw.ext_end))
+  const extCount = parseInt(raw.ext_count) || 0
 
   const handleIpBlur = () => {
     onBlur('vm_ip')
@@ -922,10 +921,11 @@ export function VMConfigPanel({
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.extension_pool)}>Extension Pool</SectionHeader>
         <FormRow
-          label="Range"
-          hint="Any two extensions from this pool may be paired for a call."
+          label="Pool Size"
+          hint="Enter the starting extension and how many extensions to use. The ending extension is calculated automatically."
         >
           <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-400">Starting Extension</span>
             <Input
               type="number"
               value={raw.ext_start}
@@ -935,27 +935,31 @@ export function VMConfigPanel({
               className="w-32 font-mono text-xs"
               aria-invalid={t('ext_start') && !!errors.ext_start ? true : undefined}
             />
-            <span className="text-slate-500">→</span>
+            <span className="text-xs text-slate-400"># of Extensions</span>
             <Input
               type="number"
-              value={raw.ext_end}
-              onChange={(ev) => onChange('ext_end', ev.target.value)}
-              onBlur={() => onBlur('ext_end')}
-              placeholder="4001009"
-              className="w-32 font-mono text-xs"
-              aria-invalid={t('ext_end') && !!errors.ext_end ? true : undefined}
+              min={2}
+              value={raw.ext_count}
+              onChange={(ev) => onChange('ext_count', ev.target.value)}
+              onBlur={() => onBlur('ext_count')}
+              placeholder="10"
+              className="w-24 font-mono text-xs"
+              aria-invalid={t('ext_count') && !!errors.ext_count ? true : undefined}
             />
             <span className="text-slate-500">·</span>
             <span className="font-mono text-xs text-slate-300">
-              {extCount > 0 ? `${extCount} ext` : '—'}
+              {extCount > 0 && raw.ext_start && raw.ext_end
+                ? `${raw.ext_start} → ${raw.ext_end} (${extCount} ext)`
+                : '—'}
             </span>
           </div>
-          {(e('ext_start') || e('ext_end')) && null /* errors shown via FormRow on each Input below if needed */}
+          {(e('ext_start') || e('ext_count') || e('ext_end')) && null /* errors shown below */}
         </FormRow>
-        {/* Inline per-field errors when start/end are individually invalid */}
-        {(e('ext_start') || e('ext_end')) && (
+        {/* Inline per-field errors when start/count are individually invalid */}
+        {(e('ext_start') || e('ext_count') || e('ext_end')) && (
           <div className="ml-[160px] pl-3 space-y-1">
             {e('ext_start') && <FieldError error={e('ext_start')} />}
+            {e('ext_count') && <FieldError error={e('ext_count')} />}
             {e('ext_end')   && <FieldError error={e('ext_end')} />}
           </div>
         )}

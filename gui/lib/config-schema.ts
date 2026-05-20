@@ -53,6 +53,7 @@ export const VMConfigSchema = z
     // Unified extension range (single pool)
     ext_start: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
     ext_end: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
+    ext_count: z.number().int().min(2, 'Need at least 2 extensions').max(100000, 'Too many extensions').optional(),
 
     sbc_host: z
       .string()
@@ -117,7 +118,7 @@ export const VMConfigSchema = z
     if (data.ext_end - data.ext_start < 1) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['ext_end'],
+        path: ['ext_count'],
         message: 'Need at least 2 extensions',
       })
     }

@@ -328,26 +328,19 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 	if maxRetries <= 0 {
 		maxRetries = 3
 	}
-	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		subCtx, cancel := context.WithTimeout(ctx, timeout)
 		var attemptProgress []struct {
 			event          string
 			ok             bool
 			notifyReceived bool
 		}
-		err := ag.SubscribeWithProgress(subCtx, func(event string, ok bool, notifyReceived bool) {
+		err := ag.SubscribeWithProgress(ctx, func(event string, ok bool, notifyReceived bool) {
 			attemptProgress = append(attemptProgress, struct {
 				event          string
 				ok             bool
 				notifyReceived bool
 			}{event: event, ok: ok, notifyReceived: notifyReceived})
 		})
-		cancel()
 
 		if err == nil {
 			if onProgress != nil {
@@ -485,9 +478,7 @@ func StartSubscribeRefreshLoop(
 						defer wg.Done()
 						sem <- struct{}{}
 						defer func() { <-sem }()
-						rCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout)*time.Second)
-						defer cancel()
-						if err := a.Resubscribe(rCtx); err != nil {
+						if err := a.Resubscribe(ctx); err != nil {
 							slog.Warn("Resubscribe failed", "ext", a.Ext, "err", err)
 						}
 					}(ag)

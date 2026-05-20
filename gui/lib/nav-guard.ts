@@ -1,6 +1,6 @@
 // Shared navigation-guard logic used by HomeGuardButton (top-left "Home"
-// chevron) and StepIndicator (top-centre Config / Reg-Sub / Running /
-// Complete tabs). Both surfaces guard against operators leaving an
+// chevron) and StepIndicator (top-centre Config / Reg-Sub / Traffic /
+// Report / Cleanup tabs). Both surfaces guard against operators leaving an
 // in-flight phase and surface the same Emergency Cleanup & Reset escape
 // hatch when the GUI's phase implies the operator might otherwise be
 // locked out.
@@ -104,23 +104,24 @@ export function getGuardConfig(phase: RunPhase): GuardConfig | null {
 // Step navigation rules
 // ---------------------------------------------------------------------------
 
-export type StepIndex = 0 | 1 | 2 | 3
+export type StepIndex = 0 | 1 | 2 | 3 | 4
 
-// Step → route mapping. Step 3 (Complete) shares /run with step 2
-// because the FinalReport view is rendered conditionally inside the
-// /run page based on phase.
+// Step → route mapping. Traffic, Report, and Cleanup share /run because the
+// /run page switches views/cards based on phase.
 export const STEP_ROUTES: Record<StepIndex, string> = {
   0: '/config',
   1: '/launch',
   2: '/run',
   3: '/run',
+  4: '/run',
 }
 
 export const STEP_LABELS: Record<StepIndex, string> = {
   0: 'Config',
   1: 'Reg / Sub',
-  2: 'Running',
-  3: 'Complete',
+  2: 'Traffic',
+  3: 'Report',
+  4: 'Cleanup',
 }
 
 // reachableForwardStep — returns the highest step index reachable for
@@ -144,8 +145,38 @@ export function reachableForwardStep(phase: RunPhase): StepIndex {
     case 'CLEANUP_READY':
     case 'CLEANING_UP':
     case 'COMPLETE':
-    case 'FAILED':
     case 'DONE':
+      return 4
+    case 'FAILED':
+      return 3
+    default:
+      return 0
+  }
+}
+
+// activeStepForPhase returns the step currently active for visual rendering.
+// It differs from reachableForwardStep for terminal states, where all steps
+// are reachable but Cleanup should be shown as the active/completed endpoint.
+export function activeStepForPhase(phase: RunPhase): StepIndex {
+  switch (phase) {
+    case 'IDLE':
+      return 0
+    case 'PRE_PHASE':
+    case 'PRE_REGISTER':
+    case 'REGSUB_READY':
+    case 'REGSUB_RUNNING':
+    case 'REGSUB_DONE':
+    case 'TRAFFIC_READY':
+      return 1
+    case 'TRAFFIC':
+    case 'STOPPING':
+      return 2
+    case 'CLEANUP_READY':
+    case 'CLEANING_UP':
+    case 'COMPLETE':
+    case 'DONE':
+      return 4
+    case 'FAILED':
       return 3
     default:
       return 0
