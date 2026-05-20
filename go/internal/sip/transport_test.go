@@ -49,3 +49,19 @@ func TestExtractSIPMessageRejectsInvalidContentLength(t *testing.T) {
 		t.Fatalf("extractSIPMessage=%q,%d, want drop with no message", msg, consumed)
 	}
 }
+
+func TestExtractSIPMessageRejectsConflictingContentLength(t *testing.T) {
+	raw := "SIP/2.0 200 OK\r\nContent-Length: 0\r\nl: 5\r\n\r\n"
+	msg, consumed := extractSIPMessage([]byte(raw))
+	if msg != "" || consumed == 0 {
+		t.Fatalf("extractSIPMessage=%q,%d, want drop with no message", msg, consumed)
+	}
+}
+
+func TestExtractSIPMessageAllowsDuplicateMatchingContentLength(t *testing.T) {
+	raw := "SIP/2.0 200 OK\r\nContent-Length: 0\r\nl: 0\r\n\r\n"
+	msg, consumed := extractSIPMessage([]byte(raw))
+	if msg != raw || consumed != len(raw) {
+		t.Fatalf("extractSIPMessage=%q,%d, want message/%d", msg, consumed, len(raw))
+	}
+}

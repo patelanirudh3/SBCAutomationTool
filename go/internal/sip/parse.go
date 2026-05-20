@@ -2,6 +2,7 @@ package sip
 
 import (
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 )
@@ -36,8 +37,13 @@ func ParseHeaders(raw string) *SipMessage {
 			msg.appendFoldedHeader(lastHeader, strings.TrimSpace(line))
 			continue
 		}
+		if (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) && lastHeader == "" {
+			slog.Debug("ParseHeaders: folded header without previous header", "line", truncateLine(line, 120))
+			continue
+		}
 		idx := strings.Index(line, ":")
 		if idx < 0 {
+			slog.Debug("ParseHeaders: malformed header without colon", "line", truncateLine(line, 120))
 			continue
 		}
 		name := line[:idx]
@@ -106,4 +112,12 @@ func scanLine(s string, offset int) (line string, next int, ok bool) {
 		return s[start:end], end + len(CRLF), true
 	}
 	return s[offset:], len(s), true
+}
+
+func truncateLine(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

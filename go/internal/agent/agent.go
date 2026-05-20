@@ -2153,23 +2153,19 @@ func firstLine(raw string) string {
 }
 
 func extractCallID(raw string) string {
-	for _, line := range strings.Split(raw, "\r\n") {
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "call-id:") || strings.HasPrefix(lower, "i:") {
-			return strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		}
+	msg, _, err := sip.ParseMessage(raw)
+	if err != nil {
+		msg = sip.ParseHeaders(raw)
 	}
-	return ""
+	return msg.GetCallID()
 }
 
 func hasToTag(raw string) bool {
-	for _, line := range strings.Split(raw, "\r\n") {
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "to:") || strings.HasPrefix(lower, "t:") {
-			return strings.Contains(lower, "tag=")
-		}
+	msg, _, err := sip.ParseMessage(raw)
+	if err != nil {
+		msg = sip.ParseHeaders(raw)
 	}
-	return false
+	return msg.GetToTag() != ""
 }
 
 // RemoveDialog removes a dialog from the active set by call ID and drains the

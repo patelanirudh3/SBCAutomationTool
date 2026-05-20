@@ -121,18 +121,11 @@ func truncHead(s string, n int) string {
 // cseqMethod extracts the method token from the CSeq header
 // (e.g. "CSeq: 1 INVITE" → "INVITE"). Returns empty string if not found.
 func cseqMethod(raw string) string {
-	for _, line := range strings.Split(raw, CRLF) {
-		trimmed := strings.TrimSpace(line)
-		lower := strings.ToLower(trimmed)
-		if !strings.HasPrefix(lower, "cseq:") {
-			continue
-		}
-		val := strings.TrimSpace(trimmed[len("cseq:"):])
-		parts := strings.Fields(val)
-		if len(parts) >= 2 {
-			return strings.ToUpper(parts[len(parts)-1])
-		}
+	headerSection, _, _ := strings.Cut(raw, CRLFCRLF)
+	msg := ParseHeaders(headerSection)
+	method := msg.GetMethod()
+	if method == "" {
 		return ""
 	}
-	return ""
+	return strings.ToUpper(method)
 }

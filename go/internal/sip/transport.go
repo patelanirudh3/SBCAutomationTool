@@ -411,6 +411,7 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 func parseContentLength(headerBlock string) (int, bool) {
 	offset := 0
 	contentLength := 0
+	seen := false
 	for offset < len(headerBlock) {
 		line, next, ok := scanHeaderLine(headerBlock, offset)
 		if !ok {
@@ -432,7 +433,11 @@ func parseContentLength(headerBlock string) (int, bool) {
 		if err != nil || v < 0 {
 			return 0, false
 		}
-		return v, true
+		if seen && v != contentLength {
+			return 0, false
+		}
+		contentLength = v
+		seen = true
 	}
 	return contentLength, true
 }

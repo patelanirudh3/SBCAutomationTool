@@ -44,6 +44,16 @@ func newTestAgent(t *testing.T, tr *mockTransport) *ExtensionAgent {
 	return a
 }
 
+func TestRawHeaderHelpersUseSharedParser(t *testing.T) {
+	raw := "BYE sip:6001@example.com SIP/2.0\r\ni: compact-call\r\nt: <sip:6001@example.com>;tag=remote\r\nContent-Length: 0\r\n\r\n"
+	if got := extractCallID(raw); got != "compact-call" {
+		t.Fatalf("extractCallID=%q, want compact-call", got)
+	}
+	if !hasToTag(raw) {
+		t.Fatal("hasToTag=false, want true")
+	}
+}
+
 // raw100 is a minimal SIP 100 Trying whose CSeq method is INVITE.
 const raw100 = "SIP/2.0 100 Trying\r\nCall-ID: test-call\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
 
