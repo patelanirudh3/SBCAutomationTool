@@ -15,7 +15,7 @@ import {
   APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { PrepStatus } from '@/types'
+import type { PrepStatus, SubscriptionEventStats } from '@/types'
 
 const POLL_INTERVAL_MS = 1_000
 
@@ -26,6 +26,7 @@ interface RegSubMetrics {
   registered_total?: number
   subscribed_count?: number
   subscribed_total?: number
+  subscriptions_by_event?: Record<string, SubscriptionEventStats>
   idle_count?: number
   non_idle_count?: number
   reg_only_count?: number
@@ -200,6 +201,8 @@ export function PrePhasePanel() {
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
   const extCount = pair ? (pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1 : 0
+  const subscribeEventCount = Math.max(pair?.uac.subscribe_events?.length ?? 1, 1)
+  const subscribeTxnFallback = extCount * subscribeEventCount
 
   const [prepStatus, setPrepStatus] = useState<PrepStatus>('idle')
   const [regStarted, setRegStarted] = useState(false)
@@ -208,6 +211,7 @@ export function PrePhasePanel() {
   const [subCount, setSubCount] = useState(0)
   const [regTotal, setRegTotal] = useState(0)
   const [subTotal, setSubTotal] = useState(0)
+  const [subByEvent, setSubByEvent] = useState<Record<string, SubscriptionEventStats>>({})
   const [localIdleCount, setLocalIdleCount] = useState(0)
   const [localRegOnlyCount, setLocalRegOnlyCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
@@ -279,6 +283,7 @@ export function PrePhasePanel() {
 
         setRegCount(newReg)
         setSubCount(m.subscribed_count ?? 0)
+        setSubByEvent(m.subscriptions_by_event ?? {})
         if ((m.registered_total ?? 0) > 0) setRegTotal(m.registered_total ?? 0)
         if ((m.subscribed_total ?? 0) > 0) setSubTotal(m.subscribed_total ?? 0)
         setLocalIdleCount(m.idle_count ?? 0)
@@ -296,7 +301,7 @@ export function PrePhasePanel() {
             register_total: extCount,
             subscribe_complete: true,
             subscribe_count: m.subscribed_count ?? 0,
-            subscribe_total: extCount,
+            subscribe_total: subscribeTxnFallback,
             extensions_ready: (m.idle_count ?? 0) >= 2,
             idle_count: m.idle_count,
             reg_only_count: m.reg_only_count,
@@ -306,7 +311,7 @@ export function PrePhasePanel() {
         // transient — keep polling
       }
     }, POLL_INTERVAL_MS)
-  }, [vmIp, vmPort, pair, extCount, stopPolling, setPhase, setPrePhaseStatus, updateUACMetrics])
+  }, [vmIp, vmPort, pair, extCount, subscribeTxnFallback, stopPolling, setPhase, setPrePhaseStatus, updateUACMetrics])
 
   // ------------------------------------------------------------------
   // Engine state check on mount
@@ -477,7 +482,7 @@ export function PrePhasePanel() {
     setCurrentRunId(runId)
     setRegStarted(true)
     setRegTotal(n)
-    setSubTotal(n)
+    setSubTotal(n * subscribeEventCount)
     setPhase('REGSUB_RUNNING')
     let reg = 0
     let sub = 0
@@ -516,9 +521,9 @@ export function PrePhasePanel() {
     return denom > 0 ? Math.round((regCount / denom) * 100) : 0
   }, [regCount, regTotal, extCount])
   const subBarPct = useMemo(() => {
-    const denom = subTotal > 0 ? subTotal : extCount
+    const denom = subTotal > 0 ? subTotal : subscribeTxnFallback
     return denom > 0 ? Math.round((subCount / denom) * 100) : 0
-  }, [subCount, subTotal, extCount])
+  }, [subCount, subTotal, subscribeTxnFallback])
   const subAmberPct = Math.round((displayRegOnly / total) * 100)
   const failedCount = regDone ? Math.max(0, total - regCount) : 0
 
@@ -689,13 +694,28 @@ export function PrePhasePanel() {
                 <div className="flex justify-between text-xs text-muted-foreground">
                   <span>SUBSCRIBE</span>
                   <span className="font-mono">
-                    <span className="font-semibold text-foreground">{subCount}</span> / {subTotal > 0 ? subTotal : extCount}
-                    {subCount >= (subTotal > 0 ? subTotal : extCount) && subTotal > 0 && (
+                    <span className="font-semibold text-foreground">{subCount}</span> / {subTotal > 0 ? subTotal : subscribeTxnFallback}
+                    {subCount >= (subTotal > 0 ? subTotal : subscribeTxnFallback) && subTotal > 0 && (
                       <CheckCircle2 className="ml-1 inline size-3 text-emerald-400" />
                     )}
                   </span>
                 </div>
                 <LayeredBar completed={subBarPct} partial={subAmberPct} />
+                {Object.keys(subByEvent).length > 0 && (
+                  <div className="grid gap-1 rounded-lg border border-slate-800 bg-slate-950/35 p-2 text-[11px]">
+                    {Object.entries(subByEvent).map(([event, stats]) => (
+                      <div key={event} className="flex items-center justify-between gap-3">
+                        <span className="truncate text-slate-400">{event}</span>
+                        <span className="shrink-0 font-mono text-slate-300">
+                          <span className="text-emerald-300">{stats.successful}</span>
+                          /{stats.total}
+                          <span className="ml-2 text-sky-300">N:{stats.notify_received}</span>
+                          {stats.failed > 0 && <span className="ml-2 text-rose-300">F:{stats.failed}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

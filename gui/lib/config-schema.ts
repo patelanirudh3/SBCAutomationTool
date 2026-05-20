@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { SUBSCRIBE_EVENT_VALUES } from './subscription-events'
 
 const VM_ID_REGEX = /^[a-zA-Z][a-zA-Z0-9-]{0,31}$/
 const DOMAIN_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$/
@@ -33,7 +34,7 @@ export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
 export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
 export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
-export const SubscribeEventSchema = z.enum(['reg', 'dialog', 'message-summary', 'presence', 'cci-info'])
+export const SubscribeEventSchema = z.enum(SUBSCRIBE_EVENT_VALUES)
 
 export const VMConfigSchema = z
   .object({
@@ -82,6 +83,8 @@ export const VMConfigSchema = z
     register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_events: z.array(SubscribeEventSchema).min(1, 'Select at least one SUBSCRIBE event').optional(),
+    subscribe_refresh_events: z.array(SubscribeEventSchema).optional(),
+    subscribe_unsubscribe_events: z.array(SubscribeEventSchema).optional(),
     register_rate_cps: z.number().positive('Rate must be positive').max(500, 'Cannot exceed 500 reg/s').optional(),
     t1_ms: z.number().int().min(100, 'Minimum 100 ms').max(5000, 'Maximum 5000 ms').optional(),
     timer_b_seconds: z.number().int().min(1, 'Minimum 1 s').max(300, 'Maximum 300 s').optional(),
@@ -132,6 +135,26 @@ export const VMConfigSchema = z
         path: ['duration_hours'],
         message: 'duration_hours required for timed mode',
       })
+    }
+
+    const selected = new Set(data.subscribe_events ?? [])
+    for (const event of data.subscribe_refresh_events ?? []) {
+      if (!selected.has(event)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['subscribe_refresh_events'],
+          message: `${event} must be selected before refresh can be enabled`,
+        })
+      }
+    }
+    for (const event of data.subscribe_unsubscribe_events ?? []) {
+      if (!selected.has(event)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['subscribe_unsubscribe_events'],
+          message: `${event} must be selected before unsubscribe can be enabled`,
+        })
+      }
     }
 
     if (data.sip_transport === 'TLS') {

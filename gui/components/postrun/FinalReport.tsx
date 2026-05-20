@@ -117,6 +117,23 @@ export function FinalReport({
   const regFail  = prePhaseStatus?.failed_count    ?? 0
   const subDone  = prePhaseStatus?.subscribe_count ?? 0
   const subTotal = prePhaseStatus?.subscribe_total ?? extCount
+  const cleanedUp = cleanupStatus?.complete === true && (cleanupStatus.total ?? 0) > 0
+  const unregisterFailedCount =
+    (cleanupStatus?.unregister_failed_extensions ?? cleanupStatus?.failed_extensions ?? []).length
+  const unsubscribeByEvent = cleanupStatus?.unsubscribe_by_event
+  const unsubscribeSuccessful = unsubscribeByEvent
+    ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.successful ?? 0), 0)
+    : Math.max(0, (cleanupStatus?.unsubscribe_count ?? 0) - (cleanupStatus?.unsubscribe_failed_extensions ?? []).length)
+  const activeRegistered = cleanedUp
+    ? Math.max(0, regDone - Math.max(0, (cleanupStatus?.unregister_count ?? 0) - unregisterFailedCount))
+    : regDone
+  const activeSubscribed = cleanedUp
+    ? Math.max(0, subDone - unsubscribeSuccessful)
+    : subDone
+  const unregisteredCount = cleanedUp ? Math.max(0, regDone - activeRegistered) : 0
+  const unsubscribedCount = cleanedUp ? Math.max(0, subDone - activeSubscribed) : 0
+  const regCardLabel = cleanedUp ? 'Registered (Active)' : 'Registered'
+  const subCardLabel = cleanedUp ? 'Subscribed (Active)' : 'Subscribed'
 
   // Call traffic summary
   // attempted = OOD INVITEs that received 100 Trying from the remote server.
@@ -161,9 +178,8 @@ export function FinalReport({
 
   const isFailed = phase === 'FAILED'
   const cleanupSucceeded =
-    cleanupStatus?.complete === true &&
-    (cleanupStatus.total ?? 0) > 0 &&
-    (cleanupStatus.unregister_failed_extensions ?? cleanupStatus.failed_extensions ?? []).length === 0 &&
+    cleanedUp &&
+    unregisterFailedCount === 0 &&
     (cleanupStatus.unsubscribe_failed_extensions ?? []).length === 0
   const newRunDisabled = !cleanupSucceeded || unregistering || phase === 'CLEANING_UP'
 
@@ -294,9 +310,9 @@ export function FinalReport({
       <div className="space-y-3">
         <SectionLabel>Registration &amp; Subscription</SectionLabel>
         <div className="grid grid-cols-4 gap-3">
-          <StatCard icon={CheckCircle2} label="Registered"      value={regDone.toLocaleString()}  color="success" />
+          <StatCard icon={CheckCircle2} label={regCardLabel}    value={activeRegistered.toLocaleString()}  color={activeRegistered > 0 ? 'success' : 'default'} sub={cleanedUp ? `${unregisteredCount.toLocaleString()} unregistered` : undefined} />
           <StatCard icon={XCircle}      label="Reg Failed"      value={regFail}                    color={regFail > 0 ? 'danger' : 'default'} />
-          <StatCard icon={CheckCircle2} label="Subscribed"      value={subDone.toLocaleString()}   color="success" />
+          <StatCard icon={CheckCircle2} label={subCardLabel}    value={activeSubscribed.toLocaleString()}   color={activeSubscribed > 0 ? 'success' : 'default'} sub={cleanedUp ? `${unsubscribedCount.toLocaleString()} unsubscribed` : undefined} />
           <StatCard icon={XCircle}      label="Sub Failed"      value={subTotal - subDone}          color={(subTotal - subDone) > 0 ? 'danger' : 'default'} />
         </div>
       </div>

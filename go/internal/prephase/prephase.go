@@ -32,7 +32,6 @@ import (
 	"github.com/cci/traffic-engine/internal/config"
 )
 
-
 // batchMinExt returns the numerically smallest extension in the batch.
 func batchMinExt(batch []*agent.ExtensionAgent) string {
 	min := math.MaxInt
@@ -258,14 +257,14 @@ func registerOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMCo
 // Returns the list of extensions that failed to subscribe.
 // SubscribeAll subscribes successfully-registered extensions concurrently.
 //
-// onProgress, if non-nil, is invoked once per agent after its subscribe
-// attempt completes. Used to drive the live SUBSCRIBE progress counter.
+// onProgress, if non-nil, is invoked once per configured event package after
+// its subscribe attempt completes. Used to drive live per-event progress.
 func SubscribeAll(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 	agentCb func(ag *agent.ExtensionAgent, succeeded bool),
-	onProgress func(),
+	onProgress func(event string, ok bool, notifyReceived bool),
 	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
@@ -296,7 +295,7 @@ func SubscribeAll(
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			ok := subscribeOne(ctx, ag, cfg)
+			ok := subscribeOne(ctx, ag, cfg, onProgress)
 			if !ok {
 				mu.Lock()
 				failed = append(failed, ag.Ext)
@@ -304,9 +303,6 @@ func SubscribeAll(
 			}
 			if agentCb != nil {
 				agentCb(ag, ok)
-			}
-			if onProgress != nil {
-				onProgress()
 			}
 		}(a)
 	}
@@ -327,7 +323,7 @@ func SubscribeAll(
 }
 
 // subscribeOne attempts to subscribe a single agent with retries.
-func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig) bool {
+func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig, onProgress func(event string, ok bool, notifyReceived bool)) bool {
 	maxRetries := cfg.RegisterRetry
 	if maxRetries <= 0 {
 		maxRetries = 3
@@ -339,10 +335,26 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		subCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := ag.Subscribe(subCtx)
+		var attemptProgress []struct {
+			event          string
+			ok             bool
+			notifyReceived bool
+		}
+		err := ag.SubscribeWithProgress(subCtx, func(event string, ok bool, notifyReceived bool) {
+			attemptProgress = append(attemptProgress, struct {
+				event          string
+				ok             bool
+				notifyReceived bool
+			}{event: event, ok: ok, notifyReceived: notifyReceived})
+		})
 		cancel()
 
 		if err == nil {
+			if onProgress != nil {
+				for _, p := range attemptProgress {
+					onProgress(p.event, p.ok, p.notifyReceived)
+				}
+			}
 			return true
 		}
 
@@ -357,6 +369,10 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 			case <-ctx.Done():
 				return false
 			case <-time.After(backoff):
+			}
+		} else if onProgress != nil {
+			for _, p := range attemptProgress {
+				onProgress(p.event, p.ok, p.notifyReceived)
 			}
 		}
 	}
@@ -746,7 +762,7 @@ func RunSubscribe(
 	skipSubscribe bool,
 	onIdle func(ag *agent.ExtensionAgent),
 	onRegOnly func(ag *agent.ExtensionAgent),
-	onProgress func(),
+	onProgress func(event string, ok bool, notifyReceived bool),
 	stopNew *atomic.Bool,
 ) (failed []string, stopRefresh func()) {
 	noopStop := func() {}

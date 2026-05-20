@@ -161,16 +161,21 @@ type ExtensionAgent struct {
 
 // SubscriptionState tracks one event-package subscription dialog.
 type SubscriptionState struct {
-	Event      string
-	CallID     string
-	FromHeader string
-	ToHeader   string
-	Contact    string
-	Nonce      string
-	Realm      string
-	Opaque     string
-	CSeq       int
-	NonceCount int
+	Event             string
+	CallID            string
+	FromHeader        string
+	ToHeader          string
+	Contact           string
+	RemoteTarget      string
+	RouteSet          []string
+	AuthHeaderName    string
+	Nonce             string
+	Realm             string
+	Opaque            string
+	CSeq              int
+	NonceCount        int
+	NotifyReceived    bool
+	SubscriptionState string
 }
 
 // nextRegNC returns the next nonce-count for REGISTER digest auth as the
@@ -303,10 +308,16 @@ func (a *ExtensionAgent) SubscriptionEvent() string {
 	return strings.Join(events, ",")
 }
 
-// NeedsUnsubscribe reports whether cleanup should send SUBSCRIBE Expires:0.
-// Unsubscribe policy is intentionally disabled for all events until the SBC
-// event-package-specific behavior is agreed.
+// NeedsUnsubscribe reports whether cleanup should send SUBSCRIBE Expires:0 for
+// any established subscription whose event policy requires explicit teardown.
 func (a *ExtensionAgent) NeedsUnsubscribe() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for event := range a.subscriptions {
+		if a.Config.ShouldUnsubscribeSubscribeEvent(event) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -621,13 +632,30 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 // (Proxy-Auth) and 401 (WWW-Auth) challenges. All configured events must
 // succeed for the agent to be considered subscribed.
 func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
+	return a.SubscribeWithProgress(ctx, nil)
+}
+
+// SubscribeWithProgress performs every configured event-package subscription.
+// The callback is invoked exactly once per configured event so metrics can track
+// per-event success, failure, and NOTIFY confirmation.
+func (a *ExtensionAgent) SubscribeWithProgress(ctx context.Context, cb func(event string, ok bool, notifyReceived bool)) error {
 	events := a.Config.SubscribeEvents
 	if len(events) == 0 {
 		events = []string{"dialog"}
 	}
-	for _, event := range events {
-		if err := a.SubscribeEvent(ctx, event); err != nil {
+	for i, event := range events {
+		st, err := a.SubscribeEvent(ctx, event)
+		if err != nil {
+			if cb != nil {
+				cb(event, false, false)
+				for _, skipped := range events[i+1:] {
+					cb(skipped, false, false)
+				}
+			}
 			return err
+		}
+		if cb != nil {
+			cb(event, true, st != nil && st.NotifyReceived)
 		}
 	}
 	a.subscribedOnce.Do(func() { close(a.Subscribed) })
@@ -636,11 +664,14 @@ func (a *ExtensionAgent) Subscribe(ctx context.Context) error {
 
 // SubscribeEvent establishes one event-package subscription and stores the
 // resulting dialog/auth state independently from other subscriptions.
-func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error {
+func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) (*SubscriptionState, error) {
 	a.syncLocalPort()
 	event = strings.ToLower(strings.TrimSpace(event))
 	if event == "" {
 		event = "dialog"
+	}
+	if _, ok := config.SubscribeEventPolicyFor(event); !ok {
+		return nil, fmt.Errorf("unsupported subscribe event %q", event)
 	}
 
 	st := &SubscriptionState{
@@ -657,13 +688,15 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error
 	ch401 := a.waitForEvent("401")
 	ch200 := a.waitForEvent("200")
 	ch202 := a.waitForEvent("202")
+	notifyQ := a.RegisterWildcardListener()
 	defer a.deregisterCh(ch407, "407")
 	defer a.deregisterCh(ch401, "401")
 	defer a.deregisterCh(ch200, "200")
 	defer a.deregisterCh(ch202, "202")
+	defer a.DeregisterWildcardListener(notifyQ)
 
 	if err := a.Send(msg, ""); err != nil {
-		return err
+		return nil, err
 	}
 
 	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
@@ -677,28 +710,28 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error
 	select {
 	case raw407 := <-ch407:
 		if err := sendAuthRetry(raw407, false); err != nil {
-			return err
+			return nil, err
 		}
 		select {
 		case finalRaw = <-ch200:
 		case finalRaw = <-ch202:
 		case <-tCtx.Done():
-			return tCtx.Err()
+			return nil, tCtx.Err()
 		}
 	case raw401 := <-ch401:
 		if err := sendAuthRetry(raw401, true); err != nil {
-			return err
+			return nil, err
 		}
 		select {
 		case finalRaw = <-ch200:
 		case finalRaw = <-ch202:
 		case <-tCtx.Done():
-			return tCtx.Err()
+			return nil, tCtx.Err()
 		}
 	case finalRaw = <-ch200:
 	case finalRaw = <-ch202:
 	case <-tCtx.Done():
-		return tCtx.Err()
+		return nil, tCtx.Err()
 	}
 
 	if finalRaw != "" {
@@ -706,13 +739,21 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) error
 		if toResp := parsed.GetHeader(sip.HdrTo); len(toResp) > 0 {
 			st.ToHeader = toResp[0]
 		}
+		st.RemoteTarget = firstURIFromHeader(parsed.GetHeader(sip.HdrContact))
+		st.RouteSet = parsed.GetRecordRoutes(true)
 	}
+	notifyState, err := a.waitForSubscriptionNotify(tCtx, notifyQ, st, false)
+	if err != nil {
+		return nil, err
+	}
+	st.NotifyReceived = true
+	st.SubscriptionState = notifyState
 
 	a.mu.Lock()
 	a.subscriptions[event] = st
 	a.mu.Unlock()
-	slog.Info("subscribed", "ext", a.Ext, "event", event)
-	return nil
+	slog.Info("subscribed", "ext", a.Ext, "event", event, "subscription_state", notifyState)
+	return st, nil
 }
 
 // Resubscribe refreshes every successfully established subscription.
@@ -730,6 +771,9 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 	}
 
 	for _, st := range states {
+		if !a.Config.ShouldRefreshSubscribeEvent(st.Event) {
+			continue
+		}
 		if err := a.resubscribeEvent(ctx, st); err != nil {
 			return err
 		}
@@ -742,9 +786,9 @@ func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionS
 	msg := a.buildSubscribeMessage(st, a.Config.SubscribeExpires)
 	if st.Nonce != "" {
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+		uri := subscribeRequestURI(a, st)
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, st.Realm, st.Nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", st.Opaque)
-		msg.AddHeader(sip.HdrAuthorization, authHdr)
+		addSubscriptionAuth(msg, st, authHdr)
 	}
 
 	ch401 := a.waitForEvent("401")
@@ -797,22 +841,120 @@ func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionS
 	return nil
 }
 
-// Unsubscribe is intentionally a no-op for now. Event-package-specific
-// unsubscribe policy will be added later; cleanup currently only unregisters.
+// Unsubscribe tears down every active subscription whose event policy requires
+// explicit cleanup, using RFC 6665's SUBSCRIBE-with-Expires:0 mechanism.
 func (a *ExtensionAgent) Unsubscribe(ctx context.Context) error {
+	return a.UnsubscribeWithProgress(ctx, nil)
+}
+
+// UnsubscribeWithProgress tears down unsubscribe-enabled subscriptions and
+// reports one result per event package.
+func (a *ExtensionAgent) UnsubscribeWithProgress(ctx context.Context, cb func(event string, ok bool)) error {
+	a.syncLocalPort()
+	a.mu.RLock()
+	states := make([]*SubscriptionState, 0, len(a.subscriptions))
+	for _, st := range a.subscriptions {
+		cp := *st
+		states = append(states, &cp)
+	}
+	a.mu.RUnlock()
+
+	for _, st := range states {
+		if !a.Config.ShouldUnsubscribeSubscribeEvent(st.Event) {
+			continue
+		}
+		if err := a.unsubscribeEvent(ctx, st); err != nil {
+			if cb != nil {
+				cb(st.Event, false)
+			}
+			return err
+		}
+		if cb != nil {
+			cb(st.Event, true)
+		}
+		a.mu.Lock()
+		delete(a.subscriptions, st.Event)
+		a.mu.Unlock()
+	}
+	return nil
+}
+
+func (a *ExtensionAgent) unsubscribeEvent(ctx context.Context, st *SubscriptionState) error {
+	st.CSeq++
+	msg := a.buildSubscribeMessage(st, 0)
+	if st.Nonce != "" {
+		cnonce := sip.GenCNonce()
+		uri := subscribeRequestURI(a, st)
+		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, st.Realm, st.Nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", st.Opaque)
+		addSubscriptionAuth(msg, st, authHdr)
+	}
+
+	ch401 := a.waitForEvent("401")
+	ch407 := a.waitForEvent("407")
+	ch200 := a.waitForEvent("200")
+	ch202 := a.waitForEvent("202")
+	notifyQ := a.RegisterWildcardListener()
+	defer a.deregisterCh(ch401, "401")
+	defer a.deregisterCh(ch407, "407")
+	defer a.deregisterCh(ch200, "200")
+	defer a.deregisterCh(ch202, "202")
+	defer a.DeregisterWildcardListener(notifyQ)
+
+	if err := a.Send(msg, ""); err != nil {
+		return err
+	}
+
+	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	defer cancel()
+
+	select {
+	case raw401 := <-ch401:
+		if err := a.sendSubscribeAuthRetry(msg, st, raw401, true); err != nil {
+			return err
+		}
+		select {
+		case <-ch200:
+		case <-ch202:
+		case <-tCtx.Done():
+			return tCtx.Err()
+		}
+	case raw407 := <-ch407:
+		if err := a.sendSubscribeAuthRetry(msg, st, raw407, false); err != nil {
+			return err
+		}
+		select {
+		case <-ch200:
+		case <-ch202:
+		case <-tCtx.Done():
+			return tCtx.Err()
+		}
+	case <-ch200:
+	case <-ch202:
+	case <-tCtx.Done():
+		return tCtx.Err()
+	}
+
+	state, err := a.waitForSubscriptionNotify(tCtx, notifyQ, st, true)
+	if err != nil {
+		return err
+	}
+	slog.Debug("unsubscribed", "ext", a.Ext, "event", st.Event, "subscription_state", state)
 	return nil
 }
 
 func (a *ExtensionAgent) buildSubscribeMessage(st *SubscriptionState, expires int) *sip.SipMessage {
-	if expires <= 0 {
+	if expires < 0 {
 		expires = a.Config.SubscribeExpires
 	}
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE sip:%s@%s SIP/2.0", a.Ext, a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("SUBSCRIBE %s SIP/2.0", subscribeRequestURI(a, st)))
 	msg.AddHeader(sip.HdrCallID, st.CallID)
 	msg.AddHeader(sip.HdrFrom, st.FromHeader)
 	msg.AddHeader(sip.HdrTo, st.ToHeader)
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
+	for _, route := range st.RouteSet {
+		msg.AddHeader(sip.HdrRoute, route)
+	}
 	msg.AddHeader(sip.HdrContact, st.Contact)
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrExpires, fmt.Sprintf("%d", expires))
@@ -820,10 +962,41 @@ func (a *ExtensionAgent) buildSubscribeMessage(st *SubscriptionState, expires in
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d SUBSCRIBE", st.CSeq))
 	msg.AddHeader(sip.HdrContentLength, "0")
 	msg.AddHeader(sip.HdrSupported, "100rel")
-	if strings.EqualFold(st.Event, "dialog") {
-		msg.AddHeader("Accept", "application/dialog-info+xml")
+	if policy, ok := config.SubscribeEventPolicyFor(st.Event); ok && policy.Accept != "" {
+		msg.AddHeader("Accept", policy.Accept)
 	}
 	return msg
+}
+
+func subscribeRequestURI(a *ExtensionAgent, st *SubscriptionState) string {
+	if st.RemoteTarget != "" {
+		return st.RemoteTarget
+	}
+	return fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+}
+
+func addSubscriptionAuth(msg *sip.SipMessage, st *SubscriptionState, authHdr string) {
+	msg.RemoveHeader(sip.HdrAuthorization)
+	msg.RemoveHeader(sip.HdrProxyAuthorization)
+	switch st.AuthHeaderName {
+	case sip.HdrProxyAuthorization:
+		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
+	default:
+		msg.AddHeader(sip.HdrAuthorization, authHdr)
+	}
+}
+
+func firstURIFromHeader(vals []string) string {
+	if len(vals) == 0 {
+		return ""
+	}
+	value := vals[0]
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		if end := strings.IndexByte(value[start:], '>'); end >= 0 {
+			return value[start+1 : start+end]
+		}
+	}
+	return strings.TrimSpace(value)
 }
 
 func (a *ExtensionAgent) sendSubscribeAuthRetry(msg *sip.SipMessage, st *SubscriptionState, rawChallenge string, use401 bool) error {
@@ -839,9 +1012,14 @@ func (a *ExtensionAgent) sendSubscribeAuthRetry(msg *sip.SipMessage, st *Subscri
 		realm = a.Config.Domain
 	}
 	st.resetNonce(nonce, realm, opaque)
+	if use401 {
+		st.AuthHeaderName = sip.HdrAuthorization
+	} else {
+		st.AuthHeaderName = sip.HdrProxyAuthorization
+	}
 
 	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+	uri := subscribeRequestURI(a, st)
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", opaque)
 
 	st.CSeq++
@@ -1849,7 +2027,67 @@ func (a *ExtensionAgent) respond200ToNotify(raw string) {
 		}
 	}
 	resp.AddHeader(sip.HdrContentLength, "0")
-	_ = a.Send(resp, "")
+	if err := a.Send(resp, ""); err != nil {
+		slog.Warn("NOTIFY 200 OK send failed", "ext", a.Ext, "err", err)
+	}
+}
+
+func (a *ExtensionAgent) waitForSubscriptionNotify(ctx context.Context, wq chan WildcardEvent, st *SubscriptionState, requireTerminated bool) (string, error) {
+	for {
+		code, raw, err := a.WaitWildcard(ctx, wq, time.Until(deadlineFromContext(ctx)))
+		if err != nil {
+			return "", fmt.Errorf("subscribe event %s: wait NOTIFY: %w", st.Event, err)
+		}
+		if code != "NOTIFY" {
+			continue
+		}
+		if !matchesSubscriptionNotify(raw, st) {
+			continue
+		}
+		state := parseSubscriptionState(raw)
+		if state == "" {
+			return "", fmt.Errorf("subscribe event %s: NOTIFY missing Subscription-State", st.Event)
+		}
+		if requireTerminated && !strings.EqualFold(state, "terminated") {
+			continue
+		}
+		return state, nil
+	}
+}
+
+func deadlineFromContext(ctx context.Context) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return time.Now().Add(30 * time.Second)
+}
+
+func matchesSubscriptionNotify(raw string, st *SubscriptionState) bool {
+	msg, _, _ := sip.ParseMessage(raw)
+	if !strings.EqualFold(msg.GetMethod(), "NOTIFY") {
+		return false
+	}
+	if msg.GetCallID() != st.CallID {
+		return false
+	}
+	return normalizeEventToken(msg.GetEvent()) == normalizeEventToken(st.Event)
+}
+
+func parseSubscriptionState(raw string) string {
+	msg, _, _ := sip.ParseMessage(raw)
+	vals := msg.GetHeader(sip.HdrSubscriptionState)
+	if len(vals) == 0 {
+		return ""
+	}
+	return normalizeEventToken(vals[0])
+}
+
+func normalizeEventToken(v string) string {
+	token := strings.TrimSpace(strings.ToLower(v))
+	if before, _, ok := strings.Cut(token, ";"); ok {
+		token = strings.TrimSpace(before)
+	}
+	return token
 }
 
 func (a *ExtensionAgent) respond200ToRequest(raw string) {

@@ -188,13 +188,24 @@ export function UnregisterProgressCard({
     const unregisterFailed = cleanupStatus?.unregister_failed_extensions ?? failed
     const unregisterCount = cleanupStatus?.unregister_count ?? count
     const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
-    const unsubscribeCount = cleanupStatus?.unsubscribe_count ?? 0
+    const unsubscribeByEvent = cleanupStatus?.unsubscribe_by_event
+    const eventUnsubscribeTotal = unsubscribeByEvent
+      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.total ?? 0), 0)
+      : 0
+    const eventUnsubscribeOk = unsubscribeByEvent
+      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.successful ?? 0), 0)
+      : 0
+    const eventUnsubscribeFailed = unsubscribeByEvent
+      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.failed ?? 0), 0)
+      : 0
+    const unsubscribeCount = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
     const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
     const unregisterOk = Math.max(0, unregisterCount - unregisterFailed.length)
-    const unsubscribeOk = Math.max(0, unsubscribeCount - unsubscribeFailed.length)
+    const unsubscribeOk = eventUnsubscribeTotal > 0 ? eventUnsubscribeOk : Math.max(0, unsubscribeCount - unsubscribeFailed.length)
+    const unsubscribeFailedCount = eventUnsubscribeTotal > 0 ? eventUnsubscribeFailed : unsubscribeFailed.length
     const allUnregistered = unregisterFailed.length === 0 && unregisterCount >= total && total > 0
-    const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailed.length > 0
-    const allClean = allUnregistered && unsubscribeFailed.length === 0
+    const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
+    const allClean = allUnregistered && unsubscribeFailedCount === 0
     const totalFailed = unregisterFailed.length === total
     const elapsedLabel = cleanupStatus?.elapsed_seconds != null
       ? ` (${fmtElapsed(cleanupStatus.elapsed_seconds)})`
@@ -211,7 +222,7 @@ export function UnregisterProgressCard({
             <div className="mt-1 font-mono text-[11px] text-emerald-300/80">
               {unsubscribeSkipped > 0
                 ? `Unsubscribe skipped ${unsubscribeSkipped.toLocaleString()} / ${total.toLocaleString()} (not enabled)`
-                : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${total.toLocaleString()}`}
+                : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${Math.max(unsubscribeCount, total).toLocaleString()}`}
             </div>
           )}
         </div>
@@ -274,25 +285,25 @@ export function UnregisterProgressCard({
 
         {hasUnsubscribeWork && (
           <div className="rounded-md border border-amber-500/20 bg-slate-900/30 px-2.5 py-2 font-mono text-[11px] text-amber-100/90">
-            <div>Unsubscribed {unsubscribeOk.toLocaleString()} / {total.toLocaleString()}</div>
+            <div>Unsubscribed {unsubscribeOk.toLocaleString()} / {Math.max(unsubscribeCount, total).toLocaleString()}</div>
             {unsubscribeSkipped > 0 && (
               <div>Unsubscribe skipped {unsubscribeSkipped.toLocaleString()} / {total.toLocaleString()} (not enabled)</div>
             )}
-            {unsubscribeFailed.length > 0 && (
-              <div className="text-rose-300">Unsubscribe failed {unsubscribeFailed.length.toLocaleString()} / {total.toLocaleString()}</div>
+            {unsubscribeFailedCount > 0 && (
+              <div className="text-rose-300">Unsubscribe failed {unsubscribeFailedCount.toLocaleString()} / {Math.max(unsubscribeCount, total).toLocaleString()}</div>
             )}
           </div>
         )}
 
         <div className="flex flex-wrap items-center gap-2">
-          {(unregisterFailed.length > 0 || unsubscribeFailed.length > 0) && (
+          {(unregisterFailed.length > 0 || unsubscribeFailedCount > 0) && (
             <button
               type="button"
               onClick={() => setShowFailed((v) => !v)}
               className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/20"
             >
               {showFailed ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-              {showFailed ? 'Hide' : 'Show'} failed extensions ({unregisterFailed.length + unsubscribeFailed.length})
+              {showFailed ? 'Hide' : 'Show'} failed extensions ({unregisterFailed.length + unsubscribeFailedCount})
             </button>
           )}
           {onRetryFailed && unregisterFailed.length > 0 && (

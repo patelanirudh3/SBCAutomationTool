@@ -8,6 +8,9 @@ func TestSubscribeEventsDefaultAndLegacyAlias(t *testing.T) {
 	if len(cfg.SubscribeEvents) != 1 || cfg.SubscribeEvents[0] != "dialog" {
 		t.Fatalf("default subscribe_events=%v, want [dialog]", cfg.SubscribeEvents)
 	}
+	if !cfg.ShouldRefreshSubscribeEvent("dialog") || !cfg.ShouldUnsubscribeSubscribeEvent("dialog") {
+		t.Fatalf("default dialog refresh/unsubscribe not enabled: refresh=%v unsubscribe=%v", cfg.SubscribeRefreshEvents, cfg.SubscribeUnsubscribeEvents)
+	}
 
 	cfg = &VMConfig{SubscribeEvent: "reg"}
 	ApplyDefaults(cfg)
@@ -16,10 +19,25 @@ func TestSubscribeEventsDefaultAndLegacyAlias(t *testing.T) {
 	}
 }
 
-func TestSubscribeEventsNormalizeAndValidate(t *testing.T) {
-	cfg := &VMConfig{SubscribeEvents: []string{"dialog", "reg", "dialog", "presence"}}
+func TestSubscribePolicyEventsCanBeDisabled(t *testing.T) {
+	cfg := &VMConfig{
+		SubscribeEvents:            []string{"dialog", "reg"},
+		SubscribeRefreshEvents:     []string{},
+		SubscribeUnsubscribeEvents: []string{"reg"},
+	}
 	ApplyDefaults(cfg)
-	want := []string{"dialog", "reg", "presence"}
+	if cfg.ShouldRefreshSubscribeEvent("dialog") || cfg.ShouldRefreshSubscribeEvent("reg") {
+		t.Fatalf("refresh should be disabled, got %v", cfg.SubscribeRefreshEvents)
+	}
+	if cfg.ShouldUnsubscribeSubscribeEvent("dialog") || !cfg.ShouldUnsubscribeSubscribeEvent("reg") {
+		t.Fatalf("unsubscribe policy mismatch: %v", cfg.SubscribeUnsubscribeEvents)
+	}
+}
+
+func TestSubscribeEventsNormalizeAndValidate(t *testing.T) {
+	cfg := &VMConfig{SubscribeEvents: []string{"dialog", "reg", "dialog", "avaya-cm-cc-info"}}
+	ApplyDefaults(cfg)
+	want := []string{"dialog", "reg", "avaya-cm-cc-info"}
 	if len(cfg.SubscribeEvents) != len(want) {
 		t.Fatalf("subscribe_events=%v, want %v", cfg.SubscribeEvents, want)
 	}
@@ -43,10 +61,18 @@ func TestSubscribeEventsNormalizeAndValidate(t *testing.T) {
 		RTPPtime:        20,
 		RTPMode:         "3phase",
 		TrafficMode:     "unlimited",
-		SubscribeEvents: []string{"dialog", "bad-event"},
+		SubscribeEvents: []string{"dialog", "presence"},
 	}
 	ApplyDefaults(bad)
 	if err := Validate(bad); err == nil {
 		t.Fatal("Validate succeeded with unsupported subscribe event")
+	}
+
+	badPolicy := *bad
+	badPolicy.SubscribeEvents = []string{"dialog"}
+	badPolicy.SubscribeRefreshEvents = []string{"reg"}
+	ApplyDefaults(&badPolicy)
+	if err := Validate(&badPolicy); err == nil {
+		t.Fatal("Validate succeeded with refresh for unselected event")
 	}
 }

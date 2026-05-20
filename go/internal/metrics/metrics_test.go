@@ -121,3 +121,57 @@ func TestCleanupSplitCountersKeepUnregisterSeparate(t *testing.T) {
 		t.Fatalf("unsubscribe failed=%v, want [6002]", snap.CleanupUnsubscribeFailed)
 	}
 }
+
+func TestCleanupUnsubscribeByEventIsExposed(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	c.ResetCleanup(2)
+	c.RecordCleanupUnsubscribeEvent("reg", true)
+	c.RecordCleanupUnsubscribeEvent("reg", true)
+	c.IncrementCleanupUnsubscribe("6001", false, true)
+	c.IncrementCleanupUnsubscribe("6002", false, true)
+
+	snap := c.BuildSnapshot()
+	if got := snap.CleanupUnsubscribeByEvent["reg"]; got.Total != 2 || got.Successful != 2 || got.Failed != 0 {
+		t.Fatalf("cleanup unsubscribe by event=%+v, want total=2 successful=2 failed=0", got)
+	}
+	details := c.CleanupDetailsSnapshot()
+	if got := details.UnsubscribeByEvent["reg"]; got.Total != 2 || got.Successful != 2 {
+		t.Fatalf("cleanup details by event=%+v, want total=2 successful=2", got)
+	}
+}
+
+func TestUpdateCountsDoesNotCollapseMultiEventSubscribeProgress(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	c.SetRegisterTotal(5)
+	c.SetSubscribeTotal(30)
+	c.SetSubscribeEventTotals([]string{
+		"avaya-cm-feature-status",
+		"avaya-cm-cc-info",
+		"dialog",
+		"avaya-ccs-profile",
+		"reg",
+		"message-summary",
+	}, 5)
+
+	for _, event := range []string{
+		"avaya-cm-feature-status",
+		"avaya-cm-cc-info",
+		"dialog",
+		"avaya-ccs-profile",
+		"reg",
+		"message-summary",
+	} {
+		for i := 0; i < 5; i++ {
+			c.RecordSubscriptionEvent(event, true, true)
+		}
+	}
+
+	c.UpdateCounts(0, 5, 5, 5)
+	snap := c.BuildSnapshot()
+	if snap.SubscribedCount != 30 || snap.SubscribedTotal != 30 {
+		t.Fatalf("subscribe progress=%d/%d, want 30/30", snap.SubscribedCount, snap.SubscribedTotal)
+	}
+	if got := snap.SubscriptionsByEvent["dialog"]; got.Successful != 5 || got.NotifyReceived != 5 {
+		t.Fatalf("dialog stats=%+v, want successful=5 notify=5", got)
+	}
+}

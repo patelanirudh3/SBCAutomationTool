@@ -25,29 +25,30 @@ import (
 // TrafficMetrics is the snapshot of traffic metrics for one VM at one point in time.
 // JSON field names must match the Python version exactly — the Next.js GUI depends on them.
 type TrafficMetrics struct {
-	Timestamp         float64 `json:"timestamp"`
-	VMID              string  `json:"vm_id"`
-	Phase             string  `json:"phase"`
-	CPSActual         float64 `json:"cps_actual"`
-	ConcurrentCalls   int     `json:"concurrent_calls"`
-	CallsInviteSent   int     `json:"calls_invite_sent"`
-	CallsAttempted    int     `json:"calls_attempted"`
-	CallsAnswered     int     `json:"calls_answered"`
-	CallsAcknowledged int     `json:"calls_acknowledged"`
-	CallsCompleted    int     `json:"calls_completed"`
-	CallsFailed       int     `json:"calls_failed"`
-	ASR               float64 `json:"asr"`
-	CSR               float64 `json:"csr"`
-	AvgPDDMs          float64 `json:"avg_pdd_ms"`
-	MinPDDMs          float64 `json:"min_pdd_ms"`
-	MaxPDDMs          float64 `json:"max_pdd_ms"`
-	AvgHoldMs         float64 `json:"avg_hold_ms"`
-	AvgTotalMs        float64 `json:"avg_total_ms"`
-	SocketCount       int     `json:"socket_count"`
-	RegisteredCount   int     `json:"registered_count"`
-	RegisteredTotal   int     `json:"registered_total"`
-	SubscribedCount   int     `json:"subscribed_count"`
-	SubscribedTotal   int     `json:"subscribed_total"`
+	Timestamp            float64                           `json:"timestamp"`
+	VMID                 string                            `json:"vm_id"`
+	Phase                string                            `json:"phase"`
+	CPSActual            float64                           `json:"cps_actual"`
+	ConcurrentCalls      int                               `json:"concurrent_calls"`
+	CallsInviteSent      int                               `json:"calls_invite_sent"`
+	CallsAttempted       int                               `json:"calls_attempted"`
+	CallsAnswered        int                               `json:"calls_answered"`
+	CallsAcknowledged    int                               `json:"calls_acknowledged"`
+	CallsCompleted       int                               `json:"calls_completed"`
+	CallsFailed          int                               `json:"calls_failed"`
+	ASR                  float64                           `json:"asr"`
+	CSR                  float64                           `json:"csr"`
+	AvgPDDMs             float64                           `json:"avg_pdd_ms"`
+	MinPDDMs             float64                           `json:"min_pdd_ms"`
+	MaxPDDMs             float64                           `json:"max_pdd_ms"`
+	AvgHoldMs            float64                           `json:"avg_hold_ms"`
+	AvgTotalMs           float64                           `json:"avg_total_ms"`
+	SocketCount          int                               `json:"socket_count"`
+	RegisteredCount      int                               `json:"registered_count"`
+	RegisteredTotal      int                               `json:"registered_total"`
+	SubscribedCount      int                               `json:"subscribed_count"`
+	SubscribedTotal      int                               `json:"subscribed_total"`
+	SubscriptionsByEvent map[string]SubscriptionEventStats `json:"subscriptions_by_event,omitempty"`
 	// PrepStatus tracks the optional async unregister-flush invoked by the
 	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
 	// | "failed". The GUI reads this to drive the corner-button visual state
@@ -71,11 +72,12 @@ type TrafficMetrics struct {
 	CleanupFailed []string `json:"cleanup_failed,omitempty"`
 	// Split cleanup results let the GUI distinguish subscription cleanup from
 	// registration cleanup. Legacy cleanup_* fields remain unregister-focused.
-	CleanupUnsubscribeCount   int      `json:"cleanup_unsubscribe_count"`
-	CleanupUnsubscribeSkipped int      `json:"cleanup_unsubscribe_skipped"`
-	CleanupUnsubscribeFailed  []string `json:"cleanup_unsubscribe_failed,omitempty"`
-	CleanupUnregisterCount    int      `json:"cleanup_unregister_count"`
-	CleanupUnregisterFailed   []string `json:"cleanup_unregister_failed,omitempty"`
+	CleanupUnsubscribeCount   int                               `json:"cleanup_unsubscribe_count"`
+	CleanupUnsubscribeSkipped int                               `json:"cleanup_unsubscribe_skipped"`
+	CleanupUnsubscribeFailed  []string                          `json:"cleanup_unsubscribe_failed,omitempty"`
+	CleanupUnsubscribeByEvent map[string]SubscriptionEventStats `json:"cleanup_unsubscribe_by_event,omitempty"`
+	CleanupUnregisterCount    int                               `json:"cleanup_unregister_count"`
+	CleanupUnregisterFailed   []string                          `json:"cleanup_unregister_failed,omitempty"`
 
 	// QoS / Media aggregate metrics (Phase 1).
 	// AvgJitterMs / AvgMOSScore are simple means over calls that produced
@@ -103,6 +105,14 @@ type TrafficMetrics struct {
 	AvgRTTMs float64 `json:"avg_rtt_ms"`
 
 	HostHealth HostHealth `json:"host_health"`
+}
+
+// SubscriptionEventStats exposes per-event-package subscription progress.
+type SubscriptionEventStats struct {
+	Total          int `json:"total"`
+	Successful     int `json:"successful"`
+	Failed         int `json:"failed"`
+	NotifyReceived int `json:"notify_received"`
 }
 
 // ---------------------------------------------------------------------------
@@ -201,17 +211,18 @@ type MetricsCollector struct {
 
 	latest TrafficMetrics
 
-	concurrentCalls int
-	socketCount     int
-	registeredCount int
-	registeredTotal int
-	subscribedCount int
-	subscribedTotal int
-	prepStatus      string // "idle" | "running" | "done" | "failed"
-	phase           string
-	runStart        time.Time
-	running         bool
-	runStartSet     bool
+	concurrentCalls      int
+	socketCount          int
+	registeredCount      int
+	registeredTotal      int
+	subscribedCount      int
+	subscribedTotal      int
+	subscriptionsByEvent map[string]SubscriptionEventStats
+	prepStatus           string // "idle" | "running" | "done" | "failed"
+	phase                string
+	runStart             time.Time
+	running              bool
+	runStartSet          bool
 
 	callResults        []CallResultData
 	rawEvents          []map[string]any
@@ -240,6 +251,7 @@ type MetricsCollector struct {
 	cleanupUnsubscribeCount   int
 	cleanupUnsubscribeSkipped int
 	cleanupUnsubscribeFailed  []string
+	cleanupUnsubscribeByEvent map[string]SubscriptionEventStats
 	cleanupUnregisterCount    int
 	cleanupUnregisterFailed   []string
 
@@ -266,17 +278,19 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		metricsIntervalSec = 10
 	}
 	return &MetricsCollector{
-		vmID:               vmID,
-		interval:           time.Duration(metricsIntervalSec) * time.Second,
-		windowStart:        time.Now(),
-		phase:              "IDLE",
-		prepStatus:         "idle",
-		latest:             TrafficMetrics{VMID: vmID, Phase: "IDLE", PrepStatus: "idle", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
-		rtpHealthCounts:    map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
-		mediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
-		callMilestones:     make(map[string]*callMilestoneState),
-		hostHealth:         NewHostHealthCollector(),
-		wsClients:          make(map[*websocket.Conn]struct{}),
+		vmID:                      vmID,
+		interval:                  time.Duration(metricsIntervalSec) * time.Second,
+		windowStart:               time.Now(),
+		phase:                     "IDLE",
+		prepStatus:                "idle",
+		latest:                    TrafficMetrics{VMID: vmID, Phase: "IDLE", PrepStatus: "idle", RTPHealth: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}, MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}},
+		subscriptionsByEvent:      make(map[string]SubscriptionEventStats),
+		cleanupUnsubscribeByEvent: make(map[string]SubscriptionEventStats),
+		rtpHealthCounts:           map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
+		mediaQualityCounts:        map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
+		callMilestones:            make(map[string]*callMilestoneState),
+		hostHealth:                NewHostHealthCollector(),
+		wsClients:                 make(map[*websocket.Conn]struct{}),
 	}
 }
 
@@ -398,9 +412,28 @@ func (c *MetricsCollector) ResetCleanup(total int) {
 	c.cleanupUnsubscribeCount = 0
 	c.cleanupUnsubscribeSkipped = 0
 	c.cleanupUnsubscribeFailed = nil
+	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
 	c.cleanupUnregisterFailed = nil
 	c.mu.Unlock()
+}
+
+// RecordCleanupUnsubscribeEvent records one per-event Expires:0 teardown.
+func (c *MetricsCollector) RecordCleanupUnsubscribeEvent(event string, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	event = strings.ToLower(strings.TrimSpace(event))
+	if event == "" {
+		return
+	}
+	st := c.cleanupUnsubscribeByEvent[event]
+	st.Total++
+	if ok {
+		st.Successful++
+	} else {
+		st.Failed++
+	}
+	c.cleanupUnsubscribeByEvent[event] = st
 }
 
 // IncrementCleanupUnsubscribe records the result of one subscription cleanup
@@ -447,6 +480,7 @@ type CleanupDetails struct {
 	UnsubscribeCount   int
 	UnsubscribeSkipped int
 	UnsubscribeFailed  []string
+	UnsubscribeByEvent map[string]SubscriptionEventStats
 	UnregisterCount    int
 	UnregisterFailed   []string
 }
@@ -462,6 +496,7 @@ func (c *MetricsCollector) CleanupDetailsSnapshot() CleanupDetails {
 		UnsubscribeCount:   c.cleanupUnsubscribeCount,
 		UnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
 		UnsubscribeFailed:  append([]string(nil), c.cleanupUnsubscribeFailed...),
+		UnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
 		UnregisterCount:    c.cleanupUnregisterCount,
 		UnregisterFailed:   append([]string(nil), c.cleanupUnregisterFailed...),
 	}
@@ -484,7 +519,13 @@ func (c *MetricsCollector) UpdateCounts(concurrent, sockets, registered, subscri
 	c.concurrentCalls = concurrent
 	c.socketCount = sockets
 	c.registeredCount = registered
-	c.subscribedCount = subscribed
+	// In multi-event SUBSCRIBE mode subscribedCount is maintained per event
+	// package by RecordSubscriptionEvent. Do not collapse it back to the agent
+	// count after REG/SUB completes, otherwise the GUI shows e.g. 5/30 even
+	// though all six event subscriptions succeeded for five users.
+	if c.subscribedTotal <= c.registeredTotal {
+		c.subscribedCount = subscribed
+	}
 	c.mu.Unlock()
 }
 
@@ -507,6 +548,21 @@ func (c *MetricsCollector) SetSubscribeTotal(total int) {
 	c.mu.Unlock()
 }
 
+// SetSubscribeEventTotals initializes per-event SUBSCRIBE counters. perEventTotal
+// is normally the number of successfully registered extensions.
+func (c *MetricsCollector) SetSubscribeEventTotals(events []string, perEventTotal int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscriptionsByEvent = make(map[string]SubscriptionEventStats, len(events))
+	for _, event := range events {
+		event = strings.ToLower(strings.TrimSpace(event))
+		if event == "" {
+			continue
+		}
+		c.subscriptionsByEvent[event] = SubscriptionEventStats{Total: perEventTotal}
+	}
+}
+
 // IncrementRegistered bumps the live REGISTER progress counter by one. Called
 // from RegisterAll's per-agent goroutine once the agent's REGISTER attempt
 // finishes (regardless of success).
@@ -522,6 +578,28 @@ func (c *MetricsCollector) IncrementSubscribed() {
 	c.mu.Lock()
 	c.subscribedCount++
 	c.mu.Unlock()
+}
+
+// RecordSubscriptionEvent records the outcome of one event-package subscription
+// transaction for one extension.
+func (c *MetricsCollector) RecordSubscriptionEvent(event string, ok bool, notifyReceived bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	event = strings.ToLower(strings.TrimSpace(event))
+	if event == "" {
+		return
+	}
+	st := c.subscriptionsByEvent[event]
+	if ok {
+		st.Successful++
+		c.subscribedCount++
+	} else {
+		st.Failed++
+	}
+	if notifyReceived {
+		st.NotifyReceived++
+	}
+	c.subscriptionsByEvent[event] = st
 }
 
 // SetPrepStatus updates the optional async prep flag exposed to the GUI as
@@ -876,6 +954,7 @@ func (c *MetricsCollector) Reset() {
 	c.registeredTotal = 0
 	c.subscribedCount = 0
 	c.subscribedTotal = 0
+	c.subscriptionsByEvent = make(map[string]SubscriptionEventStats)
 	c.prepStatus = "idle"
 	c.phase = "IDLE"
 	c.runStart = time.Time{}
@@ -907,6 +986,7 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupUnsubscribeCount = 0
 	c.cleanupUnsubscribeSkipped = 0
 	c.cleanupUnsubscribeFailed = nil
+	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
 	c.cleanupUnregisterFailed = nil
 	c.vmID = "unconfigured"
@@ -1018,32 +1098,33 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	}
 
 	snap := TrafficMetrics{
-		Timestamp:         float64(time.Now().UnixMilli()) / 1000.0,
-		VMID:              c.vmID,
-		Phase:             c.phase,
-		CPSActual:         math.Round(cpsActual*1000) / 1000,
-		ConcurrentCalls:   concurrent,
-		CallsInviteSent:   c.callsInviteSent,
-		CallsAttempted:    c.callsAttempted,
-		CallsAnswered:     c.callsAnswered,
-		CallsAcknowledged: c.callsAcknowledged,
-		CallsCompleted:    c.callsCompleted,
-		CallsFailed:       c.callsFailed,
-		ASR:               math.Round(asr*100) / 100,
-		CSR:               math.Round(csr*100) / 100,
-		AvgPDDMs:          roundAvg(c.pddSamples),
-		MinPDDMs:          roundMin(c.pddSamples),
-		MaxPDDMs:          roundMax(c.pddSamples),
-		AvgHoldMs:         roundAvg(c.holdSamples),
-		AvgTotalMs:        roundAvg(c.totalSamples),
-		SocketCount:       c.socketCount,
-		RegisteredCount:   c.registeredCount,
-		RegisteredTotal:   c.registeredTotal,
-		SubscribedCount:   c.subscribedCount,
-		SubscribedTotal:   c.subscribedTotal,
-		PrepStatus:        c.prepStatus,
-		RunElapsedSec:     runElapsed,
-		Running:           c.running,
+		Timestamp:            float64(time.Now().UnixMilli()) / 1000.0,
+		VMID:                 c.vmID,
+		Phase:                c.phase,
+		CPSActual:            math.Round(cpsActual*1000) / 1000,
+		ConcurrentCalls:      concurrent,
+		CallsInviteSent:      c.callsInviteSent,
+		CallsAttempted:       c.callsAttempted,
+		CallsAnswered:        c.callsAnswered,
+		CallsAcknowledged:    c.callsAcknowledged,
+		CallsCompleted:       c.callsCompleted,
+		CallsFailed:          c.callsFailed,
+		ASR:                  math.Round(asr*100) / 100,
+		CSR:                  math.Round(csr*100) / 100,
+		AvgPDDMs:             roundAvg(c.pddSamples),
+		MinPDDMs:             roundMin(c.pddSamples),
+		MaxPDDMs:             roundMax(c.pddSamples),
+		AvgHoldMs:            roundAvg(c.holdSamples),
+		AvgTotalMs:           roundAvg(c.totalSamples),
+		SocketCount:          c.socketCount,
+		RegisteredCount:      c.registeredCount,
+		RegisteredTotal:      c.registeredTotal,
+		SubscribedCount:      c.subscribedCount,
+		SubscribedTotal:      c.subscribedTotal,
+		SubscriptionsByEvent: copySubscriptionEventStats(c.subscriptionsByEvent),
+		PrepStatus:           c.prepStatus,
+		RunElapsedSec:        runElapsed,
+		Running:              c.running,
 		RTPHealth: map[string]int{
 			"OK":       c.rtpHealthCounts["OK"],
 			"WARNING":  c.rtpHealthCounts["WARNING"],
@@ -1057,6 +1138,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CleanupTotal:              c.cleanupTotal,
 		CleanupUnsubscribeCount:   c.cleanupUnsubscribeCount,
 		CleanupUnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
+		CleanupUnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
 		CleanupUnregisterCount:    c.cleanupUnregisterCount,
 
 		AvgJitterMs:       roundAvg(c.jitterSamples),
@@ -1107,6 +1189,17 @@ func roundAvg(samples []float64) float64 {
 		sum += v
 	}
 	return math.Round(sum/float64(len(samples))*100) / 100
+}
+
+func copySubscriptionEventStats(in map[string]SubscriptionEventStats) map[string]SubscriptionEventStats {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]SubscriptionEventStats, len(in))
+	for event, stats := range in {
+		out[event] = stats
+	}
+	return out
 }
 
 func roundMin(samples []float64) float64 {
@@ -2059,6 +2152,7 @@ func BuildMux(
 			"unsubscribe_count":             details.UnsubscribeCount,
 			"unsubscribe_skipped":           details.UnsubscribeSkipped,
 			"unsubscribe_failed_extensions": details.UnsubscribeFailed,
+			"unsubscribe_by_event":          details.UnsubscribeByEvent,
 			"unregister_count":              details.UnregisterCount,
 			"unregister_failed_extensions":  details.UnregisterFailed,
 			"in_progress":                   latest.Phase == "CLEANING_UP",

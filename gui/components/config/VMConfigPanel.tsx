@@ -20,6 +20,7 @@ import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
 import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode } from '@/types'
+import { SUBSCRIBE_EVENT_OPTIONS, SUBSCRIBE_EVENT_VALUES } from '@/lib/subscription-events'
 
 // All form values stored as strings so inputs stay fully controlled
 export type RawVMFormValues = {
@@ -35,6 +36,8 @@ export type RawVMFormValues = {
   register_expires: string
   subscribe_expires: string
   subscribe_events: string[]
+  subscribe_refresh_events: string[]
+  subscribe_unsubscribe_events: string[]
   register_rate_cps: string
   // RFC 3261 INVITE client-transaction timers (UAC). Empty -> backend uses RFC defaults.
   t1_ms: string
@@ -114,7 +117,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name',
   ],
   signaling: [
-    'register_expires', 'subscribe_expires', 'subscribe_events', 'register_rate_cps',
+    'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps',
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
@@ -131,12 +134,12 @@ const DEFAULTS_REGISTRATION = {
   register_expires:  '3600',
   subscribe_expires: '3600',
   subscribe_events:  ['dialog'],
+  subscribe_refresh_events: ['dialog'],
+  subscribe_unsubscribe_events: ['dialog'],
   register_rate_cps: '10',
   t1_ms:             '500',
   timer_b_seconds:   '32',
 }
-
-const SUBSCRIBE_EVENT_OPTIONS = ['reg', 'dialog', 'message-summary', 'presence', 'cci-info'] as const
 
 // Fields belonging to each logical section — used by per-section Reset buttons
 const SECTION_FIELDS = {
@@ -146,7 +149,7 @@ const SECTION_FIELDS = {
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
                    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_end'] as (keyof RawVMFormValues)[],
-  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
@@ -965,6 +968,8 @@ export function VMConfigPanel({
           raw.register_expires !== DEFAULTS_REGISTRATION.register_expires ||
           raw.subscribe_expires !== DEFAULTS_REGISTRATION.subscribe_expires ||
           raw.subscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_events.join(',') ||
+          raw.subscribe_refresh_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_refresh_events.join(',') ||
+          raw.subscribe_unsubscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_unsubscribe_events.join(',') ||
           raw.register_rate_cps !== DEFAULTS_REGISTRATION.register_rate_cps ||
           raw.t1_ms !== DEFAULTS_REGISTRATION.t1_ms ||
           raw.timer_b_seconds !== DEFAULTS_REGISTRATION.timer_b_seconds
@@ -1047,14 +1052,31 @@ export function VMConfigPanel({
 
             <FormRow
               label="SUBSCRIBE Events"
-              hint="Event packages to subscribe after REGISTER. Default: dialog. Cleanup sends unsubscribe only for reg and skips unsubscribe for other event packages."
+              hint="Event packages to subscribe after REGISTER. Badges: R = refresh before expiry, U = unsubscribe during cleanup."
             >
+              <label className="mb-2 flex w-fit cursor-pointer items-center gap-2 rounded-md border border-slate-700 bg-slate-900/40 px-2.5 py-1.5 text-xs font-semibold text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={raw.subscribe_events.length === SUBSCRIBE_EVENT_VALUES.length}
+                  onChange={(ev) => {
+                    const next = ev.target.checked ? [...SUBSCRIBE_EVENT_VALUES] : []
+                    onChange('subscribe_events', next)
+                    onChange('subscribe_refresh_events', next)
+                    onChange('subscribe_unsubscribe_events', next)
+                    onBlur('subscribe_events')
+                  }}
+                  className="size-3.5 rounded border-slate-600 bg-slate-950 text-emerald-500 accent-emerald-500"
+                />
+                <span>All events</span>
+              </label>
               <div className="flex flex-wrap gap-2">
-                {SUBSCRIBE_EVENT_OPTIONS.map((event) => {
-                  const selected = raw.subscribe_events.includes(event)
+                {SUBSCRIBE_EVENT_OPTIONS.map((option) => {
+                  const selected = raw.subscribe_events.includes(option.event)
+                  const refreshSelected = raw.subscribe_refresh_events.includes(option.event)
+                  const unsubscribeSelected = raw.subscribe_unsubscribe_events.includes(option.event)
                   return (
                     <label
-                      key={event}
+                      key={option.event}
                       className={cn(
                         'flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors',
                         selected
@@ -1067,19 +1089,79 @@ export function VMConfigPanel({
                         checked={selected}
                         onChange={(ev) => {
                           const next = ev.target.checked
-                            ? [...raw.subscribe_events, event]
-                            : raw.subscribe_events.filter((v) => v !== event)
+                            ? [...raw.subscribe_events, option.event]
+                            : raw.subscribe_events.filter((v) => v !== option.event)
+                          const nextRefresh = ev.target.checked
+                            ? Array.from(new Set([...raw.subscribe_refresh_events, option.event]))
+                            : raw.subscribe_refresh_events.filter((v) => v !== option.event)
+                          const nextUnsubscribe = ev.target.checked
+                            ? Array.from(new Set([...raw.subscribe_unsubscribe_events, option.event]))
+                            : raw.subscribe_unsubscribe_events.filter((v) => v !== option.event)
                           onChange('subscribe_events', next)
+                          onChange('subscribe_refresh_events', nextRefresh)
+                          onChange('subscribe_unsubscribe_events', nextUnsubscribe)
                           onBlur('subscribe_events')
                         }}
                         className="size-3.5 rounded border-slate-600 bg-slate-950 text-emerald-500 accent-emerald-500"
                       />
-                      <span>{event}</span>
+                      <span title={`${option.serverGroup}: ${option.event}`}>{option.label}</span>
+                      {option.refresh && (
+                        <span
+                          className={cn(
+                            'flex items-center gap-1 rounded bg-sky-500/15 px-1 text-[10px] font-bold text-sky-300',
+                            !selected && 'opacity-45',
+                          )}
+                          title="R = Refresh: when enabled, the engine refreshes this SUBSCRIBE before it expires"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selected && refreshSelected}
+                            disabled={!selected}
+                            onClick={(ev) => ev.stopPropagation()}
+                            onChange={(ev) => {
+                              const next = ev.target.checked
+                                ? Array.from(new Set([...raw.subscribe_refresh_events, option.event]))
+                                : raw.subscribe_refresh_events.filter((v) => v !== option.event)
+                              onChange('subscribe_refresh_events', next)
+                              onBlur('subscribe_refresh_events')
+                            }}
+                            className="size-3 rounded border-slate-600 bg-slate-950 accent-sky-500"
+                          />
+                          <span>R</span>
+                        </span>
+                      )}
+                      {option.unsubscribe && (
+                        <span
+                          className={cn(
+                            'flex items-center gap-1 rounded bg-amber-500/15 px-1 text-[10px] font-bold text-amber-300',
+                            !selected && 'opacity-45',
+                          )}
+                          title="U = Unsubscribe: when enabled, cleanup sends SUBSCRIBE with Expires: 0 for this event"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selected && unsubscribeSelected}
+                            disabled={!selected}
+                            onClick={(ev) => ev.stopPropagation()}
+                            onChange={(ev) => {
+                              const next = ev.target.checked
+                                ? Array.from(new Set([...raw.subscribe_unsubscribe_events, option.event]))
+                                : raw.subscribe_unsubscribe_events.filter((v) => v !== option.event)
+                              onChange('subscribe_unsubscribe_events', next)
+                              onBlur('subscribe_unsubscribe_events')
+                            }}
+                            className="size-3 rounded border-slate-600 bg-slate-950 accent-amber-500"
+                          />
+                          <span>U</span>
+                        </span>
+                      )}
                     </label>
                   )
                 })}
               </div>
               {e('subscribe_events') && <FieldError error={e('subscribe_events')} />}
+              {e('subscribe_refresh_events') && <FieldError error={e('subscribe_refresh_events')} />}
+              {e('subscribe_unsubscribe_events') && <FieldError error={e('subscribe_unsubscribe_events')} />}
             </FormRow>
 
             {/* SIP Timers — T1 and Timer-B with explicit per-input labels. */}

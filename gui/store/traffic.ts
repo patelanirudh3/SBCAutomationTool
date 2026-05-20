@@ -53,6 +53,8 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     register_expires: 3600,
     subscribe_expires: 3600,
     subscribe_events: ['dialog'],
+    subscribe_refresh_events: ['dialog'],
+    subscribe_unsubscribe_events: ['dialog'],
     register_rate_cps: 10,
     t1_ms: 500,
     timer_b_seconds: 32,
@@ -246,7 +248,11 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
       const count = m.cleanup_unregister_count ?? m.cleanup_count ?? 0
       const unregisterFailed = m.cleanup_unregister_failed ?? m.cleanup_failed ?? cleanupStatus?.unregister_failed_extensions ?? cleanupStatus?.failed_extensions ?? []
       const unsubscribeFailed = m.cleanup_unsubscribe_failed ?? cleanupStatus?.unsubscribe_failed_extensions ?? []
-      const unsubscribeCount = m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
+      const unsubscribeByEvent = m.cleanup_unsubscribe_by_event ?? cleanupStatus?.unsubscribe_by_event
+      const eventUnsubscribeCount = unsubscribeByEvent
+        ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.successful ?? 0) + (stats.failed ?? 0), 0)
+        : undefined
+      const unsubscribeCount = eventUnsubscribeCount ?? m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
       const unsubscribeSkipped = m.cleanup_unsubscribe_skipped ?? cleanupStatus?.unsubscribe_skipped ?? 0
       if (
         total > 0 ||
@@ -263,6 +269,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
           unsubscribe_count: unsubscribeCount,
           unsubscribe_skipped: unsubscribeSkipped,
           unsubscribe_failed_extensions: unsubscribeFailed,
+          unsubscribe_by_event: unsubscribeByEvent,
           unregister_count: count,
           unregister_failed_extensions: unregisterFailed,
           in_progress: mappedPhase === 'CLEANING_UP',

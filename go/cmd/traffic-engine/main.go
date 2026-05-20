@@ -23,6 +23,7 @@ import (
 	"github.com/cci/traffic-engine/internal/metrics"
 	"github.com/cci/traffic-engine/internal/prephase"
 	"github.com/cci/traffic-engine/internal/spine"
+	"github.com/cci/traffic-engine/internal/version"
 )
 
 func main() {
@@ -46,8 +47,9 @@ func main() {
 	setupLogging(*logLevel)
 
 	slog.Info("============================================================")
-	slog.Info("SBC Traffic Engine — Go",
+	slog.Info(version.ProductName,
 		"pid", os.Getpid(),
+		"version", version.Version,
 		"log_level", *logLevel,
 	)
 	slog.Info("============================================================")
@@ -311,12 +313,15 @@ func runLifecycle(
 
 		// Live SUB progress (only if any agent registered)
 		if len(registeredAg) > 0 {
-			collector.SetSubscribeTotal(len(registeredAg))
+			collector.SetSubscribeTotal(len(registeredAg) * len(cfg.SubscribeEvents))
+			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(registeredAg))
 			subStart := time.Now()
 			failedSubscribe, stopSubRefresh = prephase.RunSubscribe(
 				ctx, registeredAg, cfg, skipSubscribe,
 				onIdle, onRegOnly,
-				func() { collector.IncrementSubscribed() },
+				func(event string, ok bool, notifyReceived bool) {
+					collector.RecordSubscriptionEvent(event, ok, notifyReceived)
+				},
 				stopNew,
 			)
 			slog.Info("SUBSCRIBE phase complete",
@@ -667,7 +672,9 @@ func shutdownCleanup(
 				if unsubSkipped {
 					slog.Debug("Unsubscribe skipped", "ext", a.Ext, "event", a.SubscriptionEvent())
 				} else {
-					unsubErr := a.Unsubscribe(unregCtx)
+					unsubErr := a.UnsubscribeWithProgress(unregCtx, func(event string, ok bool) {
+						collector.RecordCleanupUnsubscribeEvent(event, ok)
+					})
 					unsubOK = unsubErr == nil
 					if unsubErr != nil {
 						slog.Debug("Unsubscribe error", "ext", a.Ext, "event", a.SubscriptionEvent(), "err", unsubErr)
@@ -731,22 +738,24 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 	}
 
 	cfgMap := map[string]any{
-		"vm_id":             cfg.VMID,
-		"ext_start":         cfg.ExtStart,
-		"ext_end":           cfg.ExtEnd,
-		"sbc_host":          cfg.SBCHost,
-		"sbc_port":          cfg.SBCPort,
-		"sip_transport":     cfg.SIPTransport,
-		"domain":            cfg.Domain,
-		"cps":               cfg.CPS,
-		"hold_time_seconds": cfg.HoldTimeSeconds,
-		"ramp_up_seconds":   cfg.RampUpSeconds,
-		"register_expires":  cfg.RegisterExpires,
-		"subscribe_expires": cfg.SubscribeExpires,
-		"subscribe_events":  cfg.SubscribeEvents,
-		"media_enabled":     cfg.MediaEnabled,
-		"metrics_port":      cfg.MetricsPort,
-		"traffic_mode":      cfg.TrafficMode,
+		"vm_id":                        cfg.VMID,
+		"ext_start":                    cfg.ExtStart,
+		"ext_end":                      cfg.ExtEnd,
+		"sbc_host":                     cfg.SBCHost,
+		"sbc_port":                     cfg.SBCPort,
+		"sip_transport":                cfg.SIPTransport,
+		"domain":                       cfg.Domain,
+		"cps":                          cfg.CPS,
+		"hold_time_seconds":            cfg.HoldTimeSeconds,
+		"ramp_up_seconds":              cfg.RampUpSeconds,
+		"register_expires":             cfg.RegisterExpires,
+		"subscribe_expires":            cfg.SubscribeExpires,
+		"subscribe_events":             cfg.SubscribeEvents,
+		"subscribe_refresh_events":     cfg.SubscribeRefreshEvents,
+		"subscribe_unsubscribe_events": cfg.SubscribeUnsubscribeEvents,
+		"media_enabled":                cfg.MediaEnabled,
+		"metrics_port":                 cfg.MetricsPort,
+		"traffic_mode":                 cfg.TrafficMode,
 	}
 
 	cleanupDetails := collector.CleanupDetailsSnapshot()

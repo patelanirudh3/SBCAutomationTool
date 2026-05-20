@@ -138,6 +138,8 @@ export interface VMConfig {
   subscribe_expires?: number       // default: 3600 (seconds)
   subscribe_event?: string         // legacy single-event alias
   subscribe_events?: string[]      // default: ['dialog']
+  subscribe_refresh_events?: string[]
+  subscribe_unsubscribe_events?: string[]
   register_rate_cps?: number       // default: 10 — REGISTERs per second
 
   // SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
@@ -253,6 +255,7 @@ export interface TrafficMetrics {
   registered_total?: number
   subscribed_count?: number
   subscribed_total?: number
+  subscriptions_by_event?: Record<string, SubscriptionEventStats>
   // prep_status drives the corner Prep button visual state and the
   // disabled/enabled state of Start Reg/Sub. Backend defaults to 'idle'
   // until the operator clicks Start Prep.
@@ -276,6 +279,7 @@ export interface TrafficMetrics {
   cleanup_unsubscribe_count?: number
   cleanup_unsubscribe_skipped?: number
   cleanup_unsubscribe_failed?: string[]
+  cleanup_unsubscribe_by_event?: Record<string, SubscriptionEventStats>
   cleanup_unregister_count?: number
   cleanup_unregister_failed?: string[]
 
@@ -340,6 +344,13 @@ export interface TrafficMetrics {
   }
 }
 
+export interface SubscriptionEventStats {
+  total: number
+  successful: number
+  failed: number
+  notify_received: number
+}
+
 export interface HostHealth {
   cpu_percent?: number
   load1?: number
@@ -379,6 +390,7 @@ export interface CleanupStatus {
   unsubscribe_count?: number
   unsubscribe_skipped?: number
   unsubscribe_failed_extensions?: string[]
+  unsubscribe_by_event?: Record<string, SubscriptionEventStats>
   unregister_count?: number
   unregister_failed_extensions?: string[]
   in_progress: boolean

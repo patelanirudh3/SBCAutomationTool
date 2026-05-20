@@ -55,15 +55,17 @@ type VMConfig struct {
 	MetricsInterval int `yaml:"metrics_interval" json:"metrics_interval"`
 	MetricsPort     int `yaml:"metrics_port" json:"metrics_port"`
 
-	RegisterBatchSize    int      `yaml:"register_batch_size" json:"register_batch_size"`
-	RegisterBatchDelayMs int      `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
-	RegisterExpires      int      `yaml:"register_expires" json:"register_expires"`
-	RegisterRetry        int      `yaml:"register_retry" json:"register_retry"`
-	RegisterTimeout      int      `yaml:"register_timeout" json:"register_timeout"`
-	SubscribeConcurrency int      `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
-	SubscribeExpires     int      `yaml:"subscribe_expires" json:"subscribe_expires"`
-	SubscribeEvent       string   `yaml:"subscribe_event,omitempty" json:"subscribe_event,omitempty"` // legacy single-event alias
-	SubscribeEvents      []string `yaml:"subscribe_events" json:"subscribe_events"`
+	RegisterBatchSize          int      `yaml:"register_batch_size" json:"register_batch_size"`
+	RegisterBatchDelayMs       int      `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
+	RegisterExpires            int      `yaml:"register_expires" json:"register_expires"`
+	RegisterRetry              int      `yaml:"register_retry" json:"register_retry"`
+	RegisterTimeout            int      `yaml:"register_timeout" json:"register_timeout"`
+	SubscribeConcurrency       int      `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
+	SubscribeExpires           int      `yaml:"subscribe_expires" json:"subscribe_expires"`
+	SubscribeEvent             string   `yaml:"subscribe_event,omitempty" json:"subscribe_event,omitempty"` // legacy single-event alias
+	SubscribeEvents            []string `yaml:"subscribe_events" json:"subscribe_events"`
+	SubscribeRefreshEvents     []string `yaml:"subscribe_refresh_events" json:"subscribe_refresh_events"`
+	SubscribeUnsubscribeEvents []string `yaml:"subscribe_unsubscribe_events" json:"subscribe_unsubscribe_events"`
 
 	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
 	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
@@ -312,6 +314,16 @@ func ApplyDefaults(cfg *VMConfig) {
 		cfg.SubscribeExpires = 3600
 	}
 	cfg.SubscribeEvents = normalizeSubscribeEvents(cfg.SubscribeEvents, cfg.SubscribeEvent)
+	if cfg.SubscribeRefreshEvents == nil {
+		cfg.SubscribeRefreshEvents = defaultSubscribePolicyEvents(cfg.SubscribeEvents, func(p SubscribeEventPolicy) bool { return p.Refresh })
+	} else {
+		cfg.SubscribeRefreshEvents = normalizeExplicitSubscribeEvents(cfg.SubscribeRefreshEvents)
+	}
+	if cfg.SubscribeUnsubscribeEvents == nil {
+		cfg.SubscribeUnsubscribeEvents = defaultSubscribePolicyEvents(cfg.SubscribeEvents, func(p SubscribeEventPolicy) bool { return p.Unsubscribe })
+	} else {
+		cfg.SubscribeUnsubscribeEvents = normalizeExplicitSubscribeEvents(cfg.SubscribeUnsubscribeEvents)
+	}
 	if len(cfg.SubscribeEvents) == 1 {
 		cfg.SubscribeEvent = cfg.SubscribeEvents[0]
 	}
@@ -413,12 +425,60 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 }
 
-var allowedSubscribeEvents = map[string]struct{}{
-	"reg":             {},
-	"dialog":          {},
-	"message-summary": {},
-	"presence":        {},
-	"cci-info":        {},
+// SubscribeEventPolicy describes the RFC 6665 behavior the engine applies to a
+// supported event package. The GUI mirrors this table so operators can see the
+// refresh/unsubscribe policy before starting registration.
+type SubscribeEventPolicy struct {
+	Event       string `json:"event"`
+	Label       string `json:"label"`
+	ServerGroup string `json:"server_group"`
+	Refresh     bool   `json:"refresh"`
+	Unsubscribe bool   `json:"unsubscribe"`
+	Accept      string `json:"accept,omitempty"`
+}
+
+var subscribeEventPolicies = map[string]SubscribeEventPolicy{
+	"avaya-cm-feature-status": {
+		Event: "avaya-cm-feature-status", Label: "CM Feature Status", ServerGroup: "Avaya CM", Refresh: true, Unsubscribe: true,
+	},
+	"avaya-cm-cc-info": {
+		Event: "avaya-cm-cc-info", Label: "CM CC Info", ServerGroup: "Avaya CM", Refresh: true, Unsubscribe: true,
+	},
+	"dialog": {
+		Event: "dialog", Label: "Dialog", ServerGroup: "RFC", Refresh: true, Unsubscribe: true, Accept: "application/dialog-info+xml",
+	},
+	"avaya-ccs-profile": {
+		Event: "avaya-ccs-profile", Label: "CCS Profile", ServerGroup: "Avaya CCS", Refresh: true, Unsubscribe: true,
+	},
+	"reg": {
+		Event: "reg", Label: "Registration", ServerGroup: "RFC", Refresh: true, Unsubscribe: true,
+	},
+	"message-summary": {
+		Event: "message-summary", Label: "Message Summary", ServerGroup: "RFC", Refresh: true, Unsubscribe: true,
+	},
+}
+
+// SubscribeEventPolicyFor returns the policy for a normalized event package.
+func SubscribeEventPolicyFor(event string) (SubscribeEventPolicy, bool) {
+	p, ok := subscribeEventPolicies[strings.ToLower(strings.TrimSpace(event))]
+	return p, ok
+}
+
+// SubscribeEventPolicies returns policies in the GUI display order.
+func SubscribeEventPolicies() []SubscribeEventPolicy {
+	events := []string{
+		"avaya-cm-feature-status",
+		"avaya-cm-cc-info",
+		"dialog",
+		"avaya-ccs-profile",
+		"reg",
+		"message-summary",
+	}
+	out := make([]SubscribeEventPolicy, 0, len(events))
+	for _, event := range events {
+		out = append(out, subscribeEventPolicies[event])
+	}
+	return out
 }
 
 func normalizeSubscribeEvents(events []string, legacy string) []string {
@@ -446,6 +506,56 @@ func normalizeSubscribeEvents(events []string, legacy string) []string {
 		return []string{"dialog"}
 	}
 	return out
+}
+
+func normalizeExplicitSubscribeEvents(events []string) []string {
+	seen := make(map[string]struct{}, len(events))
+	out := make([]string, 0, len(events))
+	for _, event := range events {
+		event = strings.ToLower(strings.TrimSpace(event))
+		if event == "" {
+			continue
+		}
+		if _, dup := seen[event]; dup {
+			continue
+		}
+		seen[event] = struct{}{}
+		out = append(out, event)
+	}
+	return out
+}
+
+func defaultSubscribePolicyEvents(selected []string, enabled func(SubscribeEventPolicy) bool) []string {
+	out := make([]string, 0, len(selected))
+	for _, event := range selected {
+		policy, ok := SubscribeEventPolicyFor(event)
+		if ok && enabled(policy) {
+			out = append(out, policy.Event)
+		}
+	}
+	return out
+}
+
+func containsSubscribeEvent(events []string, event string) bool {
+	event = strings.ToLower(strings.TrimSpace(event))
+	for _, candidate := range events {
+		if strings.EqualFold(candidate, event) {
+			return true
+		}
+	}
+	return false
+}
+
+// ShouldRefreshSubscribeEvent reports whether admin policy enables refresh for
+// the specified event package.
+func (cfg *VMConfig) ShouldRefreshSubscribeEvent(event string) bool {
+	return containsSubscribeEvent(cfg.SubscribeRefreshEvents, event)
+}
+
+// ShouldUnsubscribeSubscribeEvent reports whether admin policy enables
+// SUBSCRIBE Expires:0 cleanup for the specified event package.
+func (cfg *VMConfig) ShouldUnsubscribeSubscribeEvent(event string) bool {
+	return containsSubscribeEvent(cfg.SubscribeUnsubscribeEvents, event)
 }
 
 // Validate checks that a VMConfig has all required fields set and that
@@ -572,8 +682,24 @@ func Validate(cfg *VMConfig) error {
 		errs = append(errs, fmt.Sprintf("rtcp_sr_interval_seconds must be 1..60 s, got %d", cfg.RTCPSRIntervalSeconds))
 	}
 	for _, event := range cfg.SubscribeEvents {
-		if _, ok := allowedSubscribeEvents[event]; !ok {
+		if _, ok := SubscribeEventPolicyFor(event); !ok {
 			errs = append(errs, fmt.Sprintf("subscribe_events contains unsupported event %q", event))
+		}
+	}
+	for _, event := range cfg.SubscribeRefreshEvents {
+		if _, ok := SubscribeEventPolicyFor(event); !ok {
+			errs = append(errs, fmt.Sprintf("subscribe_refresh_events contains unsupported event %q", event))
+		}
+		if !containsSubscribeEvent(cfg.SubscribeEvents, event) {
+			errs = append(errs, fmt.Sprintf("subscribe_refresh_events contains unselected event %q", event))
+		}
+	}
+	for _, event := range cfg.SubscribeUnsubscribeEvents {
+		if _, ok := SubscribeEventPolicyFor(event); !ok {
+			errs = append(errs, fmt.Sprintf("subscribe_unsubscribe_events contains unsupported event %q", event))
+		}
+		if !containsSubscribeEvent(cfg.SubscribeEvents, event) {
+			errs = append(errs, fmt.Sprintf("subscribe_unsubscribe_events contains unselected event %q", event))
 		}
 	}
 	if cfg.TrafficMode == "smoke" && cfg.CallCount <= 0 {
@@ -603,6 +729,8 @@ func Validate(cfg *VMConfig) error {
 		"register_expires", cfg.RegisterExpires,
 		"subscribe_expires", cfg.SubscribeExpires,
 		"subscribe_events", cfg.SubscribeEvents,
+		"subscribe_refresh_events", cfg.SubscribeRefreshEvents,
+		"subscribe_unsubscribe_events", cfg.SubscribeUnsubscribeEvents,
 		"register_batch_size", cfg.RegisterBatchSize,
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
