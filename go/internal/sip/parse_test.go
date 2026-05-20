@@ -21,7 +21,7 @@ func TestParseMessagePreservesExactBody(t *testing.T) {
 }
 
 func TestParseHeadersCompactCaseInsensitiveAndFolded(t *testing.T) {
-	msg := ParseHeaders("SIP/2.0 200 OK\r\ncontent-length: 12\r\nc: application/sdp\r\nSupported: replaces,\r\n 100rel\r\n\r\n")
+	msg := ParseHeaders("SIP/2.0 200 OK\r\ncontent-length: 12\r\nc: application/sdp\r\nSupported: replaces,\r\n 100rel\r\nv: SIP/2.0/TCP first\r\nVia: SIP/2.0/TCP second\r\nX-Trace-ID: abc\r\n\r\n")
 	if got := msg.GetHeader(HdrContentLength); len(got) != 1 || got[0] != "12" {
 		t.Fatalf("Content-Length=%v", got)
 	}
@@ -30,6 +30,27 @@ func TestParseHeadersCompactCaseInsensitiveAndFolded(t *testing.T) {
 	}
 	if got := msg.GetHeader(HdrSupported); len(got) != 1 || got[0] != "replaces, 100rel" {
 		t.Fatalf("Supported=%v", got)
+	}
+	if got := msg.GetHeader(HdrVia); len(got) != 2 || got[0] != "SIP/2.0/TCP first" || got[1] != "SIP/2.0/TCP second" {
+		t.Fatalf("Via=%v", got)
+	}
+	if got := msg.GetHeader("X-Trace-ID"); len(got) != 1 || got[0] != "abc" {
+		t.Fatalf("unknown header=%v", got)
+	}
+}
+
+func TestParseMessageRequestLineAndExactBody(t *testing.T) {
+	body := "hello\r\nworld"
+	raw := "NOTIFY sip:6001@example.com SIP/2.0\r\nCall-ID: n1\r\nCSeq: 7 NOTIFY\r\nContent-Length: 999\r\n\r\n" + body
+	msg, gotBody, err := ParseMessage(raw)
+	if err != nil {
+		t.Fatalf("ParseMessage err=%v", err)
+	}
+	if !msg.IsRequest() || msg.GetRequestURI() != "sip:6001@example.com" || msg.GetMethod() != "NOTIFY" {
+		t.Fatalf("bad request parse line=%q uri=%q cseqMethod=%q", msg.GetRequestLine(), msg.GetRequestURI(), msg.GetMethod())
+	}
+	if gotBody != body {
+		t.Fatalf("body=%q, want %q", gotBody, body)
 	}
 }
 

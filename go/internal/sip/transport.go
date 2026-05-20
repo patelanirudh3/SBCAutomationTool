@@ -393,21 +393,11 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	headerEnd := sepIdx + len(crlfcrlfBytes)
 	headerBlock := string(buf[:headerEnd])
 
-	contentLength := 0
-	for _, line := range strings.Split(headerBlock, CRLF) {
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		name := strings.ToLower(strings.TrimSpace(parts[0]))
-		switch name {
-		case "content-length", "l":
-			if contentLength == 0 {
-				if v, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
-					contentLength = v
-				}
-			}
-		}
+	contentLength, ok := parseContentLength(headerBlock)
+	if !ok {
+		slog.Warn("extractSIPMessage: invalid Content-Length; dropping message",
+			"header_len", len(headerBlock))
+		return "", skip + headerEnd
 	}
 
 	totalNeeded := headerEnd + contentLength
@@ -416,6 +406,47 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	}
 
 	return string(buf[:totalNeeded]), skip + totalNeeded
+}
+
+func parseContentLength(headerBlock string) (int, bool) {
+	offset := 0
+	contentLength := 0
+	for offset < len(headerBlock) {
+		line, next, ok := scanHeaderLine(headerBlock, offset)
+		if !ok {
+			break
+		}
+		offset = next
+		if line == "" {
+			break
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(line[:idx]))
+		if name != "content-length" && name != "l" {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(line[idx+1:]))
+		if err != nil || v < 0 {
+			return 0, false
+		}
+		return v, true
+	}
+	return contentLength, true
+}
+
+func scanHeaderLine(s string, offset int) (line string, next int, ok bool) {
+	if offset >= len(s) {
+		return "", offset, false
+	}
+	if idx := strings.Index(s[offset:], CRLF); idx >= 0 {
+		start := offset
+		end := offset + idx
+		return s[start:end], end + len(CRLF), true
+	}
+	return s[offset:], len(s), true
 }
 
 // ---------------------------------------------------------------------------

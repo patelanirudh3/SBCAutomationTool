@@ -66,6 +66,24 @@ func (m *SipMessage) AddHeader(name, value string) {
 	m.headerOrder = append(m.headerOrder, sipHeader{name: name, value: value})
 }
 
+func (m *SipMessage) appendFoldedHeader(name, continuation string) {
+	if name == "" || continuation == "" {
+		return
+	}
+	vals := m.headers[name]
+	if len(vals) == 0 {
+		return
+	}
+	vals[len(vals)-1] = vals[len(vals)-1] + " " + continuation
+	m.headers[name] = vals
+	for i := len(m.headerOrder) - 1; i >= 0; i-- {
+		if m.headerOrder[i].name == name {
+			m.headerOrder[i].value = vals[len(vals)-1]
+			return
+		}
+	}
+}
+
 // RemoveHeader deletes all values for the given header.
 func (m *SipMessage) RemoveHeader(name string) {
 	name = NormalizeHeaderName(name)

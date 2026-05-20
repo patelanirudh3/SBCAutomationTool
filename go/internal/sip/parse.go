@@ -6,19 +6,16 @@ import (
 	"strings"
 )
 
-// ParseHeaders splits a raw SIP message (headers only, no body) into a
-// SipMessage. The first line is treated as a request-line or status-line
-// depending on whether it starts with "SIP/2.0". Remaining lines are
-// parsed as "Header-Name: value" pairs and normalized.
+// ParseHeaders parses a SIP start-line + header block into a SipMessage.
+// It scans line-by-line instead of splitting the whole message, preserving
+// header order, duplicate headers, unknown headers, and folded continuation
+// lines while normalizing lookup names.
 func ParseHeaders(raw string) *SipMessage {
-	lines := strings.Split(raw, CRLF)
 	msg := NewSipMessage()
-
-	if len(lines) == 0 {
+	first, next, ok := scanLine(raw, 0)
+	if !ok {
 		return msg
 	}
-
-	first := lines[0]
 	if strings.HasPrefix(first, "SIP/2.0") {
 		msg.SetResponseLine(first)
 	} else {
@@ -26,22 +23,17 @@ func ParseHeaders(raw string) *SipMessage {
 	}
 
 	lastHeader := ""
-	for _, line := range lines[1:] {
+	for next <= len(raw) {
+		line, after, ok := scanLine(raw, next)
+		if !ok {
+			break
+		}
+		next = after
 		if line == "" {
-			continue
+			break
 		}
 		if (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) && lastHeader != "" {
-			vals := msg.headers[lastHeader]
-			if len(vals) > 0 {
-				vals[len(vals)-1] = vals[len(vals)-1] + " " + strings.TrimSpace(line)
-				msg.headers[lastHeader] = vals
-				for i := len(msg.headerOrder) - 1; i >= 0; i-- {
-					if msg.headerOrder[i].name == lastHeader {
-						msg.headerOrder[i].value = vals[len(vals)-1]
-						break
-					}
-				}
-			}
+			msg.appendFoldedHeader(lastHeader, strings.TrimSpace(line))
 			continue
 		}
 		idx := strings.Index(line, ":")
@@ -56,15 +48,16 @@ func ParseHeaders(raw string) *SipMessage {
 	return msg
 }
 
-// ParseMessage splits a complete SIP message into parsed headers and its exact
-// body. Transport framing has already applied Content-Length; this helper does
-// not read beyond the header/body separator.
+// ParseMessage parses a complete SIP message into headers and the exact body
+// bytes delivered by transport framing. It does not read beyond the first
+// CRLFCRLF separator and does not trust Content-Length inside this already
+// framed message.
 func ParseMessage(raw string) (*SipMessage, string, error) {
-	parts := strings.SplitN(raw, CRLFCRLF, 2)
-	if len(parts) != 2 {
+	sep := strings.Index(raw, CRLFCRLF)
+	if sep < 0 {
 		return ParseHeaders(raw), "", fmt.Errorf("sip message missing header/body separator")
 	}
-	return ParseHeaders(parts[0]), parts[1], nil
+	return ParseHeaders(raw[:sep]), raw[sep+len(CRLFCRLF):], nil
 }
 
 // BuildMessage serializes a SipMessage back into a raw SIP wire-format string.
@@ -98,4 +91,19 @@ func BuildMessage(msg *SipMessage, content string) string {
 	b.WriteString(content)
 
 	return b.String()
+}
+
+func scanLine(s string, offset int) (line string, next int, ok bool) {
+	if offset > len(s) {
+		return "", offset, false
+	}
+	if offset == len(s) {
+		return "", offset, false
+	}
+	if idx := strings.Index(s[offset:], CRLF); idx >= 0 {
+		start := offset
+		end := offset + idx
+		return s[start:end], end + len(CRLF), true
+	}
+	return s[offset:], len(s), true
 }
