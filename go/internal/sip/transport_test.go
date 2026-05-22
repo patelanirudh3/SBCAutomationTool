@@ -43,18 +43,28 @@ func TestExtractSIPMessageLeavesNextMessageInBuffer(t *testing.T) {
 }
 
 func TestExtractSIPMessageRejectsInvalidContentLength(t *testing.T) {
+	before := ParserHealthSnapshot()
 	raw := "SIP/2.0 200 OK\r\nContent-Length: nope\r\n\r\n"
 	msg, consumed := extractSIPMessage([]byte(raw))
 	if msg != "" || consumed == 0 {
 		t.Fatalf("extractSIPMessage=%q,%d, want drop with no message", msg, consumed)
 	}
+	after := ParserHealthSnapshot()
+	if after.InvalidContentLength != before.InvalidContentLength+1 {
+		t.Fatalf("invalid content-length counter=%d, want %d", after.InvalidContentLength, before.InvalidContentLength+1)
+	}
 }
 
 func TestExtractSIPMessageRejectsConflictingContentLength(t *testing.T) {
+	before := ParserHealthSnapshot()
 	raw := "SIP/2.0 200 OK\r\nContent-Length: 0\r\nl: 5\r\n\r\n"
 	msg, consumed := extractSIPMessage([]byte(raw))
 	if msg != "" || consumed == 0 {
 		t.Fatalf("extractSIPMessage=%q,%d, want drop with no message", msg, consumed)
+	}
+	after := ParserHealthSnapshot()
+	if after.ConflictingContentLength != before.ConflictingContentLength+1 {
+		t.Fatalf("conflicting content-length counter=%d, want %d", after.ConflictingContentLength, before.ConflictingContentLength+1)
 	}
 }
 

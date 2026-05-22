@@ -54,6 +54,21 @@ func TestParseMessageRequestLineAndExactBody(t *testing.T) {
 	}
 }
 
+func TestParseHeadersDiagnosticsCounters(t *testing.T) {
+	before := ParserHealthSnapshot()
+	msg := ParseHeaders("SIP/2.0 200 OK\r\n orphan\r\nBadHeader\r\nContent-Length: 0\r\n\r\n")
+	if msg.GetResponseCode() != "200" {
+		t.Fatalf("response code=%q, want 200", msg.GetResponseCode())
+	}
+	after := ParserHealthSnapshot()
+	if after.FoldedHeaderWithoutParent != before.FoldedHeaderWithoutParent+1 {
+		t.Fatalf("folded counter=%d, want %d", after.FoldedHeaderWithoutParent, before.FoldedHeaderWithoutParent+1)
+	}
+	if after.MalformedHeader != before.MalformedHeader+1 {
+		t.Fatalf("malformed counter=%d, want %d", after.MalformedHeader, before.MalformedHeader+1)
+	}
+}
+
 func TestBuildMessageComputesContentLengthAndPreservesHeaderOrder(t *testing.T) {
 	msg := NewSipMessage()
 	msg.SetResponseLine("SIP/2.0 200 OK")

@@ -51,6 +51,102 @@ func TestNonInviteTransactionTimeoutDerivesFromT1(t *testing.T) {
 	}
 }
 
+func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
+	cfg := &VMConfig{}
+	ApplyDefaults(cfg)
+	if cfg.MediaSecurity != "rtp" || cfg.SRTPKeyMode != "auto" || len(cfg.SRTPCryptoSuites) != 1 {
+		t.Fatalf("media security defaults got security=%q key_mode=%q suites=%v", cfg.MediaSecurity, cfg.SRTPKeyMode, cfg.SRTPCryptoSuites)
+	}
+
+	bad := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        1000,
+		ExtEnd:          1001,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		MediaEnabled:    true,
+		MediaSecurity:   "capneg",
+	}
+	ApplyDefaults(bad)
+	if err := Validate(bad); err == nil {
+		t.Fatal("Validate succeeded with unsupported media_security")
+	}
+
+	bad.MediaSecurity = "srtp_sdes"
+	bad.SRTPCryptoSuites = []string{"BAD_SUITE"}
+	if err := Validate(bad); err == nil {
+		t.Fatal("Validate succeeded with unsupported SRTP crypto suite")
+	}
+}
+
+func TestTLSVersionValidation(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        1000,
+		ExtEnd:          1001,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5061,
+		SIPTransport:    "TLS",
+		TLSMode:         "insecure",
+		TLSMinVersion:   "1.3",
+		TLSMaxVersion:   "1.2",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err == nil {
+		t.Fatal("Validate succeeded with tls_max_version lower than min")
+	}
+	cfg.TLSMaxVersion = "auto"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed for TLS1.3 min / auto max: %v", err)
+	}
+}
+
+func TestSIPSRequiresTLSTransport(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        1000,
+		ExtEnd:          1001,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		SIPScheme:       "SIPS",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err == nil {
+		t.Fatal("Validate succeeded with SIPS over TCP")
+	}
+	cfg.SIPTransport = "TLS"
+	cfg.TLSMode = "insecure"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed with SIPS over TLS: %v", err)
+	}
+	if got := cfg.URIScheme(); got != "sips" {
+		t.Fatalf("URIScheme=%q, want sips", got)
+	}
+}
+
 func TestSubscribeEventsNormalizeAndValidate(t *testing.T) {
 	cfg := &VMConfig{SubscribeEvents: []string{"dialog", "reg", "dialog", "avaya-cm-cc-info"}}
 	ApplyDefaults(cfg)
