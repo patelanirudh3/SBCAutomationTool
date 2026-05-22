@@ -4,6 +4,8 @@ export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type SipScheme = 'SIP' | 'SIPS'
 export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
 export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
+export type MediaSecurity = 'rtp' | 'srtp_sdes'
+export type SRTPCryptoSuite = 'AES_CM_128_HMAC_SHA1_80' | 'AES_CM_128_HMAC_SHA1_32'
 export type RunPhase =
   | 'IDLE'
   | 'PRE_PHASE'        // legacy alias of REGSUB_RUNNING
@@ -126,6 +128,8 @@ export interface VMConfig {
   tls_cert_path?: string           // PEM file with client certificate
   tls_key_path?: string            // PEM file with client private key
   tls_server_name?: string         // SNI / cert verification hostname
+  tls_min_version?: '1.2' | '1.3'
+  tls_max_version?: 'auto' | '1.2' | '1.3'
 
   // SIP Connection (Secondary / Failover)
   secondary_host?: string
@@ -168,6 +172,9 @@ export interface VMConfig {
   tcp_keepalive_seconds?: number
 
   // Media
+  media_security?: MediaSecurity
+  srtp_crypto_suites?: SRTPCryptoSuite[]
+  srtp_key_mode?: 'auto'
   rtp_codec?: RtpCodec             // default: 'G711_ULAW'
   rtp_ptime?: number               // default: 20 ms
   rtp_mode?: RtpMode
@@ -310,6 +317,10 @@ export interface TrafficMetrics {
   // SR/RR exchange. Always 0 when rtcp_sr_enabled is false.
   avg_rtt_ms?: number
   host_health?: HostHealth
+  parser_health?: ParserHealth
+  media_security?: MediaSecurity
+  srtp_crypto_suites?: SRTPCryptoSuite[]
+  srtp_crypto_suite?: SRTPCryptoSuite
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -378,6 +389,14 @@ export interface HostHealth {
   goroutines?: number
   open_fds?: number
   uptime_seconds?: number
+}
+
+export interface ParserHealth {
+  invalid_start_line?: number
+  invalid_content_length?: number
+  conflicting_content_length?: number
+  malformed_header?: number
+  folded_header_without_parent?: number
 }
 
 // CleanupStatus mirrors the backend GET /api/cleanup/status payload and the

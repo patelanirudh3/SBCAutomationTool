@@ -33,21 +33,25 @@ func CloneSipMessage(m *SipMessage) *SipMessage {
 // BuildInitialRegister constructs the first REGISTER request for a given
 // extension, including the full Avaya phone Contact header with feature tags.
 func BuildInitialRegister(fromUser, domain, transport, localIP string, localPort int, expires int) *SipMessage {
+	return BuildInitialRegisterWithScheme(fromUser, domain, "sip", transport, localIP, localPort, expires)
+}
+
+func BuildInitialRegisterWithScheme(fromUser, domain, scheme, transport, localIP string, localPort int, expires int) *SipMessage {
 	m := NewSipMessage()
-	m.SetRequestLine(fmt.Sprintf("REGISTER sip:%s SIP/2.0", domain))
+	m.SetRequestLine(fmt.Sprintf("REGISTER %s:%s SIP/2.0", scheme, domain))
 
 	m.AddHeader(HdrCallID, CreateCallID())
 
 	fromTag := CreateFromTag()
-	m.AddHeader(HdrFrom, fmt.Sprintf("<sip:%s@%s>;tag=%s", fromUser, domain, fromTag))
-	m.AddHeader(HdrTo, fmt.Sprintf("<sip:%s@%s>", fromUser, domain))
+	m.AddHeader(HdrFrom, fmt.Sprintf("<%s:%s@%s>;tag=%s", scheme, fromUser, domain, fromTag))
+	m.AddHeader(HdrTo, fmt.Sprintf("<%s:%s@%s>", scheme, fromUser, domain))
 	// RFC 3261 §20.42: include the listening port in the Via sent-by so
 	// stateless responses can be returned to the correct UDP socket.
 	m.AddHeader(HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", transport, localIP, localPort, CreateBranchID()))
 
 	contact := fmt.Sprintf(
-		"<sip:%s@%s:%d;transport=%s;avaya-sc-enabled>;q=1;expires=%d;",
-		fromUser, localIP, localPort, transport, expires,
+		"<%s:%s@%s:%d;transport=%s;avaya-sc-enabled>;q=1;expires=%d;",
+		scheme, fromUser, localIP, localPort, transport, expires,
 	)
 	contact += `avaya-actions="presence.initiate-pubsub,presence.redirect";`
 	contact += `+avaya.gmtoffset="0:00";+avaya.js-ver="1.0";`
@@ -74,7 +78,6 @@ func BuildInitialRegister(fromUser, domain, transport, localIP string, localPort
 // from a 401 challenge.
 func BuildAuthRegister(prev *SipMessage, domain, transport, localIP, authHeader string, cseq int) *SipMessage {
 	m := CloneSipMessage(prev)
-	m.SetRequestLine(fmt.Sprintf("REGISTER sip:%s SIP/2.0", domain))
 	m.ReplaceHeader(HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", transport, localIP, CreateBranchID()))
 	m.ReplaceHeader(HdrCSeq, fmt.Sprintf("%d REGISTER", cseq))
 	m.AddHeader(HdrAuthorization, authHeader)
@@ -85,7 +88,6 @@ func BuildAuthRegister(prev *SipMessage, domain, transport, localIP, authHeader 
 // by cloning the most recent REGISTER and overriding the relevant headers.
 func BuildUnregister(prev *SipMessage, domain, transport, localIP, authHeader string) *SipMessage {
 	m := CloneSipMessage(prev)
-	m.SetRequestLine(fmt.Sprintf("REGISTER sip:%s SIP/2.0", domain))
 	m.ReplaceHeader(HdrVia, fmt.Sprintf("SIP/2.0/%s %s;branch=%s", transport, localIP, CreateBranchID()))
 	m.ReplaceHeader(HdrContact, "*")
 	m.ReplaceHeader(HdrExpires, "0")

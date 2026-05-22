@@ -20,7 +20,7 @@ import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth, putConfigFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode } from '@/types'
+import type { VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
@@ -60,10 +60,15 @@ const DEFAULTS: RawVMFormValues = {
   tls_cert_path: '',
   tls_key_path: '',
   tls_server_name: '',
+  tls_min_version: '1.2',
+  tls_max_version: 'auto',
   cps: '1',
   hold_time_seconds: '5',
   ramp_up_seconds: '30',
   media_enabled: true,
+  media_security: 'rtp',
+  srtp_crypto_suites: ['AES_CM_128_HMAC_SHA1_80'],
+  srtp_key_mode: 'auto',
   rtp_codec: 'G711_ULAW',
   rtp_ptime: '20',
   metrics_port: '8082',
@@ -120,10 +125,15 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     tls_cert_path:      u.tls_cert_path    ?? '',
     tls_key_path:       u.tls_key_path     ?? '',
     tls_server_name:    u.tls_server_name  ?? '',
+    tls_min_version:    (u.tls_min_version ?? '1.2') as '1.2' | '1.3',
+    tls_max_version:    (u.tls_max_version ?? 'auto') as 'auto' | '1.2' | '1.3',
     cps:                String(u.cps               ?? parseFloat(DEFAULTS.cps)),
     hold_time_seconds:  String(u.hold_time_seconds ?? parseFloat(DEFAULTS.hold_time_seconds)),
     ramp_up_seconds:    String(u.ramp_up_seconds   ?? parseInt(DEFAULTS.ramp_up_seconds)),
     media_enabled:      u.media_enabled    ?? true,
+    media_security:     (u.media_security   ?? 'rtp') as MediaSecurity,
+    srtp_crypto_suites: (u.srtp_crypto_suites?.length ? u.srtp_crypto_suites : ['AES_CM_128_HMAC_SHA1_80']) as SRTPCryptoSuite[],
+    srtp_key_mode:      u.srtp_key_mode    ?? 'auto',
     rtp_codec:          (u.rtp_codec       ?? 'G711_ULAW') as RtpCodec,
     rtp_ptime:          String(u.rtp_ptime ?? parseInt(DEFAULTS.rtp_ptime)),
     metrics_port:       String(u.metrics_port ?? parseInt(DEFAULTS.metrics_port)),
@@ -168,6 +178,8 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     tls_cert_path: raw.sip_transport === 'TLS' ? (raw.tls_cert_path || undefined) : undefined,
     tls_key_path: raw.sip_transport === 'TLS' ? (raw.tls_key_path || undefined) : undefined,
     tls_server_name: raw.sip_transport === 'TLS' ? (raw.tls_server_name || undefined) : undefined,
+    tls_min_version: raw.sip_transport === 'TLS' ? raw.tls_min_version : undefined,
+    tls_max_version: raw.sip_transport === 'TLS' ? raw.tls_max_version : undefined,
     register_expires: raw.register_expires ? parseInt(raw.register_expires) : undefined,
     subscribe_expires: raw.subscribe_expires ? parseInt(raw.subscribe_expires) : undefined,
     subscribe_events: raw.subscribe_events,
@@ -180,6 +192,9 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
     ramp_up_seconds: raw.ramp_up_seconds ? parseInt(raw.ramp_up_seconds) : undefined,
     media_enabled: raw.media_enabled,
+    media_security: raw.media_security === 'capneg' ? 'rtp' : raw.media_security,
+    srtp_crypto_suites: raw.srtp_crypto_suites,
+    srtp_key_mode: raw.srtp_key_mode,
     rtp_codec: raw.rtp_codec as RtpCodec,
     rtp_ptime: raw.rtp_ptime ? parseInt(raw.rtp_ptime) : undefined,
     metrics_port: parseInt(raw.metrics_port) || 0,

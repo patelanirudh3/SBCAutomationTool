@@ -46,10 +46,13 @@ type DialogState struct {
 	// InviteSDP is the SDP body sent with the original INVITE; needed so
 	// Timer A retransmissions (RFC 3261 §17.1.1.2, UDP only) can re-send
 	// the exact same payload without rebuilding it.
-	InviteSDP     string
-	ProvMsg       *sip.SipMessage
-	RTPRemoteIP   string
-	RTPRemotePort int
+	InviteSDP        string
+	ProvMsg          *sip.SipMessage
+	RTPRemoteIP      string
+	RTPRemotePort    int
+	MediaSecurity    string
+	SRTPCryptoOffers []SRTPCryptoOffer
+	SRTPRemoteCrypto SDPMediaInfo
 
 	// [FIX-2] Proactive Auth: after the first INVITE 407 challenge is handled,
 	// these fields store the digest credentials so that every subsequent
@@ -336,6 +339,30 @@ func (a *ExtensionAgent) syncLocalPort() {
 	}
 }
 
+func (a *ExtensionAgent) uriScheme() string {
+	return a.Config.URIScheme()
+}
+
+func (a *ExtensionAgent) uri(user, domain string) string {
+	return fmt.Sprintf("%s:%s@%s", a.uriScheme(), user, domain)
+}
+
+func (a *ExtensionAgent) addrOfRecord(user string) string {
+	return a.uri(user, a.Config.Domain)
+}
+
+func (a *ExtensionAgent) domainURI() string {
+	return fmt.Sprintf("%s:%s", a.uriScheme(), a.Config.Domain)
+}
+
+func (a *ExtensionAgent) nameAddr(user, domain string) string {
+	return fmt.Sprintf("<%s>", a.uri(user, domain))
+}
+
+func (a *ExtensionAgent) contactURI(user string) string {
+	return fmt.Sprintf("%s:%s@%s:%d;transport=%s", a.uriScheme(), user, a.localHost, a.localPort, a.Config.SIPTransport)
+}
+
 // Register performs the full REGISTER flow: initial -> 401 -> auth -> 200.
 //
 // Both response waits use WaitForSIPEvent so that any 200 OK that arrived
@@ -346,9 +373,9 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
 
-	msg := sip.BuildInitialRegister(a.Ext, a.Config.Domain, a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg := sip.BuildInitialRegisterWithScheme(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
 	msg.ReplaceHeader(sip.HdrCallID, callID)
-	fromHdr := fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag)
+	fromHdr := fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), fromTag)
 	msg.ReplaceHeader(sip.HdrFrom, fromHdr)
 
 	a.regCallID = callID
@@ -388,7 +415,7 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	}
 
 	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+	uri := a.domainURI()
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 
 	a.regCSeq = 2
@@ -432,7 +459,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	a.regCSeq++
 	expiresVal := fmt.Sprintf("%d", a.Config.RegisterExpires)
 
-	msg := sip.BuildInitialRegister(a.Ext, a.Config.Domain, a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg := sip.BuildInitialRegisterWithScheme(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
 	msg.ReplaceHeader(sip.HdrCallID, a.regCallID)
 	msg.ReplaceHeader(sip.HdrFrom, a.regFromHeader)
 	msg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
@@ -441,7 +468,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	// Include cached credentials proactively to avoid an extra 401 round-trip.
 	if a.regNonce != "" {
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		uri := a.domainURI()
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
@@ -464,7 +491,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 		a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque)
 		a.regCSeq++
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		uri := a.domainURI()
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		retryMsg := sip.CloneSipMessage(msg)
 		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
@@ -501,10 +528,10 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 	a.regCSeq++
 
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("REGISTER sip:%s SIP/2.0", a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("REGISTER %s SIP/2.0", a.domainURI()))
 	msg.AddHeader(sip.HdrCallID, a.regCallID)
 	msg.AddHeader(sip.HdrFrom, a.regFromHeader)
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain))
+	msg.AddHeader(sip.HdrTo, a.nameAddr(a.Ext, a.Config.Domain))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrContact, "*")
 	msg.AddHeader(sip.HdrExpires, "0")
@@ -514,7 +541,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 
 	if a.regNonce != "" {
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		uri := a.domainURI()
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
@@ -543,7 +570,7 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 		retryMsg.ReplaceHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 		retryMsg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		uri := a.domainURI()
 		authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, a.regRealm, a.regNonce, uri, "REGISTER", cnonce, a.nextRegNC(), "auth", a.regOpaque)
 		retryMsg.RemoveHeader(sip.HdrAuthorization)
 		retryMsg.AddHeader(sip.HdrAuthorization, authHdr)
@@ -571,10 +598,10 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 	fromTag := sip.CreateFromTag()
 
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("REGISTER sip:%s SIP/2.0", a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("REGISTER %s SIP/2.0", a.domainURI()))
 	msg.AddHeader(sip.HdrCallID, callID)
-	msg.AddHeader(sip.HdrFrom, fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, fromTag))
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain))
+	msg.AddHeader(sip.HdrFrom, fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), fromTag))
+	msg.AddHeader(sip.HdrTo, a.nameAddr(a.Ext, a.Config.Domain))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrContact, "*")
 	msg.AddHeader(sip.HdrExpires, "0")
@@ -601,7 +628,7 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 	case raw401 := <-ch401:
 		challenge := sip.Parse401Challenge(raw401)
 		cnonce := sip.GenCNonce()
-		uri := fmt.Sprintf("sip:%s", a.Config.Domain)
+		uri := a.domainURI()
 		realm := challenge.Realm
 		if realm == "" {
 			realm = a.Config.Domain
@@ -677,9 +704,9 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) (*Sub
 	st := &SubscriptionState{
 		Event:      event,
 		CallID:     sip.CreateCallID(),
-		FromHeader: fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, sip.CreateFromTag()),
-		ToHeader:   fmt.Sprintf("<sip:%s@%s>", a.Ext, a.Config.Domain),
-		Contact:    fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport),
+		FromHeader: fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), sip.CreateFromTag()),
+		ToHeader:   a.nameAddr(a.Ext, a.Config.Domain),
+		Contact:    fmt.Sprintf("<%s>", a.contactURI(a.Ext)),
 		CSeq:       1,
 	}
 
@@ -972,7 +999,7 @@ func subscribeRequestURI(a *ExtensionAgent, st *SubscriptionState) string {
 	if st.RemoteTarget != "" {
 		return st.RemoteTarget
 	}
-	return fmt.Sprintf("sip:%s@%s", a.Ext, a.Config.Domain)
+	return a.addrOfRecord(a.Ext)
 }
 
 func addSubscriptionAuth(msg *sip.SipMessage, st *SubscriptionState, authHdr string) {
@@ -1041,15 +1068,23 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	localTag := sip.CreateFromTag()
-	sdpBody := BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
+	cryptoOffers, err := a.buildSRTPCryptoOffers()
+	if err != nil {
+		return nil, err
+	}
+	sdpBody := BuildSDPWithOptions(a.localHost, rtpPort, SDPOptions{
+		RTCPMux:         a.Config.IsRTCPMuxEnabled(),
+		MediaSecurity:   a.Config.MediaSecurity,
+		SRTPCryptoLines: cryptoOfferLines(cryptoOffers),
+	})
 
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("INVITE sip:%s@%s SIP/2.0", calleeExt, a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("INVITE %s SIP/2.0", a.uri(calleeExt, a.Config.Domain)))
 	msg.AddHeader(sip.HdrCallID, callID)
-	msg.AddHeader(sip.HdrFrom, fmt.Sprintf("<sip:%s@%s>;tag=%s", a.Ext, a.Config.Domain, localTag))
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>", calleeExt, a.Config.Domain))
+	msg.AddHeader(sip.HdrFrom, fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), localTag))
+	msg.AddHeader(sip.HdrTo, a.nameAddr(calleeExt, a.Config.Domain))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d;transport=%s>", a.Ext, a.localHost, a.localPort, a.Config.SIPTransport))
+	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<%s>", a.contactURI(a.Ext)))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, "1 INVITE")
 	msg.AddHeader(sip.HdrSupported, "100rel")
@@ -1057,21 +1092,23 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 	msg.AddHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
 
 	dialog := &DialogState{
-		CallID:       callID,
-		LocalTag:     localTag,
-		LocalExt:     a.Ext,
-		RemoteExt:    calleeExt,
-		Domain:       a.Config.Domain,
-		Transport:    a.Config.SIPTransport,
-		LocalHost:    a.localHost,
-		LocalPort:    a.localPort,
-		CSeq:         1,
-		InviteCSeq:   1,
-		State:        "INVITE_SENT",
-		InviteSentMs: float64(time.Now().UnixMilli()),
-		InviteMsg:    msg,
-		InviteSDP:    sdpBody,
-		IsReliable:   true,
+		CallID:           callID,
+		LocalTag:         localTag,
+		LocalExt:         a.Ext,
+		RemoteExt:        calleeExt,
+		Domain:           a.Config.Domain,
+		Transport:        a.Config.SIPTransport,
+		LocalHost:        a.localHost,
+		LocalPort:        a.localPort,
+		CSeq:             1,
+		InviteCSeq:       1,
+		State:            "INVITE_SENT",
+		InviteSentMs:     float64(time.Now().UnixMilli()),
+		InviteMsg:        msg,
+		InviteSDP:        sdpBody,
+		IsReliable:       true,
+		MediaSecurity:    a.Config.MediaSecurity,
+		SRTPCryptoOffers: cryptoOffers,
 	}
 
 	a.mu.Lock()
@@ -1125,26 +1162,26 @@ func (a *ExtensionAgent) SendPrack(dialog *DialogState) error {
 	dialog.CSeq++
 
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("PRACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("PRACK %s SIP/2.0", a.uri(dialog.RemoteExt, a.Config.Domain)))
 	msg.AddHeader(sip.HdrCallID, dialog.CallID)
 	if dialog.InviteMsg != nil {
 		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
 			msg.AddHeader(sip.HdrFrom, fh[0])
 		}
 	}
-	toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, a.Config.Domain)
+	toBase := a.nameAddr(dialog.RemoteExt, a.Config.Domain)
 	if dialog.RemoteTag != "" {
 		msg.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
 	} else {
 		msg.AddHeader(sip.HdrTo, toBase)
 	}
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d>", a.Ext, a.localHost, a.localPort))
+	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<%s>", a.contactURI(a.Ext)))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d PRACK", dialog.CSeq))
 	msg.AddHeader(sip.HdrRAck, rackValue)
 	// [FIX-2] Proactive auth on PRACK — digest uri matches the PRACK Request-URI
-	if authHdr := a.buildProxyAuth(dialog, "PRACK", fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)); authHdr != "" {
+	if authHdr := a.buildProxyAuth(dialog, "PRACK", a.uri(dialog.RemoteExt, a.Config.Domain)); authHdr != "" {
 		msg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 	}
 	msg.AddHeader(sip.HdrContentLength, "0")
@@ -1157,7 +1194,7 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 	dialog.AckSentMs = float64(time.Now().UnixMilli())
 	target := dialog.RemoteTarget
 	if target == "" {
-		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+		target = a.uri(dialog.RemoteExt, a.Config.Domain)
 	}
 
 	msg := sip.NewSipMessage()
@@ -1168,7 +1205,7 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 			msg.AddHeader(sip.HdrFrom, fh[0])
 		}
 	}
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>;tag=%s", dialog.RemoteExt, dialog.Domain, dialog.RemoteTag))
+	msg.AddHeader(sip.HdrTo, fmt.Sprintf("%s;tag=%s", a.nameAddr(dialog.RemoteExt, dialog.Domain), dialog.RemoteTag))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	// RFC 3261 §13.2.2.4: the ACK CSeq sequence number MUST equal the
@@ -1196,7 +1233,7 @@ func (a *ExtensionAgent) SendAck(dialog *DialogState) error {
 // any remote tag assigned by the UAS is preserved.
 func (a *ExtensionAgent) SendAckForFailure(dialog *DialogState, rawResponse string) error {
 	msg := sip.NewSipMessage()
-	target := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	target := a.uri(dialog.RemoteExt, a.Config.Domain)
 	if dialog.InviteMsg != nil {
 		if uri := dialog.InviteMsg.GetRequestURI(); uri != "" {
 			target = uri
@@ -1253,7 +1290,7 @@ func (a *ExtensionAgent) SendCancel(dialog *DialogState) error {
 
 	cancelURI := dialog.InviteMsg.GetRequestURI()
 	if cancelURI == "" {
-		cancelURI = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+		cancelURI = a.uri(dialog.RemoteExt, a.Config.Domain)
 	}
 
 	msg := sip.NewSipMessage()
@@ -1262,7 +1299,7 @@ func (a *ExtensionAgent) SendCancel(dialog *DialogState) error {
 	if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
 		msg.AddHeader(sip.HdrFrom, fh[0])
 	}
-	toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, dialog.Domain)
+	toBase := a.nameAddr(dialog.RemoteExt, dialog.Domain)
 	if dialog.RemoteTag != "" {
 		msg.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
 	} else {
@@ -1284,7 +1321,7 @@ func (a *ExtensionAgent) SendBye(dialog *DialogState) error {
 
 	target := dialog.RemoteTarget
 	if target == "" {
-		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+		target = a.uri(dialog.RemoteExt, a.Config.Domain)
 	}
 
 	msg := sip.NewSipMessage()
@@ -1295,7 +1332,7 @@ func (a *ExtensionAgent) SendBye(dialog *DialogState) error {
 			msg.AddHeader(sip.HdrFrom, fh[0])
 		}
 	}
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>;tag=%s", dialog.RemoteExt, dialog.Domain, dialog.RemoteTag))
+	msg.AddHeader(sip.HdrTo, fmt.Sprintf("%s;tag=%s", a.nameAddr(dialog.RemoteExt, dialog.Domain), dialog.RemoteTag))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d BYE", dialog.CSeq))
@@ -1322,20 +1359,21 @@ func (a *ExtensionAgent) HandleIncomingInvite(rawMsg string) (*DialogState, erro
 	remoteExt := invite.GetReqURIUserPart()
 
 	dialog := &DialogState{
-		CallID:     callID,
-		LocalTag:   localTag,
-		LocalExt:   a.Ext,
-		RemoteExt:  remoteExt,
-		Domain:     a.Config.Domain,
-		Transport:  a.Config.SIPTransport,
-		LocalHost:  a.localHost,
-		LocalPort:  a.localPort,
-		RemoteTag:  remoteTag,
-		CSeq:       cseq,
-		InviteCSeq: cseq,
-		State:      "INVITE_RCVD",
-		InviteMsg:  invite,
-		IsReliable: false,
+		CallID:        callID,
+		LocalTag:      localTag,
+		LocalExt:      a.Ext,
+		RemoteExt:     remoteExt,
+		Domain:        a.Config.Domain,
+		Transport:     a.Config.SIPTransport,
+		LocalHost:     a.localHost,
+		LocalPort:     a.localPort,
+		RemoteTag:     remoteTag,
+		CSeq:          cseq,
+		InviteCSeq:    cseq,
+		State:         "INVITE_RCVD",
+		InviteMsg:     invite,
+		IsReliable:    false,
+		MediaSecurity: a.Config.MediaSecurity,
 	}
 
 	a.mu.Lock()
@@ -1382,7 +1420,7 @@ func (a *ExtensionAgent) sendProvisional(invite *sip.SipMessage, code, reason, l
 		resp.AddHeader(sip.HdrCSeq, ch[0])
 	}
 	if includeContact {
-		resp.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d>", a.Ext, a.localHost, a.localPort))
+		resp.AddHeader(sip.HdrContact, fmt.Sprintf("<%s>", a.contactURI(a.Ext)))
 	}
 	if rseq > 0 {
 		resp.AddHeader(sip.HdrRequire, "100rel")
@@ -1457,7 +1495,17 @@ func (a *ExtensionAgent) HandleBye(rawMsg string, dialog *DialogState) error {
 // Send200Invite sends 200 OK to an incoming INVITE.
 func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 	invite := dialog.InviteMsg
-	sdpBody := BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
+	cryptoOffers, err := a.buildSRTPCryptoOffers()
+	if err != nil {
+		return err
+	}
+	sdpBody := BuildSDPWithOptions(a.localHost, rtpPort, SDPOptions{
+		RTCPMux:         a.Config.IsRTCPMuxEnabled(),
+		MediaSecurity:   a.Config.MediaSecurity,
+		SRTPCryptoLines: cryptoOfferLines(cryptoOffers),
+	})
+	dialog.SRTPCryptoOffers = cryptoOffers
+	dialog.MediaSecurity = a.Config.MediaSecurity
 
 	resp := sip.NewSipMessage()
 	resp.SetResponseLine("SIP/2.0 200 OK")
@@ -1476,7 +1524,7 @@ func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 	if ch := invite.GetHeader(sip.HdrCSeq); len(ch) > 0 {
 		resp.AddHeader(sip.HdrCSeq, ch[0])
 	}
-	resp.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d>", a.Ext, a.localHost, a.localPort))
+	resp.AddHeader(sip.HdrContact, fmt.Sprintf("<%s>", a.contactURI(a.Ext)))
 	// RFC 3261 §20.5 / §13.3.1: a 2xx response to INVITE MUST include the
 	// Allow header listing the methods supported within the dialog.
 	resp.AddHeader(sip.HdrAllow, "INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,INFO,UPDATE,PRACK")
@@ -1527,10 +1575,21 @@ func (a *ExtensionAgent) Parse200Invite(rawMsg string, dialog *DialogState) {
 }
 
 func (a *ExtensionAgent) applySDPMedia(dialog *DialogState, body, source string) {
-	ip, port := ParseSDPMedia(body)
-	if ip != "" && port > 0 {
-		dialog.RTPRemoteIP = ip
-		dialog.RTPRemotePort = port
+	info := ParseSDPMediaInfo(body)
+	if info.IP != "" && info.Port > 0 {
+		dialog.RTPRemoteIP = info.IP
+		dialog.RTPRemotePort = info.Port
+		if dialog.MediaSecurity == "srtp_sdes" {
+			dialog.SRTPRemoteCrypto = info
+			if info.Proto != "RTP/SAVP" || len(info.CryptoLines) == 0 {
+				slog.Warn("SRTP SDP did not include usable crypto",
+					"ext", a.Ext,
+					"call_id", dialog.CallID,
+					"source", source,
+					"proto", info.Proto,
+					"crypto_count", len(info.CryptoLines))
+			}
+		}
 		return
 	}
 	slog.Warn("SDP did not contain usable audio media address",
@@ -1541,6 +1600,21 @@ func (a *ExtensionAgent) applySDPMedia(dialog *DialogState, body, source string)
 		"has_audio", strings.Contains(body, "m=audio"),
 		"has_connection", strings.Contains(body, "c=IN "),
 	)
+}
+
+func (a *ExtensionAgent) buildSRTPCryptoOffers() ([]SRTPCryptoOffer, error) {
+	if !a.Config.IsSRTPSDESEnabled() {
+		return nil, nil
+	}
+	return GenerateSRTPCryptoOffers(a.Config.SRTPCryptoSuites)
+}
+
+func cryptoOfferLines(offers []SRTPCryptoOffer) []string {
+	lines := make([]string, 0, len(offers))
+	for _, offer := range offers {
+		lines = append(lines, offer.SDPLine)
+	}
+	return lines
 }
 
 // WaitForEvent registers for specific SIP event codes and waits.
@@ -1607,28 +1681,28 @@ func (a *ExtensionAgent) handleAuthPrack(dialog *DialogState, rawChallenge strin
 	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	uri := a.uri(dialog.RemoteExt, a.Config.Domain)
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "PRACK", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	rackValue := fmt.Sprintf("%d %d INVITE", dialog.RSeq, dialog.CSeq-1)
 	dialog.CSeq++
 
 	msg := sip.NewSipMessage()
-	msg.SetRequestLine(fmt.Sprintf("PRACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	msg.SetRequestLine(fmt.Sprintf("PRACK %s SIP/2.0", uri))
 	msg.AddHeader(sip.HdrCallID, dialog.CallID)
 	if dialog.InviteMsg != nil {
 		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
 			msg.AddHeader(sip.HdrFrom, fh[0])
 		}
 	}
-	toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, a.Config.Domain)
+	toBase := a.nameAddr(dialog.RemoteExt, a.Config.Domain)
 	if dialog.RemoteTag != "" {
 		msg.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
 	} else {
 		msg.AddHeader(sip.HdrTo, toBase)
 	}
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
-	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<sip:%s@%s:%d>", a.Ext, a.localHost, a.localPort))
+	msg.AddHeader(sip.HdrContact, fmt.Sprintf("<%s>", a.contactURI(a.Ext)))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d PRACK", dialog.CSeq))
 	msg.AddHeader(sip.HdrRAck, rackValue)
@@ -1653,7 +1727,7 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 	dialog.CSeq++
 	target := dialog.RemoteTarget
 	if target == "" {
-		target = fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+		target = a.uri(dialog.RemoteExt, a.Config.Domain)
 	}
 
 	// Refresh stored auth state with the fresh nonce from this 407 so
@@ -1665,8 +1739,7 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
-	// [FIX-3] Use target (the BYE Request-URI) as digest uri per RFC 2617
-	// Revert FIX-3: change target back to fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	// Use target (the BYE Request-URI) as digest uri per RFC 2617.
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, target, "BYE", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	msg := sip.NewSipMessage()
@@ -1677,7 +1750,7 @@ func (a *ExtensionAgent) Handle407Bye(dialog *DialogState, raw407 string) error 
 			msg.AddHeader(sip.HdrFrom, fh[0])
 		}
 	}
-	msg.AddHeader(sip.HdrTo, fmt.Sprintf("<sip:%s@%s>;tag=%s", dialog.RemoteExt, dialog.Domain, dialog.RemoteTag))
+	msg.AddHeader(sip.HdrTo, fmt.Sprintf("%s;tag=%s", a.nameAddr(dialog.RemoteExt, dialog.Domain), dialog.RemoteTag))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
 	msg.AddHeader(sip.HdrMaxForwards, "70")
 	msg.AddHeader(sip.HdrCSeq, fmt.Sprintf("%d BYE", dialog.CSeq))
@@ -1701,7 +1774,7 @@ func (a *ExtensionAgent) Handle401Invite(dialog *DialogState, raw401 string, rtp
 	}
 
 	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	uri := a.uri(dialog.RemoteExt, a.Config.Domain)
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, "00000001", "auth", challenge.Opaque)
 
 	if dialog.InviteMsg != nil {
@@ -1718,7 +1791,11 @@ func (a *ExtensionAgent) Handle401Invite(dialog *DialogState, raw401 string, rtp
 
 		sdpBody := dialog.InviteSDP
 		if sdpBody == "" {
-			sdpBody = BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
+			sdpBody = BuildSDPWithOptions(a.localHost, rtpPort, SDPOptions{
+				RTCPMux:         a.Config.IsRTCPMuxEnabled(),
+				MediaSecurity:   dialog.MediaSecurity,
+				SRTPCryptoLines: cryptoOfferLines(dialog.SRTPCryptoOffers),
+			})
 			dialog.InviteSDP = sdpBody
 		}
 		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
@@ -1747,7 +1824,7 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 	dialog.AuthNonceCount = 0
 
 	cnonce := sip.GenCNonce()
-	uri := fmt.Sprintf("sip:%s@%s", dialog.RemoteExt, a.Config.Domain)
+	uri := a.uri(dialog.RemoteExt, a.Config.Domain)
 	authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, realm, challenge.Nonce, uri, "INVITE", cnonce, dialog.NextNCHex(), "auth", challenge.Opaque)
 
 	if dialog.InviteMsg != nil {
@@ -1773,7 +1850,11 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 		// to BuildSDP only if the dialog never stored one (defence in depth).
 		sdpBody := dialog.InviteSDP
 		if sdpBody == "" {
-			sdpBody = BuildSDP(a.localHost, rtpPort, a.Config.IsRTCPMuxEnabled())
+			sdpBody = BuildSDPWithOptions(a.localHost, rtpPort, SDPOptions{
+				RTCPMux:         a.Config.IsRTCPMuxEnabled(),
+				MediaSecurity:   dialog.MediaSecurity,
+				SRTPCryptoLines: cryptoOfferLines(dialog.SRTPCryptoOffers),
+			})
 			dialog.InviteSDP = sdpBody
 		}
 		dialog.InviteMsg.ReplaceHeader(sip.HdrContentLength, fmt.Sprintf("%d", len(sdpBody)))
@@ -1799,7 +1880,7 @@ func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error
 	}
 
 	ack := sip.NewSipMessage()
-	ack.SetRequestLine(fmt.Sprintf("ACK sip:%s@%s SIP/2.0", dialog.RemoteExt, a.Config.Domain))
+	ack.SetRequestLine(fmt.Sprintf("ACK %s SIP/2.0", a.uri(dialog.RemoteExt, a.Config.Domain)))
 	ack.AddHeader(sip.HdrCallID, dialog.CallID)
 	if dialog.InviteMsg != nil {
 		if fh := dialog.InviteMsg.GetHeader(sip.HdrFrom); len(fh) > 0 {
@@ -1810,7 +1891,7 @@ func (a *ExtensionAgent) sendAckFor407(dialog *DialogState, raw407 string) error
 	if toHdrs := resp407.GetHeader(sip.HdrTo); len(toHdrs) > 0 {
 		ack.AddHeader(sip.HdrTo, toHdrs[0])
 	} else {
-		toBase := fmt.Sprintf("<sip:%s@%s>", dialog.RemoteExt, a.Config.Domain)
+		toBase := a.nameAddr(dialog.RemoteExt, a.Config.Domain)
 		if dialog.RemoteTag != "" {
 			ack.AddHeader(sip.HdrTo, toBase+";tag="+dialog.RemoteTag)
 		} else {

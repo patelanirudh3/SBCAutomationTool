@@ -23,7 +23,7 @@ import (
 //   - "" or "insecure"   → InsecureSkipVerify=true (lab/testing only)
 //   - "server_ca"        → RootCAs loaded from TLSCAPath
 //   - "client_cert"      → Certificates loaded from TLSCertPath/TLSKeyPath;
-//                          server verified against system roots
+//     server verified against system roots
 //   - "mutual"           → both RootCAs and Certificates loaded
 //
 // TLSServerName populates ServerName for SNI / hostname verification when
@@ -34,7 +34,8 @@ func BuildTLSConfig(cfg *VMConfig) (*tls.Config, error) {
 	}
 
 	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: mustTLSVersion(cfg.TLSMinVersion),
+		MaxVersion: mustTLSMaxVersion(cfg.TLSMaxVersion),
 		ServerName: cfg.TLSServerName,
 	}
 
@@ -74,9 +75,47 @@ func BuildTLSConfig(cfg *VMConfig) (*tls.Config, error) {
 	slog.Info("SIP TLS configured",
 		"vm_id", cfg.VMID,
 		"tls_mode", mode,
+		"tls_min_version", cfg.TLSMinVersion,
+		"tls_max_version", cfg.TLSMaxVersion,
 		"server_name", tlsCfg.ServerName,
 		"has_root_cas", tlsCfg.RootCAs != nil,
 		"has_client_cert", len(tlsCfg.Certificates) > 0,
 	)
 	return tlsCfg, nil
+}
+
+func parseTLSVersionName(v string) (uint16, bool) {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "", "1.2", "tls1.2", "tls 1.2":
+		return tls.VersionTLS12, true
+	case "1.3", "tls1.3", "tls 1.3":
+		return tls.VersionTLS13, true
+	default:
+		return 0, false
+	}
+}
+
+func parseTLSMaxVersionName(v string) (uint16, bool) {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "", "auto":
+		return 0, true
+	default:
+		return parseTLSVersionName(v)
+	}
+}
+
+func mustTLSVersion(v string) uint16 {
+	out, ok := parseTLSVersionName(v)
+	if !ok {
+		return tls.VersionTLS12
+	}
+	return out
+}
+
+func mustTLSMaxVersion(v string) uint16 {
+	out, ok := parseTLSMaxVersionName(v)
+	if !ok {
+		return 0
+	}
+	return out
 }

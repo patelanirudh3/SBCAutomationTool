@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"math"
@@ -378,6 +379,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
 
 		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv, rtpExpected, rtpSSRCCount int
+		var srtpDecryptFailures, srtpAuthFailures, srtpReplayFailures int
 		var lostPkts, oooPkts int
 		var jitterMs, packetLossPct, remoteJitter, remoteLoss, mosScore, rttMs float64
 		var mediaOK bool
@@ -392,6 +394,9 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			markersRecv = st.MarkersReceived
 			rtpExpected = st.ExpectedPackets
 			rtpSSRCCount = st.SSRCCount
+			srtpDecryptFailures = st.SRTPDecryptFailures
+			srtpAuthFailures = st.SRTPAuthFailures
+			srtpReplayFailures = st.SRTPReplayFailures
 			mediaOK = rtpRx > 0
 			jitterMs = math.Round(st.JitterMs*100) / 100
 			packetLossPct = math.Round(st.PacketLossPct*100) / 100
@@ -413,30 +418,35 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		}
 
 		return CallResult{
-			CallID:           callID,
-			Caller:           ag.Ext,
-			Callee:           callee,
-			Success:          false,
-			FailureReason:    reason,
-			TotalMs:          msSince(callStart),
-			RTPLocalPort:     rtpLocalPort(rtpEP),
-			RTPTxPkts:        rtpTx,
-			RTPRxPkts:        rtpRx,
-			MediaVerified:    mediaOK,
-			RTPRxFromSBCPkts: rtpRxFromSBC,
-			RTPRxOtherPkts:   rtpRxOt,
-			RTCPRxPkts:       rtcpRx,
-			MarkersSent:      markersSent,
-			MarkersReceived:  markersRecv,
-			RTPExpectedPkts:  rtpExpected,
-			RTPSSRCCount:     rtpSSRCCount,
-			SBCRTPRelayIP:    sbcRelayIP,
-			SBCRTPRelayPort:  sbcRelayPort,
-			RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
-			PeerExt:          callee,
-			TsUTC:            inviteTsUTC,
-			Direction:        "uac",
-			SipMilestones:    milestones,
+			CallID:              callID,
+			Caller:              ag.Ext,
+			Callee:              callee,
+			Success:             false,
+			FailureReason:       reason,
+			TotalMs:             msSince(callStart),
+			RTPLocalPort:        rtpLocalPort(rtpEP),
+			RTPTxPkts:           rtpTx,
+			RTPRxPkts:           rtpRx,
+			MediaVerified:       mediaOK,
+			RTPRxFromSBCPkts:    rtpRxFromSBC,
+			RTPRxOtherPkts:      rtpRxOt,
+			RTCPRxPkts:          rtcpRx,
+			MarkersSent:         markersSent,
+			MarkersReceived:     markersRecv,
+			RTPExpectedPkts:     rtpExpected,
+			RTPSSRCCount:        rtpSSRCCount,
+			SBCRTPRelayIP:       sbcRelayIP,
+			SBCRTPRelayPort:     sbcRelayPort,
+			RTPAsymmetryFlag:    ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+			MediaSecurity:       cfg.MediaSecurity,
+			SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
+			SRTPDecryptFailures: srtpDecryptFailures,
+			SRTPAuthFailures:    srtpAuthFailures,
+			SRTPReplayFailures:  srtpReplayFailures,
+			PeerExt:             callee,
+			TsUTC:               inviteTsUTC,
+			Direction:           "uac",
+			SipMilestones:       milestones,
 
 			JitterMs:            jitterMs,
 			PacketLossPct:       packetLossPct,
@@ -534,9 +544,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			result := CallResult{
 				CallID: callID, Caller: ag.Ext, Callee: callee,
 				Success: false, FailureReason: "timeout",
-				TotalMs:      msSince(callStart),
-				RTPLocalPort: rtpLocalPort(rtpEP),
-				PeerExt:      callee, TsUTC: inviteTsUTC, Direction: "uac",
+				TotalMs:         msSince(callStart),
+				RTPLocalPort:    rtpLocalPort(rtpEP),
+				MediaSecurity:   cfg.MediaSecurity,
+				SRTPCryptoSuite: selectedSRTPCryptoSuite(dialog),
+				PeerExt:         callee, TsUTC: inviteTsUTC, Direction: "uac",
 				SipMilestones: milestones,
 			}
 			e.complete(result)
@@ -746,6 +758,12 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("ACK_SENT", 0, milestones.AckSentMs, nil)
 
+	if err := configureSRTPForDialog(rtpEP, dialog); err != nil {
+		result := fail(fmt.Sprintf("srtp_config: %v", err))
+		e.complete(result)
+		return
+	}
+
 	// ── RTP ────────────────────────────────────────────────────────
 	isContinuous := cfg.RTPMode == "continuous"
 	isCoverage := cfg.RTPMode == "3phase_coverage"
@@ -869,15 +887,20 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		mediaEvent := ClassifyMedia(st, float64(cfg.HoldTimeSeconds))
 		milestones.MediaVerifiedMs = msSince(callStart)
 		emitCallEvent(e.metrics, callID, ag.Ext, mediaEvent, "uac", callee, 0, milestones.MediaVerifiedMs, map[string]any{
-			"rtp_tx_pkts":          rtpTx,
-			"rtp_rx_pkts":          rtpRx,
-			"rtp_rx_from_sbc_pkts": rtpRxFromSBC,
-			"rtp_rx_other_pkts":    rtpRxOt,
-			"rtcp_rx_pkts":         rtcpRx,
-			"markers_sent":         markersSent,
-			"markers_received":     markersRecv,
-			"rtp_expected_pkts":    rtpExpected,
-			"rtp_ssrc_count":       rtpSSRCCount,
+			"rtp_tx_pkts":           rtpTx,
+			"rtp_rx_pkts":           rtpRx,
+			"rtp_rx_from_sbc_pkts":  rtpRxFromSBC,
+			"rtp_rx_other_pkts":     rtpRxOt,
+			"rtcp_rx_pkts":          rtcpRx,
+			"markers_sent":          markersSent,
+			"markers_received":      markersRecv,
+			"rtp_expected_pkts":     rtpExpected,
+			"rtp_ssrc_count":        rtpSSRCCount,
+			"media_security":        cfg.MediaSecurity,
+			"srtp_crypto_suite":     selectedSRTPCryptoSuite(dialog),
+			"srtp_decrypt_failures": st.SRTPDecryptFailures,
+			"srtp_auth_failures":    st.SRTPAuthFailures,
+			"srtp_replay_failures":  st.SRTPReplayFailures,
 		})
 	}
 
@@ -898,14 +921,17 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 	// ── QoS / Media metrics (Phase 1+2) ────────────────────────────
 	var (
-		jitterMs      float64
-		packetLossPct float64
-		lostPackets   int
-		oooPackets    int
-		remoteJitter  float64
-		remoteLoss    float64
-		mosScore      float64
-		rttMs         float64
+		jitterMs            float64
+		packetLossPct       float64
+		lostPackets         int
+		oooPackets          int
+		remoteJitter        float64
+		remoteLoss          float64
+		mosScore            float64
+		rttMs               float64
+		srtpDecryptFailures int
+		srtpAuthFailures    int
+		srtpReplayFailures  int
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -916,6 +942,9 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
 		rttMs = math.Round(st.RTTMs*100) / 100
+		srtpDecryptFailures = st.SRTPDecryptFailures
+		srtpAuthFailures = st.SRTPAuthFailures
+		srtpReplayFailures = st.SRTPReplayFailures
 		if cfg.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
@@ -924,31 +953,36 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
 
 	result := CallResult{
-		CallID:           callID,
-		Caller:           ag.Ext,
-		Callee:           callee,
-		Success:          true,
-		PDDMs:            pddMs,
-		HoldMs:           holdMs,
-		TotalMs:          totalMs,
-		RTPTxPkts:        rtpTx,
-		RTPRxPkts:        rtpRx,
-		MediaVerified:    mediaOK,
-		RTPLocalPort:     rtpLocalPort(rtpEP),
-		PeerExt:          callee,
-		TsUTC:            inviteTsUTC,
-		Direction:        "uac",
-		SBCRTPRelayIP:    dialog.RTPRemoteIP,
-		SBCRTPRelayPort:  dialog.RTPRemotePort,
-		SipMilestones:    milestones,
-		RTPRxFromSBCPkts: rtpRxFromSBC,
-		RTPRxOtherPkts:   rtpRxOt,
-		RTCPRxPkts:       rtcpRx,
-		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
-		MarkersSent:      markersSent,
-		MarkersReceived:  markersRecv,
-		RTPExpectedPkts:  rtpExpected,
-		RTPSSRCCount:     rtpSSRCCount,
+		CallID:              callID,
+		Caller:              ag.Ext,
+		Callee:              callee,
+		Success:             true,
+		PDDMs:               pddMs,
+		HoldMs:              holdMs,
+		TotalMs:             totalMs,
+		RTPTxPkts:           rtpTx,
+		RTPRxPkts:           rtpRx,
+		MediaVerified:       mediaOK,
+		RTPLocalPort:        rtpLocalPort(rtpEP),
+		MediaSecurity:       cfg.MediaSecurity,
+		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
+		SRTPDecryptFailures: srtpDecryptFailures,
+		SRTPAuthFailures:    srtpAuthFailures,
+		SRTPReplayFailures:  srtpReplayFailures,
+		PeerExt:             callee,
+		TsUTC:               inviteTsUTC,
+		Direction:           "uac",
+		SBCRTPRelayIP:       dialog.RTPRemoteIP,
+		SBCRTPRelayPort:     dialog.RTPRemotePort,
+		SipMilestones:       milestones,
+		RTPRxFromSBCPkts:    rtpRxFromSBC,
+		RTPRxOtherPkts:      rtpRxOt,
+		RTCPRxPkts:          rtcpRx,
+		RTPAsymmetryFlag:    ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+		MarkersSent:         markersSent,
+		MarkersReceived:     markersRecv,
+		RTPExpectedPkts:     rtpExpected,
+		RTPSSRCCount:        rtpSSRCCount,
 
 		JitterMs:         jitterMs,
 		PacketLossPct:    packetLossPct,
@@ -1018,6 +1052,58 @@ func rtpLocalPort(ep *rtp.RtpEndpoint) int {
 		return ep.LocalPort()
 	}
 	return 0
+}
+
+func selectedSRTPCryptoSuite(dialog *agent.DialogState) string {
+	if dialog == nil || len(dialog.SRTPRemoteCrypto.CryptoLines) == 0 {
+		return ""
+	}
+	return dialog.SRTPRemoteCrypto.CryptoLines[0].Suite
+}
+
+func configureSRTPForDialog(ep *rtp.RtpEndpoint, dialog *agent.DialogState) error {
+	if ep == nil || dialog == nil || dialog.MediaSecurity != "srtp_sdes" {
+		return nil
+	}
+	if len(dialog.SRTPCryptoOffers) == 0 {
+		return fmt.Errorf("no local SRTP crypto offer")
+	}
+	if len(dialog.SRTPRemoteCrypto.CryptoLines) == 0 {
+		return fmt.Errorf("no remote SRTP crypto answer")
+	}
+	remote := dialog.SRTPRemoteCrypto.CryptoLines[0]
+	local := dialog.SRTPCryptoOffers[0]
+	for _, offer := range dialog.SRTPCryptoOffers {
+		if offer.Suite == remote.Suite {
+			local = offer
+			break
+		}
+	}
+	remoteKeySalt, err := decodeSDESInlineKeySalt(remote.KeyParams)
+	if err != nil {
+		return err
+	}
+	return ep.ConfigureSRTP(rtp.SRTPSessionConfig{
+		Enabled:         true,
+		CryptoSuite:     local.Suite,
+		OutboundKeySalt: local.KeySalt,
+		InboundKeySalt:  remoteKeySalt,
+	})
+}
+
+func decodeSDESInlineKeySalt(params string) ([]byte, error) {
+	if !strings.HasPrefix(params, "inline:") {
+		return nil, fmt.Errorf("unsupported SRTP key params %q", params)
+	}
+	raw := strings.TrimPrefix(params, "inline:")
+	if idx := strings.IndexByte(raw, '|'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	keySalt, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode SRTP inline key: %w", err)
+	}
+	return keySalt, nil
 }
 
 func atoi(s string) int {

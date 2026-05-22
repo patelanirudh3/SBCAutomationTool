@@ -3,12 +3,16 @@ package rtp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/pion/srtp/v3"
 )
 
 const (
@@ -53,6 +57,18 @@ type RtpStats struct {
 	// Zero when RTCP SR transmission is disabled or no RR has been
 	// received that references one of our SRs.
 	RTTMs float64
+
+	SRTPEnabled         bool
+	SRTPDecryptFailures int
+	SRTPAuthFailures    int
+	SRTPReplayFailures  int
+}
+
+type SRTPSessionConfig struct {
+	Enabled         bool
+	CryptoSuite     string
+	OutboundKeySalt []byte
+	InboundKeySalt  []byte
 }
 
 // RtpEndpoint is a bidirectional G.711 PCMU RTP endpoint used by both UAC and UAS.
@@ -119,6 +135,14 @@ type RtpEndpoint struct {
 	// derived from RTCP SR/RR exchange (RFC 3550 §6.4.1). Zero when no RR
 	// referencing one of our SRs has been received yet.
 	rttMs float64
+
+	srtpEnabled         bool
+	srtpSuite           string
+	srtpEncrypt         *srtp.Context
+	srtpDecrypt         *srtp.Context
+	srtpDecryptFailures int
+	srtpAuthFailures    int
+	srtpReplayFailures  int
 
 	remoteIP   string
 	remotePort int
@@ -324,14 +348,71 @@ func (ep *RtpEndpoint) Stats() RtpStats {
 		FirstRxMs:       firstMs,
 		LastRxMs:        lastMs,
 
-		JitterMs:       jitterMs,
-		LostPackets:    lostPackets,
-		OOOPackets:     ep.oooPackets,
-		DupPackets:     ep.dupPackets,
-		PacketLossPct:  lossPct,
-		RemoteJitterMs: remoteJitterMs,
-		RemoteLossPct:  ep.remoteLossPct,
-		RTTMs:          ep.rttMs,
+		JitterMs:            jitterMs,
+		LostPackets:         lostPackets,
+		OOOPackets:          ep.oooPackets,
+		DupPackets:          ep.dupPackets,
+		PacketLossPct:       lossPct,
+		RemoteJitterMs:      remoteJitterMs,
+		RemoteLossPct:       ep.remoteLossPct,
+		RTTMs:               ep.rttMs,
+		SRTPEnabled:         ep.srtpEnabled,
+		SRTPDecryptFailures: ep.srtpDecryptFailures,
+		SRTPAuthFailures:    ep.srtpAuthFailures,
+		SRTPReplayFailures:  ep.srtpReplayFailures,
+	}
+}
+
+func (ep *RtpEndpoint) ConfigureSRTP(cfg SRTPSessionConfig) error {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if !cfg.Enabled {
+		ep.srtpEnabled = false
+		ep.srtpEncrypt = nil
+		ep.srtpDecrypt = nil
+		return nil
+	}
+	profile, err := protectionProfile(cfg.CryptoSuite)
+	if err != nil {
+		return err
+	}
+	keyLen, err := profile.KeyLen()
+	if err != nil {
+		return err
+	}
+	saltLen, err := profile.SaltLen()
+	if err != nil {
+		return err
+	}
+	if len(cfg.OutboundKeySalt) != keyLen+saltLen {
+		return fmt.Errorf("srtp outbound key/salt len=%d, want %d", len(cfg.OutboundKeySalt), keyLen+saltLen)
+	}
+	if len(cfg.InboundKeySalt) != keyLen+saltLen {
+		return fmt.Errorf("srtp inbound key/salt len=%d, want %d", len(cfg.InboundKeySalt), keyLen+saltLen)
+	}
+	enc, err := srtp.CreateContext(cfg.OutboundKeySalt[:keyLen], cfg.OutboundKeySalt[keyLen:], profile)
+	if err != nil {
+		return fmt.Errorf("srtp encrypt context: %w", err)
+	}
+	dec, err := srtp.CreateContext(cfg.InboundKeySalt[:keyLen], cfg.InboundKeySalt[keyLen:], profile)
+	if err != nil {
+		return fmt.Errorf("srtp decrypt context: %w", err)
+	}
+	ep.srtpEnabled = true
+	ep.srtpSuite = cfg.CryptoSuite
+	ep.srtpEncrypt = enc
+	ep.srtpDecrypt = dec
+	return nil
+}
+
+func protectionProfile(suite string) (srtp.ProtectionProfile, error) {
+	switch suite {
+	case "AES_CM_128_HMAC_SHA1_80":
+		return srtp.ProtectionProfileAes128CmHmacSha1_80, nil
+	case "AES_CM_128_HMAC_SHA1_32":
+		return srtp.ProtectionProfileAes128CmHmacSha1_32, nil
+	default:
+		return 0, fmt.Errorf("unsupported SRTP crypto suite %q", suite)
 	}
 }
 
@@ -456,7 +537,12 @@ func (ep *RtpEndpoint) Run(
 
 			payload := ep.getPayload()
 			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
-			if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
+			wirePkt, err := ep.protectRTP(pkt)
+			if err != nil {
+				slog.Warn("SRTP keepalive protect error", "err", err)
+				break
+			}
+			if _, err := ep.conn.WriteToUDP(wirePkt, dest); err != nil {
 				slog.Warn("RTP keepalive sendto error", "err", err, "dest", dest.String())
 				break
 			}
@@ -465,7 +551,7 @@ func (ep *RtpEndpoint) Run(
 			pw := ep.pcap
 			ep.mu.Unlock()
 			if pw != nil {
-				pw.WriteTx(pkt, remoteIP, remotePort)
+				pw.WriteTx(wirePkt, remoteIP, remotePort)
 			}
 
 			seq++
@@ -661,13 +747,18 @@ func (ep *RtpEndpoint) RunUntilCancelled(
 
 			payload := ep.getPayload()
 			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
-			_, _ = ep.conn.WriteToUDP(pkt, dest)
+			wirePkt, err := ep.protectRTP(pkt)
+			if err != nil {
+				slog.Warn("SRTP keepalive protect error", "err", err)
+				continue
+			}
+			_, _ = ep.conn.WriteToUDP(wirePkt, dest)
 
 			ep.mu.Lock()
 			pw := ep.pcap
 			ep.mu.Unlock()
 			if pw != nil {
-				pw.WriteTx(pkt, remoteIP, remotePort)
+				pw.WriteTx(wirePkt, remoteIP, remotePort)
 			}
 
 			seq++
@@ -745,7 +836,12 @@ func (ep *RtpEndpoint) sendKeepalive(
 
 		payload := ep.getPayload()
 		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
-		if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
+		wirePkt, err := ep.protectRTP(pkt)
+		if err != nil {
+			slog.Warn("SRTP keepalive protect error", "err", err)
+			return seq, ts, nil
+		}
+		if _, err := ep.conn.WriteToUDP(wirePkt, dest); err != nil {
 			remaining := time.Until(deadline)
 			if remaining > 0 {
 				select {
@@ -757,7 +853,7 @@ func (ep *RtpEndpoint) sendKeepalive(
 		}
 
 		if pw != nil {
-			pw.WriteTx(pkt, dest.IP.String(), dest.Port)
+			pw.WriteTx(wirePkt, dest.IP.String(), dest.Port)
 		}
 
 		seq++
@@ -789,6 +885,34 @@ func clampFloat(v, minV, maxV float64) float64 {
 	return v
 }
 
+func (ep *RtpEndpoint) protectRTP(pkt []byte) ([]byte, error) {
+	ep.mu.Lock()
+	enabled := ep.srtpEnabled
+	ctx := ep.srtpEncrypt
+	ep.mu.Unlock()
+	if !enabled {
+		return pkt, nil
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("srtp encrypt context not configured")
+	}
+	return ctx.EncryptRTP(nil, pkt, nil)
+}
+
+func (ep *RtpEndpoint) unprotectRTP(pkt []byte) ([]byte, error) {
+	ep.mu.Lock()
+	enabled := ep.srtpEnabled
+	ctx := ep.srtpDecrypt
+	ep.mu.Unlock()
+	if !enabled {
+		return pkt, nil
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("srtp decrypt context not configured")
+	}
+	return ctx.DecryptRTP(nil, pkt, nil)
+}
+
 // sendBurst sends at pps packets/sec until deadline with drift-correcting pacing.
 func (ep *RtpEndpoint) sendBurst(
 	ctx context.Context,
@@ -813,7 +937,12 @@ func (ep *RtpEndpoint) sendBurst(
 
 		payload := ep.getPayload()
 		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
-		if _, err := ep.conn.WriteToUDP(pkt, dest); err != nil {
+		wirePkt, err := ep.protectRTP(pkt)
+		if err != nil {
+			slog.Warn("SRTP burst protect error", "err", err)
+			return seq, ts, nil
+		}
+		if _, err := ep.conn.WriteToUDP(wirePkt, dest); err != nil {
 			remaining := time.Until(deadline)
 			if remaining > 0 {
 				select {
@@ -825,7 +954,7 @@ func (ep *RtpEndpoint) sendBurst(
 		}
 
 		if pw != nil {
-			pw.WriteTx(pkt, dest.IP.String(), dest.Port)
+			pw.WriteTx(wirePkt, dest.IP.String(), dest.Port)
 		}
 
 		seq++
@@ -889,6 +1018,22 @@ func (ep *RtpEndpoint) receiveLoop() {
 		if (data[0] >> 6) != 2 {
 			continue
 		}
+
+		plain, err := ep.unprotectRTP(data)
+		if err != nil {
+			ep.mu.Lock()
+			ep.srtpDecryptFailures++
+			errText := strings.ToLower(err.Error())
+			if strings.Contains(errText, "duplicated") || strings.Contains(errText, "replay") {
+				ep.srtpReplayFailures++
+			} else {
+				ep.srtpAuthFailures++
+			}
+			ep.mu.Unlock()
+			continue
+		}
+		data = plain
+		n = len(data)
 
 		ep.mu.Lock()
 		pw := ep.pcap

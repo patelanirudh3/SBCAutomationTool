@@ -380,6 +380,7 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	}
 
 	if !looksLikeSIPStart(buf) {
+		recordInvalidStartLine()
 		slog.Warn("extractSIPMessage: invalid SIP start-line; dropping buffered bytes",
 			"bytes", len(buf))
 		return "", skip + len(buf)
@@ -393,10 +394,15 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	headerEnd := sepIdx + len(crlfcrlfBytes)
 	headerBlock := string(buf[:headerEnd])
 
-	contentLength, ok := parseContentLength(headerBlock)
-	if !ok {
+	contentLength, clErr := parseContentLength(headerBlock)
+	if clErr != "" {
+		if clErr == "conflict" {
+			recordConflictingContentLength()
+		} else {
+			recordInvalidContentLength()
+		}
 		slog.Warn("extractSIPMessage: invalid Content-Length; dropping message",
-			"header_len", len(headerBlock))
+			"header_len", len(headerBlock), "reason", clErr)
 		return "", skip + headerEnd
 	}
 
@@ -408,7 +414,7 @@ func extractSIPMessage(buf []byte) (msg string, consumed int) {
 	return string(buf[:totalNeeded]), skip + totalNeeded
 }
 
-func parseContentLength(headerBlock string) (int, bool) {
+func parseContentLength(headerBlock string) (int, string) {
 	offset := 0
 	contentLength := 0
 	seen := false
@@ -431,15 +437,15 @@ func parseContentLength(headerBlock string) (int, bool) {
 		}
 		v, err := strconv.Atoi(strings.TrimSpace(line[idx+1:]))
 		if err != nil || v < 0 {
-			return 0, false
+			return 0, "invalid"
 		}
 		if seen && v != contentLength {
-			return 0, false
+			return 0, "conflict"
 		}
 		contentLength = v
 		seen = true
 	}
-	return contentLength, true
+	return contentLength, ""
 }
 
 func scanHeaderLine(s string, offset int) (line string, next int, ok bool) {

@@ -4,18 +4,31 @@ package metrics
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/cci/traffic-engine/internal/config"
+	"github.com/cci/traffic-engine/internal/sip"
 )
 
 // ---------------------------------------------------------------------------
@@ -104,7 +117,10 @@ type TrafficMetrics struct {
 	// RR with usable LSR/DLSR comes back).
 	AvgRTTMs float64 `json:"avg_rtt_ms"`
 
-	HostHealth HostHealth `json:"host_health"`
+	HostHealth       HostHealth       `json:"host_health"`
+	ParserHealth     sip.ParserHealth `json:"parser_health"`
+	MediaSecurity    string           `json:"media_security"`
+	SRTPCryptoSuites []string         `json:"srtp_crypto_suites,omitempty"`
 }
 
 // SubscriptionEventStats exposes per-event-package subscription progress.
@@ -130,31 +146,36 @@ type CallResultData struct {
 	// was received from the caller. A call can be Answered=true and
 	// Success=false if the call was answered but media or BYE handshake
 	// failed afterwards.
-	Answered         bool
-	FailureReason    string
-	PDDMs            float64
-	HoldMs           float64
-	TotalMs          float64
-	RTPTxPkts        int
-	RTPRxPkts        int
-	MediaVerified    bool
-	RTPLocalPort     int
-	PoolWrapIndex    int
-	PeerExt          string
-	TsUTC            string
-	Direction        string
-	SBCRTPRelayIP    string
-	SBCRTPRelayPort  int
-	RTPRxFromSBCPkts int
-	RTPRxOtherPkts   int
-	RTCPRxPkts       int
-	RTPAsymmetryFlag string
-	MarkersSent      int
-	MarkersReceived  int
-	RTPExpectedPkts  int
-	RTPSSRCCount     int
-	Scenario         string
-	SipMilestones    json.RawMessage
+	Answered            bool
+	FailureReason       string
+	PDDMs               float64
+	HoldMs              float64
+	TotalMs             float64
+	RTPTxPkts           int
+	RTPRxPkts           int
+	MediaVerified       bool
+	RTPLocalPort        int
+	MediaSecurity       string
+	SRTPCryptoSuite     string
+	SRTPDecryptFailures int
+	SRTPAuthFailures    int
+	SRTPReplayFailures  int
+	PoolWrapIndex       int
+	PeerExt             string
+	TsUTC               string
+	Direction           string
+	SBCRTPRelayIP       string
+	SBCRTPRelayPort     int
+	RTPRxFromSBCPkts    int
+	RTPRxOtherPkts      int
+	RTCPRxPkts          int
+	RTPAsymmetryFlag    string
+	MarkersSent         int
+	MarkersReceived     int
+	RTPExpectedPkts     int
+	RTPSSRCCount        int
+	Scenario            string
+	SipMilestones       json.RawMessage
 
 	// QoS / Media metrics (Phase 1, mirrors engine.CallResult).
 	JitterMs         float64
@@ -706,35 +727,40 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 	out := make([]map[string]any, 0, len(c.callResults))
 	for _, r := range c.callResults {
 		m := map[string]any{
-			"call_id":              r.CallID,
-			"caller":               r.Caller,
-			"callee":               r.Callee,
-			"success":              r.Success,
-			"answered":             r.Answered,
-			"acknowledged":         r.Answered,
-			"failure_reason":       r.FailureReason,
-			"pdd_ms":               r.PDDMs,
-			"hold_ms":              r.HoldMs,
-			"total_ms":             r.TotalMs,
-			"rtp_tx_pkts":          r.RTPTxPkts,
-			"rtp_rx_pkts":          r.RTPRxPkts,
-			"media_verified":       r.MediaVerified,
-			"rtp_local_port":       r.RTPLocalPort,
-			"pool_wrap_index":      r.PoolWrapIndex,
-			"peer_ext":             r.PeerExt,
-			"ts_utc":               r.TsUTC,
-			"direction":            r.Direction,
-			"sbc_rtp_relay_ip":     r.SBCRTPRelayIP,
-			"sbc_rtp_relay_port":   r.SBCRTPRelayPort,
-			"rtp_rx_from_sbc_pkts": r.RTPRxFromSBCPkts,
-			"rtp_rx_other_pkts":    r.RTPRxOtherPkts,
-			"rtcp_rx_pkts":         r.RTCPRxPkts,
-			"rtp_asymmetry_flag":   r.RTPAsymmetryFlag,
-			"markers_sent":         r.MarkersSent,
-			"markers_received":     r.MarkersReceived,
-			"rtp_expected_pkts":    r.RTPExpectedPkts,
-			"rtp_ssrc_count":       r.RTPSSRCCount,
-			"scenario":             r.Scenario,
+			"call_id":               r.CallID,
+			"caller":                r.Caller,
+			"callee":                r.Callee,
+			"success":               r.Success,
+			"answered":              r.Answered,
+			"acknowledged":          r.Answered,
+			"failure_reason":        r.FailureReason,
+			"pdd_ms":                r.PDDMs,
+			"hold_ms":               r.HoldMs,
+			"total_ms":              r.TotalMs,
+			"rtp_tx_pkts":           r.RTPTxPkts,
+			"rtp_rx_pkts":           r.RTPRxPkts,
+			"media_verified":        r.MediaVerified,
+			"rtp_local_port":        r.RTPLocalPort,
+			"media_security":        r.MediaSecurity,
+			"srtp_crypto_suite":     r.SRTPCryptoSuite,
+			"srtp_decrypt_failures": r.SRTPDecryptFailures,
+			"srtp_auth_failures":    r.SRTPAuthFailures,
+			"srtp_replay_failures":  r.SRTPReplayFailures,
+			"pool_wrap_index":       r.PoolWrapIndex,
+			"peer_ext":              r.PeerExt,
+			"ts_utc":                r.TsUTC,
+			"direction":             r.Direction,
+			"sbc_rtp_relay_ip":      r.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":    r.SBCRTPRelayPort,
+			"rtp_rx_from_sbc_pkts":  r.RTPRxFromSBCPkts,
+			"rtp_rx_other_pkts":     r.RTPRxOtherPkts,
+			"rtcp_rx_pkts":          r.RTCPRxPkts,
+			"rtp_asymmetry_flag":    r.RTPAsymmetryFlag,
+			"markers_sent":          r.MarkersSent,
+			"markers_received":      r.MarkersReceived,
+			"rtp_expected_pkts":     r.RTPExpectedPkts,
+			"rtp_ssrc_count":        r.RTPSSRCCount,
+			"scenario":              r.Scenario,
 			// Phase-1 QoS fields
 			"jitter_ms":          r.JitterMs,
 			"packet_loss_pct":    r.PacketLossPct,
@@ -795,33 +821,38 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 		}
 
 		m := map[string]any{
-			"call_id":              callID,
-			"uac_ext":              caller,
-			"uas_ext":              callee,
-			"ext":                  ext,
-			"peer_ext":             cr.PeerExt,
-			"direction":            direction,
-			"result":               ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-			"answered":             cr.Answered,
-			"acknowledged":         cr.Answered,
-			"failure_reason":       nilIfEmpty(cr.FailureReason),
-			"pdd_ms":               cr.PDDMs,
-			"hold_ms":              cr.HoldMs,
-			"media_status":         media,
-			"rtp_tx_pkts":          cr.RTPTxPkts,
-			"rtp_rx_pkts":          cr.RTPRxPkts,
-			"rtp_rx_from_sbc_pkts": cr.RTPRxFromSBCPkts,
-			"rtp_rx_other_pkts":    cr.RTPRxOtherPkts,
-			"rtp_asymmetry_flag":   cr.RTPAsymmetryFlag,
-			"rtcp_rx_pkts":         cr.RTCPRxPkts,
-			"markers_sent":         cr.MarkersSent,
-			"markers_received":     cr.MarkersReceived,
-			"rtp_expected_pkts":    cr.RTPExpectedPkts,
-			"rtp_ssrc_count":       cr.RTPSSRCCount,
-			"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
-			"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
-			"ts_utc":               ts,
-			"timestamp":            ts,
+			"call_id":               callID,
+			"uac_ext":               caller,
+			"uas_ext":               callee,
+			"ext":                   ext,
+			"peer_ext":              cr.PeerExt,
+			"direction":             direction,
+			"result":                ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+			"answered":              cr.Answered,
+			"acknowledged":          cr.Answered,
+			"failure_reason":        nilIfEmpty(cr.FailureReason),
+			"pdd_ms":                cr.PDDMs,
+			"hold_ms":               cr.HoldMs,
+			"media_status":          media,
+			"media_security":        cr.MediaSecurity,
+			"srtp_crypto_suite":     cr.SRTPCryptoSuite,
+			"srtp_decrypt_failures": cr.SRTPDecryptFailures,
+			"srtp_auth_failures":    cr.SRTPAuthFailures,
+			"srtp_replay_failures":  cr.SRTPReplayFailures,
+			"rtp_tx_pkts":           cr.RTPTxPkts,
+			"rtp_rx_pkts":           cr.RTPRxPkts,
+			"rtp_rx_from_sbc_pkts":  cr.RTPRxFromSBCPkts,
+			"rtp_rx_other_pkts":     cr.RTPRxOtherPkts,
+			"rtp_asymmetry_flag":    cr.RTPAsymmetryFlag,
+			"rtcp_rx_pkts":          cr.RTCPRxPkts,
+			"markers_sent":          cr.MarkersSent,
+			"markers_received":      cr.MarkersReceived,
+			"rtp_expected_pkts":     cr.RTPExpectedPkts,
+			"rtp_ssrc_count":        cr.RTPSSRCCount,
+			"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
+			"ts_utc":                ts,
+			"timestamp":             ts,
 			// Phase-1 QoS fields
 			"jitter_ms":          cr.JitterMs,
 			"packet_loss_pct":    cr.PacketLossPct,
@@ -1048,6 +1079,21 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	if c.poolCountsProvider != nil {
 		idleCount, nonIdleCount, regOnlyCount = c.poolCountsProvider()
 	}
+	mediaSecurity := "rtp"
+	cryptoSuites := map[string]struct{}{}
+	for _, r := range c.callResults {
+		if r.MediaSecurity != "" {
+			mediaSecurity = r.MediaSecurity
+		}
+		if r.SRTPCryptoSuite != "" {
+			cryptoSuites[r.SRTPCryptoSuite] = struct{}{}
+		}
+	}
+	cryptoSuiteList := make([]string, 0, len(cryptoSuites))
+	for suite := range cryptoSuites {
+		cryptoSuiteList = append(cryptoSuiteList, suite)
+	}
+	sort.Strings(cryptoSuiteList)
 	hostHealth := HostHealth{}
 	if c.hostHealth != nil {
 		hostHealth = c.hostHealth.Snapshot()
@@ -1157,6 +1203,9 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		RTPAsymmetryFlag:  rtpAsymmetryFlag,
 		AvgRTTMs:          roundAvg(c.rttSamples),
 		HostHealth:        hostHealth,
+		ParserHealth:      sip.ParserHealthSnapshot(),
+		MediaSecurity:     mediaSecurity,
+		SRTPCryptoSuites:  cryptoSuiteList,
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],
@@ -1434,6 +1483,154 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 }
 
 // ---------------------------------------------------------------------------
+// TLS certificate helpers
+// ---------------------------------------------------------------------------
+
+var safeCertName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+func storeUploadedCertificate(kind string, header *multipart.FileHeader, file multipart.File) (map[string]any, error) {
+	switch kind {
+	case "ca", "client_cert", "client_key":
+	default:
+		return nil, fmt.Errorf("certificate type must be ca|client_cert|client_key")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty upload")
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("upload is not PEM")
+	}
+	resp := map[string]any{"kind": kind}
+	if kind == "ca" || kind == "client_cert" {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse certificate: %w", err)
+		}
+		sum := sha256.Sum256(cert.Raw)
+		resp["subject"] = cert.Subject.String()
+		resp["issuer"] = cert.Issuer.String()
+		resp["not_before"] = cert.NotBefore.Format(time.RFC3339)
+		resp["not_after"] = cert.NotAfter.Format(time.RFC3339)
+		resp["fingerprint_sha256"] = hex.EncodeToString(sum[:])
+	} else if !strings.Contains(block.Type, "PRIVATE KEY") {
+		return nil, fmt.Errorf("client_key upload must contain a private key PEM block")
+	}
+	dir := filepath.Join("certs", certSubdir(kind))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	name := safeCertName.ReplaceAllString(filepath.Base(header.Filename), "_")
+	if name == "" || name == "." {
+		name = kind + ".pem"
+	}
+	path := filepath.Join(dir, name)
+	perm := os.FileMode(0o644)
+	if kind == "client_key" {
+		perm = 0o600
+	}
+	if err := os.WriteFile(path, data, perm); err != nil {
+		return nil, err
+	}
+	resp["path"] = path
+	return resp, nil
+}
+
+func certSubdir(kind string) string {
+	switch kind {
+	case "ca":
+		return "ca"
+	case "client_cert":
+		return "client"
+	case "client_key":
+		return "private"
+	default:
+		return "misc"
+	}
+}
+
+func verifyTLSConfig(body map[string]any) (map[string]any, error) {
+	host := getString(body, "sbc_host")
+	port := int(getFloat(body, "sbc_port"))
+	if host == "" || port <= 0 {
+		return nil, fmt.Errorf("sbc_host and sbc_port are required")
+	}
+	cfg := &config.VMConfig{
+		VMID:          getString(body, "vm_id"),
+		SIPTransport:  "TLS",
+		SBCHost:       host,
+		SBCPort:       port,
+		TLSMode:       getString(body, "tls_mode"),
+		TLSCAPath:     getString(body, "tls_ca_path"),
+		TLSCertPath:   getString(body, "tls_cert_path"),
+		TLSKeyPath:    getString(body, "tls_key_path"),
+		TLSServerName: getString(body, "tls_server_name"),
+		TLSMinVersion: getString(body, "tls_min_version"),
+		TLSMaxVersion: getString(body, "tls_max_version"),
+	}
+	config.ApplyDefaults(cfg)
+	tlsCfg, err := config.BuildTLSConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	state := conn.ConnectionState()
+	resp := map[string]any{
+		"ok":                 true,
+		"negotiated_version": tlsVersionName(state.Version),
+		"cipher_suite":       tls.CipherSuiteName(state.CipherSuite),
+		"server_name":        cfg.TLSServerName,
+	}
+	if len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		sum := sha256.Sum256(cert.Raw)
+		resp["peer_subject"] = cert.Subject.String()
+		resp["peer_issuer"] = cert.Issuer.String()
+		resp["peer_not_after"] = cert.NotAfter.Format(time.RFC3339)
+		resp["fingerprint_sha256"] = hex.EncodeToString(sum[:])
+	}
+	return resp, nil
+}
+
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
+}
+
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getFloat(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	default:
+		return 0
+	}
+}
+
+// ---------------------------------------------------------------------------
 // JSON helpers
 // ---------------------------------------------------------------------------
 
@@ -1647,6 +1844,44 @@ func BuildMux(
 			"role":      cfgRole,
 			"yaml_path": yamlPath,
 		})
+	})
+
+	// POST /api/certificates/upload — store a PEM certificate/key under a
+	// managed cert directory and return the path that can be used in TLS config.
+	mux.HandleFunc("POST /api/certificates/upload", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("parse multipart: %v", err)})
+			return
+		}
+		kind := strings.TrimSpace(r.FormValue("type"))
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing file"})
+			return
+		}
+		defer file.Close()
+		resp, err := storeUploadedCertificate(kind, header, file)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+
+	// POST /api/tls/verify — attempt a TLS connection using the supplied TLS
+	// config and return the negotiated protocol/certificate summary.
+	mux.HandleFunc("POST /api/tls/verify", func(w http.ResponseWriter, r *http.Request) {
+		body, err := readJSONBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		resp, err := verifyTLSConfig(body)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	// POST /api/test/start
@@ -1879,33 +2114,38 @@ func BuildMux(
 			}
 
 			out = append(out, map[string]any{
-				"call_id":              callID,
-				"uac_ext":              caller,
-				"uas_ext":              callee,
-				"ext":                  ext,
-				"peer_ext":             cr.PeerExt,
-				"direction":            direction,
-				"result":               ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-				"answered":             cr.Answered,
-				"acknowledged":         cr.Answered,
-				"failure_reason":       nilIfEmpty(cr.FailureReason),
-				"pdd_ms":               cr.PDDMs,
-				"hold_ms":              cr.HoldMs,
-				"media_status":         media,
-				"rtp_tx_pkts":          cr.RTPTxPkts,
-				"rtp_rx_pkts":          cr.RTPRxPkts,
-				"rtp_rx_from_sbc_pkts": cr.RTPRxFromSBCPkts,
-				"rtp_rx_other_pkts":    cr.RTPRxOtherPkts,
-				"rtp_asymmetry_flag":   cr.RTPAsymmetryFlag,
-				"rtcp_rx_pkts":         cr.RTCPRxPkts,
-				"markers_sent":         cr.MarkersSent,
-				"markers_received":     cr.MarkersReceived,
-				"rtp_expected_pkts":    cr.RTPExpectedPkts,
-				"rtp_ssrc_count":       cr.RTPSSRCCount,
-				"sbc_rtp_relay_ip":     cr.SBCRTPRelayIP,
-				"sbc_rtp_relay_port":   cr.SBCRTPRelayPort,
-				"ts_utc":               ts,
-				"timestamp":            ts,
+				"call_id":               callID,
+				"uac_ext":               caller,
+				"uas_ext":               callee,
+				"ext":                   ext,
+				"peer_ext":              cr.PeerExt,
+				"direction":             direction,
+				"result":                ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+				"answered":              cr.Answered,
+				"acknowledged":          cr.Answered,
+				"failure_reason":        nilIfEmpty(cr.FailureReason),
+				"pdd_ms":                cr.PDDMs,
+				"hold_ms":               cr.HoldMs,
+				"media_status":          media,
+				"media_security":        cr.MediaSecurity,
+				"srtp_crypto_suite":     cr.SRTPCryptoSuite,
+				"srtp_decrypt_failures": cr.SRTPDecryptFailures,
+				"srtp_auth_failures":    cr.SRTPAuthFailures,
+				"srtp_replay_failures":  cr.SRTPReplayFailures,
+				"rtp_tx_pkts":           cr.RTPTxPkts,
+				"rtp_rx_pkts":           cr.RTPRxPkts,
+				"rtp_rx_from_sbc_pkts":  cr.RTPRxFromSBCPkts,
+				"rtp_rx_other_pkts":     cr.RTPRxOtherPkts,
+				"rtp_asymmetry_flag":    cr.RTPAsymmetryFlag,
+				"rtcp_rx_pkts":          cr.RTCPRxPkts,
+				"markers_sent":          cr.MarkersSent,
+				"markers_received":      cr.MarkersReceived,
+				"rtp_expected_pkts":     cr.RTPExpectedPkts,
+				"rtp_ssrc_count":        cr.RTPSSRCCount,
+				"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
+				"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
+				"ts_utc":                ts,
+				"timestamp":             ts,
 				// Phase-1 QoS fields
 				"jitter_ms":          cr.JitterMs,
 				"packet_loss_pct":    cr.PacketLossPct,

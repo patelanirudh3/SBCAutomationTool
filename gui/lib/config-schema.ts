@@ -34,6 +34,8 @@ export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
 export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
 export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
+export const MediaSecuritySchema = z.enum(['rtp', 'srtp_sdes'])
+export const SRTPCryptoSuiteSchema = z.enum(['AES_CM_128_HMAC_SHA1_80', 'AES_CM_128_HMAC_SHA1_32'])
 export const SubscribeEventSchema = z.enum(SUBSCRIBE_EVENT_VALUES)
 
 export const VMConfigSchema = z
@@ -80,6 +82,8 @@ export const VMConfigSchema = z
     tls_cert_path: z.string().optional(),
     tls_key_path: z.string().optional(),
     tls_server_name: z.string().optional(),
+    tls_min_version: z.enum(['1.2', '1.3']).optional(),
+    tls_max_version: z.enum(['auto', '1.2', '1.3']).optional(),
 
     register_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
     subscribe_expires: z.number().int().min(60, 'Minimum 60s').max(86400, 'Maximum 86400s (24h)').optional(),
@@ -97,6 +101,9 @@ export const VMConfigSchema = z
     // VMConfig.RampUpSeconds semantics in go/internal/engine/call_engine.go.
     ramp_up_seconds: z.number().int().nonnegative('Ramp-up must be ≥ 0').max(3600, 'Cannot exceed 3600s').optional(),
     media_enabled: z.boolean().optional(),
+    media_security: MediaSecuritySchema.optional(),
+    srtp_crypto_suites: z.array(SRTPCryptoSuiteSchema).optional(),
+    srtp_key_mode: z.literal('auto').optional(),
     rtp_codec: RtpCodecSchema.optional(),
     rtp_ptime: z.number().int().min(10).max(80).optional(),
     metrics_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
@@ -138,6 +145,14 @@ export const VMConfigSchema = z
       })
     }
 
+    if (data.sip_scheme === 'SIPS' && data.sip_transport !== 'TLS') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['sip_scheme'],
+        message: 'SIPS requires TLS transport',
+      })
+    }
+
     const selected = new Set(data.subscribe_events ?? [])
     for (const event of data.subscribe_refresh_events ?? []) {
       if (!selected.has(event)) {
@@ -160,6 +175,15 @@ export const VMConfigSchema = z
 
     if (data.sip_transport === 'TLS') {
       const mode = data.tls_mode ?? 'insecure'
+      const min = data.tls_min_version ?? '1.2'
+      const max = data.tls_max_version ?? 'auto'
+      if (max !== 'auto' && Number(max) < Number(min)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['tls_max_version'],
+          message: 'Max TLS version cannot be lower than minimum',
+        })
+      }
       if ((mode === 'server_ca' || mode === 'mutual') && !data.tls_ca_path) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -182,6 +206,23 @@ export const VMConfigSchema = z
             message: 'Client private key path is required for this TLS mode',
           })
         }
+      }
+    }
+
+    if (data.media_security === 'srtp_sdes') {
+      if (data.media_enabled === false) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['media_security'],
+          message: 'SRTP requires media to be enabled',
+        })
+      }
+      if (!data.srtp_crypto_suites || data.srtp_crypto_suites.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['srtp_crypto_suites'],
+          message: 'Select at least one SRTP crypto suite',
+        })
       }
     }
   })

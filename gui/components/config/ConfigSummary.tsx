@@ -93,6 +93,13 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
 
   const media: SummaryItem[] = raw.media_enabled
     ? [
+        { label: 'Security', value: raw.media_security === 'srtp_sdes' ? 'SRTP (SDES)' : 'RTP' },
+        ...(raw.media_security === 'srtp_sdes'
+          ? [
+              { label: 'SRTP Suites', value: raw.srtp_crypto_suites.join(', ') || '—' },
+              { label: 'SRTP Keys', value: 'Auto per call' },
+            ]
+          : []),
         { label: 'Codec', value: raw.rtp_codec },
         { label: 'ptime', value: `${raw.rtp_ptime || '20'}ms` },
       ]

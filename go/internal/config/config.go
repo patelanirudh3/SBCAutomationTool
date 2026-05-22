@@ -32,6 +32,7 @@ type VMConfig struct {
 	FailoverEnabled bool   `yaml:"failover_enabled" json:"failover_enabled"`
 	DNSServers      string `yaml:"dns_servers" json:"dns_servers"`
 	SIPTransport    string `yaml:"sip_transport" json:"sip_transport"`
+	SIPScheme       string `yaml:"sip_scheme" json:"sip_scheme"`
 	Domain          string `yaml:"domain" json:"domain"`
 	SIPPassword     string `yaml:"sip_password" json:"sip_password"`
 
@@ -48,6 +49,8 @@ type VMConfig struct {
 	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSMinVersion string `yaml:"tls_min_version" json:"tls_min_version"`
+	TLSMaxVersion string `yaml:"tls_max_version" json:"tls_max_version"`
 
 	CPS             int `yaml:"cps" json:"cps"`
 	HoldTimeSeconds int `yaml:"hold_time_seconds" json:"hold_time_seconds"`
@@ -78,19 +81,22 @@ type VMConfig struct {
 	LocalHost          string `yaml:"local_host" json:"local_host"`
 	LocalPort          int    `yaml:"local_port" json:"local_port"`
 
-	RTPBurstSeconds             int    `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
-	RTPBurstPPS                 int    `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
-	RTPKeepaliveInterval        int    `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
-	MediaEnabled                bool   `yaml:"media_enabled" json:"media_enabled"`
-	RTPMode                     string `yaml:"rtp_mode" json:"rtp_mode"`
-	RTPPtime                    int    `yaml:"rtp_ptime" json:"rtp_ptime"`
-	RTPPcap                     bool   `yaml:"rtp_pcap" json:"rtp_pcap"`
-	RTPMediaCoveragePct         int    `yaml:"rtp_media_coverage_pct" json:"rtp_media_coverage_pct"`
-	RTPStartBurstSharePct       int    `yaml:"rtp_start_burst_share_pct" json:"rtp_start_burst_share_pct"`
-	RTPEndBurstSharePct         int    `yaml:"rtp_end_burst_share_pct" json:"rtp_end_burst_share_pct"`
-	RTPMidBurstSeconds          int    `yaml:"rtp_mid_burst_seconds" json:"rtp_mid_burst_seconds"`
-	RTPCoverageKeepaliveEnabled *bool  `yaml:"rtp_coverage_keepalive_enabled,omitempty" json:"rtp_coverage_keepalive_enabled,omitempty"`
-	RTPCoverageKeepalivePPS     int    `yaml:"rtp_coverage_keepalive_pps" json:"rtp_coverage_keepalive_pps"`
+	RTPBurstSeconds             int      `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
+	RTPBurstPPS                 int      `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
+	RTPKeepaliveInterval        int      `yaml:"rtp_keepalive_interval" json:"rtp_keepalive_interval"`
+	MediaEnabled                bool     `yaml:"media_enabled" json:"media_enabled"`
+	MediaSecurity               string   `yaml:"media_security" json:"media_security"` // "rtp" | "srtp_sdes"
+	SRTPCryptoSuites            []string `yaml:"srtp_crypto_suites" json:"srtp_crypto_suites"`
+	SRTPKeyMode                 string   `yaml:"srtp_key_mode" json:"srtp_key_mode"` // "auto"
+	RTPMode                     string   `yaml:"rtp_mode" json:"rtp_mode"`
+	RTPPtime                    int      `yaml:"rtp_ptime" json:"rtp_ptime"`
+	RTPPcap                     bool     `yaml:"rtp_pcap" json:"rtp_pcap"`
+	RTPMediaCoveragePct         int      `yaml:"rtp_media_coverage_pct" json:"rtp_media_coverage_pct"`
+	RTPStartBurstSharePct       int      `yaml:"rtp_start_burst_share_pct" json:"rtp_start_burst_share_pct"`
+	RTPEndBurstSharePct         int      `yaml:"rtp_end_burst_share_pct" json:"rtp_end_burst_share_pct"`
+	RTPMidBurstSeconds          int      `yaml:"rtp_mid_burst_seconds" json:"rtp_mid_burst_seconds"`
+	RTPCoverageKeepaliveEnabled *bool    `yaml:"rtp_coverage_keepalive_enabled,omitempty" json:"rtp_coverage_keepalive_enabled,omitempty"`
+	RTPCoverageKeepalivePPS     int      `yaml:"rtp_coverage_keepalive_pps" json:"rtp_coverage_keepalive_pps"`
 
 	TrafficMode   string  `yaml:"traffic_mode" json:"traffic_mode"`
 	CallCount     int     `yaml:"call_count" json:"call_count"`
@@ -157,6 +163,17 @@ func (c *VMConfig) IsRTCPMuxEnabled() bool {
 // low-rate RTP during idle gaps between full-rate coverage bursts.
 func (c *VMConfig) IsRTPCoverageKeepaliveEnabled() bool {
 	return c.RTPCoverageKeepaliveEnabled == nil || *c.RTPCoverageKeepaliveEnabled
+}
+
+func (c *VMConfig) IsSRTPSDESEnabled() bool {
+	return strings.EqualFold(c.MediaSecurity, "srtp_sdes")
+}
+
+func (c *VMConfig) URIScheme() string {
+	if strings.EqualFold(c.SIPScheme, "SIPS") {
+		return "sips"
+	}
+	return "sip"
 }
 
 // ExtCount returns the total number of extensions in the configured range.
@@ -354,6 +371,18 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RTPPtime == 0 {
 		cfg.RTPPtime = 20
 	}
+	if cfg.SIPScheme == "" {
+		cfg.SIPScheme = "SIP"
+	}
+	if cfg.MediaSecurity == "" {
+		cfg.MediaSecurity = "rtp"
+	}
+	if len(cfg.SRTPCryptoSuites) == 0 {
+		cfg.SRTPCryptoSuites = []string{"AES_CM_128_HMAC_SHA1_80"}
+	}
+	if cfg.SRTPKeyMode == "" {
+		cfg.SRTPKeyMode = "auto"
+	}
 	if cfg.RTPMediaCoveragePct == 0 {
 		cfg.RTPMediaCoveragePct = 25
 	}
@@ -383,6 +412,12 @@ func ApplyDefaults(cfg *VMConfig) {
 	// preserve backward compatibility with configs that just say sip_transport: TLS.
 	if strings.EqualFold(cfg.SIPTransport, "TLS") && cfg.TLSMode == "" {
 		cfg.TLSMode = "insecure"
+	}
+	if cfg.TLSMinVersion == "" {
+		cfg.TLSMinVersion = "1.2"
+	}
+	if cfg.TLSMaxVersion == "" {
+		cfg.TLSMaxVersion = "auto"
 	}
 	if cfg.SBCPort == 0 {
 		cfg.SBCPort = 5060
@@ -577,9 +612,27 @@ func Validate(cfg *VMConfig) error {
 	if transport != "TCP" && transport != "TLS" && transport != "UDP" {
 		errs = append(errs, fmt.Sprintf("sip_transport must be TCP/TLS/UDP, got %q", cfg.SIPTransport))
 	}
+	scheme := strings.ToUpper(cfg.SIPScheme)
+	if scheme != "SIP" && scheme != "SIPS" {
+		errs = append(errs, fmt.Sprintf("sip_scheme must be SIP or SIPS, got %q", cfg.SIPScheme))
+	}
+	if scheme == "SIPS" && transport != "TLS" {
+		errs = append(errs, "sip_scheme=SIPS requires sip_transport=TLS")
+	}
 
 	if transport == "TLS" {
 		mode := strings.ToLower(cfg.TLSMode)
+		minTLS, minOK := parseTLSVersionName(cfg.TLSMinVersion)
+		maxTLS, maxOK := parseTLSMaxVersionName(cfg.TLSMaxVersion)
+		if !minOK {
+			errs = append(errs, fmt.Sprintf("tls_min_version must be 1.2 or 1.3, got %q", cfg.TLSMinVersion))
+		}
+		if !maxOK {
+			errs = append(errs, fmt.Sprintf("tls_max_version must be auto, 1.2, or 1.3, got %q", cfg.TLSMaxVersion))
+		}
+		if minOK && maxOK && maxTLS != 0 && maxTLS < minTLS {
+			errs = append(errs, "tls_max_version cannot be lower than tls_min_version")
+		}
 		switch mode {
 		case "", "insecure":
 		case "server_ca":
@@ -655,6 +708,32 @@ func Validate(cfg *VMConfig) error {
 	}
 	if cfg.RTPPtime != 20 && cfg.RTPPtime != 40 {
 		errs = append(errs, fmt.Sprintf("rtp_ptime must be 20 or 40, got %d", cfg.RTPPtime))
+	}
+	switch cfg.MediaSecurity {
+	case "rtp", "srtp_sdes":
+	default:
+		errs = append(errs, fmt.Sprintf("media_security must be 'rtp' or 'srtp_sdes', got %q", cfg.MediaSecurity))
+	}
+	if cfg.IsSRTPSDESEnabled() {
+		if !cfg.MediaEnabled {
+			errs = append(errs, "media_security='srtp_sdes' requires media_enabled=true")
+		}
+		if cfg.IsRTCPSREnabled() {
+			errs = append(errs, "rtcp_sr_enabled is not supported with SRTP until SRTCP support is implemented")
+		}
+		if cfg.SRTPKeyMode != "auto" {
+			errs = append(errs, fmt.Sprintf("srtp_key_mode must be 'auto', got %q", cfg.SRTPKeyMode))
+		}
+		if len(cfg.SRTPCryptoSuites) == 0 {
+			errs = append(errs, "srtp_crypto_suites must contain at least one suite when SRTP is enabled")
+		}
+	}
+	for _, suite := range cfg.SRTPCryptoSuites {
+		switch suite {
+		case "AES_CM_128_HMAC_SHA1_80", "AES_CM_128_HMAC_SHA1_32":
+		default:
+			errs = append(errs, fmt.Sprintf("unsupported srtp_crypto_suite %q", suite))
+		}
 	}
 	if cfg.RTPMode == "3phase_coverage" {
 		if cfg.RTPMediaCoveragePct < 1 || cfg.RTPMediaCoveragePct > 100 {
@@ -732,6 +811,7 @@ func Validate(cfg *VMConfig) error {
 		"secondary_host", fmt.Sprintf("%s:%d", cfg.SecondaryHost, cfg.SecondaryPort),
 		"dns_servers", cfg.DNSServers,
 		"transport", cfg.SIPTransport,
+		"sip_scheme", cfg.SIPScheme,
 		"cps", cfg.CPS,
 		"hold_s", cfg.HoldTimeSeconds,
 		"ext_range", fmt.Sprintf("%d-%d (%d)", cfg.ExtStart, cfg.ExtEnd, cfg.ExtCount()),
@@ -745,6 +825,8 @@ func Validate(cfg *VMConfig) error {
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
 		"register_timeout", cfg.RegisterTimeout,
+		"media_security", cfg.MediaSecurity,
+		"srtp_crypto_suites", cfg.SRTPCryptoSuites,
 		"rtp_mode", cfg.RTPMode,
 		"traffic_mode", cfg.TrafficMode,
 	)

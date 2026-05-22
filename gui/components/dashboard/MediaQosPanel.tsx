@@ -5,6 +5,8 @@ import { cn } from '@/lib/utils'
 import type { AdvancedSettings } from '@/types'
 
 export interface RtpFlowStats {
+  mediaSecurity?: string | null
+  srtpCryptoSuites?: string[] | null
   configuredPacketsPerDirection?: number | null
   avgTxPackets?: number | null
   avgRxFromSbcPackets?: number | null
@@ -146,6 +148,8 @@ function asymmetryTone(flag?: string | null): 'default' | 'success' | 'warning' 
 
 export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEnabled, rtpFlow }: MediaQosPanelProps) {
   const isPending = jitterMs == null && mosEstimate == null && qosScore == null
+  const isSRTP = rtpFlow?.mediaSecurity === 'srtp_sdes'
+  const mediaLabel = isSRTP ? 'SRTP' : 'RTP'
 
   // RTT card is shown only when RTCP SR is enabled — otherwise the SBC has
   // never received an SR from us so the field would always read 0/—.
@@ -157,6 +161,9 @@ export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEn
       <div className="flex items-center gap-2">
         <Activity className="size-4 text-sky-400" />
         <span className="text-sm font-semibold text-slate-200">Media &amp; QoS</span>
+        <span className="rounded border border-slate-700 bg-slate-900/50 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+          {isSRTP ? `SRTP (SDES${rtpFlow?.srtpCryptoSuites?.length ? ` · ${rtpFlow.srtpCryptoSuites.join(', ')}` : ''})` : 'RTP'}
+        </span>
         {isPending && (
           <span className="ml-auto flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
             <Construction className="size-3" />
@@ -173,7 +180,7 @@ export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEn
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Radio className="size-3.5 text-indigo-400" />
-          <span className="text-xs font-bold uppercase tracking-wide text-slate-300">RTP Flow</span>
+          <span className="text-xs font-bold uppercase tracking-wide text-slate-300">{mediaLabel} Flow</span>
         </div>
         <div className="grid gap-3 sm:grid-cols-4">
           <FlowCard
@@ -194,15 +201,15 @@ export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEn
           />
           <FlowCard
             icon={Percent}
-            label="RTP Loss"
+            label={`${mediaLabel} Loss`}
             value={typeof rtpFlow?.lossPct === 'number' ? `${rtpFlow.lossPct.toFixed(2)}%` : '—'}
             sub={`${formatCount(rtpFlow?.totalLostPackets)} lost / ${formatCount(rtpFlow?.totalExpectedPackets)} expected`}
             tone={(rtpFlow?.lossPct ?? 0) > 5 ? 'danger' : (rtpFlow?.lossPct ?? 0) > 1 ? 'warning' : 'success'}
           />
         </div>
         <div className="grid gap-3 sm:grid-cols-4">
-          <FlowCard icon={Send} label="Total RTP TX" value={formatCount(rtpFlow?.totalTxPackets)} />
-          <FlowCard icon={Download} label="Total RTP RX" value={formatCount(rtpFlow?.totalRxFromSbcPackets ?? rtpFlow?.totalRxPackets)} sub="from SBC" />
+          <FlowCard icon={Send} label={`Total ${mediaLabel} TX`} value={formatCount(rtpFlow?.totalTxPackets)} />
+          <FlowCard icon={Download} label={`Total ${mediaLabel} RX`} value={formatCount(rtpFlow?.totalRxFromSbcPackets ?? rtpFlow?.totalRxPackets)} sub="from SBC" />
           <FlowCard
             icon={Gauge}
             label="TX/RX Asymmetry"

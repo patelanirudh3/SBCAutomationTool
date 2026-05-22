@@ -18,8 +18,9 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
-import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode } from '@/types'
+import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { SUBSCRIBE_EVENT_OPTIONS, SUBSCRIBE_EVENT_VALUES } from '@/lib/subscription-events'
+import { uploadCertificateFor, verifyTLSFor, type TLSVerifyResult } from '@/lib/api'
 
 // All form values stored as strings so inputs stay fully controlled
 export type RawVMFormValues = {
@@ -58,12 +59,17 @@ export type RawVMFormValues = {
   tls_cert_path: string
   tls_key_path: string
   tls_server_name: string
+  tls_min_version: '1.2' | '1.3'
+  tls_max_version: 'auto' | '1.2' | '1.3'
   // Traffic
   cps: string
   hold_time_seconds: string
   ramp_up_seconds: string
   // Media
   media_enabled: boolean
+  media_security: MediaSecurity | 'capneg'
+  srtp_crypto_suites: SRTPCryptoSuite[]
+  srtp_key_mode: 'auto'
   rtp_codec: RtpCodec
   rtp_ptime: string
   // Engine
@@ -113,7 +119,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
     'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
     'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
-    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name',
+    'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
   ],
   signaling: [
     'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps',
@@ -124,7 +130,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'cps', 'hold_time_seconds', 'ramp_up_seconds',
     'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
   ],
-  media: ['media_enabled', 'rtp_codec', 'rtp_ptime'],
+  media: ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_ptime'],
 }
 
 // Default values for the Registration section — used to detect "dirty" state
@@ -146,11 +152,11 @@ const SECTION_FIELDS = {
   agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
-                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name'] as (keyof RawVMFormValues)[],
+                  'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
-  media:          ['media_enabled', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
+  media:          ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
 
 // ---------------------------------------------------------------------------
@@ -543,6 +549,56 @@ export function VMConfigPanel({
   const t = (field: string) => touched.has(field)
 
   const extCount = parseInt(raw.ext_count) || 0
+  const [tlsBusy, setTLSBusy] = useState<string | null>(null)
+  const [tlsVerify, setTLSVerify] = useState<TLSVerifyResult | null>(null)
+  const [tlsUploadError, setTLSUploadError] = useState<string | null>(null)
+  const uploadTLSFile = async (kind: 'ca' | 'client_cert' | 'client_key', file?: File) => {
+    if (!file) return
+    setTLSBusy(kind)
+    setTLSUploadError(null)
+    setTLSVerify(null)
+    try {
+      const result = await uploadCertificateFor(raw.vm_ip || '127.0.0.1', parseInt(raw.metrics_port) || 8082, kind, file)
+      if (kind === 'ca') onChange('tls_ca_path', result.path)
+      if (kind === 'client_cert') onChange('tls_cert_path', result.path)
+      if (kind === 'client_key') onChange('tls_key_path', result.path)
+    } catch (err) {
+      setTLSUploadError(err instanceof Error ? err.message : 'Certificate upload failed')
+    } finally {
+      setTLSBusy(null)
+    }
+  }
+  const tlsVerifyBlocked =
+    raw.sip_transport === 'TLS' &&
+    ((raw.tls_mode === 'server_ca' || raw.tls_mode === 'mutual') && !raw.tls_ca_path ||
+      (raw.tls_mode === 'client_cert' || raw.tls_mode === 'mutual') && (!raw.tls_cert_path || !raw.tls_key_path))
+  const verifyTLS = async () => {
+    if (tlsVerifyBlocked) {
+      setTLSVerify({ ok: false, error: 'Upload the required TLS certificate/key files before testing TLS' })
+      return
+    }
+    setTLSBusy('verify')
+    setTLSVerify(null)
+    try {
+      const result = await verifyTLSFor(raw.vm_ip || '127.0.0.1', parseInt(raw.metrics_port) || 8082, {
+        vm_id: raw.vm_id,
+        sbc_host: raw.sbc_host,
+        sbc_port: parseInt(raw.sbc_port) || 5061,
+        tls_mode: raw.tls_mode,
+        tls_ca_path: raw.tls_ca_path,
+        tls_cert_path: raw.tls_cert_path,
+        tls_key_path: raw.tls_key_path,
+        tls_server_name: raw.tls_server_name,
+        tls_min_version: raw.tls_min_version,
+        tls_max_version: raw.tls_max_version,
+      })
+      setTLSVerify(result)
+    } catch (err) {
+      setTLSVerify({ ok: false, error: err instanceof Error ? err.message : 'TLS verification failed' })
+    } finally {
+      setTLSBusy(null)
+    }
+  }
 
   const handleIpBlur = () => {
     onBlur('vm_ip')
@@ -700,7 +756,18 @@ export function VMConfigPanel({
             />
             <Select
               value={raw.sip_transport}
-              onValueChange={(v) => { onChange('sip_transport', v as SipTransport); onBlur('sip_transport') }}
+              onValueChange={(v) => {
+                const transport = v as SipTransport
+                onChange('sip_transport', transport)
+                if (transport === 'TLS') onChange('sbc_port', '5061')
+                if (transport === 'TCP') {
+                  onChange('sbc_port', '5060')
+                  onChange('sip_scheme', 'SIP')
+                  onBlur('sip_scheme')
+                }
+                onBlur('sip_transport')
+                onBlur('sbc_port')
+              }}
             >
               <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -726,7 +793,17 @@ export function VMConfigPanel({
           <div className="flex flex-wrap items-center gap-1.5">
             <Select
               value={raw.sip_scheme}
-              onValueChange={(v) => { onChange('sip_scheme', v as SipScheme); onBlur('sip_scheme') }}
+              onValueChange={(v) => {
+                const scheme = v as SipScheme
+                onChange('sip_scheme', scheme)
+                if (scheme === 'SIPS') {
+                  onChange('sip_transport', 'TLS')
+                  onChange('sbc_port', '5061')
+                  onBlur('sip_transport')
+                  onBlur('sbc_port')
+                }
+                onBlur('sip_scheme')
+              }}
             >
               <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -748,6 +825,9 @@ export function VMConfigPanel({
               {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
               {e('domain')     && <FieldError error={e('domain')} />}
             </>
+          )}
+          {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
+            <FieldError error="SIPS requires TLS transport." />
           )}
         </FormRow>
 
@@ -776,61 +856,131 @@ export function VMConfigPanel({
               </Select>
             </FormRow>
 
+            <FormRow label="TLS Version" error={e('tls_min_version') || e('tls_max_version')} hint="Default supports TLS 1.2 and TLS 1.3, negotiating the highest version supported by the SBC.">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-slate-400">Min</span>
+                <Select
+                  value={raw.tls_min_version || '1.2'}
+                  onValueChange={(v) => { onChange('tls_min_version', v as '1.2' | '1.3'); onBlur('tls_min_version') }}
+                >
+                  <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="1.2">TLS 1.2</SelectItem>
+                    <SelectItem value="1.3">TLS 1.3</SelectItem>
+                  </SelectContent>
+                </Select>
+                <span className="text-xs text-slate-400">Max</span>
+                <Select
+                  value={raw.tls_max_version || 'auto'}
+                  onValueChange={(v) => { onChange('tls_max_version', v as 'auto' | '1.2' | '1.3'); onBlur('tls_max_version') }}
+                >
+                  <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto</SelectItem>
+                    <SelectItem value="1.2">TLS 1.2</SelectItem>
+                    <SelectItem value="1.3">TLS 1.3</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </FormRow>
+
             {(raw.tls_mode === 'server_ca' || raw.tls_mode === 'mutual') && (
               <FormRow
-                label="CA Cert Path"
+                label="CA Certificate"
                 error={e('tls_ca_path')}
-                hint="PEM file on the engine VM, e.g. /etc/ssl/certs/sbc-ca.pem"
+                hint="Upload a CA certificate PEM/CRT from your laptop. The engine stores it under its managed certs/ca directory."
               >
                 <Input
-                  value={raw.tls_ca_path}
-                  onChange={(ev) => onChange('tls_ca_path', ev.target.value)}
-                  onBlur={() => onBlur('tls_ca_path')}
-                  placeholder="/path/to/ca.pem"
-                  className="w-72 font-mono text-xs"
-                  aria-invalid={t('tls_ca_path') && !!errors.tls_ca_path ? true : undefined}
+                  type="file"
+                  accept=".pem,.crt,.cer,.cacrt,.ca"
+                  className="w-72 text-xs"
+                  disabled={tlsBusy === 'ca'}
+                  onChange={(ev) => uploadTLSFile('ca', ev.target.files?.[0])}
                 />
+                {tlsBusy === 'ca' && <p className="mt-1 text-xs text-slate-400">Uploading CA certificate...</p>}
+                {raw.tls_ca_path && <p className="mt-1 text-xs text-emerald-300">CA certificate installed on engine VM.</p>}
+                {raw.tls_ca_path && (
+                  <details className="mt-2 text-xs text-slate-400">
+                    <summary className="cursor-pointer text-slate-500">Advanced: stored CA path</summary>
+                    <Input
+                      value={raw.tls_ca_path}
+                      onChange={(ev) => onChange('tls_ca_path', ev.target.value)}
+                      onBlur={() => onBlur('tls_ca_path')}
+                      placeholder="certs/ca/ca.pem"
+                      className="mt-2 w-72 font-mono text-xs"
+                      aria-invalid={t('tls_ca_path') && !!errors.tls_ca_path ? true : undefined}
+                    />
+                  </details>
+                )}
               </FormRow>
             )}
 
             {(raw.tls_mode === 'client_cert' || raw.tls_mode === 'mutual') && (
               <>
                 <FormRow
-                  label="Client Cert Path"
+                  label="Client Certificate"
                   error={e('tls_cert_path')}
-                  hint="PEM containing the tool's identity certificate."
+                  hint="Upload the tool's client certificate PEM/CRT. The engine stores it under certs/client."
                 >
                   <Input
-                    value={raw.tls_cert_path}
-                    onChange={(ev) => onChange('tls_cert_path', ev.target.value)}
-                    onBlur={() => onBlur('tls_cert_path')}
-                    placeholder="/path/to/client.crt"
-                    className="w-72 font-mono text-xs"
-                    aria-invalid={t('tls_cert_path') && !!errors.tls_cert_path ? true : undefined}
+                    type="file"
+                    accept=".pem,.crt,.cer,.cacrt,.ca"
+                    className="w-72 text-xs"
+                    disabled={tlsBusy === 'client_cert'}
+                    onChange={(ev) => uploadTLSFile('client_cert', ev.target.files?.[0])}
                   />
+                  {tlsBusy === 'client_cert' && <p className="mt-1 text-xs text-slate-400">Uploading client certificate...</p>}
+                  {raw.tls_cert_path && <p className="mt-1 text-xs text-emerald-300">Client certificate installed on engine VM.</p>}
+                  {raw.tls_cert_path && (
+                    <details className="mt-2 text-xs text-slate-400">
+                      <summary className="cursor-pointer text-slate-500">Advanced: stored client cert path</summary>
+                      <Input
+                        value={raw.tls_cert_path}
+                        onChange={(ev) => onChange('tls_cert_path', ev.target.value)}
+                        onBlur={() => onBlur('tls_cert_path')}
+                        placeholder="certs/client/client.crt"
+                        className="mt-2 w-72 font-mono text-xs"
+                        aria-invalid={t('tls_cert_path') && !!errors.tls_cert_path ? true : undefined}
+                      />
+                    </details>
+                  )}
                 </FormRow>
                 <FormRow
-                  label="Client Key Path"
+                  label="Client Private Key"
                   error={e('tls_key_path')}
-                  hint="Private key (chmod 600 on the VM). Must match the certificate above."
+                  hint="Upload the matching private key PEM. The engine stores it under certs/private with restricted permissions."
                 >
                   <Input
-                    value={raw.tls_key_path}
-                    onChange={(ev) => onChange('tls_key_path', ev.target.value)}
-                    onBlur={() => onBlur('tls_key_path')}
-                    placeholder="/path/to/client.key"
-                    className="w-72 font-mono text-xs"
-                    aria-invalid={t('tls_key_path') && !!errors.tls_key_path ? true : undefined}
+                    type="file"
+                    accept=".pem,.key"
+                    className="w-72 text-xs"
+                    disabled={tlsBusy === 'client_key'}
+                    onChange={(ev) => uploadTLSFile('client_key', ev.target.files?.[0])}
                   />
+                  {tlsBusy === 'client_key' && <p className="mt-1 text-xs text-slate-400">Uploading private key...</p>}
+                  {raw.tls_key_path && <p className="mt-1 text-xs text-emerald-300">Private key installed on engine VM.</p>}
+                  {raw.tls_key_path && (
+                    <details className="mt-2 text-xs text-slate-400">
+                      <summary className="cursor-pointer text-slate-500">Advanced: stored private key path</summary>
+                      <Input
+                        value={raw.tls_key_path}
+                        onChange={(ev) => onChange('tls_key_path', ev.target.value)}
+                        onBlur={() => onBlur('tls_key_path')}
+                        placeholder="certs/private/client.key"
+                        className="mt-2 w-72 font-mono text-xs"
+                        aria-invalid={t('tls_key_path') && !!errors.tls_key_path ? true : undefined}
+                      />
+                    </details>
+                  )}
                 </FormRow>
               </>
             )}
 
             {raw.tls_mode && raw.tls_mode !== 'insecure' && (
               <FormRow
-                label="Server Name (SNI)"
+                label="Server Name / SNI (optional)"
                 error={e('tls_server_name')}
-                hint="Override only if the SBC certificate CN/SAN differs from the host above."
+                hint="Optional. Use only when connecting by IP or alias but the certificate is issued to a different DNS name."
               >
                 <Input
                   value={raw.tls_server_name}
@@ -841,6 +991,31 @@ export function VMConfigPanel({
                 />
               </FormRow>
             )}
+            <FormRow label="Verify TLS">
+              <div className="space-y-2">
+                <Button type="button" size="sm" variant="outline" disabled={tlsBusy === 'verify'} onClick={verifyTLS}>
+                  {tlsBusy === 'verify' ? 'Testing TLS...' : 'Test TLS'}
+                </Button>
+                {tlsUploadError && (
+                  <div className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                    Certificate upload failed: {tlsUploadError}
+                  </div>
+                )}
+                {tlsVerifyBlocked && !tlsVerify && (
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                    Upload the required TLS certificate/key files before testing TLS.
+                  </div>
+                )}
+                {tlsVerify && (
+                  <div className={cn('rounded-md border px-3 py-2 text-xs', tlsVerify.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-rose-500/30 bg-rose-500/10 text-rose-300')}>
+                    {tlsVerify.ok
+                      ? `Verified ${tlsVerify.negotiated_version ?? ''} ${tlsVerify.cipher_suite ?? ''}`
+                      : `TLS verification failed: ${tlsVerify.error ?? 'unknown error'}`}
+                    {tlsVerify.peer_not_after && <div className="mt-1 text-slate-400">Peer cert expires: {tlsVerify.peer_not_after}</div>}
+                  </div>
+                )}
+              </div>
+            </FormRow>
           </div>
         )}
 
@@ -1315,6 +1490,94 @@ export function VMConfigPanel({
 
         {raw.media_enabled && (
           <>
+            <FormRow
+              label="Media Type"
+              hint="RTP is the default. SRTP (SDES) currently negotiates SDP crypto lines; media encryption is planned for the next phase. CAPNEG is shown for future support."
+            >
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { value: 'rtp', label: 'RTP', disabled: false },
+                  { value: 'srtp_sdes', label: 'SRTP (SDES)', disabled: false },
+                  { value: 'capneg', label: 'CAPNEG (future)', disabled: true },
+                ].map((option) => (
+                  <label
+                    key={option.value}
+                    className={cn(
+                      'flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs font-semibold',
+                      option.disabled
+                        ? 'cursor-not-allowed border-slate-800 bg-slate-900/20 text-slate-600'
+                        : raw.media_security === option.value
+                          ? 'border-emerald-500/50 bg-emerald-500/10 text-slate-100'
+                          : 'cursor-pointer border-slate-700 bg-slate-900/30 text-slate-400 hover:border-slate-500 hover:text-slate-200',
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="media_security"
+                      checked={raw.media_security === option.value}
+                      disabled={option.disabled}
+                      onChange={() => {
+                        if (!option.disabled) {
+                          onChange('media_security', option.value as MediaSecurity)
+                          onBlur('media_security')
+                        }
+                      }}
+                      className="size-3.5 accent-emerald-500"
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
+              </div>
+              {e('media_security') && <FieldError error={e('media_security')} />}
+            </FormRow>
+            <FormRow
+              label="SRTP Crypto Suite"
+              hint="Select one or more SDES crypto suites to advertise when SRTP is selected."
+            >
+              <div className="flex flex-wrap gap-2">
+                {(['AES_CM_128_HMAC_SHA1_80', 'AES_CM_128_HMAC_SHA1_32'] as SRTPCryptoSuite[]).map((suite) => {
+                  const enabled = raw.media_security === 'srtp_sdes'
+                  const checked = raw.srtp_crypto_suites.includes(suite)
+                  return (
+                    <label
+                      key={suite}
+                      className={cn(
+                        'flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs font-medium',
+                        enabled
+                          ? 'cursor-pointer border-slate-700 bg-slate-900/30 text-slate-300 hover:border-slate-500'
+                          : 'cursor-not-allowed border-slate-800 bg-slate-900/20 text-slate-600',
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!enabled}
+                        onChange={(ev) => {
+                          const next = ev.target.checked
+                            ? Array.from(new Set([...raw.srtp_crypto_suites, suite]))
+                            : raw.srtp_crypto_suites.filter((v) => v !== suite)
+                          onChange('srtp_crypto_suites', next)
+                          onBlur('srtp_crypto_suites')
+                        }}
+                        className="size-3.5 accent-emerald-500"
+                      />
+                      <span>{suite}</span>
+                    </label>
+                  )
+                })}
+              </div>
+              {e('srtp_crypto_suites') && <FieldError error={e('srtp_crypto_suites')} />}
+            </FormRow>
+            <FormRow label="SRTP Key Mode" hint="Keying material is generated per call and is never shown in logs or reports.">
+              <span className={cn(
+                'rounded-md border px-3 py-1.5 text-xs font-semibold',
+                raw.media_security === 'srtp_sdes'
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                  : 'border-slate-800 bg-slate-900/20 text-slate-600',
+              )}>
+                Auto-generate per call
+              </span>
+            </FormRow>
             <FormRow label="Codec">
               <Select
                 value={raw.rtp_codec}

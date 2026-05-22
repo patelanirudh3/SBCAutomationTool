@@ -288,6 +288,12 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	}
 	emit("UAS_ACK_RECEIVED", 0, milestones.AckReceivedMs, nil)
 
+	if err := configureSRTPForDialog(rtpEP, dialog); err != nil {
+		slog.Error("UAS SRTP config failed", "ext", ag.Ext, "call_id", callID, "err", err)
+		u.handleTimeout(ag, dialog, callStart, callID, callerExt, rtpEP, milestones, uasInviteTsUTC)
+		return
+	}
+
 	// ── Start RTP (safety cap = 2× hold_time; real stop via rtpCancel on BYE) ──
 	var rtpDone chan struct{}
 	if rtpEP != nil {
@@ -380,14 +386,17 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		rtpSSRCCount          int
 		mediaOK               bool
 
-		jitterMs     float64
-		packetLoss   float64
-		lostPkts     int
-		oooPkts      int
-		remoteJitter float64
-		remoteLoss   float64
-		mosScore     float64
-		rttMs        float64
+		jitterMs            float64
+		packetLoss          float64
+		lostPkts            int
+		oooPkts             int
+		remoteJitter        float64
+		remoteLoss          float64
+		mosScore            float64
+		rttMs               float64
+		srtpDecryptFailures int
+		srtpAuthFailures    int
+		srtpReplayFailures  int
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -409,24 +418,32 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
 		rttMs = math.Round(st.RTTMs*100) / 100
+		srtpDecryptFailures = st.SRTPDecryptFailures
+		srtpAuthFailures = st.SRTPAuthFailures
+		srtpReplayFailures = st.SRTPReplayFailures
 		if cfg.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
 
 		mediaEvent := ClassifyMedia(st, float64(cfg.HoldTimeSeconds))
 		emitCallEvent(u.metrics, callID, ag.Ext, mediaEvent, "uas", callerExt, 0, 0, map[string]any{
-			"rtp_tx_pkts":          rtpTx,
-			"rtp_rx_pkts":          rtpRx,
-			"rtp_rx_from_sbc_pkts": rtpRxFromSBC,
-			"rtp_rx_other_pkts":    rtpRxOt,
-			"rtcp_rx_pkts":         rtcpRx,
-			"markers_sent":         markersSent,
-			"markers_received":     markersRecv,
-			"rtp_expected_pkts":    rtpExpected,
-			"rtp_ssrc_count":       rtpSSRCCount,
-			"jitter_ms":            jitterMs,
-			"packet_loss_pct":      packetLoss,
-			"mos_score":            mosScore,
+			"rtp_tx_pkts":           rtpTx,
+			"rtp_rx_pkts":           rtpRx,
+			"rtp_rx_from_sbc_pkts":  rtpRxFromSBC,
+			"rtp_rx_other_pkts":     rtpRxOt,
+			"rtcp_rx_pkts":          rtcpRx,
+			"markers_sent":          markersSent,
+			"markers_received":      markersRecv,
+			"rtp_expected_pkts":     rtpExpected,
+			"rtp_ssrc_count":        rtpSSRCCount,
+			"jitter_ms":             jitterMs,
+			"packet_loss_pct":       packetLoss,
+			"mos_score":             mosScore,
+			"media_security":        cfg.MediaSecurity,
+			"srtp_crypto_suite":     selectedSRTPCryptoSuite(dialog),
+			"srtp_decrypt_failures": st.SRTPDecryptFailures,
+			"srtp_auth_failures":    st.SRTPAuthFailures,
+			"srtp_replay_failures":  st.SRTPReplayFailures,
 		})
 	}
 
@@ -439,29 +456,34 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 
 	totalMs := msSince(callStart)
 	result := CallResult{
-		CallID:           callID,
-		Caller:           callerOrRemote(callerExt),
-		Callee:           ag.Ext,
-		Success:          true,
-		TotalMs:          totalMs,
-		RTPTxPkts:        rtpTx,
-		RTPRxPkts:        rtpRx,
-		MediaVerified:    mediaOK,
-		RTPLocalPort:     rtpLocalPort(rtpEP),
-		PeerExt:          callerExt,
-		TsUTC:            uasInviteTsUTC,
-		Direction:        "uas",
-		SBCRTPRelayIP:    dialog.RTPRemoteIP,
-		SBCRTPRelayPort:  dialog.RTPRemotePort,
-		SipMilestones:    milestones,
-		RTPRxFromSBCPkts: rtpRxFromSBC,
-		RTPRxOtherPkts:   rtpRxOt,
-		RTCPRxPkts:       rtcpRx,
-		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
-		MarkersSent:      markersSent,
-		MarkersReceived:  markersRecv,
-		RTPExpectedPkts:  rtpExpected,
-		RTPSSRCCount:     rtpSSRCCount,
+		CallID:              callID,
+		Caller:              callerOrRemote(callerExt),
+		Callee:              ag.Ext,
+		Success:             true,
+		TotalMs:             totalMs,
+		RTPTxPkts:           rtpTx,
+		RTPRxPkts:           rtpRx,
+		MediaVerified:       mediaOK,
+		RTPLocalPort:        rtpLocalPort(rtpEP),
+		MediaSecurity:       u.config.MediaSecurity,
+		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
+		SRTPDecryptFailures: srtpDecryptFailures,
+		SRTPAuthFailures:    srtpAuthFailures,
+		SRTPReplayFailures:  srtpReplayFailures,
+		PeerExt:             callerExt,
+		TsUTC:               uasInviteTsUTC,
+		Direction:           "uas",
+		SBCRTPRelayIP:       dialog.RTPRemoteIP,
+		SBCRTPRelayPort:     dialog.RTPRemotePort,
+		SipMilestones:       milestones,
+		RTPRxFromSBCPkts:    rtpRxFromSBC,
+		RTPRxOtherPkts:      rtpRxOt,
+		RTCPRxPkts:          rtcpRx,
+		RTPAsymmetryFlag:    ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+		MarkersSent:         markersSent,
+		MarkersReceived:     markersRecv,
+		RTPExpectedPkts:     rtpExpected,
+		RTPSSRCCount:        rtpSSRCCount,
 
 		JitterMs:            jitterMs,
 		PacketLossPct:       packetLoss,
@@ -511,14 +533,17 @@ func (u *UasAutoAnswer) handleTimeout(
 		rtpSSRCCount          int
 		mediaOK               bool
 
-		jitterMs     float64
-		packetLoss   float64
-		lostPkts     int
-		oooPkts      int
-		remoteJitter float64
-		remoteLoss   float64
-		mosScore     float64
-		rttMs        float64
+		jitterMs            float64
+		packetLoss          float64
+		lostPkts            int
+		oooPkts             int
+		remoteJitter        float64
+		remoteLoss          float64
+		mosScore            float64
+		rttMs               float64
+		srtpDecryptFailures int
+		srtpAuthFailures    int
+		srtpReplayFailures  int
 	)
 	if rtpEP != nil {
 		st := rtpEP.Stats()
@@ -539,6 +564,9 @@ func (u *UasAutoAnswer) handleTimeout(
 		remoteJitter = math.Round(st.RemoteJitterMs*100) / 100
 		remoteLoss = math.Round(st.RemoteLossPct*100) / 100
 		rttMs = math.Round(st.RTTMs*100) / 100
+		srtpDecryptFailures = st.SRTPDecryptFailures
+		srtpAuthFailures = st.SRTPAuthFailures
+		srtpReplayFailures = st.SRTPReplayFailures
 		if u.config.IsQoSMOSEnabled() && mediaOK {
 			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
 		}
@@ -552,30 +580,35 @@ func (u *UasAutoAnswer) handleTimeout(
 	callSetupMs, prackRTTMs, sipTxnRTTMs, byeCompletionMs := DeriveSipTimings(milestones)
 
 	result := CallResult{
-		CallID:           callID,
-		Caller:           callerOrRemote(callerExt),
-		Callee:           ag.Ext,
-		Success:          false,
-		FailureReason:    "timeout",
-		TotalMs:          msSince(callStart),
-		RTPLocalPort:     rtpLocalPort(rtpEP),
-		RTPTxPkts:        rtpTx,
-		RTPRxPkts:        rtpRx,
-		MediaVerified:    mediaOK,
-		RTPRxFromSBCPkts: rtpRxFromSBC,
-		RTPRxOtherPkts:   rtpRxOt,
-		RTCPRxPkts:       rtcpRx,
-		MarkersSent:      markersSent,
-		MarkersReceived:  markersRecv,
-		RTPExpectedPkts:  rtpExpected,
-		RTPSSRCCount:     rtpSSRCCount,
-		SBCRTPRelayIP:    sbcRelayIP,
-		SBCRTPRelayPort:  sbcRelayPort,
-		RTPAsymmetryFlag: ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
-		PeerExt:          callerExt,
-		TsUTC:            uasInviteTsUTC,
-		Direction:        "uas",
-		SipMilestones:    milestones,
+		CallID:              callID,
+		Caller:              callerOrRemote(callerExt),
+		Callee:              ag.Ext,
+		Success:             false,
+		FailureReason:       "timeout",
+		TotalMs:             msSince(callStart),
+		RTPLocalPort:        rtpLocalPort(rtpEP),
+		RTPTxPkts:           rtpTx,
+		RTPRxPkts:           rtpRx,
+		MediaVerified:       mediaOK,
+		RTPRxFromSBCPkts:    rtpRxFromSBC,
+		RTPRxOtherPkts:      rtpRxOt,
+		RTCPRxPkts:          rtcpRx,
+		MarkersSent:         markersSent,
+		MarkersReceived:     markersRecv,
+		RTPExpectedPkts:     rtpExpected,
+		RTPSSRCCount:        rtpSSRCCount,
+		MediaSecurity:       u.config.MediaSecurity,
+		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
+		SRTPDecryptFailures: srtpDecryptFailures,
+		SRTPAuthFailures:    srtpAuthFailures,
+		SRTPReplayFailures:  srtpReplayFailures,
+		SBCRTPRelayIP:       sbcRelayIP,
+		SBCRTPRelayPort:     sbcRelayPort,
+		RTPAsymmetryFlag:    ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
+		PeerExt:             callerExt,
+		TsUTC:               uasInviteTsUTC,
+		Direction:           "uas",
+		SipMilestones:       milestones,
 
 		JitterMs:            jitterMs,
 		PacketLossPct:       packetLoss,

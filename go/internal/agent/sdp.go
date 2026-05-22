@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -14,6 +16,12 @@ import (
 // host (e.g. burst of concurrent INVITEs at high CPS).
 var sdpSessionCounter uint64
 
+type SDPOptions struct {
+	RTCPMux         bool
+	MediaSecurity   string
+	SRTPCryptoLines []string
+}
+
 // BuildSDP builds a G.711 audio SDP for the given local host and RTP port.
 // The o= line carries a unique session-id derived from a process-local
 // monotonic timestamp combined with an atomic counter, satisfying RFC 4566
@@ -24,10 +32,24 @@ var sdpSessionCounter uint64
 // signalling that the same UDP port carries both RTP and RTCP. Phase 2
 // — only enabled when the endpoint will also transmit RTCP SR.
 func BuildSDP(localHost string, rtpPort int, rtcpMux bool) string {
+	return BuildSDPWithOptions(localHost, rtpPort, SDPOptions{RTCPMux: rtcpMux})
+}
+
+func BuildSDPWithOptions(localHost string, rtpPort int, opts SDPOptions) string {
 	sessID := uint64(time.Now().UnixNano()) ^ atomic.AddUint64(&sdpSessionCounter, 1)
 	rtcpMuxLine := ""
-	if rtcpMux {
+	if opts.RTCPMux {
 		rtcpMuxLine = "a=rtcp-mux\r\n"
+	}
+	proto := "RTP/AVP"
+	cryptoLines := ""
+	if opts.MediaSecurity == "srtp_sdes" {
+		proto = "RTP/SAVP"
+		for _, line := range opts.SRTPCryptoLines {
+			if strings.TrimSpace(line) != "" {
+				cryptoLines += line + "\r\n"
+			}
+		}
 	}
 	return fmt.Sprintf(
 		"v=0\r\n"+
@@ -35,16 +57,45 @@ func BuildSDP(localHost string, rtpPort int, rtcpMux bool) string {
 			"s=-\r\n"+
 			"c=IN IP4 %s\r\n"+
 			"t=0 0\r\n"+
-			"m=audio %d RTP/AVP 0 8 101\r\n"+
+			"m=audio %d %s 0 8 101\r\n"+
 			"a=rtpmap:0 PCMU/8000\r\n"+
 			"a=rtpmap:8 PCMA/8000\r\n"+
 			"a=rtpmap:101 telephone-event/8000\r\n"+
 			"a=fmtp:101 0-15\r\n"+
 			"a=ptime:20\r\n"+
 			"a=sendrecv\r\n"+
+			"%s"+
 			"%s",
-		sessID, localHost, localHost, rtpPort, rtcpMuxLine,
+		sessID, localHost, localHost, rtpPort, proto, cryptoLines, rtcpMuxLine,
 	)
+}
+
+type SRTPCryptoOffer struct {
+	Tag       int
+	Suite     string
+	KeySalt   []byte
+	SDPLine   string
+	KeyParams string
+}
+
+func GenerateSRTPCryptoOffers(suites []string) ([]SRTPCryptoOffer, error) {
+	out := make([]SRTPCryptoOffer, 0, len(suites))
+	for i, suite := range suites {
+		keySalt := make([]byte, 30)
+		if _, err := rand.Read(keySalt); err != nil {
+			return nil, err
+		}
+		keyParams := "inline:" + base64.StdEncoding.EncodeToString(keySalt)
+		tag := i + 1
+		out = append(out, SRTPCryptoOffer{
+			Tag:       tag,
+			Suite:     suite,
+			KeySalt:   keySalt,
+			KeyParams: keyParams,
+			SDPLine:   fmt.Sprintf("a=crypto:%d %s %s", tag, suite, keyParams),
+		})
+	}
+	return out, nil
 }
 
 // SDPMediaInfo is a strict summary of the audio media section needed by the
@@ -58,6 +109,7 @@ type SDPMediaInfo struct {
 	PayloadTypes    []int
 	CryptoSuite     string
 	CryptoKeyParams string
+	CryptoLines     []SRTPCryptoOffer
 	RTCPMux         bool
 	HasSessionConn  bool
 	HasMediaConn    bool
@@ -167,8 +219,16 @@ func parseCryptoLine(line string, info *SDPMediaInfo) {
 	if len(fields) < 3 {
 		return
 	}
+	tagRaw := strings.TrimPrefix(fields[0], "a=crypto:")
+	tag, _ := strconv.Atoi(tagRaw)
 	info.CryptoSuite = fields[1]
 	info.CryptoKeyParams = fields[2]
+	info.CryptoLines = append(info.CryptoLines, SRTPCryptoOffer{
+		Tag:       tag,
+		Suite:     fields[1],
+		KeyParams: fields[2],
+		SDPLine:   line,
+	})
 }
 
 func truncateSDP(s string, max int) string {

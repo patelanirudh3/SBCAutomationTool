@@ -328,6 +328,58 @@ export async function putConfigFor(
   return parseJsonResponse<{ status: string; vm_id?: string }>(res)
 }
 
+export interface CertificateUploadResult {
+  path: string
+  kind: string
+  subject?: string
+  issuer?: string
+  not_before?: string
+  not_after?: string
+  fingerprint_sha256?: string
+}
+
+export async function uploadCertificateFor(
+  ip: string,
+  port: number,
+  kind: 'ca' | 'client_cert' | 'client_key',
+  file: File
+): Promise<CertificateUploadResult> {
+  const form = new FormData()
+  form.append('type', kind)
+  form.append('file', file)
+  const res = await fetch(`http://${ip}:${port}/api/certificates/upload`, {
+    method: 'POST',
+    body: form,
+    signal: AbortSignal.timeout(15_000),
+  })
+  return parseJsonResponse<CertificateUploadResult>(res)
+}
+
+export interface TLSVerifyResult {
+  ok: boolean
+  error?: string
+  negotiated_version?: string
+  cipher_suite?: string
+  peer_subject?: string
+  peer_issuer?: string
+  peer_not_after?: string
+  fingerprint_sha256?: string
+}
+
+export async function verifyTLSFor(
+  ip: string,
+  port: number,
+  config: Record<string, unknown>
+): Promise<TLSVerifyResult> {
+  const res = await fetch(`http://${ip}:${port}/api/tls/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+    signal: AbortSignal.timeout(15_000),
+  })
+  return parseJsonResponse<TLSVerifyResult>(res)
+}
+
 // ---------------------------------------------------------------------------
 // Per-VM traffic start — POST /api/test/start on a specific VM backend
 // ---------------------------------------------------------------------------

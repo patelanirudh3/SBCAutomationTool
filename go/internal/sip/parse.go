@@ -38,11 +38,13 @@ func ParseHeaders(raw string) *SipMessage {
 			continue
 		}
 		if (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) && lastHeader == "" {
+			recordFoldedHeaderWithoutParent()
 			slog.Debug("ParseHeaders: folded header without previous header", "line", truncateLine(line, 120))
 			continue
 		}
 		idx := strings.Index(line, ":")
 		if idx < 0 {
+			recordMalformedHeader()
 			slog.Debug("ParseHeaders: malformed header without colon", "line", truncateLine(line, 120))
 			continue
 		}

@@ -44,25 +44,30 @@ type SipMilestones struct {
 // CallResult carries the outcome of a single call (UAC or UAS) and is fed
 // into the metrics pipeline.
 type CallResult struct {
-	CallID          string        `json:"call_id"`
-	Caller          string        `json:"caller"`
-	Callee          string        `json:"callee"`
-	Success         bool          `json:"success"`
-	FailureReason   string        `json:"failure_reason"`
-	PDDMs           float64       `json:"pdd_ms"`
-	HoldMs          float64       `json:"hold_ms"`
-	TotalMs         float64       `json:"total_ms"`
-	RTPTxPkts       int           `json:"rtp_tx_pkts"`
-	RTPRxPkts       int           `json:"rtp_rx_pkts"`
-	MediaVerified   bool          `json:"media_verified"`
-	RTPLocalPort    int           `json:"rtp_local_port"`
-	PoolWrapIndex   int           `json:"pool_wrap_index"`
-	PeerExt         string        `json:"peer_ext"`
-	TsUTC           string        `json:"ts_utc"`
-	Direction       string        `json:"direction"`
-	SBCRTPRelayIP   string        `json:"sbc_rtp_relay_ip"`
-	SBCRTPRelayPort int           `json:"sbc_rtp_relay_port"`
-	SipMilestones   SipMilestones `json:"sip_milestones"`
+	CallID              string        `json:"call_id"`
+	Caller              string        `json:"caller"`
+	Callee              string        `json:"callee"`
+	Success             bool          `json:"success"`
+	FailureReason       string        `json:"failure_reason"`
+	PDDMs               float64       `json:"pdd_ms"`
+	HoldMs              float64       `json:"hold_ms"`
+	TotalMs             float64       `json:"total_ms"`
+	RTPTxPkts           int           `json:"rtp_tx_pkts"`
+	RTPRxPkts           int           `json:"rtp_rx_pkts"`
+	MediaVerified       bool          `json:"media_verified"`
+	RTPLocalPort        int           `json:"rtp_local_port"`
+	MediaSecurity       string        `json:"media_security"`
+	SRTPCryptoSuite     string        `json:"srtp_crypto_suite,omitempty"`
+	SRTPDecryptFailures int           `json:"srtp_decrypt_failures,omitempty"`
+	SRTPAuthFailures    int           `json:"srtp_auth_failures,omitempty"`
+	SRTPReplayFailures  int           `json:"srtp_replay_failures,omitempty"`
+	PoolWrapIndex       int           `json:"pool_wrap_index"`
+	PeerExt             string        `json:"peer_ext"`
+	TsUTC               string        `json:"ts_utc"`
+	Direction           string        `json:"direction"`
+	SBCRTPRelayIP       string        `json:"sbc_rtp_relay_ip"`
+	SBCRTPRelayPort     int           `json:"sbc_rtp_relay_port"`
+	SipMilestones       SipMilestones `json:"sip_milestones"`
 
 	RTPRxFromSBCPkts int    `json:"rtp_rx_from_sbc_pkts"`
 	RTPRxOtherPkts   int    `json:"rtp_rx_other_pkts"`
