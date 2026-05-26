@@ -321,6 +321,12 @@ export interface TrafficMetrics {
   media_security?: MediaSecurity
   srtp_crypto_suites?: SRTPCryptoSuite[]
   srtp_crypto_suite?: SRTPCryptoSuite
+  host_cpu_avg_percent?: number
+  host_cpu_max_percent?: number
+  process_cpu_core_avg_percent?: number
+  process_cpu_core_max_percent?: number
+  softirq_cpu_max_percent?: number
+  iowait_cpu_max_percent?: number
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -364,6 +370,13 @@ export interface SubscriptionEventStats {
 
 export interface HostHealth {
   cpu_percent?: number
+  cpu_user_percent?: number
+  cpu_system_percent?: number
+  cpu_iowait_percent?: number
+  cpu_irq_percent?: number
+  cpu_softirq_percent?: number
+  cpu_steal_percent?: number
+  cpu_idle_percent?: number
   load1?: number
   load5?: number
   load15?: number
@@ -371,6 +384,8 @@ export interface HostHealth {
   mem_available_bytes?: number
   mem_used_percent?: number
   process_cpu_percent?: number
+  process_cpu_percent_vm?: number
+  process_cpu_percent_core?: number
   process_rss_bytes?: number
   process_vms_bytes?: number
   process_threads?: number
@@ -389,6 +404,19 @@ export interface HostHealth {
   goroutines?: number
   open_fds?: number
   uptime_seconds?: number
+  top_process_mode?: PerformanceDiagnosticsMode
+  top_processes?: TopProcessSnapshot[]
+  top_process_sample_unix?: number
+  performance_warnings?: string[]
+}
+
+export type PerformanceDiagnosticsMode = 'off' | 'warning_only' | 'slow'
+
+export interface TopProcessSnapshot {
+  pid: number
+  name: string
+  cpu_percent_core?: number
+  rss_bytes?: number
 }
 
 export interface ParserHealth {

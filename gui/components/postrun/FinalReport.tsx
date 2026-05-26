@@ -382,7 +382,18 @@ export function FinalReport({
             asymmetryFlag: uacMetrics?.rtp_asymmetry_flag ?? aggregate?.rtp_asymmetry_flag ?? eventAsymFlag,
           }}
         />
-        <VMHealthPanel health={uacMetrics?.host_health ?? null} />
+        <VMHealthPanel
+          health={uacMetrics?.host_health ?? null}
+          variant={phase === 'CLEANING_UP' ? 'compact' : 'summary'}
+          summary={{
+            hostCpuAvg: uacMetrics?.host_cpu_avg_percent ?? null,
+            hostCpuMax: uacMetrics?.host_cpu_max_percent ?? null,
+            engineCpuCoreAvg: uacMetrics?.process_cpu_core_avg_percent ?? null,
+            engineCpuCoreMax: uacMetrics?.process_cpu_core_max_percent ?? null,
+            softirqCpuMax: uacMetrics?.softirq_cpu_max_percent ?? null,
+            iowaitCpuMax: uacMetrics?.iowait_cpu_max_percent ?? null,
+          }}
+        />
       </div>
 
       {/* Download */}

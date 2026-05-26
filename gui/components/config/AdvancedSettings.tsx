@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Settings2, Pencil, Check, ChevronDown, Info } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -220,8 +220,10 @@ export function AdvancedSettings({
   tab?: AdvancedTab
 }) {
   const { pairs, updateAdvancedSettings } = useTrafficStore()
-  const saved: AdvancedSettingsType =
-    pairs[pairIndex]?.advancedSettings ?? { ...DEFAULT_ADVANCED_SETTINGS }
+  const saved: AdvancedSettingsType = useMemo(
+    () => pairs[pairIndex]?.advancedSettings ?? { ...DEFAULT_ADVANCED_SETTINGS },
+    [pairs, pairIndex],
+  )
 
   // Tab gates — drive both the token row's filtering and the expanded
   // body's field groups so the same component renders cleanly under

@@ -270,7 +270,10 @@ export function SessionMenu() {
     setFetching(false)
   }, [pairs])
 
-  useEffect(() => { if (open) fetchStates() }, [open, fetchStates])
+  useEffect(() => {
+    if (!open) return
+    void Promise.resolve().then(fetchStates)
+  }, [open, fetchStates])
 
   const setLoading = (ip: string, port: number, val: boolean) => {
     setPairData((prev) =>

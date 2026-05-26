@@ -282,7 +282,13 @@ function LiveDashboard({
           asymmetryFlag: uacMetrics.rtp_asymmetry_flag ?? null,
         }}
       />
-      <VMHealthPanel health={uacMetrics.host_health ?? null} />
+      <VMHealthPanel
+        health={uacMetrics.host_health ?? null}
+        variant="full"
+        vmIp={pair?.uac.vm_ip}
+        metricsPort={pair?.uac.metrics_port}
+        showDiagnosticsControl
+      />
     </div>
   )
 }

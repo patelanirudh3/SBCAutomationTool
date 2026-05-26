@@ -121,6 +121,13 @@ type TrafficMetrics struct {
 	ParserHealth     sip.ParserHealth `json:"parser_health"`
 	MediaSecurity    string           `json:"media_security"`
 	SRTPCryptoSuites []string         `json:"srtp_crypto_suites,omitempty"`
+
+	HostCPUAvgPercent        float64 `json:"host_cpu_avg_percent"`
+	HostCPUMaxPercent        float64 `json:"host_cpu_max_percent"`
+	ProcessCPUCoreAvgPercent float64 `json:"process_cpu_core_avg_percent"`
+	ProcessCPUCoreMaxPercent float64 `json:"process_cpu_core_max_percent"`
+	SoftIRQCPUMaxPercent     float64 `json:"softirq_cpu_max_percent"`
+	IOWaitCPUMaxPercent      float64 `json:"iowait_cpu_max_percent"`
 }
 
 // SubscriptionEventStats exposes per-event-package subscription progress.
@@ -252,6 +259,13 @@ type MetricsCollector struct {
 	concurrentProvider func() int
 	poolCountsProvider func() (idle, nonIdle, regOnly int)
 	hostHealth         *HostHealthCollector
+	hostHealthSamples  int
+	hostCPUSum         float64
+	hostCPUMax         float64
+	processCPUCoreSum  float64
+	processCPUCoreMax  float64
+	softIRQCPUMax      float64
+	iowaitCPUMax       float64
 
 	rtpHealthCounts map[string]int
 
@@ -530,8 +544,33 @@ func (c *MetricsCollector) SetRunning(running bool) {
 	if running {
 		c.runStart = time.Now()
 		c.runStartSet = true
+		c.hostHealthSamples = 0
+		c.hostCPUSum = 0
+		c.hostCPUMax = 0
+		c.processCPUCoreSum = 0
+		c.processCPUCoreMax = 0
+		c.softIRQCPUMax = 0
+		c.iowaitCPUMax = 0
 	}
 	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) SetPerformanceDiagnosticsMode(mode string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hostHealth == nil {
+		return TopProcessModeWarningOnly
+	}
+	return c.hostHealth.SetTopProcessMode(mode)
+}
+
+func (c *MetricsCollector) PerformanceDiagnosticsMode() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hostHealth == nil {
+		return TopProcessModeWarningOnly
+	}
+	return c.hostHealth.TopProcessMode()
 }
 
 // UpdateCounts updates the external count gauges.
@@ -1020,6 +1059,13 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
 	c.cleanupUnregisterFailed = nil
+	c.hostHealthSamples = 0
+	c.hostCPUSum = 0
+	c.hostCPUMax = 0
+	c.processCPUCoreSum = 0
+	c.processCPUCoreMax = 0
+	c.softIRQCPUMax = 0
+	c.iowaitCPUMax = 0
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
@@ -1097,6 +1143,9 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	hostHealth := HostHealth{}
 	if c.hostHealth != nil {
 		hostHealth = c.hostHealth.Snapshot()
+	}
+	if c.running {
+		c.recordHostHealthAggregate(hostHealth)
 	}
 
 	var totalRTPTx, totalRTPRx, totalRTPRxFromSBC, totalRTPExpected, totalRTPLost, totalRTPSSRCCount, rtpSampleCount int
@@ -1187,25 +1236,31 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CleanupUnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
 		CleanupUnregisterCount:    c.cleanupUnregisterCount,
 
-		AvgJitterMs:       roundAvg(c.jitterSamples),
-		AvgMOSScore:       roundAvg(c.mosSamples),
-		AvgPacketLossPct:  roundAvg(c.packetLossSamples),
-		TotalRTPTxPkts:    totalRTPTx,
-		TotalRTPRxPkts:    totalRTPRx,
-		TotalRTPRxFromSBC: totalRTPRxFromSBC,
-		TotalRTPExpected:  totalRTPExpected,
-		TotalRTPLostPkts:  totalRTPLost,
-		TotalRTPSSRCCount: totalRTPSSRCCount,
-		AvgRTPTxPkts:      avgRTPTx,
-		AvgRTPRxFromSBC:   avgRTPRxFromSBC,
-		RTPLossPct:        rtpLossPct,
-		RTPAsymmetryPct:   rtpAsymmetryPct,
-		RTPAsymmetryFlag:  rtpAsymmetryFlag,
-		AvgRTTMs:          roundAvg(c.rttSamples),
-		HostHealth:        hostHealth,
-		ParserHealth:      sip.ParserHealthSnapshot(),
-		MediaSecurity:     mediaSecurity,
-		SRTPCryptoSuites:  cryptoSuiteList,
+		AvgJitterMs:              roundAvg(c.jitterSamples),
+		AvgMOSScore:              roundAvg(c.mosSamples),
+		AvgPacketLossPct:         roundAvg(c.packetLossSamples),
+		TotalRTPTxPkts:           totalRTPTx,
+		TotalRTPRxPkts:           totalRTPRx,
+		TotalRTPRxFromSBC:        totalRTPRxFromSBC,
+		TotalRTPExpected:         totalRTPExpected,
+		TotalRTPLostPkts:         totalRTPLost,
+		TotalRTPSSRCCount:        totalRTPSSRCCount,
+		AvgRTPTxPkts:             avgRTPTx,
+		AvgRTPRxFromSBC:          avgRTPRxFromSBC,
+		RTPLossPct:               rtpLossPct,
+		RTPAsymmetryPct:          rtpAsymmetryPct,
+		RTPAsymmetryFlag:         rtpAsymmetryFlag,
+		AvgRTTMs:                 roundAvg(c.rttSamples),
+		HostHealth:               hostHealth,
+		ParserHealth:             sip.ParserHealthSnapshot(),
+		MediaSecurity:            mediaSecurity,
+		SRTPCryptoSuites:         cryptoSuiteList,
+		HostCPUAvgPercent:        round2(avgFromSum(c.hostCPUSum, c.hostHealthSamples)),
+		HostCPUMaxPercent:        round2(c.hostCPUMax),
+		ProcessCPUCoreAvgPercent: round2(avgFromSum(c.processCPUCoreSum, c.hostHealthSamples)),
+		ProcessCPUCoreMaxPercent: round2(c.processCPUCoreMax),
+		SoftIRQCPUMaxPercent:     round2(c.softIRQCPUMax),
+		IOWaitCPUMaxPercent:      round2(c.iowaitCPUMax),
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],
@@ -1227,6 +1282,31 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	}
 	c.latest = snap
 	return snap
+}
+
+func (c *MetricsCollector) recordHostHealthAggregate(h HostHealth) {
+	c.hostHealthSamples++
+	c.hostCPUSum += h.CPUPercent
+	if h.CPUPercent > c.hostCPUMax {
+		c.hostCPUMax = h.CPUPercent
+	}
+	c.processCPUCoreSum += h.ProcessCPUPercentCore
+	if h.ProcessCPUPercentCore > c.processCPUCoreMax {
+		c.processCPUCoreMax = h.ProcessCPUPercentCore
+	}
+	if h.CPUSoftIRQPercent > c.softIRQCPUMax {
+		c.softIRQCPUMax = h.CPUSoftIRQPercent
+	}
+	if h.CPUIOWaitPercent > c.iowaitCPUMax {
+		c.iowaitCPUMax = h.CPUIOWaitPercent
+	}
+}
+
+func avgFromSum(sum float64, count int) float64 {
+	if count <= 0 {
+		return 0
+	}
+	return sum / float64(count)
 }
 
 func roundAvg(samples []float64) float64 {
@@ -1746,6 +1826,25 @@ func BuildMux(
 			"role":      effectiveRole(),
 			"phase":     latest.Phase,
 			"state":     stateStr(),
+		})
+	})
+
+	mux.HandleFunc("GET /api/diagnostics/performance", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"top_process_mode": collector.PerformanceDiagnosticsMode(),
+		})
+	})
+
+	mux.HandleFunc("POST /api/diagnostics/performance", func(w http.ResponseWriter, r *http.Request) {
+		body, err := readJSONBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		mode, _ := body["top_process_mode"].(string)
+		applied := collector.SetPerformanceDiagnosticsMode(mode)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"top_process_mode": applied,
 		})
 	})
 

@@ -3,7 +3,6 @@
 import { CheckCircle2, XCircle, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
-import type { RunPhase } from '@/types'
 
 function ExitBadge({ exit, label }: { exit: number; label: string }) {
   const ok = exit === 0

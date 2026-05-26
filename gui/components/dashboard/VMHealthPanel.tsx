@@ -1,11 +1,25 @@
 'use client'
 
+import { useState } from 'react'
 import { Activity, Cpu, HardDrive, MemoryStick, Network, Server } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { HostHealth } from '@/types'
+import { setPerformanceDiagnosticsFor } from '@/lib/api'
+import type { HostHealth, PerformanceDiagnosticsMode } from '@/types'
 
 interface VMHealthPanelProps {
   health?: HostHealth | null
+  variant?: 'compact' | 'full' | 'summary'
+  vmIp?: string
+  metricsPort?: number
+  showDiagnosticsControl?: boolean
+  summary?: {
+    hostCpuAvg?: number | null
+    hostCpuMax?: number | null
+    engineCpuCoreAvg?: number | null
+    engineCpuCoreMax?: number | null
+    softirqCpuMax?: number | null
+    iowaitCpuMax?: number | null
+  }
 }
 
 function formatBytes(v?: number): string {
@@ -33,6 +47,12 @@ function toneForPct(v?: number): 'default' | 'warning' | 'danger' {
 
 function formatNumber(v?: number): string {
   return typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString() : '-'
+}
+
+function modeLabel(mode?: PerformanceDiagnosticsMode): string {
+  if (mode === 'slow') return 'Slow Scan'
+  if (mode === 'off') return 'Off'
+  return 'Warning Only'
 }
 
 function HealthCard({
@@ -65,17 +85,98 @@ function HealthCard({
   )
 }
 
-export function VMHealthPanel({ health }: VMHealthPanelProps) {
+export function VMHealthPanel(props: VMHealthPanelProps) {
+  return <VMHealthPanelContent {...props} />
+}
+
+export function VMHealthPanelContent({
+  health,
+  variant = 'full',
+  vmIp,
+  metricsPort,
+  showDiagnosticsControl = false,
+  summary,
+}: VMHealthPanelProps) {
+  const [pendingMode, setPendingMode] = useState<PerformanceDiagnosticsMode | null>(null)
+  const [modeError, setModeError] = useState<string | null>(null)
+  const mode = pendingMode ?? health?.top_process_mode ?? 'warning_only'
+  const engineCPUCore = health?.process_cpu_percent_core ?? (
+    typeof health?.process_cpu_percent === 'number' ? health.process_cpu_percent : undefined
+  )
+  const engineCPUVM = health?.process_cpu_percent_vm ?? health?.process_cpu_percent
+  const topProcess = health?.top_processes?.[0]
+  const isCompact = variant === 'compact'
+  const isSummary = variant === 'summary'
+  const canSetMode = !!vmIp && !!metricsPort
+
+  const setMode = async (next: PerformanceDiagnosticsMode) => {
+    if (!canSetMode) return
+    setModeError(null)
+    setPendingMode(next)
+    try {
+      await setPerformanceDiagnosticsFor(vmIp, metricsPort, next)
+    } catch (err) {
+      setModeError(err instanceof Error ? err.message : 'Failed to update CPU attribution mode')
+      setPendingMode(null)
+    }
+  }
+
   return (
     <div className="rounded-xl border border-slate-700/40 bg-card p-4 space-y-3">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Server className="size-4 text-emerald-400" />
         <span className="text-sm font-semibold text-slate-200">Traffic Engine VM Health</span>
+        {showDiagnosticsControl && (
+          <div className="ml-auto flex flex-wrap items-center gap-1 text-[11px]">
+            <span className="mr-1 text-slate-400">CPU Attribution:</span>
+            {(['warning_only', 'slow', 'off'] as PerformanceDiagnosticsMode[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                disabled={!canSetMode}
+                onClick={() => setMode(m)}
+                className={cn(
+                  'rounded border px-2 py-0.5 font-semibold transition',
+                  mode === m
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                    : 'border-slate-700 bg-slate-900/50 text-slate-400 hover:text-slate-200',
+                  !canSetMode && 'cursor-not-allowed opacity-60',
+                )}
+              >
+                {modeLabel(m)}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
+      {modeError && (
+        <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {modeError}
+        </div>
+      )}
+
+      {health?.performance_warnings?.length ? (
+        <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {health.performance_warnings[0]}
+        </div>
+      ) : null}
+
       <div className="space-y-2">
-        <div className="text-xs font-bold uppercase tracking-wide text-slate-300">VM Health</div>
-        <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="text-xs font-bold uppercase tracking-wide text-slate-300">
+          {isSummary ? 'Run CPU Summary' : 'VM Readiness'}
+        </div>
+        {isSummary && summary ? (
+          <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <HealthCard icon={Cpu} label="Avg Host CPU" value={formatPct(summary.hostCpuAvg ?? undefined)} />
+            <HealthCard icon={Cpu} label="Max Host CPU" value={formatPct(summary.hostCpuMax ?? undefined)} tone={toneForPct(summary.hostCpuMax ?? undefined)} />
+            <HealthCard icon={Cpu} label="Avg Engine CPU" value={formatPct(summary.engineCpuCoreAvg ?? undefined)} sub="% core" />
+            <HealthCard icon={Cpu} label="Max Engine CPU" value={formatPct(summary.engineCpuCoreMax ?? undefined)} sub="% core" tone={toneForPct(summary.engineCpuCoreMax ?? undefined)} />
+            <HealthCard icon={Network} label="Max SoftIRQ" value={formatPct(summary.softirqCpuMax ?? undefined)} tone={toneForPct((summary.softirqCpuMax ?? 0) * 8)} />
+            <HealthCard icon={HardDrive} label="Max IOWait" value={formatPct(summary.iowaitCpuMax ?? undefined)} />
+          </div>
+        ) : (
+        <div className={cn('grid gap-3', isCompact ? 'sm:grid-cols-4' : 'sm:grid-cols-3 lg:grid-cols-6')}>
         <HealthCard
           icon={Cpu}
           label="Host CPU"
@@ -84,19 +185,28 @@ export function VMHealthPanel({ health }: VMHealthPanelProps) {
           tone={toneForPct(health?.cpu_percent)}
         />
         <HealthCard
+          icon={Cpu}
+          label="Engine CPU"
+          value={formatPct(engineCPUCore)}
+          sub="% of one core"
+          tone={toneForPct(engineCPUCore)}
+        />
+        <HealthCard
           icon={MemoryStick}
           label="Host Memory"
           value={formatPct(health?.mem_used_percent)}
           sub={`${formatBytes(health?.mem_available_bytes)} free`}
           tone={toneForPct(health?.mem_used_percent)}
         />
-        <HealthCard
-          icon={HardDrive}
-          label="Disk"
-          value={formatPct(health?.disk_used_percent)}
-          sub={`${formatBytes(health?.disk_free_bytes)} free`}
-          tone={toneForPct(health?.disk_used_percent)}
-        />
+        {!isCompact && (
+          <HealthCard
+            icon={HardDrive}
+            label="Disk"
+            value={formatPct(health?.disk_used_percent)}
+            sub={`${formatBytes(health?.disk_free_bytes)} free`}
+            tone={toneForPct(health?.disk_used_percent)}
+          />
+        )}
         <HealthCard
           icon={Network}
           label="UDP Errors"
@@ -104,23 +214,39 @@ export function VMHealthPanel({ health }: VMHealthPanelProps) {
           sub={`rcvbuf ${health?.udp_rcvbuf_errors ?? 0}`}
           tone={(health?.udp_in_errors ?? 0) > 0 || (health?.udp_rcvbuf_errors ?? 0) > 0 ? 'warning' : 'default'}
         />
-        <HealthCard
-          icon={Network}
-          label="Network I/O"
-          value={formatBytes(health?.net_rx_bytes)}
-          sub={`${formatBytes(health?.net_tx_bytes)} TX`}
-        />
+        {!isCompact && (
+          <>
+            <HealthCard
+              icon={Network}
+              label="SoftIRQ CPU"
+              value={formatPct(health?.cpu_softirq_percent)}
+              sub="kernel network"
+              tone={toneForPct((health?.cpu_softirq_percent ?? 0) * 8)}
+            />
+            <HealthCard
+              icon={Activity}
+              label="Top Process"
+              value={topProcess ? topProcess.name : mode === 'off' ? 'Off' : 'Not sampled'}
+              sub={topProcess ? `${formatPct(topProcess.cpu_percent_core)} core · ${formatBytes(topProcess.rss_bytes)}` : modeLabel(mode)}
+            />
+          </>
+        )}
         </div>
+        )}
       </div>
 
-      <div className="space-y-2">
-        <div className="text-xs font-bold uppercase tracking-wide text-slate-300">Traffic Engine Process</div>
-        <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+      {!isCompact && !isSummary && (
+        <details className="group rounded-lg border border-slate-700/40 bg-slate-900/20 p-3">
+          <summary className="cursor-pointer text-xs font-bold uppercase tracking-wide text-slate-300">
+            Details
+          </summary>
+          <div className="mt-3 space-y-3">
+            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <HealthCard
             icon={Cpu}
-            label="Process CPU"
-            value={formatPct(health?.process_cpu_percent)}
-            tone={toneForPct(health?.process_cpu_percent)}
+            label="Engine CPU (% VM)"
+            value={formatPct(engineCPUVM)}
+            tone={toneForPct(engineCPUVM)}
           />
           <HealthCard
             icon={MemoryStick}
@@ -151,8 +277,31 @@ export function VMHealthPanel({ health }: VMHealthPanelProps) {
             value={formatBytes(health?.process_write_bytes)}
             sub={`${formatNumber(health?.process_write_syscalls)} syscalls`}
           />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              <HealthCard icon={Cpu} label="System CPU" value={formatPct(health?.cpu_system_percent)} />
+              <HealthCard icon={HardDrive} label="IOWait CPU" value={formatPct(health?.cpu_iowait_percent)} />
+              <HealthCard icon={Activity} label="Steal CPU" value={formatPct(health?.cpu_steal_percent)} />
+              <HealthCard icon={Activity} label="IRQ CPU" value={formatPct(health?.cpu_irq_percent)} />
+              <HealthCard icon={Network} label="Network RX" value={formatBytes(health?.net_rx_bytes)} />
+              <HealthCard icon={Network} label="Network TX" value={formatBytes(health?.net_tx_bytes)} />
+            </div>
+            {health?.top_processes?.length ? (
+              <div className="rounded-lg border border-slate-700/40 bg-slate-950/30 p-3">
+                <div className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-300">Top CPU Processes</div>
+                <div className="grid gap-2">
+                  {health.top_processes.map((p) => (
+                    <div key={p.pid} className="flex items-center justify-between rounded border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs">
+                      <span className="font-mono text-slate-200">{p.name}</span>
+                      <span className="text-slate-400">pid {p.pid} · {formatPct(p.cpu_percent_core)} core · {formatBytes(p.rss_bytes)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </details>
+      )}
         </div>
-      </div>
-    </div>
   )
 }

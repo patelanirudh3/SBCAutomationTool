@@ -409,7 +409,7 @@ function EventRow({ event }: { event: LadderEvent }) {
 // Vertical timeline lines (background)
 // ---------------------------------------------------------------------------
 
-function TimelineLines({ rowCount }: { rowCount: number }) {
+function TimelineLines() {
   return (
     <div
       className="absolute pointer-events-none"
@@ -472,7 +472,7 @@ export function SipLadderLive({ spine, className }: SipLadderLiveProps) {
 
       {/* Timeline body */}
       <div className="relative py-1">
-        <TimelineLines rowCount={events.length} />
+        <TimelineLines />
         {events.map((ev, i) => (
           <EventRow key={i} event={ev} />
         ))}

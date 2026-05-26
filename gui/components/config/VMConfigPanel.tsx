@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -331,17 +331,8 @@ function TestReachabilityButton({
   reachability: ReachabilityStatus | null
   onTest: () => void
 }) {
-  const [showSuccess, setShowSuccess] = useState(false)
   const port = parseInt(metricsPort, 10)
   const canTest = !!vmIp && !Number.isNaN(port) && port > 0
-
-  useEffect(() => {
-    if (reachability?.reachable && !reachability.checking) {
-      setShowSuccess(true)
-      const t = setTimeout(() => setShowSuccess(false), 3000)
-      return () => clearTimeout(t)
-    }
-  }, [reachability?.reachable, reachability?.checking])
 
   if (!canTest) return null
 
@@ -354,7 +345,7 @@ function TestReachabilityButton({
     )
   }
 
-  if (showSuccess && reachability?.reachable) {
+  if (reachability?.reachable && !reachability.checking) {
     return (
       <Button type="button" variant="outline" size="sm"
         className="shrink-0 gap-1.5 border-emerald-500/50 bg-emerald-500/10 font-mono text-xs text-emerald-400">
@@ -429,18 +420,6 @@ function CpsBhccField({
   const [inputMode, setInputMode] = useState<'cps' | 'bhcc'>('cps')
   const [bhccDraft, setBhccDraft] = useState('')
 
-  // Keep bhcc display in sync when cps changes externally (e.g., from store load)
-  useEffect(() => {
-    if (inputMode === 'cps') {
-      const c = parseFloat(cps)
-      if (Number.isFinite(c) && c > 0) {
-        setBhccDraft(String(Math.round(c * 3600)))
-      } else {
-        setBhccDraft('')
-      }
-    }
-  }, [cps, inputMode])
-
   const handleCpsChange = (v: string) => {
     setInputMode('cps')
     onCpsChange(v)
@@ -460,6 +439,7 @@ function CpsBhccField({
 
   const cpsNum = parseFloat(cps)
   const bhccNum = Number.isFinite(cpsNum) && cpsNum > 0 ? Math.round(cpsNum * 3600) : null
+  const bhccValue = inputMode === 'bhcc' ? bhccDraft : (bhccNum ? String(bhccNum) : '')
 
   return (
     <FormRow
@@ -487,7 +467,7 @@ function CpsBhccField({
           type="number"
           min={1}
           step={1}
-          value={bhccDraft}
+          value={bhccValue}
           onChange={(ev) => handleBhccChange(ev.target.value)}
           onBlur={onBlur}
           className={cn(

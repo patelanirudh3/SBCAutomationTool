@@ -1,4 +1,4 @@
-import type { VMConfig, TrafficMetrics, RunPhase } from '@/types'
+import type { VMConfig, TrafficMetrics, RunPhase, PerformanceDiagnosticsMode } from '@/types'
 
 const BASE_URL =
   process.env.NEXT_PUBLIC_COORDINATOR_URL ?? 'http://localhost:8082'
@@ -185,6 +185,27 @@ export async function getMetricsFor(
 ): Promise<TrafficMetrics> {
   const res = await fetch(`http://${ip}:${port}/metrics`)
   return parseJsonResponse<TrafficMetrics>(res)
+}
+
+export async function getPerformanceDiagnosticsFor(
+  ip: string,
+  port: number
+): Promise<{ top_process_mode: PerformanceDiagnosticsMode }> {
+  const res = await fetch(`http://${ip}:${port}/api/diagnostics/performance`)
+  return parseJsonResponse<{ top_process_mode: PerformanceDiagnosticsMode }>(res)
+}
+
+export async function setPerformanceDiagnosticsFor(
+  ip: string,
+  port: number,
+  mode: PerformanceDiagnosticsMode
+): Promise<{ top_process_mode: PerformanceDiagnosticsMode }> {
+  const res = await fetch(`http://${ip}:${port}/api/diagnostics/performance`, {
+    method: 'POST',
+    body: JSON.stringify({ top_process_mode: mode }),
+    headers: { 'Content-Type': 'application/json' },
+  })
+  return parseJsonResponse<{ top_process_mode: PerformanceDiagnosticsMode }>(res)
 }
 
 // ---------------------------------------------------------------------------

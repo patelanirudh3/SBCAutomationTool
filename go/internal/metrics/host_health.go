@@ -3,59 +3,129 @@ package metrics
 import (
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
+const (
+	TopProcessModeOff         = "off"
+	TopProcessModeWarningOnly = "warning_only"
+	TopProcessModeSlow        = "slow"
+
+	topProcessMinInterval = 15 * time.Second
+	topProcessLimit       = 5
+)
+
 type HostHealth struct {
-	CPUPercent           float64 `json:"cpu_percent"`
-	Load1                float64 `json:"load1"`
-	Load5                float64 `json:"load5"`
-	Load15               float64 `json:"load15"`
-	MemTotalBytes        uint64  `json:"mem_total_bytes"`
-	MemAvailableBytes    uint64  `json:"mem_available_bytes"`
-	MemUsedPercent       float64 `json:"mem_used_percent"`
-	DiskTotalBytes       uint64  `json:"disk_total_bytes"`
-	DiskFreeBytes        uint64  `json:"disk_free_bytes"`
-	DiskUsedPercent      float64 `json:"disk_used_percent"`
-	UDPInDatagrams       uint64  `json:"udp_in_datagrams"`
-	UDPInErrors          uint64  `json:"udp_in_errors"`
-	UDPRcvbufErrors      uint64  `json:"udp_rcvbuf_errors"`
-	NetRXBytes           uint64  `json:"net_rx_bytes"`
-	NetTXBytes           uint64  `json:"net_tx_bytes"`
-	ProcessCPUPercent    float64 `json:"process_cpu_percent"`
-	ProcessRSSBytes      uint64  `json:"process_rss_bytes"`
-	ProcessVMSBytes      uint64  `json:"process_vms_bytes"`
-	ProcessThreads       int     `json:"process_threads"`
-	ProcessReadBytes     uint64  `json:"process_read_bytes"`
-	ProcessWriteBytes    uint64  `json:"process_write_bytes"`
-	ProcessReadSyscalls  uint64  `json:"process_read_syscalls"`
-	ProcessWriteSyscalls uint64  `json:"process_write_syscalls"`
-	Goroutines           int     `json:"goroutines"`
-	OpenFDs              int     `json:"open_fds"`
-	UptimeSeconds        float64 `json:"uptime_seconds"`
+	CPUPercent            float64              `json:"cpu_percent"`
+	CPUUserPercent        float64              `json:"cpu_user_percent"`
+	CPUSystemPercent      float64              `json:"cpu_system_percent"`
+	CPUIOWaitPercent      float64              `json:"cpu_iowait_percent"`
+	CPUIRQPercent         float64              `json:"cpu_irq_percent"`
+	CPUSoftIRQPercent     float64              `json:"cpu_softirq_percent"`
+	CPUStealPercent       float64              `json:"cpu_steal_percent"`
+	CPUIdlePercent        float64              `json:"cpu_idle_percent"`
+	Load1                 float64              `json:"load1"`
+	Load5                 float64              `json:"load5"`
+	Load15                float64              `json:"load15"`
+	MemTotalBytes         uint64               `json:"mem_total_bytes"`
+	MemAvailableBytes     uint64               `json:"mem_available_bytes"`
+	MemUsedPercent        float64              `json:"mem_used_percent"`
+	DiskTotalBytes        uint64               `json:"disk_total_bytes"`
+	DiskFreeBytes         uint64               `json:"disk_free_bytes"`
+	DiskUsedPercent       float64              `json:"disk_used_percent"`
+	UDPInDatagrams        uint64               `json:"udp_in_datagrams"`
+	UDPInErrors           uint64               `json:"udp_in_errors"`
+	UDPRcvbufErrors       uint64               `json:"udp_rcvbuf_errors"`
+	NetRXBytes            uint64               `json:"net_rx_bytes"`
+	NetTXBytes            uint64               `json:"net_tx_bytes"`
+	ProcessCPUPercent     float64              `json:"process_cpu_percent"`
+	ProcessCPUPercentVM   float64              `json:"process_cpu_percent_vm"`
+	ProcessCPUPercentCore float64              `json:"process_cpu_percent_core"`
+	ProcessRSSBytes       uint64               `json:"process_rss_bytes"`
+	ProcessVMSBytes       uint64               `json:"process_vms_bytes"`
+	ProcessThreads        int                  `json:"process_threads"`
+	ProcessReadBytes      uint64               `json:"process_read_bytes"`
+	ProcessWriteBytes     uint64               `json:"process_write_bytes"`
+	ProcessReadSyscalls   uint64               `json:"process_read_syscalls"`
+	ProcessWriteSyscalls  uint64               `json:"process_write_syscalls"`
+	Goroutines            int                  `json:"goroutines"`
+	OpenFDs               int                  `json:"open_fds"`
+	UptimeSeconds         float64              `json:"uptime_seconds"`
+	TopProcessMode        string               `json:"top_process_mode"`
+	TopProcesses          []TopProcessSnapshot `json:"top_processes,omitempty"`
+	TopProcessSampleUnix  float64              `json:"top_process_sample_unix,omitempty"`
+	PerformanceWarnings   []string             `json:"performance_warnings,omitempty"`
+}
+
+type TopProcessSnapshot struct {
+	PID            int     `json:"pid"`
+	Name           string  `json:"name"`
+	CPUPercentCore float64 `json:"cpu_percent_core"`
+	RSSBytes       uint64  `json:"rss_bytes"`
+}
+
+type cpuTimes struct {
+	User    uint64
+	Nice    uint64
+	System  uint64
+	Idle    uint64
+	IOWait  uint64
+	IRQ     uint64
+	SoftIRQ uint64
+	Steal   uint64
+	Total   uint64
 }
 
 type HostHealthCollector struct {
-	start        time.Time
-	prevCPUIdle  uint64
-	prevCPUTotal uint64
-	hasCPU       bool
-	prevProcCPU  uint64
-	hasProcCPU   bool
+	start time.Time
+
+	prevCPU     cpuTimes
+	hasCPU      bool
+	prevProcCPU uint64
+	hasProcCPU  bool
+
+	topProcessMode     string
+	lastTopProcessScan time.Time
+	lastTopProcesses   []TopProcessSnapshot
+	prevTopProcessCPU  map[int]uint64
+	prevTopProcessWall time.Time
 }
 
 func NewHostHealthCollector() *HostHealthCollector {
-	return &HostHealthCollector{start: time.Now()}
+	return &HostHealthCollector{
+		start:             time.Now(),
+		topProcessMode:    TopProcessModeWarningOnly,
+		prevTopProcessCPU: make(map[int]uint64),
+	}
+}
+
+func (c *HostHealthCollector) SetTopProcessMode(mode string) string {
+	switch mode {
+	case TopProcessModeOff, TopProcessModeWarningOnly, TopProcessModeSlow:
+		c.topProcessMode = mode
+	default:
+		c.topProcessMode = TopProcessModeWarningOnly
+	}
+	return c.topProcessMode
+}
+
+func (c *HostHealthCollector) TopProcessMode() string {
+	if c.topProcessMode == "" {
+		return TopProcessModeWarningOnly
+	}
+	return c.topProcessMode
 }
 
 func (c *HostHealthCollector) Snapshot() HostHealth {
 	h := HostHealth{
-		Goroutines:    runtime.NumGoroutine(),
-		OpenFDs:       countOpenFDs(),
-		UptimeSeconds: time.Since(c.start).Seconds(),
+		Goroutines:     runtime.NumGoroutine(),
+		OpenFDs:        countOpenFDs(),
+		UptimeSeconds:  time.Since(c.start).Seconds(),
+		TopProcessMode: c.TopProcessMode(),
 	}
 	h.Load1, h.Load5, h.Load15 = readLoadAvg()
 	h.MemTotalBytes, h.MemAvailableBytes, h.MemUsedPercent = readMemInfo()
@@ -65,23 +135,30 @@ func (c *HostHealthCollector) Snapshot() HostHealth {
 	h.DiskTotalBytes, h.DiskFreeBytes, h.DiskUsedPercent = readDiskUsage(".")
 	h.UDPInDatagrams, h.UDPInErrors, h.UDPRcvbufErrors = readUDPStats()
 	h.NetRXBytes, h.NetTXBytes = readNetDev()
-	if idle, total, ok := readCPUStat(); ok {
+	if cpu, ok := readCPUStat(); ok {
 		procCPU := readProcessCPUJiffies()
-		if c.hasCPU && total > c.prevCPUTotal {
-			totalDelta := total - c.prevCPUTotal
-			idleDelta := idle - c.prevCPUIdle
-			if totalDelta > 0 && idleDelta <= totalDelta {
-				h.CPUPercent = round2((1 - float64(idleDelta)/float64(totalDelta)) * 100)
-			}
+		if c.hasCPU && cpu.Total > c.prevCPU.Total {
+			fillCPUPercentages(&h, cpu, c.prevCPU)
+			totalDelta := cpu.Total - c.prevCPU.Total
 			if c.hasProcCPU && procCPU >= c.prevProcCPU {
-				h.ProcessCPUPercent = round2(float64(procCPU-c.prevProcCPU) / float64(totalDelta) * 100)
+				h.ProcessCPUPercentVM = round2(float64(procCPU-c.prevProcCPU) / float64(totalDelta) * 100)
+				h.ProcessCPUPercent = h.ProcessCPUPercentVM
+				h.ProcessCPUPercentCore = round2(h.ProcessCPUPercentVM * float64(runtime.NumCPU()))
 			}
 		}
-		c.prevCPUIdle = idle
-		c.prevCPUTotal = total
+		c.prevCPU = cpu
 		c.prevProcCPU = procCPU
 		c.hasCPU = true
 		c.hasProcCPU = true
+	}
+	h.PerformanceWarnings = performanceWarnings(h)
+	if c.shouldScanTopProcesses(h) {
+		c.lastTopProcesses = c.scanTopProcesses()
+		c.lastTopProcessScan = time.Now()
+	}
+	if len(c.lastTopProcesses) > 0 {
+		h.TopProcesses = append([]TopProcessSnapshot(nil), c.lastTopProcesses...)
+		h.TopProcessSampleUnix = float64(c.lastTopProcessScan.UnixMilli()) / 1000.0
 	}
 	return h
 }
@@ -244,19 +321,156 @@ func readNetDev() (rx, tx uint64) {
 	return
 }
 
-func readCPUStat() (idle, total uint64, ok bool) {
+func fillCPUPercentages(h *HostHealth, cur, prev cpuTimes) {
+	totalDelta := cur.Total - prev.Total
+	if totalDelta == 0 {
+		return
+	}
+	pct := func(delta uint64) float64 {
+		return round2(float64(delta) / float64(totalDelta) * 100)
+	}
+	idleDelta := safeDelta(cur.Idle+cur.IOWait, prev.Idle+prev.IOWait)
+	if idleDelta <= totalDelta {
+		h.CPUPercent = round2((1 - float64(idleDelta)/float64(totalDelta)) * 100)
+		h.CPUIdlePercent = round2(float64(idleDelta) / float64(totalDelta) * 100)
+	}
+	h.CPUUserPercent = pct(safeDelta(cur.User+cur.Nice, prev.User+prev.Nice))
+	h.CPUSystemPercent = pct(safeDelta(cur.System, prev.System))
+	h.CPUIOWaitPercent = pct(safeDelta(cur.IOWait, prev.IOWait))
+	h.CPUIRQPercent = pct(safeDelta(cur.IRQ, prev.IRQ))
+	h.CPUSoftIRQPercent = pct(safeDelta(cur.SoftIRQ, prev.SoftIRQ))
+	h.CPUStealPercent = pct(safeDelta(cur.Steal, prev.Steal))
+}
+
+func safeDelta(cur, prev uint64) uint64 {
+	if cur < prev {
+		return 0
+	}
+	return cur - prev
+}
+
+func readCPUStat() (cpuTimes, bool) {
 	fields := readFields("/proc/stat")
 	if len(fields) < 8 || fields[0] != "cpu" {
-		return 0, 0, false
+		return cpuTimes{}, false
 	}
-	for i, f := range fields[1:] {
-		v := parseUint(f)
-		total += v
-		if i == 3 || i == 4 {
-			idle += v
+	cpu := cpuTimes{
+		User:    parseUint(fields[1]),
+		Nice:    parseUint(fields[2]),
+		System:  parseUint(fields[3]),
+		Idle:    parseUint(fields[4]),
+		IOWait:  parseUint(fields[5]),
+		IRQ:     parseUint(fields[6]),
+		SoftIRQ: parseUint(fields[7]),
+	}
+	if len(fields) > 8 {
+		cpu.Steal = parseUint(fields[8])
+	}
+	cpu.Total = cpu.User + cpu.Nice + cpu.System + cpu.Idle + cpu.IOWait + cpu.IRQ + cpu.SoftIRQ + cpu.Steal
+	return cpu, cpu.Total > 0
+}
+
+func performanceWarnings(h HostHealth) []string {
+	warnings := []string{}
+	if h.CPUPercent > 80 && h.ProcessCPUPercentCore < 5 {
+		warnings = append(warnings, "Host CPU high while engine CPU is low; check kernel network processing, tcpdump, GUI runtime, or other VM processes.")
+	}
+	if h.CPUSoftIRQPercent > 10 {
+		warnings = append(warnings, "SoftIRQ CPU is elevated; kernel network processing is significant.")
+	}
+	if h.UDPInErrors > 0 || h.UDPRcvbufErrors > 0 {
+		warnings = append(warnings, "UDP errors detected; packet receive buffers or host networking may be stressed.")
+	}
+	return warnings
+}
+
+func (c *HostHealthCollector) shouldScanTopProcesses(h HostHealth) bool {
+	mode := c.TopProcessMode()
+	if mode == TopProcessModeOff {
+		return false
+	}
+	if !c.lastTopProcessScan.IsZero() && time.Since(c.lastTopProcessScan) < topProcessMinInterval {
+		return false
+	}
+	if mode == TopProcessModeSlow {
+		return true
+	}
+	return len(h.PerformanceWarnings) > 0
+}
+
+func (c *HostHealthCollector) scanTopProcesses() []TopProcessSnapshot {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	elapsed := now.Sub(c.prevTopProcessWall).Seconds()
+	nextCPU := make(map[int]uint64)
+	snapshots := make([]TopProcessSnapshot, 0, topProcessLimit)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		name, procCPU, rss, ok := readProcessSnapshot(pid)
+		if !ok {
+			continue
+		}
+		nextCPU[pid] = procCPU
+		cpuPct := 0.0
+		if prev, exists := c.prevTopProcessCPU[pid]; exists && procCPU >= prev && elapsed > 0 {
+			cpuPct = round2(float64(procCPU-prev) / elapsed)
+		}
+		snapshots = append(snapshots, TopProcessSnapshot{
+			PID:            pid,
+			Name:           name,
+			CPUPercentCore: cpuPct,
+			RSSBytes:       rss,
+		})
+	}
+	c.prevTopProcessCPU = nextCPU
+	c.prevTopProcessWall = now
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].CPUPercentCore == snapshots[j].CPUPercentCore {
+			return snapshots[i].RSSBytes > snapshots[j].RSSBytes
+		}
+		return snapshots[i].CPUPercentCore > snapshots[j].CPUPercentCore
+	})
+	if len(snapshots) > topProcessLimit {
+		snapshots = snapshots[:topProcessLimit]
+	}
+	return snapshots
+}
+
+func readProcessSnapshot(pid int) (name string, cpuJiffies uint64, rssBytes uint64, ok bool) {
+	statPath := "/proc/" + strconv.Itoa(pid) + "/stat"
+	data, err := os.ReadFile(statPath)
+	if err != nil {
+		return "", 0, 0, false
+	}
+	raw := string(data)
+	open := strings.Index(raw, "(")
+	close := strings.LastIndex(raw, ")")
+	if open < 0 || close <= open {
+		return "", 0, 0, false
+	}
+	name = raw[open+1 : close]
+	fields := strings.Fields(strings.TrimSpace(raw[close+1:]))
+	if len(fields) < 22 {
+		return "", 0, 0, false
+	}
+	cpuJiffies = parseUint(fields[11]) + parseUint(fields[12])
+	rssPages := parseUint(fields[21])
+	rssBytes = rssPages * uint64(os.Getpagesize())
+	if comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm"); err == nil {
+		if s := strings.TrimSpace(string(comm)); s != "" {
+			name = s
 		}
 	}
-	return idle, total, total > 0
+	return name, cpuJiffies, rssBytes, true
 }
 
 func countOpenFDs() int {

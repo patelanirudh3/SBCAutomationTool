@@ -1,6 +1,5 @@
 'use client'
 
-import { useState, useEffect } from 'react'
 import { Zap, Clock, Infinity as InfinityIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -71,17 +70,7 @@ export function TrafficModeSelector({
   onBlur,
 }: TrafficModeSelectorProps) {
   const dhFloat = parseFloat(durationHours) || 0
-  const { h: initH, m: initM } = hoursToHM(dhFloat)
-
-  const [hours, setHours] = useState(initH)
-  const [mins, setMins]   = useState(initM)
-
-  // Sync local H/M state when durationHours changes externally (preset click, reset)
-  useEffect(() => {
-    const { h, m } = hoursToHM(parseFloat(durationHours) || 0)
-    setHours(h)
-    setMins(m)
-  }, [durationHours])
+  const { h: hours, m: mins } = hoursToHM(dhFloat)
 
   const applyHM = (h: number, m: number) => {
     const total = h + m / 60
@@ -90,19 +79,15 @@ export function TrafficModeSelector({
 
   const handleHoursChange = (v: string) => {
     const h = Math.max(0, parseInt(v) || 0)
-    setHours(h)
     applyHM(h, mins)
   }
 
   const handleMinsChange = (v: string) => {
     const m = Math.min(59, Math.max(0, parseInt(v) || 0))
-    setMins(m)
     applyHM(hours, m)
   }
 
   const handlePreset = (h: number, m: number) => {
-    setHours(h)
-    setMins(m)
     applyHM(h, m)
   }
 
@@ -112,7 +97,6 @@ export function TrafficModeSelector({
     : null
 
   const isExactlyOneHour = hours === 1 && mins === 0
-  const currentPresetValue = String(dhFloat)
 
   return (
     <div className="space-y-2">
@@ -234,7 +218,6 @@ export function TrafficModeSelector({
           {/* Footer: always shows BHCC equivalent regardless of duration */}
           {maxCalls !== null && maxCalls > 0 && (() => {
             const bhcc = formatBHCC(maxCalls)
-            const bhccEquiv = formatBHCC(Math.round(maxCalls / 3600))
             const durationLabel = `${hours > 0 ? `${hours}h` : ''}${mins > 0 ? ` ${mins}m` : ''}`.trim()
             return (
               <div className="flex flex-wrap items-baseline gap-1.5 rounded border border-amber-500/20 bg-amber-950/20 px-2.5 py-1.5">

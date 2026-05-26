@@ -16,11 +16,12 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { VMConfigPanel, type RawVMFormValues, TAB_FIELDS } from './VMConfigPanel'
 import { AdvancedSettings } from './AdvancedSettings'
 import { ConfigSummaryStrip, ConfigSummaryDrawer, ConfigSummarySidebar } from './ConfigSummary'
+import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
-import { checkHealth, putConfigFor } from '@/lib/api'
+import { checkHealth, getMetricsFor, putConfigFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
+import type { HostHealth, VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
@@ -347,10 +348,10 @@ export function VMPairBook() {
   const router = useRouter()
   const { updatePair, activePairIndex, pairs, hydrateConfig } = useTrafficStore()
 
-  const pair = pairs[activePairIndex]
   const [raw, setRaw] = useState<RawVMFormValues>(DEFAULTS)
   const [touched, setTouched] = useState<Set<string>>(new Set())
   const [reachability, setReachability] = useState<ReachabilityStatus | null>(null)
+  const [configHostHealth, setConfigHostHealth] = useState<HostHealth | null>(null)
   const [validationPassed, setValidationPassed] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
@@ -424,15 +425,35 @@ export function VMPairBook() {
       }
       const result = await checkHealth(vmIp, metricsPort)
       setReachability({ vm_id: vmId, reachable: result.reachable, checking: false, error: result.reachable ? undefined : (result.error ?? 'Connection refused') })
+      if (result.reachable) {
+        const metrics = await getMetricsFor(vmIp, metricsPort).catch(() => null)
+        setConfigHostHealth(metrics?.host_health ?? null)
+      } else {
+        setConfigHostHealth(null)
+      }
     },
     [raw.vm_id]
   )
 
   useEffect(() => {
-    if (!IS_MOCK || reachabilityTriggeredRef.current) return
+    if (reachabilityTriggeredRef.current) return
+    const metricsPort = parseInt(raw.metrics_port) || 0
+    if (!raw.vm_ip || !metricsPort) return
     reachabilityTriggeredRef.current = true
-    checkReachability(DEFAULTS.vm_ip, parseInt(DEFAULTS.metrics_port))
-  }, [checkReachability])
+    checkReachability(raw.vm_ip, metricsPort)
+  }, [checkReachability, raw.vm_ip, raw.metrics_port])
+
+  useEffect(() => {
+    if (IS_MOCK || !reachability?.reachable) return
+    const vmIp = raw.vm_ip
+    const metricsPort = parseInt(raw.metrics_port) || 0
+    if (!vmIp || !metricsPort) return
+    const id = setInterval(async () => {
+      const metrics = await getMetricsFor(vmIp, metricsPort).catch(() => null)
+      if (metrics?.host_health) setConfigHostHealth(metrics.host_health)
+    }, 10000)
+    return () => clearInterval(id)
+  }, [reachability?.reachable, raw.vm_ip, raw.metrics_port])
 
   // Cmd/Ctrl+I keyboard shortcut: toggle the Config Review drawer.
   // Skipped while focus is inside a form input so users can still type "i".
@@ -593,6 +614,11 @@ export function VMPairBook() {
             full-width form area gives the inputs the room they need without
             wasting 280px on a permanent sidebar. */}
         <div className="mx-auto w-full max-w-[1440px] px-6 py-5">
+          {configHostHealth && (
+            <div className="mb-5">
+              <VMHealthPanel health={configHostHealth} variant="compact" />
+            </div>
+          )}
 
           {/* Responsive split: at lg+ (>=1280px) the sticky Config Summary
               sidebar is visible to the right; below lg the form takes the

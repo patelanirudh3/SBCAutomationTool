@@ -4,7 +4,6 @@ import { useState, useMemo } from 'react'
 import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
-import type { CallEvent } from '@/types'
 
 type SortKey = 'result' | 'pdd_ms' | null
 type SortDir = 'asc' | 'desc'
@@ -122,11 +121,6 @@ function extractSpineRow(spine: Record<string, unknown>): SpineRow {
 
 function mediaBadge(status: string) {
   return MEDIA_BADGE[status] ?? MEDIA_BADGE.NO_MEDIA
-}
-
-function truncateCallId(id: string, maxLen = 10): string {
-  if (!id || id.length <= maxLen) return id || '—'
-  return id.slice(0, maxLen) + '\u2026'
 }
 
 function SortIcon({

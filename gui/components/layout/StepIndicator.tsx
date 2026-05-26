@@ -50,7 +50,6 @@ function useCurrentStep(): StepIndex {
 
 export function StepIndicator() {
   const router = useRouter()
-  const pathname = usePathname()
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
   const currentStep = useCurrentStep()

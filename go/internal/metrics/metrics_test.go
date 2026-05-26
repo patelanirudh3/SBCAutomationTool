@@ -175,3 +175,24 @@ func TestUpdateCountsDoesNotCollapseMultiEventSubscribeProgress(t *testing.T) {
 		t.Fatalf("dialog stats=%+v, want successful=5 notify=5", got)
 	}
 }
+
+func TestPerformanceWarningsAttributeHighHostLowEngineCPU(t *testing.T) {
+	warnings := performanceWarnings(HostHealth{
+		CPUPercent:            85,
+		ProcessCPUPercentCore: 2,
+		CPUSoftIRQPercent:     12,
+	})
+	if len(warnings) < 2 {
+		t.Fatalf("warnings=%v, want host/engine and softirq warnings", warnings)
+	}
+}
+
+func TestPerformanceDiagnosticsModeDefaultsInvalidToWarningOnly(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	if got := c.SetPerformanceDiagnosticsMode("bad-mode"); got != TopProcessModeWarningOnly {
+		t.Fatalf("mode=%q, want %q", got, TopProcessModeWarningOnly)
+	}
+	if got := c.SetPerformanceDiagnosticsMode(TopProcessModeSlow); got != TopProcessModeSlow {
+		t.Fatalf("mode=%q, want %q", got, TopProcessModeSlow)
+	}
+}

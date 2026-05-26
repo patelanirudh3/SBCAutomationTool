@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { CheckCircle2, XCircle, Loader2, Clock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
+import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -136,6 +137,8 @@ export function PrePhaseReport() {
           </p>
         </div>
       </div>
+
+      <VMHealthPanel health={uacMetrics?.host_health ?? null} variant="compact" />
 
       {/* Timer + rate row */}
       <div className="grid grid-cols-3 gap-4">
