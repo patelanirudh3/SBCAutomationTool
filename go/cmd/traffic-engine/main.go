@@ -192,7 +192,7 @@ func runLifecycle(
 	agentSlice := agentsToSlice(agents)
 	slog.Info("Connecting transports", "count", len(agents))
 
-	if err := connectTransportsBatched(ctx, agents, cfg); err != nil {
+	if err := connectTransportsBatched(ctx, agents, cfg, collector); err != nil {
 		slog.Error("Transport connection failed", "err", err)
 		return 1
 	}
@@ -940,10 +940,13 @@ func createAgents(cfg *config.VMConfig) map[string]*agent.ExtensionAgent {
 	slog.Info("Creating agents",
 		"ext_start", cfg.ExtStart, "ext_end", cfg.ExtEnd,
 		"count", cfg.ExtCount(),
+		"local_ip_mode", cfg.LocalIPMode,
 	)
 	for ext := cfg.ExtStart; ext <= cfg.ExtEnd; ext++ {
 		extStr := strconv.Itoa(ext)
-		agents[extStr] = agent.NewExtensionAgent(extStr, cfg)
+		ag := agent.NewExtensionAgent(extStr, cfg)
+		ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
+		agents[extStr] = ag
 	}
 	return agents
 }
@@ -961,9 +964,13 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	return out
 }
 
-func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig) error {
+func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) error {
 	allAgents := agentsToSlice(agents)
 	total := len(allAgents)
+	if collector != nil {
+		collector.ResetTransportConnect(total)
+		defer collector.FinishTransportConnect()
+	}
 	batchSize := cfg.RegisterBatchSize
 	if batchSize <= 0 {
 		batchSize = 10
@@ -999,6 +1006,13 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 				if err := a.Start(ctx); err != nil {
 					errOnce.Do(func() { firstErr = err })
 					slog.Error("Agent start failed", "ext", a.Ext, "err", err)
+					if collector != nil {
+						collector.RecordTransportConnectFailure(a.Ext, cfg.LocalHostForExtension(a.Ext), fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort), err)
+					}
+					return
+				}
+				if collector != nil {
+					collector.RecordTransportConnectSuccess()
 				}
 			}(ag)
 		}
@@ -1237,6 +1251,8 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		TotalMs:             r.TotalMs,
 		RTPTxPkts:           r.RTPTxPkts,
 		RTPRxPkts:           r.RTPRxPkts,
+		SIPLocalIP:          r.SIPLocalIP,
+		SIPLocalPort:        r.SIPLocalPort,
 		MediaVerified:       r.MediaVerified,
 		RTPLocalPort:        r.RTPLocalPort,
 		MediaSecurity:       r.MediaSecurity,

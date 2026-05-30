@@ -18,8 +18,8 @@ const spaceMono = Space_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'CCI Traffic Dashboard',
-  description: 'CCIAutomationTool — live SIP traffic control and monitoring',
+  title: 'Nexus Traffic Dashboard',
+  description: 'NexusTrafficTool — live SIP traffic control and monitoring',
 }
 
 export default function RootLayout({

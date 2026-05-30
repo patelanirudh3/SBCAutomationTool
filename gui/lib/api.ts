@@ -208,6 +208,61 @@ export async function setPerformanceDiagnosticsFor(
   return parseJsonResponse<{ top_process_mode: PerformanceDiagnosticsMode }>(res)
 }
 
+export interface VIPRequest {
+  vip_interface: string
+  vip_cidr: string
+  vip_first_ip: string
+  vip_count: number
+  vip_gateway_ip?: string
+  vip_sanity_target_ip?: string
+}
+
+export interface VIPResult {
+  vip_interface: string
+  vip_cidr: string
+  requested: number
+  already_present: number
+  newly_added: number
+  missing: number
+  failed: number
+  ips?: string[]
+  sanity_checks?: Array<{
+    name: string
+    source_ip: string
+    target_ip?: string
+    ok: boolean
+    output?: string
+    error?: string
+  }>
+  errors?: string[]
+}
+
+export async function verifyVIPsFor(
+  ip: string,
+  port: number,
+  payload: VIPRequest
+): Promise<VIPResult> {
+  const res = await fetch(`http://${ip}:${port}/api/vips/verify`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: { 'Content-Type': 'application/json' },
+  })
+  return parseJsonResponse<VIPResult>(res)
+}
+
+export async function applyVIPsFor(
+  ip: string,
+  port: number,
+  payload: VIPRequest
+): Promise<VIPResult> {
+  const res = await fetch(`http://${ip}:${port}/api/vips/apply`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: { 'Content-Type': 'application/json' },
+  })
+  return parseJsonResponse<VIPResult>(res)
+}
+
 // ---------------------------------------------------------------------------
 // Per-VM call events — GET /api/calls on a specific VM
 // Returns [] on any error so callers never need try/catch

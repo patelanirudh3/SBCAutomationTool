@@ -30,6 +30,17 @@ interface RegSubMetrics {
   idle_count?: number
   non_idle_count?: number
   reg_only_count?: number
+  transport_connect_total?: number
+  transport_connect_done?: number
+  transport_connect_failed?: number
+  transport_connect_active?: boolean
+  transport_connect_failure_sample_limit?: number
+  transport_connect_failed_details?: Array<{
+    ext: string
+    local_ip?: string
+    remote?: string
+    error?: string
+  }>
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +205,7 @@ export function PrePhasePanel() {
     setCurrentRunId,
     idleCount,
     regOnlyCount,
+    uacMetrics,
     updateUACMetrics,
   } = useTrafficStore()
 
@@ -654,6 +666,43 @@ export function PrePhasePanel() {
                   </TooltipContent>
                 )}
               </Tooltip>
+            </div>
+          )}
+
+          {uacMetrics && (uacMetrics.transport_connect_total ?? 0) > 0 && (
+            <div className="space-y-3 rounded-xl border border-slate-700/50 bg-card p-5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-foreground">TCP/TLS Connections</h3>
+                <span className="font-mono text-xs text-muted-foreground">
+                  {(uacMetrics.transport_connect_done ?? 0).toLocaleString()} / {(uacMetrics.transport_connect_total ?? 0).toLocaleString()} connected
+                  {(uacMetrics.transport_connect_failed ?? 0) > 0 ? ` · ${(uacMetrics.transport_connect_failed ?? 0).toLocaleString()} failed` : ''}
+                </span>
+              </div>
+              <LayeredBar
+                completed={(uacMetrics.transport_connect_total ?? 0) > 0
+                  ? ((uacMetrics.transport_connect_done ?? 0) / (uacMetrics.transport_connect_total ?? 1)) * 100
+                  : 0}
+                partial={(uacMetrics.transport_connect_total ?? 0) > 0
+                  ? ((uacMetrics.transport_connect_failed ?? 0) / (uacMetrics.transport_connect_total ?? 1)) * 100
+                  : 0}
+              />
+              {(uacMetrics.transport_connect_failed_details?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-rose-500/25 bg-rose-500/5 p-3 text-xs">
+                  <div className="mb-2 font-semibold text-rose-300">
+                    Showing first {Math.min(10, uacMetrics.transport_connect_failed_details?.length ?? 0)} of {(uacMetrics.transport_connect_failure_sample_limit ?? 100)} captured failure details.
+                  </div>
+                  <div className="space-y-1">
+                    {uacMetrics.transport_connect_failed_details?.slice(0, 10).map((f) => (
+                      <div key={`${f.ext}-${f.local_ip}-${f.error}`} className="grid grid-cols-[80px_130px_150px_1fr] gap-2 font-mono text-[11px] text-rose-100">
+                        <span>{f.ext}</span>
+                        <span>{f.local_ip || '—'}</span>
+                        <span>{f.remote || '—'}</span>
+                        <span className="truncate" title={f.error}>{f.error || 'connect failed'}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

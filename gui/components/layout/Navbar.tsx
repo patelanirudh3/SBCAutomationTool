@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, MessageCircle } from 'lucide-react'
+import { MessageCircle } from 'lucide-react'
 import { useTrafficStore } from '@/store/traffic'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { SessionMenu } from './SessionMenu'
@@ -58,14 +58,17 @@ export function Navbar() {
   const pathname = usePathname()
 
   const isScenarioMode = pathname.startsWith('/scenarios')
+  const showWsStatus = (phase === 'TRAFFIC' || phase === 'STOPPING') && wsStatus !== 'connected'
 
   return (
     <header className="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-border bg-card px-5">
       {/* Logo */}
       <div className="flex items-center gap-2.5">
-        <Activity className="size-5 text-emerald-400" strokeWidth={2.5} />
+        <span className="rounded bg-red-600 px-2 py-0.5 text-xs font-black tracking-widest text-white">
+          AVAYA
+        </span>
         <span className="font-bold tracking-tight text-base text-foreground">
-          CCI Studio
+          Nexus Studio
         </span>
       </div>
 
@@ -135,11 +138,11 @@ export function Navbar() {
         <TooltipContent side="bottom">AI Analysis</TooltipContent>
       </Tooltip>
 
-      {/* Divider */}
-      <div className="h-5 w-px bg-border/50" />
-
       {/* WS status dot */}
-      <Tooltip>
+      {showWsStatus && (
+      <>
+        <div className="h-5 w-px bg-border/50" />
+        <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
@@ -150,25 +153,19 @@ export function Navbar() {
             <span
               className={cn(
                 'text-sm font-medium',
-                wsStatus === 'connected'
-                  ? 'text-emerald-400'
-                  : wsStatus === 'reconnecting'
-                    ? 'text-amber-400'
-                    : 'text-rose-500'
+                wsStatus === 'reconnecting' ? 'text-amber-400' : 'text-rose-500'
               )}
             >
-              {wsStatus === 'connected'
-                ? 'Live'
-                : wsStatus === 'reconnecting'
-                  ? 'Reconnecting…'
-                  : 'Disconnected'}
+              {wsStatus === 'reconnecting' ? 'Reconnecting…' : 'Disconnected'}
             </span>
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
           Engine: {wsStatusRaw.uac}
         </TooltipContent>
-      </Tooltip>
+        </Tooltip>
+      </>
+      )}
     </header>
   )
 }

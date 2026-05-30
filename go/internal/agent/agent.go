@@ -118,9 +118,10 @@ type ExtensionAgent struct {
 	Ext    string
 	Config *config.VMConfig
 
-	transport sip.Transport
-	localPort int
-	localHost string
+	transport         sip.Transport
+	localPort         int
+	localHost         string
+	assignedLocalHost string
 
 	Registered     chan struct{}
 	Subscribed     chan struct{}
@@ -245,9 +246,16 @@ func (a *ExtensionAgent) AutoAnswerEnabled() bool {
 	return a.autoAnswerEnabled.Load()
 }
 
+// SetAssignedLocalHost pins this agent to a specific local source IP.
+func (a *ExtensionAgent) SetAssignedLocalHost(ip string) {
+	a.assignedLocalHost = strings.TrimSpace(ip)
+}
+
 // Start creates the SIP transport, connects, and starts the dispatch goroutine.
 func (a *ExtensionAgent) Start(ctx context.Context) error {
-	if a.Config.LocalHost != "" {
+	if a.assignedLocalHost != "" {
+		a.localHost = a.assignedLocalHost
+	} else if a.Config.LocalHost != "" {
 		a.localHost = a.Config.LocalHost
 	} else {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", a.Config.SBCHost, a.Config.SBCPort), 3*time.Second)

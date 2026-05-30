@@ -97,6 +97,7 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                   <thead>
                     <tr className="border-b border-slate-700/50 text-[10px] uppercase tracking-widest text-slate-400">
                       <th className="px-4 py-2 text-left">Extension</th>
+                      <th className="px-4 py-2 text-left">VIP</th>
                       <th className="px-4 py-2 text-left">Call ID</th>
                       <th className="px-4 py-2 text-left">Time (UTC)</th>
                       <th className="px-4 py-2 text-left">Failure Reason</th>
@@ -110,6 +111,11 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                       >
                         <td className="px-4 py-2 font-mono text-amber-300">
                           {ev.uac_ext ?? ev.ext ?? '—'}
+                        </td>
+                        <td className="px-4 py-2 font-mono text-sky-300">
+                          {ev.sip_local_ip
+                            ? `${ev.sip_local_ip}${ev.sip_local_port ? `:${ev.sip_local_port}` : ''}`
+                            : '—'}
                         </td>
                         <td className="px-4 py-2 font-mono text-slate-300 truncate max-w-[160px]" title={ev.call_id}>
                           {ev.call_id ? ev.call_id.slice(0, 20) + (ev.call_id.length > 20 ? '…' : '') : '—'}

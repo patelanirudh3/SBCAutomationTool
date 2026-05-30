@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
 import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, RotateCcw, AlertTriangle } from 'lucide-react'
@@ -182,9 +183,33 @@ export function FinalReport({
     unregisterFailedCount === 0 &&
     (cleanupStatus.unsubscribe_failed_extensions ?? []).length === 0
   const newRunDisabled = !cleanupSucceeded || unregistering || phase === 'CLEANING_UP'
+  const [cleanupCountdown, setCleanupCountdown] = useState(20)
+  const [autoCleanupFired, setAutoCleanupFired] = useState(false)
+  const onUnregisterRef = useRef(onUnregister)
+  const cleanupPending = phase === 'CLEANUP_READY' && !cleanedUp
+  const cleanupLocked = unregistering || phase === 'CLEANING_UP' || autoCleanupFired
+
+  useEffect(() => {
+    onUnregisterRef.current = onUnregister
+  }, [onUnregister])
+
+  useEffect(() => {
+    if (!cleanupPending || !onUnregisterRef.current || cleanupLocked) return
+    let remaining = 20
+    const id = setInterval(() => {
+      remaining -= 1
+      setCleanupCountdown(remaining)
+      if (remaining <= 0) {
+        clearInterval(id)
+        setAutoCleanupFired(true)
+        onUnregisterRef.current?.()
+      }
+    }, 1000)
+    return () => clearInterval(id)
+  }, [cleanupPending, cleanupLocked])
 
   function handleNewRun() {
-    if (newRunDisabled) return
+    if (newRunDisabled || cleanupLocked) return
     reset()
     router.push('/config')
   }
@@ -264,6 +289,16 @@ export function FinalReport({
 
         {/* Quick-action buttons + cleanup card */}
         <div className="flex items-start gap-2 flex-wrap">
+          {cleanupPending && !cleanupLocked && (
+            <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-200">
+              Cleanup / Unregister starts in <span className="font-mono text-amber-100">{cleanupCountdown}s</span>
+            </div>
+          )}
+          {cleanupLocked && !cleanedUp && (
+            <div className="rounded-lg border border-sky-500/35 bg-sky-500/10 px-3 py-2 text-xs font-semibold text-sky-200">
+              Cleanup is running. Actions are locked until unregister completes.
+            </div>
+          )}
           {/* Run Again is intentionally disabled until backend restart semantics are safe. */}
           {onReRun && (
             <button
@@ -283,7 +318,7 @@ export function FinalReport({
           {/* Unregister card — renders idle button, live progress card,
               or final result strip depending on phase + cleanupStatus. */}
           <UnregisterProgressCard
-            starting={unregistering}
+            starting={unregistering || autoCleanupFired}
             onUnregister={onUnregister}
             onRetryFailed={onRetryFailed}
           />
@@ -291,7 +326,7 @@ export function FinalReport({
           <button
             type="button"
             onClick={handleNewRun}
-            disabled={newRunDisabled}
+            disabled={newRunDisabled || cleanupLocked}
             title={cleanupSucceeded ? 'Edit configuration for the next run' : 'Run Cleanup successfully before editing the next run'}
             className={cn(
               'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',

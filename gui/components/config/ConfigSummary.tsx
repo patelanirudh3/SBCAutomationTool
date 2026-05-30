@@ -37,6 +37,12 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
   const extCount = parseInt(raw.ext_count) || Math.max(extEnd - extStart + 1, 0)
   const cpsNum = parseFloat(raw.cps)
   const bhcc = Number.isFinite(cpsNum) && cpsNum > 0 ? Math.round(cpsNum * 3600) : null
+  const vipCount = parseInt(raw.vip_count) || 0
+  const vipLast = vipCount > 0 ? addIPv4(raw.vip_first_ip, vipCount - 1) : null
+  const vipModeLabel =
+    raw.local_ip_mode === 'unique_vip' ? 'Unique VIPs'
+    : raw.local_ip_mode === 'vip_pool' ? 'Augmented VIP Pool'
+    : 'Single IP'
 
   const server: SummaryItem[] = [
     { label: 'Host', value: raw.sbc_host || '—' },
@@ -57,11 +63,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
 
   const extensions: SummaryItem[] = [
     {
-      label: 'Starting Extension',
-      value: extStart > 0 ? raw.ext_start : '—',
-    },
-    {
-      label: 'Computed Range',
+      label: 'Ext. Range',
       value: extCount > 0 ? `${raw.ext_start} → ${raw.ext_end}` : '—',
     },
     { label: 'Count', value: extCount > 0 ? String(extCount) : '—' },
@@ -82,6 +84,17 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     { label: 'Mode', value: raw.traffic_mode || '—' },
     ...(raw.traffic_mode === 'smoke' ? [{ label: 'Calls', value: raw.call_count }] : []),
     ...(raw.traffic_mode === 'timed' ? [{ label: 'Duration', value: `${raw.duration_hours}h` }] : []),
+    { label: 'Local IP Mode', value: vipModeLabel },
+    ...(raw.local_ip_mode === 'single'
+      ? [{ label: 'Source IP', value: raw.local_host || 'auto-detect', muted: !raw.local_host }]
+      : [
+          { label: 'VIP Interface', value: raw.vip_interface || '—' },
+          { label: 'VIP CIDR', value: raw.vip_cidr || '—' },
+          { label: 'VIP Count', value: vipCount > 0 ? vipCount.toLocaleString() : '—' },
+          { label: 'VIP Range', value: raw.vip_first_ip && vipLast ? `${raw.vip_first_ip} → ${vipLast}` : '—' },
+          ...(raw.vip_gateway_ip ? [{ label: 'Gateway Check', value: raw.vip_gateway_ip }] : []),
+          ...(raw.vip_sanity_target_ip ? [{ label: 'SBC Check', value: raw.vip_sanity_target_ip }] : []),
+        ]),
   ]
 
   const registration: SummaryItem[] = [
@@ -130,6 +143,19 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     : []
 
   return { server, extensions, traffic, registration, media, advanced, extCount, bhcc }
+}
+
+function addIPv4(ip: string, offset: number): string | null {
+  const parts = ip.split('.').map((p) => Number(p))
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return null
+  const n = ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3] + offset
+  if (n < 0 || n > 0xffffffff) return null
+  return [
+    (n >>> 24) & 255,
+    (n >>> 16) & 255,
+    (n >>> 8) & 255,
+    n & 255,
+  ].join('.')
 }
 
 // ---------------------------------------------------------------------------

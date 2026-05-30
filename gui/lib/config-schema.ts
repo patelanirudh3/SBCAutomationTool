@@ -32,6 +32,7 @@ export const VMRoleSchema = z.enum(['UAC', 'UAS'])
 export const TrafficModeSchema = z.enum(['smoke', 'timed', 'unlimited'])
 export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
+export const LocalIPModeSchema = z.enum(['single', 'unique_vip', 'vip_pool'])
 export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
 export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
 export const MediaSecuritySchema = z.enum(['rtp', 'srtp_sdes'])
@@ -51,6 +52,14 @@ export const VMConfigSchema = z
       .refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
     ssh_user: z.string().optional(),
     ssh_key_path: z.string().optional(),
+    local_ip_mode: LocalIPModeSchema.optional(),
+    local_host: z.string().optional(),
+    vip_interface: z.string().optional(),
+    vip_cidr: z.string().optional(),
+    vip_first_ip: z.string().optional(),
+    vip_count: z.number().int().nonnegative().optional(),
+    vip_gateway_ip: z.string().optional(),
+    vip_sanity_target_ip: z.string().optional(),
 
     // Unified extension range (single pool)
     ext_start: z.number().int().min(1000, 'Must be at least 4 digits').max(9999999999, 'Too many digits'),
@@ -128,6 +137,32 @@ export const VMConfigSchema = z
         path: ['ext_count'],
         message: 'Need at least 2 extensions',
       })
+    }
+
+    const vipMode = data.local_ip_mode ?? 'single'
+    const extCount = data.ext_end - data.ext_start + 1
+    if (vipMode !== 'single') {
+      if (!data.vip_interface) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_interface'], message: 'Interface is required for VIP mode' })
+      }
+      if (!data.vip_cidr || !/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(data.vip_cidr)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_cidr'], message: 'CIDR is required, e.g. 10.71.16.0/21' })
+      }
+      if (!data.vip_first_ip || !isValidIpv4(data.vip_first_ip)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_first_ip'], message: 'First VIP must be a valid IPv4 address' })
+      }
+      if (!data.vip_count || data.vip_count <= 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_count'], message: 'VIP count must be greater than 0' })
+      }
+      if (vipMode === 'unique_vip' && data.vip_count && data.vip_count < extCount) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_count'], message: `Unique VIPs requires at least ${extCount} VIPs` })
+      }
+      if (data.vip_gateway_ip && !isValidIpv4(data.vip_gateway_ip)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_gateway_ip'], message: 'Gateway must be a valid IPv4 address' })
+      }
+      if (data.vip_sanity_target_ip && !isValidIpv4(data.vip_sanity_target_ip)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vip_sanity_target_ip'], message: 'Sanity target must be a valid IPv4 address' })
+      }
     }
 
     if (data.traffic_mode === 'smoke' && !data.call_count) {

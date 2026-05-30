@@ -54,6 +54,8 @@ type CallResult struct {
 	TotalMs             float64       `json:"total_ms"`
 	RTPTxPkts           int           `json:"rtp_tx_pkts"`
 	RTPRxPkts           int           `json:"rtp_rx_pkts"`
+	SIPLocalIP          string        `json:"sip_local_ip"`
+	SIPLocalPort        int           `json:"sip_local_port"`
 	MediaVerified       bool          `json:"media_verified"`
 	RTPLocalPort        int           `json:"rtp_local_port"`
 	MediaSecurity       string        `json:"media_security"`

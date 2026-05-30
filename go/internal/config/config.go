@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +81,11 @@ type VMConfig struct {
 	MaxConcurrentCalls int    `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
 	LocalHost          string `yaml:"local_host" json:"local_host"`
 	LocalPort          int    `yaml:"local_port" json:"local_port"`
+	LocalIPMode        string `yaml:"local_ip_mode" json:"local_ip_mode"`
+	VIPInterface       string `yaml:"vip_interface" json:"vip_interface"`
+	VIPCIDR            string `yaml:"vip_cidr" json:"vip_cidr"`
+	VIPFirstIP         string `yaml:"vip_first_ip" json:"vip_first_ip"`
+	VIPCount           int    `yaml:"vip_count" json:"vip_count"`
 
 	RTPBurstSeconds             int      `yaml:"rtp_burst_seconds" json:"rtp_burst_seconds"`
 	RTPBurstPPS                 int      `yaml:"rtp_burst_pps" json:"rtp_burst_pps"`
@@ -176,11 +182,6 @@ func (c *VMConfig) URIScheme() string {
 	return "sip"
 }
 
-// ExtCount returns the total number of extensions in the configured range.
-func (c *VMConfig) ExtCount() int {
-	return c.ExtEnd - c.ExtStart + 1
-}
-
 // EffectiveMaxConcurrent returns MaxConcurrentCalls if explicitly set,
 // otherwise CPS × HoldTimeSeconds — the theoretical steady-state concurrency.
 func (c *VMConfig) EffectiveMaxConcurrent() int {
@@ -188,6 +189,78 @@ func (c *VMConfig) EffectiveMaxConcurrent() int {
 		return c.MaxConcurrentCalls
 	}
 	return c.CPS * c.HoldTimeSeconds
+}
+
+// ExtCount returns the number of configured extensions in the unified pool.
+func (c *VMConfig) ExtCount() int {
+	if c.ExtEnd < c.ExtStart {
+		return 0
+	}
+	return c.ExtEnd - c.ExtStart + 1
+}
+
+// GenerateVIPs returns the configured VIP range as a list of IPv4 strings.
+func (c *VMConfig) GenerateVIPs() ([]string, error) {
+	if c.LocalIPMode == "" || c.LocalIPMode == "single" {
+		return nil, nil
+	}
+	if c.VIPCount <= 0 {
+		return nil, fmt.Errorf("vip_count must be > 0")
+	}
+	first := net.ParseIP(strings.TrimSpace(c.VIPFirstIP)).To4()
+	if first == nil {
+		return nil, fmt.Errorf("vip_first_ip must be a valid IPv4 address")
+	}
+	_, ipNet, err := net.ParseCIDR(strings.TrimSpace(c.VIPCIDR))
+	if err != nil {
+		return nil, fmt.Errorf("vip_cidr must be a valid CIDR: %w", err)
+	}
+	out := make([]string, 0, c.VIPCount)
+	cur := ipv4ToUint32(first)
+	for i := 0; i < c.VIPCount; i++ {
+		ip := uint32ToIPv4(cur + uint32(i))
+		if !ipNet.Contains(ip) {
+			return nil, fmt.Errorf("VIP range exceeds vip_cidr at %s", ip.String())
+		}
+		out = append(out, ip.String())
+	}
+	return out, nil
+}
+
+// LocalHostForExtension returns the source IP assigned to extension ext.
+func (c *VMConfig) LocalHostForExtension(ext string) string {
+	mode := strings.TrimSpace(c.LocalIPMode)
+	if mode == "" || mode == "single" {
+		return c.LocalHost
+	}
+	vips, err := c.GenerateVIPs()
+	if err != nil || len(vips) == 0 {
+		return c.LocalHost
+	}
+	extNum, err := strconv.Atoi(ext)
+	if err != nil {
+		return vips[0]
+	}
+	idx := extNum - c.ExtStart
+	if idx < 0 {
+		idx = 0
+	}
+	if mode == "unique_vip" {
+		if idx >= len(vips) {
+			return c.LocalHost
+		}
+		return vips[idx]
+	}
+	return vips[idx%len(vips)]
+}
+
+func ipv4ToUint32(ip net.IP) uint32 {
+	v := ip.To4()
+	return uint32(v[0])<<24 | uint32(v[1])<<16 | uint32(v[2])<<8 | uint32(v[3])
+}
+
+func uint32ToIPv4(v uint32) net.IP {
+	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
 // BatchDelay returns the inter-batch delay for TCP socket creation and
@@ -407,6 +480,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.SIPTransport == "" {
 		cfg.SIPTransport = "TCP"
+	}
+	if cfg.LocalIPMode == "" {
+		cfg.LocalIPMode = "single"
 	}
 	// When TLS is selected without an explicit mode, default to insecure to
 	// preserve backward compatibility with configs that just say sip_transport: TLS.
@@ -674,6 +750,35 @@ func Validate(cfg *VMConfig) error {
 	}
 	if cfg.ExtCount() < 2 {
 		errs = append(errs, fmt.Sprintf("ext range must have at least 2 extensions, got %d", cfg.ExtCount()))
+	}
+
+	cfg.LocalIPMode = strings.ToLower(strings.TrimSpace(cfg.LocalIPMode))
+	if cfg.LocalIPMode == "" {
+		cfg.LocalIPMode = "single"
+	}
+	switch cfg.LocalIPMode {
+	case "single":
+	case "unique_vip", "vip_pool":
+		if strings.TrimSpace(cfg.VIPInterface) == "" {
+			errs = append(errs, "vip_interface is required when local_ip_mode uses VIPs")
+		}
+		if strings.TrimSpace(cfg.VIPCIDR) == "" {
+			errs = append(errs, "vip_cidr is required when local_ip_mode uses VIPs")
+		}
+		if strings.TrimSpace(cfg.VIPFirstIP) == "" {
+			errs = append(errs, "vip_first_ip is required when local_ip_mode uses VIPs")
+		}
+		if cfg.VIPCount <= 0 {
+			errs = append(errs, "vip_count must be > 0 when local_ip_mode uses VIPs")
+		}
+		if cfg.LocalIPMode == "unique_vip" && cfg.VIPCount < cfg.ExtCount() {
+			errs = append(errs, fmt.Sprintf("unique_vip requires vip_count >= extension count (%d), got %d", cfg.ExtCount(), cfg.VIPCount))
+		}
+		if _, err := cfg.GenerateVIPs(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("local_ip_mode must be 'single', 'unique_vip', or 'vip_pool', got %q", cfg.LocalIPMode))
 	}
 
 	if cfg.CPS <= 0 {

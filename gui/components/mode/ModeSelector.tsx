@@ -37,11 +37,11 @@ export function ModeSelector() {
         <div className="mb-3 flex items-center justify-center gap-2">
           <Zap className="size-6 text-emerald-400" strokeWidth={2.5} />
           <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            CCI Traffic Tool
+            Nexus Traffic Tool
           </h1>
         </div>
         <p className="text-sm text-muted-foreground">
-          CCI Automation &amp; Load Testing Platform
+          Nexus Traffic Automation &amp; Load Testing Platform
         </p>
       </motion.div>
 
@@ -163,7 +163,7 @@ export function ModeSelector() {
         transition={{ delay: 0.5 }}
         className="mt-8 text-xs text-muted-foreground/60"
       >
-        CCIAutomationTool · Phase 1 · Local Mode
+        NexusTrafficTool · Phase 1 · Local Mode
       </motion.p>
     </div>
   )

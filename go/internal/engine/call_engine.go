@@ -369,7 +369,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		if !sip.IsFinalFailureCode(code) {
 			return code, false
 		}
-		ag.SendAckForFailure(dialog, raw)
+		if err := ag.SendAckForFailure(dialog, raw); err != nil {
+			emit("ACK_FINAL_FAILED", atoi(code), 0, map[string]any{"error": err.Error()})
+		} else {
+			emit("ACK_FINAL_SENT", atoi(code), 0, nil)
+		}
 		emit("CALL_FAILED", atoi(code), 0, map[string]any{"reason": "final failure"})
 		return code, true
 	}
@@ -427,6 +431,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			RTPLocalPort:        rtpLocalPort(rtpEP),
 			RTPTxPkts:           rtpTx,
 			RTPRxPkts:           rtpRx,
+			SIPLocalIP:          ag.LocalHost(),
+			SIPLocalPort:        ag.LocalPort(),
 			MediaVerified:       mediaOK,
 			RTPRxFromSBCPkts:    rtpRxFromSBC,
 			RTPRxOtherPkts:      rtpRxOt,
@@ -546,6 +552,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				Success: false, FailureReason: "timeout",
 				TotalMs:         msSince(callStart),
 				RTPLocalPort:    rtpLocalPort(rtpEP),
+				SIPLocalIP:      ag.LocalHost(),
+				SIPLocalPort:    ag.LocalPort(),
 				MediaSecurity:   cfg.MediaSecurity,
 				SRTPCryptoSuite: selectedSRTPCryptoSuite(dialog),
 				PeerExt:         callee, TsUTC: inviteTsUTC, Direction: "uac",
@@ -597,7 +605,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 		default:
 			if isFinalFailure(code) {
-				ag.SendAckForFailure(dialog, raw)
+				if err := ag.SendAckForFailure(dialog, raw); err != nil {
+					emit("ACK_FINAL_FAILED", atoi(code), 0, map[string]any{"error": err.Error()})
+				} else {
+					emit("ACK_FINAL_SENT", atoi(code), 0, nil)
+				}
 				emit("CALL_FAILED", atoi(code), 0, map[string]any{"reason": "final failure"})
 				result := fail(fmt.Sprintf("Rejected with %s", code))
 				e.complete(result)
@@ -628,7 +640,11 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		prackCode := prackEv.Code
 		if sip.IsFinalFailureCode(prackCode) {
 			if strings.EqualFold(prackEv.CSeqMethod, "INVITE") {
-				ag.SendAckForFailure(dialog, rawPrackResp)
+				if err := ag.SendAckForFailure(dialog, rawPrackResp); err != nil {
+					emit("ACK_FINAL_FAILED", atoi(prackCode), 0, map[string]any{"error": err.Error()})
+				} else {
+					emit("ACK_FINAL_SENT", atoi(prackCode), 0, nil)
+				}
 				emit("CALL_FAILED", atoi(prackCode), 0, map[string]any{"reason": "final failure"})
 				result := fail(fmt.Sprintf("Rejected with %s while awaiting PRACK", prackCode))
 				e.complete(result)
@@ -962,6 +978,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		TotalMs:             totalMs,
 		RTPTxPkts:           rtpTx,
 		RTPRxPkts:           rtpRx,
+		SIPLocalIP:          ag.LocalHost(),
+		SIPLocalPort:        ag.LocalPort(),
 		MediaVerified:       mediaOK,
 		RTPLocalPort:        rtpLocalPort(rtpEP),
 		MediaSecurity:       cfg.MediaSecurity,

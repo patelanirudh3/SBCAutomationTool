@@ -18,9 +18,9 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
-import type { TrafficMode, SipTransport, SipScheme, RtpCodec, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
+import type { TrafficMode, SipTransport, SipScheme, LocalIPMode, RtpCodec, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { SUBSCRIBE_EVENT_OPTIONS, SUBSCRIBE_EVENT_VALUES } from '@/lib/subscription-events'
-import { uploadCertificateFor, verifyTLSFor, type TLSVerifyResult } from '@/lib/api'
+import { applyVIPsFor, uploadCertificateFor, verifyTLSFor, verifyVIPsFor, type TLSVerifyResult, type VIPResult } from '@/lib/api'
 
 // All form values stored as strings so inputs stay fully controlled
 export type RawVMFormValues = {
@@ -28,6 +28,14 @@ export type RawVMFormValues = {
   vm_ip: string
   ssh_user: string
   ssh_key_path: string
+  local_ip_mode: LocalIPMode
+  local_host: string
+  vip_interface: string
+  vip_cidr: string
+  vip_first_ip: string
+  vip_count: string
+  vip_gateway_ip: string
+  vip_sanity_target_ip: string
   // Unified extension pool (single range)
   ext_start: string
   ext_end: string
@@ -117,6 +125,7 @@ export interface VMConfigPanelProps {
 export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof RawVMFormValues>> = {
   server: [
     'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
+    'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip',
     'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
     'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
@@ -149,7 +158,7 @@ const DEFAULTS_REGISTRATION = {
 // Fields belonging to each logical section — used by per-section Reset buttons
 const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
-  agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path'] as (keyof RawVMFormValues)[],
+  agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path', 'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
                    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
@@ -532,6 +541,9 @@ export function VMConfigPanel({
   const [tlsBusy, setTLSBusy] = useState<string | null>(null)
   const [tlsVerify, setTLSVerify] = useState<TLSVerifyResult | null>(null)
   const [tlsUploadError, setTLSUploadError] = useState<string | null>(null)
+  const [vipBusy, setVIPBusy] = useState<'verify' | 'apply' | null>(null)
+  const [vipResult, setVIPResult] = useState<VIPResult | null>(null)
+  const [vipError, setVIPError] = useState<string | null>(null)
   const uploadTLSFile = async (kind: 'ca' | 'client_cert' | 'client_key', file?: File) => {
     if (!file) return
     setTLSBusy(kind)
@@ -588,6 +600,30 @@ export function VMConfigPanel({
   const handleMetricsPortBlur = () => {
     onBlur('metrics_port')
     if (raw.vm_ip && raw.metrics_port) onCheckReachability()
+  }
+
+  const vipPayload = () => ({
+    vip_interface: raw.vip_interface,
+    vip_cidr: raw.vip_cidr,
+    vip_first_ip: raw.vip_first_ip,
+    vip_count: parseInt(raw.vip_count) || 0,
+    vip_gateway_ip: raw.vip_gateway_ip || undefined,
+    vip_sanity_target_ip: raw.vip_sanity_target_ip || raw.sbc_host || undefined,
+  })
+
+  const handleVIPAction = async (action: 'verify' | 'apply') => {
+    setVIPBusy(action)
+    setVIPResult(null)
+    setVIPError(null)
+    try {
+      const fn = action === 'verify' ? verifyVIPsFor : applyVIPsFor
+      const result = await fn(raw.vm_ip || '127.0.0.1', parseInt(raw.metrics_port) || 8082, vipPayload())
+      setVIPResult(result)
+    } catch (err) {
+      setVIPError(err instanceof Error ? err.message : 'VIP operation failed')
+    } finally {
+      setVIPBusy(null)
+    }
   }
 
   const ptimeNum = parseInt(raw.rtp_ptime, 10) || 20
@@ -1116,6 +1152,98 @@ export function VMConfigPanel({
             {e('ext_start') && <FieldError error={e('ext_start')} />}
             {e('ext_count') && <FieldError error={e('ext_count')} />}
             {e('ext_end')   && <FieldError error={e('ext_end')} />}
+          </div>
+        )}
+        <FormRow
+          label="Local IP Mode"
+          error={e('local_ip_mode')}
+          hint="Single IP uses the current design. Unique VIPs assigns one local source IP per extension. Augmented VIP Pool shares a VIP range across extensions."
+        >
+          <Select
+            value={raw.local_ip_mode}
+            onValueChange={(v) => onChange('local_ip_mode', v as LocalIPMode)}
+          >
+            <SelectTrigger className="w-56">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="single">Single IP</SelectItem>
+              <SelectItem value="unique_vip">Unique VIPs</SelectItem>
+              <SelectItem value="vip_pool">Augmented VIP Pool</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormRow>
+        {raw.local_ip_mode === 'single' && (
+          <FormRow
+            label="Source IP"
+            error={e('local_host')}
+            hint="Optional local source IP for all SIP/RTP sockets. Leave empty for auto-detect."
+          >
+            <Input
+              value={raw.local_host}
+              onChange={(ev) => onChange('local_host', ev.target.value)}
+              onBlur={() => onBlur('local_host')}
+              placeholder="auto-detect"
+              className="w-40 font-mono"
+            />
+          </FormRow>
+        )}
+        {raw.local_ip_mode !== 'single' && (
+          <div className="rounded-lg border border-slate-700/50 bg-slate-950/25 p-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              <FormRow label="VIP Interface" error={e('vip_interface')}>
+                <Input value={raw.vip_interface} onChange={(ev) => onChange('vip_interface', ev.target.value)} onBlur={() => onBlur('vip_interface')} placeholder="eth0" className="w-32 font-mono" />
+              </FormRow>
+              <FormRow label="VIP CIDR" error={e('vip_cidr')}>
+                <Input value={raw.vip_cidr} onChange={(ev) => onChange('vip_cidr', ev.target.value)} onBlur={() => onBlur('vip_cidr')} placeholder="10.71.16.0/21" className="w-44 font-mono" />
+              </FormRow>
+              <FormRow label="First VIP" error={e('vip_first_ip')}>
+                <Input value={raw.vip_first_ip} onChange={(ev) => onChange('vip_first_ip', ev.target.value)} onBlur={() => onBlur('vip_first_ip')} placeholder="10.71.17.101" className="w-40 font-mono" />
+              </FormRow>
+              <FormRow label="VIP Count" error={e('vip_count')}>
+                <Input type="number" min={1} value={raw.vip_count} onChange={(ev) => onChange('vip_count', ev.target.value)} onBlur={() => onBlur('vip_count')} placeholder={raw.local_ip_mode === 'unique_vip' ? String(extCount || '') : '100'} className="w-24 font-mono" />
+              </FormRow>
+              <FormRow label="Gateway Check" error={e('vip_gateway_ip')}>
+                <Input value={raw.vip_gateway_ip} onChange={(ev) => onChange('vip_gateway_ip', ev.target.value)} onBlur={() => onBlur('vip_gateway_ip')} placeholder="optional gateway IP" className="w-40 font-mono" />
+              </FormRow>
+              <FormRow label="SBC Check" error={e('vip_sanity_target_ip')}>
+                <Input value={raw.vip_sanity_target_ip} onChange={(ev) => onChange('vip_sanity_target_ip', ev.target.value)} onBlur={() => onBlur('vip_sanity_target_ip')} placeholder={raw.sbc_host || 'optional SBC IP'} className="w-40 font-mono" />
+              </FormRow>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2 pl-[172px]">
+              <Button type="button" size="sm" variant="outline" disabled={!!vipBusy} onClick={() => handleVIPAction('verify')} className="gap-1.5">
+                {vipBusy === 'verify' && <Loader2 className="size-3 animate-spin" />}
+                Verify VIPs
+              </Button>
+              <Button type="button" size="sm" disabled={!!vipBusy} onClick={() => handleVIPAction('apply')} className="gap-1.5">
+                {vipBusy === 'apply' && <Loader2 className="size-3 animate-spin" />}
+                Add / Verify VIPs
+              </Button>
+              <span className="text-xs text-slate-400">
+                {raw.local_ip_mode === 'unique_vip' ? 'Requires one VIP per extension.' : 'VIPs are shared round-robin across extensions.'}
+              </span>
+            </div>
+            {vipResult && (
+              <div className="mt-3 rounded border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-200">
+                Requested {vipResult.requested}; already present {vipResult.already_present}; newly added {vipResult.newly_added}; missing {vipResult.missing}; failed {vipResult.failed}.
+                {vipResult.sanity_checks?.length ? (
+                  <div className="mt-2 space-y-1">
+                    {vipResult.sanity_checks.map((check) => (
+                      <div key={`${check.name}-${check.target_ip ?? check.source_ip}`} className={check.ok ? 'text-emerald-200' : 'text-amber-200'}>
+                        {check.name}: {check.ok ? 'OK' : 'FAILED'} from {check.source_ip}
+                        {check.target_ip ? ` to ${check.target_ip}` : ''}
+                        {check.error ? ` (${check.error})` : ''}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            )}
+            {vipError && (
+              <div className="mt-3 rounded border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-200">
+                {vipError}
+              </div>
+            )}
           </div>
         )}
       </div>

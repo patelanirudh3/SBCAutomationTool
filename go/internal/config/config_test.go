@@ -147,6 +147,42 @@ func TestSIPSRequiresTLSTransport(t *testing.T) {
 	}
 }
 
+func TestVIPConfigValidationAndMapping(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        6000000,
+		ExtEnd:          6000002,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		LocalIPMode:     "unique_vip",
+		VIPInterface:    "eth0",
+		VIPCIDR:         "10.71.16.0/21",
+		VIPFirstIP:      "10.71.17.101",
+		VIPCount:        3,
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed for VIP config: %v", err)
+	}
+	if got := cfg.LocalHostForExtension("6000001"); got != "10.71.17.102" {
+		t.Fatalf("LocalHostForExtension=%q, want 10.71.17.102", got)
+	}
+
+	cfg.LocalIPMode = "vip_pool"
+	cfg.VIPCount = 2
+	if got := cfg.LocalHostForExtension("6000002"); got != "10.71.17.101" {
+		t.Fatalf("pooled LocalHostForExtension=%q, want round-robin first VIP", got)
+	}
+}
+
 func TestSubscribeEventsNormalizeAndValidate(t *testing.T) {
 	cfg := &VMConfig{SubscribeEvents: []string{"dialog", "reg", "dialog", "avaya-cm-cc-info"}}
 	ApplyDefaults(cfg)

@@ -38,30 +38,36 @@ import (
 // TrafficMetrics is the snapshot of traffic metrics for one VM at one point in time.
 // JSON field names must match the Python version exactly — the Next.js GUI depends on them.
 type TrafficMetrics struct {
-	Timestamp            float64                           `json:"timestamp"`
-	VMID                 string                            `json:"vm_id"`
-	Phase                string                            `json:"phase"`
-	CPSActual            float64                           `json:"cps_actual"`
-	ConcurrentCalls      int                               `json:"concurrent_calls"`
-	CallsInviteSent      int                               `json:"calls_invite_sent"`
-	CallsAttempted       int                               `json:"calls_attempted"`
-	CallsAnswered        int                               `json:"calls_answered"`
-	CallsAcknowledged    int                               `json:"calls_acknowledged"`
-	CallsCompleted       int                               `json:"calls_completed"`
-	CallsFailed          int                               `json:"calls_failed"`
-	ASR                  float64                           `json:"asr"`
-	CSR                  float64                           `json:"csr"`
-	AvgPDDMs             float64                           `json:"avg_pdd_ms"`
-	MinPDDMs             float64                           `json:"min_pdd_ms"`
-	MaxPDDMs             float64                           `json:"max_pdd_ms"`
-	AvgHoldMs            float64                           `json:"avg_hold_ms"`
-	AvgTotalMs           float64                           `json:"avg_total_ms"`
-	SocketCount          int                               `json:"socket_count"`
-	RegisteredCount      int                               `json:"registered_count"`
-	RegisteredTotal      int                               `json:"registered_total"`
-	SubscribedCount      int                               `json:"subscribed_count"`
-	SubscribedTotal      int                               `json:"subscribed_total"`
-	SubscriptionsByEvent map[string]SubscriptionEventStats `json:"subscriptions_by_event,omitempty"`
+	Timestamp                          float64                           `json:"timestamp"`
+	VMID                               string                            `json:"vm_id"`
+	Phase                              string                            `json:"phase"`
+	CPSActual                          float64                           `json:"cps_actual"`
+	ConcurrentCalls                    int                               `json:"concurrent_calls"`
+	CallsInviteSent                    int                               `json:"calls_invite_sent"`
+	CallsAttempted                     int                               `json:"calls_attempted"`
+	CallsAnswered                      int                               `json:"calls_answered"`
+	CallsAcknowledged                  int                               `json:"calls_acknowledged"`
+	CallsCompleted                     int                               `json:"calls_completed"`
+	CallsFailed                        int                               `json:"calls_failed"`
+	ASR                                float64                           `json:"asr"`
+	CSR                                float64                           `json:"csr"`
+	AvgPDDMs                           float64                           `json:"avg_pdd_ms"`
+	MinPDDMs                           float64                           `json:"min_pdd_ms"`
+	MaxPDDMs                           float64                           `json:"max_pdd_ms"`
+	AvgHoldMs                          float64                           `json:"avg_hold_ms"`
+	AvgTotalMs                         float64                           `json:"avg_total_ms"`
+	SocketCount                        int                               `json:"socket_count"`
+	TransportConnectTotal              int                               `json:"transport_connect_total"`
+	TransportConnectDone               int                               `json:"transport_connect_done"`
+	TransportConnectFailed             int                               `json:"transport_connect_failed"`
+	TransportConnectActive             bool                              `json:"transport_connect_active"`
+	TransportConnectFailureSampleLimit int                               `json:"transport_connect_failure_sample_limit"`
+	TransportConnectFailedDetails      []TransportConnectFailure         `json:"transport_connect_failed_details,omitempty"`
+	RegisteredCount                    int                               `json:"registered_count"`
+	RegisteredTotal                    int                               `json:"registered_total"`
+	SubscribedCount                    int                               `json:"subscribed_count"`
+	SubscribedTotal                    int                               `json:"subscribed_total"`
+	SubscriptionsByEvent               map[string]SubscriptionEventStats `json:"subscriptions_by_event,omitempty"`
 	// PrepStatus tracks the optional async unregister-flush invoked by the
 	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
 	// | "failed". The GUI reads this to drive the corner-button visual state
@@ -130,6 +136,15 @@ type TrafficMetrics struct {
 	IOWaitCPUMaxPercent      float64 `json:"iowait_cpu_max_percent"`
 }
 
+const transportConnectFailureSampleLimit = 100
+
+type TransportConnectFailure struct {
+	Ext     string `json:"ext"`
+	LocalIP string `json:"local_ip"`
+	Remote  string `json:"remote"`
+	Error   string `json:"error"`
+}
+
 // SubscriptionEventStats exposes per-event-package subscription progress.
 type SubscriptionEventStats struct {
 	Total          int `json:"total"`
@@ -160,6 +175,8 @@ type CallResultData struct {
 	TotalMs             float64
 	RTPTxPkts           int
 	RTPRxPkts           int
+	SIPLocalIP          string
+	SIPLocalPort        int
 	MediaVerified       bool
 	RTPLocalPort        int
 	MediaSecurity       string
@@ -239,18 +256,23 @@ type MetricsCollector struct {
 
 	latest TrafficMetrics
 
-	concurrentCalls      int
-	socketCount          int
-	registeredCount      int
-	registeredTotal      int
-	subscribedCount      int
-	subscribedTotal      int
-	subscriptionsByEvent map[string]SubscriptionEventStats
-	prepStatus           string // "idle" | "running" | "done" | "failed"
-	phase                string
-	runStart             time.Time
-	running              bool
-	runStartSet          bool
+	concurrentCalls               int
+	socketCount                   int
+	transportConnectTotal         int
+	transportConnectDone          int
+	transportConnectFailed        int
+	transportConnectActive        bool
+	transportConnectFailedDetails []TransportConnectFailure
+	registeredCount               int
+	registeredTotal               int
+	subscribedCount               int
+	subscribedTotal               int
+	subscriptionsByEvent          map[string]SubscriptionEventStats
+	prepStatus                    string // "idle" | "running" | "done" | "failed"
+	phase                         string
+	runStart                      time.Time
+	running                       bool
+	runStartSet                   bool
 
 	callResults        []CallResultData
 	rawEvents          []map[string]any
@@ -564,6 +586,46 @@ func (c *MetricsCollector) SetPerformanceDiagnosticsMode(mode string) string {
 	return c.hostHealth.SetTopProcessMode(mode)
 }
 
+func (c *MetricsCollector) ResetTransportConnect(total int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.transportConnectTotal = total
+	c.transportConnectDone = 0
+	c.transportConnectFailed = 0
+	c.transportConnectActive = total > 0
+	c.transportConnectFailedDetails = nil
+}
+
+func (c *MetricsCollector) RecordTransportConnectSuccess() {
+	c.mu.Lock()
+	c.transportConnectDone++
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) RecordTransportConnectFailure(ext, localIP, remote string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.transportConnectFailed++
+	if len(c.transportConnectFailedDetails) < transportConnectFailureSampleLimit {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		c.transportConnectFailedDetails = append(c.transportConnectFailedDetails, TransportConnectFailure{
+			Ext:     ext,
+			LocalIP: localIP,
+			Remote:  remote,
+			Error:   msg,
+		})
+	}
+}
+
+func (c *MetricsCollector) FinishTransportConnect() {
+	c.mu.Lock()
+	c.transportConnectActive = false
+	c.mu.Unlock()
+}
+
 func (c *MetricsCollector) PerformanceDiagnosticsMode() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -778,6 +840,8 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"total_ms":              r.TotalMs,
 			"rtp_tx_pkts":           r.RTPTxPkts,
 			"rtp_rx_pkts":           r.RTPRxPkts,
+			"sip_local_ip":          r.SIPLocalIP,
+			"sip_local_port":        r.SIPLocalPort,
 			"media_verified":        r.MediaVerified,
 			"rtp_local_port":        r.RTPLocalPort,
 			"media_security":        r.MediaSecurity,
@@ -874,6 +938,8 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"hold_ms":               cr.HoldMs,
 			"media_status":          media,
 			"media_security":        cr.MediaSecurity,
+			"sip_local_ip":          cr.SIPLocalIP,
+			"sip_local_port":        cr.SIPLocalPort,
 			"srtp_crypto_suite":     cr.SRTPCryptoSuite,
 			"srtp_decrypt_failures": cr.SRTPDecryptFailures,
 			"srtp_auth_failures":    cr.SRTPAuthFailures,
@@ -1020,6 +1086,11 @@ func (c *MetricsCollector) Reset() {
 	c.windowAttempts = 0
 	c.concurrentCalls = 0
 	c.socketCount = 0
+	c.transportConnectTotal = 0
+	c.transportConnectDone = 0
+	c.transportConnectFailed = 0
+	c.transportConnectActive = false
+	c.transportConnectFailedDetails = nil
 	c.registeredCount = 0
 	c.registeredTotal = 0
 	c.subscribedCount = 0
@@ -1193,33 +1264,39 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	}
 
 	snap := TrafficMetrics{
-		Timestamp:            float64(time.Now().UnixMilli()) / 1000.0,
-		VMID:                 c.vmID,
-		Phase:                c.phase,
-		CPSActual:            math.Round(cpsActual*1000) / 1000,
-		ConcurrentCalls:      concurrent,
-		CallsInviteSent:      c.callsInviteSent,
-		CallsAttempted:       c.callsAttempted,
-		CallsAnswered:        c.callsAnswered,
-		CallsAcknowledged:    c.callsAcknowledged,
-		CallsCompleted:       c.callsCompleted,
-		CallsFailed:          c.callsFailed,
-		ASR:                  math.Round(asr*100) / 100,
-		CSR:                  math.Round(csr*100) / 100,
-		AvgPDDMs:             roundAvg(c.pddSamples),
-		MinPDDMs:             roundMin(c.pddSamples),
-		MaxPDDMs:             roundMax(c.pddSamples),
-		AvgHoldMs:            roundAvg(c.holdSamples),
-		AvgTotalMs:           roundAvg(c.totalSamples),
-		SocketCount:          c.socketCount,
-		RegisteredCount:      c.registeredCount,
-		RegisteredTotal:      c.registeredTotal,
-		SubscribedCount:      c.subscribedCount,
-		SubscribedTotal:      c.subscribedTotal,
-		SubscriptionsByEvent: copySubscriptionEventStats(c.subscriptionsByEvent),
-		PrepStatus:           c.prepStatus,
-		RunElapsedSec:        runElapsed,
-		Running:              c.running,
+		Timestamp:                          float64(time.Now().UnixMilli()) / 1000.0,
+		VMID:                               c.vmID,
+		Phase:                              c.phase,
+		CPSActual:                          math.Round(cpsActual*1000) / 1000,
+		ConcurrentCalls:                    concurrent,
+		CallsInviteSent:                    c.callsInviteSent,
+		CallsAttempted:                     c.callsAttempted,
+		CallsAnswered:                      c.callsAnswered,
+		CallsAcknowledged:                  c.callsAcknowledged,
+		CallsCompleted:                     c.callsCompleted,
+		CallsFailed:                        c.callsFailed,
+		ASR:                                math.Round(asr*100) / 100,
+		CSR:                                math.Round(csr*100) / 100,
+		AvgPDDMs:                           roundAvg(c.pddSamples),
+		MinPDDMs:                           roundMin(c.pddSamples),
+		MaxPDDMs:                           roundMax(c.pddSamples),
+		AvgHoldMs:                          roundAvg(c.holdSamples),
+		AvgTotalMs:                         roundAvg(c.totalSamples),
+		SocketCount:                        c.socketCount,
+		TransportConnectTotal:              c.transportConnectTotal,
+		TransportConnectDone:               c.transportConnectDone,
+		TransportConnectFailed:             c.transportConnectFailed,
+		TransportConnectActive:             c.transportConnectActive,
+		TransportConnectFailureSampleLimit: transportConnectFailureSampleLimit,
+		TransportConnectFailedDetails:      append([]TransportConnectFailure(nil), c.transportConnectFailedDetails...),
+		RegisteredCount:                    c.registeredCount,
+		RegisteredTotal:                    c.registeredTotal,
+		SubscribedCount:                    c.subscribedCount,
+		SubscribedTotal:                    c.subscribedTotal,
+		SubscriptionsByEvent:               copySubscriptionEventStats(c.subscriptionsByEvent),
+		PrepStatus:                         c.prepStatus,
+		RunElapsedSec:                      runElapsed,
+		Running:                            c.running,
 		RTPHealth: map[string]int{
 			"OK":       c.rtpHealthCounts["OK"],
 			"WARNING":  c.rtpHealthCounts["WARNING"],
@@ -1848,6 +1925,34 @@ func BuildMux(
 		})
 	})
 
+	mux.HandleFunc("POST /api/vips/verify", func(w http.ResponseWriter, r *http.Request) {
+		req, err := decodeVIPRequest(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		result, err := verifyVIPs(req)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+
+	mux.HandleFunc("POST /api/vips/apply", func(w http.ResponseWriter, r *http.Request) {
+		req, err := decodeVIPRequest(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		result, err := applyVIPs(req)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+
 	// GET /api/test/status
 	mux.HandleFunc("GET /api/test/status", func(w http.ResponseWriter, r *http.Request) {
 		latest := collector.Latest()
@@ -2227,6 +2332,8 @@ func BuildMux(
 				"hold_ms":               cr.HoldMs,
 				"media_status":          media,
 				"media_security":        cr.MediaSecurity,
+				"sip_local_ip":          cr.SIPLocalIP,
+				"sip_local_port":        cr.SIPLocalPort,
 				"srtp_crypto_suite":     cr.SRTPCryptoSuite,
 				"srtp_decrypt_failures": cr.SRTPDecryptFailures,
 				"srtp_auth_failures":    cr.SRTPAuthFailures,

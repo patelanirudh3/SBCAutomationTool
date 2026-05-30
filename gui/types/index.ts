@@ -2,6 +2,7 @@ export type VMRole = 'UAC' | 'UAS'
 export type TrafficMode = 'smoke' | 'timed' | 'unlimited'
 export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type SipScheme = 'SIP' | 'SIPS'
+export type LocalIPMode = 'single' | 'unique_vip' | 'vip_pool'
 export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
 export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
 export type MediaSecurity = 'rtp' | 'srtp_sdes'
@@ -103,6 +104,14 @@ export interface VMConfig {
   vm_ip: string               // default '127.0.0.1' in local mode
   ssh_user?: string
   ssh_key_path?: string
+  local_ip_mode?: LocalIPMode
+  local_host?: string
+  vip_interface?: string
+  vip_cidr?: string
+  vip_first_ip?: string
+  vip_count?: number
+  vip_gateway_ip?: string
+  vip_sanity_target_ip?: string
 
   // Extensions (unified pool)
   ext_start: number
@@ -258,6 +267,12 @@ export interface TrafficMetrics {
   max_pdd_ms: number
   avg_hold_ms: number
   socket_count: number
+  transport_connect_total?: number
+  transport_connect_done?: number
+  transport_connect_failed?: number
+  transport_connect_active?: boolean
+  transport_connect_failure_sample_limit?: number
+  transport_connect_failed_details?: TransportConnectFailure[]
   registered_count: number
   registered_total?: number
   subscribed_count?: number
@@ -480,6 +495,8 @@ export interface CallEvent {
   // result=FAILED if media or BYE handshake failed afterwards.
   acknowledged?: boolean
   failure_reason?: string
+  sip_local_ip?: string
+  sip_local_port?: number
   pdd_ms: number
   hold_ms: number
   media_status: 'MEDIA_VERIFIED' | 'MEDIA_PARTIAL' | 'MEDIA_FAILED' | 'NO_MEDIA'
@@ -514,6 +531,13 @@ export interface CallEvent {
   prack_rtt_ms?: number
   sip_txn_rtt_ms?: number
   bye_completion_ms?: number
+}
+
+export interface TransportConnectFailure {
+  ext: string
+  local_ip?: string
+  remote?: string
+  error?: string
 }
 
 export interface AggregateMetrics {
