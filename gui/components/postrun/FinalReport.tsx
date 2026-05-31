@@ -1,9 +1,8 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
-import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, RotateCcw, AlertTriangle } from 'lucide-react'
+import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, PhoneCall, Clock, Zap, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
@@ -83,10 +82,6 @@ interface FinalReportProps {
   /** True while the start-cleanup POST is in flight. The card itself
    *  drives all post-click visuals from `cleanupStatus` + phase. */
   unregistering?: boolean
-  /** Called when the user clicks Re-Run */
-  onReRun?: () => void
-  /** True while a re-run navigation is in progress */
-  reRunning?: boolean
   /** Optional retry hook — invoked from the result strip's
    *  "Retry failed (n)" / "Retry all" buttons. */
   onRetryFailed?: (extensions: string[]) => void
@@ -96,10 +91,8 @@ export function FinalReport({
   frozenElapsed,
   onUnregister,
   unregistering = false,
-  onReRun,
   onRetryFailed,
 }: FinalReportProps) {
-  const router        = useRouter()
   const phase         = useTrafficStore((s) => s.phase)
   const aggregate     = useTrafficStore((s) => s.aggregate)
   const callEvents    = useTrafficStore((s) => s.callEvents) as CallEvent[]
@@ -108,7 +101,6 @@ export function FinalReport({
   const cleanupStatus  = useTrafficStore((s) => s.cleanupStatus)
   const pairs          = useTrafficStore((s) => s.pairs)
   const activePairIndex = useTrafficStore((s) => s.activePairIndex)
-  const reset           = useTrafficStore((s) => s.reset)
 
   const pair     = pairs[activePairIndex]
   const extCount = pair ? (pair.uac.ext_end - pair.uac.ext_start + 1) : 0
@@ -178,11 +170,6 @@ export function FinalReport({
     : '—'
 
   const isFailed = phase === 'FAILED'
-  const cleanupSucceeded =
-    cleanedUp &&
-    unregisterFailedCount === 0 &&
-    (cleanupStatus.unsubscribe_failed_extensions ?? []).length === 0
-  const newRunDisabled = !cleanupSucceeded || unregistering || phase === 'CLEANING_UP'
   const [cleanupCountdown, setCleanupCountdown] = useState(20)
   const [autoCleanupFired, setAutoCleanupFired] = useState(false)
   const onUnregisterRef = useRef(onUnregister)
@@ -207,12 +194,6 @@ export function FinalReport({
     }, 1000)
     return () => clearInterval(id)
   }, [cleanupPending, cleanupLocked])
-
-  function handleNewRun() {
-    if (newRunDisabled || cleanupLocked) return
-    reset()
-    router.push('/config')
-  }
 
   const rtpEvents = callEvents.filter((e) =>
     (e.rtp_tx_pkts ?? 0) > 0 ||
@@ -299,45 +280,13 @@ export function FinalReport({
               Cleanup is running. Actions are locked until unregister completes.
             </div>
           )}
-          {/* Run Again is intentionally disabled until backend restart semantics are safe. */}
-          {onReRun && (
-            <button
-              type="button"
-              disabled
-              title="Run Again is temporarily disabled. Use Cleanup first, then Edit Config or start a fresh run."
-              className={cn(
-                'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
-                'cursor-not-allowed border-slate-700 bg-slate-800/40 text-slate-500 opacity-70',
-              )}
-            >
-              <RotateCcw className="size-4" />
-              Run Again
-            </button>
-          )}
-
           {/* Unregister card — renders idle button, live progress card,
               or final result strip depending on phase + cleanupStatus. */}
           <UnregisterProgressCard
-            starting={unregistering || autoCleanupFired}
+            starting={(unregistering || autoCleanupFired) && !cleanupStatus}
             onUnregister={onUnregister}
             onRetryFailed={onRetryFailed}
           />
-
-          <button
-            type="button"
-            onClick={handleNewRun}
-            disabled={newRunDisabled || cleanupLocked}
-            title={cleanupSucceeded ? 'Edit configuration for the next run' : 'Run Cleanup successfully before editing the next run'}
-            className={cn(
-              'flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors',
-              !newRunDisabled
-                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 hover:text-emerald-200'
-                : 'cursor-not-allowed border-slate-700 bg-slate-800/40 text-slate-500 opacity-70',
-            )}
-          >
-            <RotateCcw className="size-4" />
-            Edit Config
-          </button>
         </div>
       </div>
 

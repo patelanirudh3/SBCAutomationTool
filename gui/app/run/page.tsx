@@ -25,7 +25,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor, restartTrafficFor } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor } from '@/lib/api'
 import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
 import {
   MOCK_UAC_METRICS,
@@ -448,7 +448,6 @@ export default function RunPage() {
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
-  const [reRunning, setReRunning] = useState(false)
   // Elapsed seconds frozen at the moment traffic stops (set once, never overwritten)
   const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null)
   // Wall-clock start of the unregister phase (used to freeze
@@ -549,33 +548,6 @@ export default function RunPage() {
 
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
-
-  // Restart Traffic — re-enters the traffic loop using the existing pool
-  // (no re-prep, no re-reg). Backend's CLEANUP_READY phase accepts a
-  // RestartTrafficCh signal and goes back into TRAFFIC. We clear the
-  // local aggregate / events so the UI starts fresh; the engine keeps
-  // its cumulative call counters.
-  const handleReRun = async () => {
-    setReRunning(true)
-    try {
-      await restartTrafficFor(vmIp, vmPort)
-      // Reset display-only state. Don't call full `reset()` — that would
-      // wipe pair config + run id. The engine drives the new phase which
-      // the polling loop picks up.
-      setCallEvents([])
-      setAggregate(null)
-      setFrozenElapsed(null)
-      cleanupStartedAtRef.current = null
-      setPhase('TRAFFIC')
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Restart failed'
-      // Surface the error inline rather than navigating away — the
-      // operator can fall back to a full reset by going Home.
-      console.error('Restart Traffic failed:', msg)
-    } finally {
-      setReRunning(false)
-    }
-  }
 
   // Bind for ESLint. The full reset path is no longer used inside Re-Run
   // but is still imported for potential future "Hard Reset" affordance.
@@ -898,8 +870,6 @@ export default function RunPage() {
                 frozenElapsed={frozenElapsed}
                 onUnregister={handleCleanup}
                 unregistering={stopping}
-                onReRun={handleReRun}
-                reRunning={reRunning}
                 onRetryFailed={handleRetryFailed}
               />
             </motion.div>

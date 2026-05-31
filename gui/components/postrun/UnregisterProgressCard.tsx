@@ -64,6 +64,23 @@ export function UnregisterProgressCard({
   const failed = cleanupStatus?.failed_extensions ?? []
   const pct = total > 0 ? Math.min(100, Math.round((count / total) * 100)) : 0
   const remaining = Math.max(0, total - count)
+  const unsubscribeByEvent = cleanupStatus?.unsubscribe_by_event
+  const eventUnsubscribeTotal = unsubscribeByEvent
+    ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.total ?? 0), 0)
+    : 0
+  const eventUnsubscribeOk = unsubscribeByEvent
+    ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.successful ?? 0), 0)
+    : 0
+  const eventUnsubscribeFailed = unsubscribeByEvent
+    ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.failed ?? 0), 0)
+    : 0
+  const unsubscribeCount = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
+  const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
+  const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
+  const unsubscribeOk = eventUnsubscribeTotal > 0 ? eventUnsubscribeOk : Math.max(0, unsubscribeCount - unsubscribeFailed.length)
+  const unsubscribeFailedCount = eventUnsubscribeTotal > 0 ? eventUnsubscribeFailed : unsubscribeFailed.length
+  const unsubscribePct = unsubscribeCount > 0 ? Math.min(100, Math.round((unsubscribeOk / unsubscribeCount) * 100)) : 0
+  const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
 
   // ── Live unreg-rate (mirrors the reg/s tile in PrePhasePanel) ──
   const [rate, setRate] = useState<number | null>(null)
@@ -110,8 +127,8 @@ export function UnregisterProgressCard({
   // CLEANING_UP   → progress bar + counts + rate + ETA
   // COMPLETE/DONE → result strip (clean | partial | total failure)
   const isIdle    = phase === 'CLEANUP_READY' && !starting
-  const isRunning = phase === 'CLEANING_UP' || starting
   const isDone    = (phase === 'COMPLETE' || phase === 'FAILED') && (cleanupStatus?.total ?? 0) > 0
+  const isRunning = !isDone && (phase === 'CLEANING_UP' || starting)
 
   // ───────────────────────────────────────────────────────────────────
   // Render — IDLE (button)
@@ -158,12 +175,33 @@ export function UnregisterProgressCard({
           </span>
         </div>
 
-        {/* Progress bar */}
-        <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-700/60">
-          <div
-            className="h-full rounded-full bg-amber-500 transition-all duration-500 ease-out"
-            style={{ width: `${pct}%` }}
-          />
+        <div className="space-y-2">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[11px] font-mono text-amber-300/80">
+              <span>Unregister</span>
+              <span>{count.toLocaleString()} / {total.toLocaleString()}</span>
+            </div>
+            <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-700/60">
+              <div
+                className="h-full rounded-full bg-amber-500 transition-all duration-500 ease-out"
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+          </div>
+          {hasUnsubscribeWork && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[11px] font-mono text-sky-300/80">
+                <span>Unsubscribe</span>
+                <span>{unsubscribeOk.toLocaleString()} / {unsubscribeCount.toLocaleString()}</span>
+              </div>
+              <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-700/60">
+                <div
+                  className="h-full rounded-full bg-sky-500 transition-all duration-500 ease-out"
+                  style={{ width: `${unsubscribePct}%` }}
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Rate / ETA / failed */}
@@ -172,8 +210,8 @@ export function UnregisterProgressCard({
           <div className="flex items-center gap-3">
             {rate != null && rate > 0 && <span>~{rate} unreg/s</span>}
             {eta != null && eta > 0 && <span>~{eta}s left</span>}
-            {failed.length > 0 && (
-              <span className="text-rose-400">{failed.length} failed</span>
+            {(failed.length > 0 || unsubscribeFailedCount > 0) && (
+              <span className="text-rose-400">{failed.length + unsubscribeFailedCount} failed</span>
             )}
           </div>
         </div>
@@ -187,24 +225,8 @@ export function UnregisterProgressCard({
   if (isDone) {
     const unregisterFailed = cleanupStatus?.unregister_failed_extensions ?? failed
     const unregisterCount = cleanupStatus?.unregister_count ?? count
-    const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
-    const unsubscribeByEvent = cleanupStatus?.unsubscribe_by_event
-    const eventUnsubscribeTotal = unsubscribeByEvent
-      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.total ?? 0), 0)
-      : 0
-    const eventUnsubscribeOk = unsubscribeByEvent
-      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.successful ?? 0), 0)
-      : 0
-    const eventUnsubscribeFailed = unsubscribeByEvent
-      ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.failed ?? 0), 0)
-      : 0
-    const unsubscribeCount = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
-    const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
     const unregisterOk = Math.max(0, unregisterCount - unregisterFailed.length)
-    const unsubscribeOk = eventUnsubscribeTotal > 0 ? eventUnsubscribeOk : Math.max(0, unsubscribeCount - unsubscribeFailed.length)
-    const unsubscribeFailedCount = eventUnsubscribeTotal > 0 ? eventUnsubscribeFailed : unsubscribeFailed.length
     const allUnregistered = unregisterFailed.length === 0 && unregisterCount >= total && total > 0
-    const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
     const allClean = allUnregistered && unsubscribeFailedCount === 0
     const totalFailed = unregisterFailed.length === total
     const elapsedLabel = cleanupStatus?.elapsed_seconds != null
