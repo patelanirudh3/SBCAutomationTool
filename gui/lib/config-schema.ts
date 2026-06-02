@@ -79,6 +79,8 @@ export const VMConfigSchema = z
     secondary_port: z.number().int().min(1).max(65535, 'Port must be 1–65535').optional(),
     failover_enabled: z.boolean().optional(),
     failover_mode: z.enum(['graceful', 'force']).optional(),
+    auto_failback_enabled: z.boolean().optional(),
+    failback_delay_seconds: z.number().int().min(1, 'Minimum 1 s').max(3600, 'Maximum 3600 s').optional(),
     dns_servers: z.string().optional(),
     sip_transport: SipTransportSchema,
     sip_scheme: SipSchemeSchema.optional(),

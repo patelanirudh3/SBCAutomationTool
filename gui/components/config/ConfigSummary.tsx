@@ -58,6 +58,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     server.push({ label: 'Dual Registration', value: 'On' })
     server.push({ label: 'Secondary', value: `${raw.secondary_host || '—'}:${raw.secondary_port}` })
     server.push({ label: 'Failover Mode', value: raw.failover_mode === 'force' ? 'Force' : 'Graceful' })
+    server.push({ label: 'Auto Failback', value: raw.auto_failback_enabled ? `On (${raw.failback_delay_seconds || '30'}s)` : 'Off' })
   }
   if (raw.dns_servers) {
     server.push({ label: 'DNS', value: raw.dns_servers })

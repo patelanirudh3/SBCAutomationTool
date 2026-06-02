@@ -132,7 +132,12 @@ function FlowCard({
 }
 
 function formatCount(v?: number | null): string {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.round(v).toLocaleString() : '—'
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
+  const rounded = Math.round(v)
+  if (Math.abs(rounded) >= 1_000_000_000) {
+    return `${(rounded / 1_000_000_000).toFixed(2)}B`
+  }
+  return rounded.toLocaleString()
 }
 
 function formatOne(v?: number | null): string {

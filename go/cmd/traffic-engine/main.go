@@ -200,6 +200,7 @@ func runLifecycle(
 	activeController := "primary"
 	var haMoveMu sync.Mutex
 	primaryDownCh := make(chan string, 1)
+	var primaryRecoveredAt string
 	slog.Info("Connecting transports", "count", len(agents))
 	if cfg.DualRegistrationEnabled {
 		for _, ag := range agents {
@@ -208,6 +209,8 @@ func runLifecycle(
 				case primaryDownCh <- ext:
 				default:
 				}
+				collector.SetHAPrimaryRecovery(false, "")
+				collector.RecordHAEvent("primary_down", "primary", fmt.Sprintf("ext=%s err=%v", ext, err))
 				slog.Warn("Primary controller transport down", "ext", ext, "err", err)
 			})
 		}
@@ -265,6 +268,9 @@ func runLifecycle(
 		secondaryAgentSlice = agentsToSlice(secondaryAgents)
 	}
 	collector.SetHAStatus(cfg.DualRegistrationEnabled, activeController, 0, 0, 0, 0)
+	if cfg.DualRegistrationEnabled {
+		collector.SetHAPrimaryRecovery(true, "")
+	}
 
 	// Create pool engine and wire pool counts provider into the metrics collector
 	pool := engine.NewPoolEngine()
@@ -469,6 +475,8 @@ func runLifecycle(
 	collector.UpdateCounts(0, len(agents), registered, subscribed)
 	if cfg.DualRegistrationEnabled {
 		collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(activeSubscribedAg), 0)
+		protected, degraded, notUsable := haReadinessCounts(activeSubscribedAg, secondaryRegisteredAg, len(agents))
+		collector.SetHAReadiness(protected, degraded, notUsable)
 	}
 
 	slog.Info("REG/SUB phase complete",
@@ -515,11 +523,20 @@ func runLifecycle(
 			if nonIdle > 0 {
 				if automatic {
 					collector.RecordHAFailover(true)
+					collector.RecordHAEvent("move_deferred", target, fmt.Sprintf("%d agents in active/in-progress calls", nonIdle))
 				}
 				return fmt.Errorf("cannot move subscriptions while %d agents are in active/in-progress calls", nonIdle)
 			}
 			if target == activeController {
 				return nil
+			}
+			if target == "primary" && activeController == "secondary" {
+				recovered := countConnectedAgents(activeSubscribedAg, registeredAg)
+				if recovered < 2 {
+					err := fmt.Errorf("primary controller has only %d recovered ready transports; need at least 2 for failback", recovered)
+					collector.SetHAPrimaryRecovery(false, "")
+					return err
+				}
 			}
 			collector.SetHAMove(true, target, "")
 			defer collector.SetHAMove(false, target, "")
@@ -529,6 +546,7 @@ func runLifecycle(
 				movedAgents, err := moveSubscriptions(moveCtx, activeSubscribedAg, secondaryRegisteredAg, secondaryCfg, cfg, true)
 				if err != nil {
 					collector.SetHAMove(false, target, err.Error())
+					collector.RecordHAEvent("move_failed", target, err.Error())
 					return err
 				}
 				activeController = "secondary"
@@ -542,19 +560,24 @@ func runLifecycle(
 					agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
 				}
 				collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), 0, len(movedAgents))
+				protected, degraded, notUsable := haReadinessCounts(movedAgents, registeredAg, len(agents))
+				collector.SetHAReadiness(protected, degraded, notUsable)
 				if automatic {
 					collector.RecordHAFailover(false)
 				}
+				collector.RecordHAEvent("move_complete", target, fmt.Sprintf("%d agents subscribed on target", len(movedAgents)))
 				slog.Info("HA subscription move complete", "target", target, "automatic", automatic, "agents", len(movedAgents), "idle_before", idle)
 				return nil
 			}
 			movedAgents, err := moveSubscriptions(moveCtx, activeSubscribedAg, registeredAg, cfg, secondaryCfg, false)
 			if err != nil {
 				collector.SetHAMove(false, target, err.Error())
+				collector.RecordHAEvent("move_failed", target, err.Error())
 				return err
 			}
 			activeController = "primary"
 			activeSubscribedAg = movedAgents
+			primaryRecoveredAt = ""
 			pool.ReplaceIdle(movedAgents)
 			for _, stop := range agentAutoAnswerStops {
 				stop()
@@ -564,6 +587,10 @@ func runLifecycle(
 				agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
 			}
 			collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(movedAgents), 0)
+			protected, degraded, notUsable := haReadinessCounts(movedAgents, secondaryRegisteredAg, len(agents))
+			collector.SetHAReadiness(protected, degraded, notUsable)
+			collector.SetHAPrimaryRecovery(true, "")
+			collector.RecordHAEvent("move_complete", target, fmt.Sprintf("%d agents subscribed on target", len(movedAgents)))
 			slog.Info("HA subscription move complete", "target", target, "automatic", automatic, "agents", len(movedAgents), "idle_before", idle)
 			return nil
 		}
@@ -572,6 +599,45 @@ func runLifecycle(
 			return moveToController(target, false)
 		}
 		pctx.Mu.Unlock()
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					shouldAutoFailback := false
+					haMoveMu.Lock()
+					primaryReachable := countConnectedAgents(activeSubscribedAg, registeredAg) >= 2
+					if activeController == "primary" {
+						primaryReachable = true
+					}
+					if primaryReachable && activeController == "secondary" && primaryRecoveredAt == "" {
+						primaryRecoveredAt = time.Now().UTC().Format(time.RFC3339)
+						slog.Info("HA primary controller recovered", "recovered_at", primaryRecoveredAt)
+						collector.RecordHAEvent("primary_recovered", "primary", "primary transports recovered for manual failback")
+					}
+					if !primaryReachable {
+						primaryRecoveredAt = ""
+					}
+					collector.SetHAPrimaryRecovery(primaryReachable, primaryRecoveredAt)
+					if cfg.AutoFailbackEnabled && primaryReachable && activeController == "secondary" && primaryRecoveredAt != "" {
+						if recoveredAt, err := time.Parse(time.RFC3339, primaryRecoveredAt); err == nil && time.Since(recoveredAt) >= time.Duration(cfg.FailbackDelaySeconds)*time.Second {
+							shouldAutoFailback = true
+						}
+					}
+					haMoveMu.Unlock()
+					if shouldAutoFailback {
+						collector.RecordHAEvent("auto_failback_start", "primary", fmt.Sprintf("delay_s=%d", cfg.FailbackDelaySeconds))
+						if err := moveToController("primary", true); err != nil {
+							collector.RecordHAEvent("auto_failback_failed", "primary", err.Error())
+							slog.Warn("Automatic failback failed/deferred", "err", err)
+						}
+					}
+				}
+			}
+		}()
 		go func() {
 			for {
 				select {
@@ -582,8 +648,10 @@ func runLifecycle(
 						continue
 					}
 					slog.Warn("Automatic graceful failover triggered by primary transport down", "ext", ext)
+					collector.RecordHAEvent("auto_failover_start", "secondary", fmt.Sprintf("trigger_ext=%s", ext))
 					if err := moveToController("secondary", true); err != nil {
 						collector.SetHAMove(false, "secondary", err.Error())
+						collector.RecordHAEvent("auto_failover_failed", "secondary", err.Error())
 						slog.Warn("Automatic graceful failover deferred/failed", "ext", ext, "err", err)
 					}
 				}
@@ -1108,6 +1176,39 @@ func agentsExceptExts(agents []*agent.ExtensionAgent, failed []string) []*agent.
 		}
 	}
 	return out
+}
+
+func countConnectedAgents(activeAgents, candidateAgents []*agent.ExtensionAgent) int {
+	candidatesByExt := make(map[string]*agent.ExtensionAgent, len(candidateAgents))
+	for _, ag := range candidateAgents {
+		candidatesByExt[ag.Ext] = ag
+	}
+	count := 0
+	for _, active := range activeAgents {
+		if candidate := candidatesByExt[active.Ext]; candidate != nil && candidate.IsTransportConnected() {
+			count++
+		}
+	}
+	return count
+}
+
+func haReadinessCounts(activeReady, standbyRegistered []*agent.ExtensionAgent, configuredTotal int) (protected, degradedPrimaryOnly, notUsable int) {
+	standbyByExt := make(map[string]*agent.ExtensionAgent, len(standbyRegistered))
+	for _, ag := range standbyRegistered {
+		standbyByExt[ag.Ext] = ag
+	}
+	for _, ready := range activeReady {
+		if standby := standbyByExt[ready.Ext]; standby != nil && standby.IsTransportConnected() {
+			protected++
+		} else {
+			degradedPrimaryOnly++
+		}
+	}
+	notUsable = configuredTotal - protected - degradedPrimaryOnly
+	if notUsable < 0 {
+		notUsable = 0
+	}
+	return protected, degradedPrimaryOnly, notUsable
 }
 
 func moveSubscriptions(ctx context.Context, fromAgents, toAgents []*agent.ExtensionAgent, toCfg, fromCfg *config.VMConfig, fromDown bool) ([]*agent.ExtensionAgent, error) {

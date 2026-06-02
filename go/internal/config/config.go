@@ -33,6 +33,8 @@ type VMConfig struct {
 	FailoverEnabled         bool   `yaml:"failover_enabled" json:"failover_enabled"`
 	DualRegistrationEnabled bool   `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
 	FailoverMode            string `yaml:"failover_mode" json:"failover_mode"`
+	AutoFailbackEnabled     bool   `yaml:"auto_failback_enabled" json:"auto_failback_enabled"`
+	FailbackDelaySeconds    int    `yaml:"failback_delay_seconds" json:"failback_delay_seconds"`
 	DNSServers              string `yaml:"dns_servers" json:"dns_servers"`
 	SIPTransport            string `yaml:"sip_transport" json:"sip_transport"`
 	SIPScheme               string `yaml:"sip_scheme" json:"sip_scheme"`
@@ -429,6 +431,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.CleanupBatchSize == 0 {
 		cfg.CleanupBatchSize = 10
 	}
+	if cfg.FailbackDelaySeconds == 0 {
+		cfg.FailbackDelaySeconds = 30
+	}
 	if cfg.T1Ms <= 0 {
 		cfg.T1Ms = 500
 	}
@@ -821,6 +826,9 @@ func Validate(cfg *VMConfig) error {
 	}
 	if cfg.TimerBSeconds < 1 || cfg.TimerBSeconds > 300 {
 		errs = append(errs, fmt.Sprintf("timer_b_seconds must be 1..300 s, got %d", cfg.TimerBSeconds))
+	}
+	if cfg.FailbackDelaySeconds < 1 || cfg.FailbackDelaySeconds > 3600 {
+		errs = append(errs, fmt.Sprintf("failback_delay_seconds must be 1..3600 s, got %d", cfg.FailbackDelaySeconds))
 	}
 	if cfg.CleanupBatchSize < 1 || cfg.CleanupBatchSize > 100 {
 		errs = append(errs, fmt.Sprintf("cleanup_batch_size must be 1..100, got %d", cfg.CleanupBatchSize))

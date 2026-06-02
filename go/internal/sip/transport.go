@@ -33,6 +33,7 @@ type Transport interface {
 	RecvChan() <-chan string
 	Close() error
 	LocalPort() int
+	IsConnected() bool
 	SetDownHandler(func(error))
 }
 
@@ -123,6 +124,8 @@ func (t *UDPTransport) Close() error {
 }
 
 func (t *UDPTransport) LocalPort() int { return t.localPort }
+
+func (t *UDPTransport) IsConnected() bool { return t.conn != nil }
 
 func (t *UDPTransport) SetDownHandler(func(error)) {}
 
@@ -250,6 +253,12 @@ func (t *TCPTransport) Close() error {
 }
 
 func (t *TCPTransport) LocalPort() int { return t.localPort }
+
+func (t *TCPTransport) IsConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn != nil && !t.closed.Load()
+}
 
 // readLoop continuously reads from the TCP connection, frames complete SIP
 // messages using Content-Length, and pushes them onto recvCh.

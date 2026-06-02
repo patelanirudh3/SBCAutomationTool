@@ -4,7 +4,7 @@ import { useEffect, useCallback, useState, useRef, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   AlertTriangle, Play, ArrowRight, Users, CheckCircle2, XCircle,
-  Loader2, Sparkles, RotateCcw, ShieldOff,
+  Loader2, Sparkles, RotateCcw, ShieldOff, Download,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -16,7 +16,7 @@ import {
   APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { PrepStatus, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
+import type { HAEvent, PrepStatus, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
 
 const POLL_INTERVAL_MS = 1_000
 
@@ -44,6 +44,21 @@ interface RegSubMetrics {
   }>
   register_failed_details?: RegisterFailure[]
   subscribe_failed_details?: SubscribeFailure[]
+  ha_primary_reachable?: boolean
+  ha_primary_recovered_at?: string
+  ha_ready_protected?: number
+  ha_degraded_primary_only?: number
+  ha_not_usable?: number
+  ha_active_controller?: 'primary' | 'secondary' | string
+  ha_move_active?: boolean
+  ha_move_last_error?: string
+  ha_failover_events?: number
+  ha_failover_deferred?: number
+  ha_events?: HAEvent[]
+  ha_primary_registered?: number
+  ha_secondary_registered?: number
+  ha_primary_subscribed?: number
+  ha_secondary_subscribed?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +504,24 @@ export function PrePhasePanel() {
     }
   }, [haBusy, vmIp, vmPort, updateUACMetrics])
 
+  const handleDownloadHATimeline = useCallback(() => {
+    const payload = {
+      generated_at: new Date().toISOString(),
+      active_controller: uacMetrics?.ha_active_controller ?? 'primary',
+      primary_reachable: uacMetrics?.ha_primary_reachable ?? null,
+      events: uacMetrics?.ha_events ?? [],
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `ha-timeline-${pair?.pair_id ?? 'pair'}-${Date.now()}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, [pair?.pair_id, uacMetrics])
+
   const handleStartTraffic = useCallback(async () => {
     if (isStartingTraffic) return
     setIsStartingTraffic(true)
@@ -565,6 +598,9 @@ export function PrePhasePanel() {
   const excludedFromTraffic = Math.max(0, configuredExtensions - displayIdle)
   const registerFailureDetails = uacMetrics?.register_failed_details ?? []
   const subscribeFailureDetails = uacMetrics?.subscribe_failed_details ?? []
+  const haActiveController = uacMetrics?.ha_active_controller ?? 'primary'
+  const haPrimaryReachable = uacMetrics?.ha_primary_reachable ?? haActiveController === 'primary'
+  const primaryFailbackBlocked = haActiveController === 'secondary' && !haPrimaryReachable
   const regBarPct = useMemo(() => {
     const denom = regTotal > 0 ? regTotal : extCount
     return denom > 0 ? Math.round((regCount / denom) * 100) : 0
@@ -813,19 +849,36 @@ export function PrePhasePanel() {
                 <div>
                   <h3 className="text-sm font-semibold text-sky-100">Remote Server HA</h3>
                   <p className="text-xs text-slate-400">
-                    Active controller: <span className="font-mono text-sky-300">{uacMetrics?.ha_active_controller ?? 'primary'}</span>
+                    Active controller: <span className="font-mono text-sky-300">{haActiveController}</span>
                   </p>
                   <p className="text-xs text-slate-500">
                     Auto failovers: {uacMetrics?.ha_failover_events ?? 0}
                     {(uacMetrics?.ha_failover_deferred ?? 0) > 0 ? ` · deferred ${uacMetrics?.ha_failover_deferred}` : ''}
                   </p>
+                  {haActiveController === 'secondary' && (
+                    <p className={cn('text-xs', haPrimaryReachable ? 'text-emerald-300' : 'text-amber-300')}>
+                      Primary recovery: {haPrimaryReachable ? 'reachable for manual failback' : 'waiting for recovered transport'}
+                      {uacMetrics?.ha_primary_recovered_at ? ` · ${uacMetrics.ha_primary_recovered_at}` : ''}
+                    </p>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
-                    disabled={!!haBusy || (uacMetrics?.ha_move_active ?? false)}
+                    disabled={(uacMetrics?.ha_events?.length ?? 0) === 0}
+                    onClick={handleDownloadHATimeline}
+                    className="gap-1.5"
+                  >
+                    <Download className="size-3" />
+                    Timeline
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!!haBusy || (uacMetrics?.ha_move_active ?? false) || primaryFailbackBlocked}
                     onClick={() => handleHAMove('primary')}
                     className="gap-1.5"
                   >
@@ -857,6 +910,28 @@ export function PrePhasePanel() {
                   <div className="font-mono text-slate-200">Subscribed {uacMetrics?.ha_secondary_subscribed ?? 0}</div>
                 </div>
               </div>
+              <div className="grid gap-2 text-xs sm:grid-cols-3">
+                <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2">
+                  <div className="font-bold uppercase tracking-wide text-emerald-400/80">HA Protected</div>
+                  <div className="mt-1 font-mono text-slate-100">{uacMetrics?.ha_ready_protected ?? 0}</div>
+                  <div className="mt-0.5 text-[11px] text-emerald-300/70">active + standby ready</div>
+                </div>
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
+                  <div className="font-bold uppercase tracking-wide text-amber-400/80">Degraded</div>
+                  <div className="mt-1 font-mono text-slate-100">{uacMetrics?.ha_degraded_primary_only ?? 0}</div>
+                  <div className="mt-0.5 text-[11px] text-amber-300/70">traffic ready, failover reduced</div>
+                </div>
+                <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2">
+                  <div className="font-bold uppercase tracking-wide text-rose-400/80">Not Usable</div>
+                  <div className="mt-1 font-mono text-slate-100">{uacMetrics?.ha_not_usable ?? 0}</div>
+                  <div className="mt-0.5 text-[11px] text-rose-300/70">excluded from traffic</div>
+                </div>
+              </div>
+              {(uacMetrics?.ha_degraded_primary_only ?? 0) > 0 && (
+                <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  Some ready users are running without full standby protection. Traffic can continue, but failover capacity is reduced.
+                </div>
+              )}
               {haError && (
                 <div className="rounded border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
                   {haError}
@@ -865,6 +940,20 @@ export function PrePhasePanel() {
               {uacMetrics?.ha_move_last_error && (
                 <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
                   Last HA move error: {uacMetrics.ha_move_last_error}
+                </div>
+              )}
+              {(uacMetrics?.ha_events?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-slate-700/50 bg-slate-950/30 p-2 text-xs">
+                  <div className="mb-1 font-bold uppercase tracking-wide text-slate-400">HA Timeline</div>
+                  <div className="space-y-1">
+                    {uacMetrics?.ha_events?.slice(-5).reverse().map((ev, idx) => (
+                      <div key={`${ev.timestamp}-${ev.type}-${idx}`} className="grid grid-cols-[135px_120px_1fr] gap-2 font-mono text-[11px] text-slate-300">
+                        <span className="text-slate-500">{ev.timestamp}</span>
+                        <span className="text-sky-300">{ev.type}{ev.target ? `:${ev.target}` : ''}</span>
+                        <span className="truncate" title={ev.details}>{ev.details || '—'}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>

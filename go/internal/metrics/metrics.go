@@ -130,23 +130,29 @@ type TrafficMetrics struct {
 	MediaSecurity    string           `json:"media_security"`
 	SRTPCryptoSuites []string         `json:"srtp_crypto_suites,omitempty"`
 
-	HostCPUAvgPercent        float64 `json:"host_cpu_avg_percent"`
-	HostCPUMaxPercent        float64 `json:"host_cpu_max_percent"`
-	ProcessCPUCoreAvgPercent float64 `json:"process_cpu_core_avg_percent"`
-	ProcessCPUCoreMaxPercent float64 `json:"process_cpu_core_max_percent"`
-	SoftIRQCPUMaxPercent     float64 `json:"softirq_cpu_max_percent"`
-	IOWaitCPUMaxPercent      float64 `json:"iowait_cpu_max_percent"`
-	HAEnabled                bool    `json:"ha_enabled"`
-	HAActiveController       string  `json:"ha_active_controller,omitempty"`
-	HAPrimaryRegistered      int     `json:"ha_primary_registered"`
-	HASecondaryRegistered    int     `json:"ha_secondary_registered"`
-	HAPrimarySubscribed      int     `json:"ha_primary_subscribed"`
-	HASecondarySubscribed    int     `json:"ha_secondary_subscribed"`
-	HAMoveActive             bool    `json:"ha_move_active"`
-	HAMoveTarget             string  `json:"ha_move_target,omitempty"`
-	HAMoveLastError          string  `json:"ha_move_last_error,omitempty"`
-	HAFailoverEvents         int     `json:"ha_failover_events"`
-	HAFailoverDeferred       int     `json:"ha_failover_deferred"`
+	HostCPUAvgPercent        float64   `json:"host_cpu_avg_percent"`
+	HostCPUMaxPercent        float64   `json:"host_cpu_max_percent"`
+	ProcessCPUCoreAvgPercent float64   `json:"process_cpu_core_avg_percent"`
+	ProcessCPUCoreMaxPercent float64   `json:"process_cpu_core_max_percent"`
+	SoftIRQCPUMaxPercent     float64   `json:"softirq_cpu_max_percent"`
+	IOWaitCPUMaxPercent      float64   `json:"iowait_cpu_max_percent"`
+	HAEnabled                bool      `json:"ha_enabled"`
+	HAActiveController       string    `json:"ha_active_controller,omitempty"`
+	HAPrimaryRegistered      int       `json:"ha_primary_registered"`
+	HASecondaryRegistered    int       `json:"ha_secondary_registered"`
+	HAPrimarySubscribed      int       `json:"ha_primary_subscribed"`
+	HASecondarySubscribed    int       `json:"ha_secondary_subscribed"`
+	HAPrimaryReachable       bool      `json:"ha_primary_reachable"`
+	HAPrimaryRecoveredAt     string    `json:"ha_primary_recovered_at,omitempty"`
+	HAReadyProtected         int       `json:"ha_ready_protected"`
+	HADegradedPrimaryOnly    int       `json:"ha_degraded_primary_only"`
+	HANotUsable              int       `json:"ha_not_usable"`
+	HAMoveActive             bool      `json:"ha_move_active"`
+	HAMoveTarget             string    `json:"ha_move_target,omitempty"`
+	HAMoveLastError          string    `json:"ha_move_last_error,omitempty"`
+	HAFailoverEvents         int       `json:"ha_failover_events"`
+	HAFailoverDeferred       int       `json:"ha_failover_deferred"`
+	HAEvents                 []HAEvent `json:"ha_events,omitempty"`
 }
 
 const transportConnectFailureSampleLimit = 100
@@ -167,6 +173,13 @@ type SubscribeFailure struct {
 	Ext    string `json:"ext"`
 	Events string `json:"events,omitempty"`
 	Error  string `json:"error"`
+}
+
+type HAEvent struct {
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`
+	Target    string `json:"target,omitempty"`
+	Details   string `json:"details,omitempty"`
 }
 
 // SubscriptionEventStats exposes per-event-package subscription progress.
@@ -320,11 +333,17 @@ type MetricsCollector struct {
 	haSecondaryRegistered int
 	haPrimarySubscribed   int
 	haSecondarySubscribed int
+	haPrimaryReachable    bool
+	haPrimaryRecoveredAt  string
+	haReadyProtected      int
+	haDegradedPrimaryOnly int
+	haNotUsable           int
 	haMoveActive          bool
 	haMoveTarget          string
 	haMoveLastError       string
 	haFailoverEvents      int
 	haFailoverDeferred    int
+	haEvents              []HAEvent
 
 	rtpHealthCounts map[string]int
 
@@ -674,6 +693,21 @@ func (c *MetricsCollector) SetHAStatus(enabled bool, active string, primaryRegis
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) SetHAPrimaryRecovery(reachable bool, recoveredAt string) {
+	c.mu.Lock()
+	c.haPrimaryReachable = reachable
+	c.haPrimaryRecoveredAt = recoveredAt
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) SetHAReadiness(protected, degradedPrimaryOnly, notUsable int) {
+	c.mu.Lock()
+	c.haReadyProtected = protected
+	c.haDegradedPrimaryOnly = degradedPrimaryOnly
+	c.haNotUsable = notUsable
+	c.mu.Unlock()
+}
+
 func (c *MetricsCollector) SetHAMove(active bool, target, lastErr string) {
 	c.mu.Lock()
 	c.haMoveActive = active
@@ -689,6 +723,20 @@ func (c *MetricsCollector) RecordHAFailover(deferred bool) {
 		c.haFailoverDeferred++
 	}
 	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) RecordHAEvent(eventType, target, details string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.haEvents = append(c.haEvents, HAEvent{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Type:      eventType,
+		Target:    target,
+		Details:   details,
+	})
+	if len(c.haEvents) > 100 {
+		c.haEvents = c.haEvents[len(c.haEvents)-100:]
+	}
 }
 
 func (c *MetricsCollector) PerformanceDiagnosticsMode() string {
@@ -1245,11 +1293,17 @@ func (c *MetricsCollector) Reset() {
 	c.haSecondaryRegistered = 0
 	c.haPrimarySubscribed = 0
 	c.haSecondarySubscribed = 0
+	c.haPrimaryReachable = false
+	c.haPrimaryRecoveredAt = ""
+	c.haReadyProtected = 0
+	c.haDegradedPrimaryOnly = 0
+	c.haNotUsable = 0
 	c.haMoveActive = false
 	c.haMoveTarget = ""
 	c.haMoveLastError = ""
 	c.haFailoverEvents = 0
 	c.haFailoverDeferred = 0
+	c.haEvents = nil
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
@@ -1472,11 +1526,17 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		HASecondaryRegistered:    c.haSecondaryRegistered,
 		HAPrimarySubscribed:      c.haPrimarySubscribed,
 		HASecondarySubscribed:    c.haSecondarySubscribed,
+		HAPrimaryReachable:       c.haPrimaryReachable,
+		HAPrimaryRecoveredAt:     c.haPrimaryRecoveredAt,
+		HAReadyProtected:         c.haReadyProtected,
+		HADegradedPrimaryOnly:    c.haDegradedPrimaryOnly,
+		HANotUsable:              c.haNotUsable,
 		HAMoveActive:             c.haMoveActive,
 		HAMoveTarget:             c.haMoveTarget,
 		HAMoveLastError:          c.haMoveLastError,
 		HAFailoverEvents:         c.haFailoverEvents,
 		HAFailoverDeferred:       c.haFailoverDeferred,
+		HAEvents:                 append([]HAEvent(nil), c.haEvents...),
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],

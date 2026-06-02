@@ -147,6 +147,8 @@ export interface VMConfig {
   secondary_port?: number
   failover_enabled?: boolean
   failover_mode?: 'graceful' | 'force'
+  auto_failback_enabled?: boolean
+  failback_delay_seconds?: number
   dns_servers?: string
 
   // Registration / Subscription
@@ -354,11 +356,17 @@ export interface TrafficMetrics {
   ha_secondary_registered?: number
   ha_primary_subscribed?: number
   ha_secondary_subscribed?: number
+  ha_primary_reachable?: boolean
+  ha_primary_recovered_at?: string
+  ha_ready_protected?: number
+  ha_degraded_primary_only?: number
+  ha_not_usable?: number
   ha_move_active?: boolean
   ha_move_target?: 'primary' | 'secondary' | string
   ha_move_last_error?: string
   ha_failover_events?: number
   ha_failover_deferred?: number
+  ha_events?: HAEvent[]
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -566,6 +574,13 @@ export interface SubscribeFailure {
   ext: string
   events?: string
   error?: string
+}
+
+export interface HAEvent {
+  timestamp: string
+  type: string
+  target?: string
+  details?: string
 }
 
 export interface AggregateMetrics {

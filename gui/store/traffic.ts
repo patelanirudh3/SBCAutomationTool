@@ -74,6 +74,8 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     secondary_port: 5060,
     failover_enabled: false,
     failover_mode: 'graceful' as const,
+    auto_failback_enabled: false,
+    failback_delay_seconds: 30,
     dns_servers: '',
     sip_transport: 'TCP' as const,
     sip_scheme: 'SIP' as const,

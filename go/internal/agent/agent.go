@@ -256,6 +256,10 @@ func (a *ExtensionAgent) SetTransportDownHandler(fn func(ext string, err error))
 	a.transportDown = fn
 }
 
+func (a *ExtensionAgent) IsTransportConnected() bool {
+	return a.transport != nil && a.transport.IsConnected()
+}
+
 // Start creates the SIP transport, connects, and starts the dispatch goroutine.
 func (a *ExtensionAgent) Start(ctx context.Context) error {
 	if a.assignedLocalHost != "" {

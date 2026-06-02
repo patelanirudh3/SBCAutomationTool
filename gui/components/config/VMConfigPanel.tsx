@@ -59,6 +59,8 @@ export type RawVMFormValues = {
   secondary_port: string
   failover_enabled: boolean
   failover_mode: 'graceful' | 'force'
+  auto_failback_enabled: boolean
+  failback_delay_seconds: string
   dns_servers: string
   sip_transport: SipTransport
   sip_scheme: SipScheme
@@ -130,7 +132,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
     'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip',
     'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'dns_servers',
+    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds', 'dns_servers',
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
   ],
   signaling: [
@@ -164,7 +166,7 @@ const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
   agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path', 'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-                   'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'dns_servers',
+                   'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
@@ -920,6 +922,35 @@ export function VMConfigPanel({
                     <SelectItem value="force">Force Failover</SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="space-y-1 rounded-md border border-slate-800/70 bg-slate-950/30 p-2">
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+                  <Switch
+                    checked={raw.auto_failback_enabled}
+                    onCheckedChange={(checked) => onChange('auto_failback_enabled', checked)}
+                    disabled={!raw.dual_registration_enabled}
+                  />
+                  Auto failback to primary
+                </label>
+                <div className="flex items-center gap-2 pl-10">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={3600}
+                    value={raw.failback_delay_seconds}
+                    onChange={(ev) => onChange('failback_delay_seconds', ev.target.value)}
+                    onBlur={() => onBlur('failback_delay_seconds')}
+                    className="w-20 font-mono"
+                    disabled={!raw.dual_registration_enabled || !raw.auto_failback_enabled}
+                  />
+                  <span className="text-xs text-slate-400">seconds after primary recovery</span>
+                </div>
+                {e('failback_delay_seconds') && <FieldError error={e('failback_delay_seconds')} />}
+                {raw.auto_failback_enabled && (
+                  <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                    Lab caution: auto failback moves subscriptions back to primary after recovery delay. Validate manual failback first.
+                  </div>
+                )}
               </div>
               </div>
           </div>

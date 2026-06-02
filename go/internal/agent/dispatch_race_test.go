@@ -23,6 +23,7 @@ func (m *mockTransport) Send(msg string) error {
 func (m *mockTransport) RecvChan() <-chan string    { return m.ch }
 func (m *mockTransport) Close() error               { return nil }
 func (m *mockTransport) LocalPort() int             { return 0 }
+func (m *mockTransport) IsConnected() bool          { return true }
 func (m *mockTransport) SetDownHandler(func(error)) {}
 
 // newTestAgent creates an agent wired to a mockTransport and starts its
