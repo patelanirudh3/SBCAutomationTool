@@ -185,8 +185,9 @@ func (e *CallEngine) Run(ctx context.Context) error {
 func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) error {
 	cfg := e.config
 	fullInterval := time.Duration(float64(time.Second) / float64(cfg.CPS))
-	rampSteps := int(math.Max(float64(cfg.RampUpSeconds*cfg.CPS), 1))
-	step := 0
+	rampStart := time.Now()
+	nextLaunchAt := rampStart
+	maxSchedulerLag := fullInterval * 3
 
 	slog.Info("CallEngine starting",
 		"cps", cfg.CPS,
@@ -256,14 +257,16 @@ func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) erro
 			continue
 		}
 
-		// Linear ramp-up: interval decreases from fullInterval×10 → fullInterval
-		var interval time.Duration
-		if step < rampSteps {
-			rampFactor := 1.0 + 9.0*(1.0-float64(step)/float64(rampSteps))
-			interval = time.Duration(float64(fullInterval) * rampFactor)
-			step++
-		} else {
-			interval = fullInterval
+		interval := pacingInterval(fullInterval, cfg.RampUpSeconds, rampStart, time.Now())
+		if sleepFor := time.Until(nextLaunchAt); sleepFor > 0 {
+			select {
+			case <-launchCtx.Done():
+				continue
+			case <-e.StopEvent:
+				wg.Wait()
+				return nil
+			case <-time.After(sleepFor):
+			}
 		}
 
 		// Pick a pair from the pool
@@ -277,6 +280,7 @@ func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) erro
 		if !ok {
 			// Back-pressure: fewer than 2 idle users; wait for returning pairs
 			time.Sleep(50 * time.Millisecond)
+			nextLaunchAt = time.Now().Add(interval)
 			continue
 		}
 
@@ -291,8 +295,26 @@ func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) erro
 			e.executeCall(callCtx, ag, calleeAg)
 		}(caller, callee)
 
-		time.Sleep(interval)
+		nextLaunchAt = nextLaunchAt.Add(interval)
+		if lag := time.Since(nextLaunchAt); lag > maxSchedulerLag {
+			slog.Debug("CPS scheduler lag reset", "lag_ms", lag.Milliseconds(), "interval_ms", interval.Milliseconds())
+			nextLaunchAt = time.Now().Add(interval)
+		}
 	}
+}
+
+func pacingInterval(fullInterval time.Duration, rampUpSeconds int, rampStart, now time.Time) time.Duration {
+	if rampUpSeconds <= 0 {
+		return fullInterval
+	}
+	rampDuration := time.Duration(rampUpSeconds) * time.Second
+	elapsed := now.Sub(rampStart)
+	if elapsed >= rampDuration {
+		return fullInterval
+	}
+	progress := math.Max(0, math.Min(1, float64(elapsed)/float64(rampDuration)))
+	rampFactor := 1.0 + 9.0*(1.0-progress)
+	return time.Duration(float64(fullInterval) * rampFactor)
 }
 
 // executeCall runs a single call through the full SIP+RTP sequence:

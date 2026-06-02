@@ -12,10 +12,11 @@ import { useTrafficStore } from '@/store/traffic'
 import {
   getMetricsFor, startPrepFor, startRegSubFor, abortRegSubFor,
   startTrafficFor, startTestFor, resetTestFor, startCleanupFor,
+  moveHASubscriptionFor,
   APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { PrepStatus, SubscriptionEventStats } from '@/types'
+import type { PrepStatus, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
 
 const POLL_INTERVAL_MS = 1_000
 
@@ -41,6 +42,8 @@ interface RegSubMetrics {
     remote?: string
     error?: string
   }>
+  register_failed_details?: RegisterFailure[]
+  subscribe_failed_details?: SubscribeFailure[]
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +239,8 @@ export function PrePhasePanel() {
   const [isStartingTraffic, setIsStartingTraffic] = useState(false)
   const [isAborting, setIsAborting] = useState(false)
   const [isUnregisteringAll, setIsUnregisteringAll] = useState(false)
+  const [haBusy, setHaBusy] = useState<'primary' | 'secondary' | null>(null)
+  const [haError, setHaError] = useState<string | null>(null)
 
   // Pre-run engine state check
   const [enginePhase, setEnginePhase] = useState<string | null>(null)
@@ -302,6 +307,13 @@ export function PrePhasePanel() {
         setLocalRegOnlyCount(m.reg_only_count ?? 0)
 
         const phase = (m.phase ?? '').toUpperCase()
+        if (phase === 'FAILED') {
+          setRegDone(false)
+          setRegRate(0)
+          setPhase('FAILED')
+          setError('Reg/Sub failed. Review transport, register, and subscribe diagnostics below.')
+          return
+        }
         if (phase === 'REGSUB_DONE' || phase === 'TRAFFIC_READY' || phase === 'TRAFFIC' || phase === 'CLEANUP_READY' || phase === 'DONE') {
           setRegDone(true)
           setRegRate(0)
@@ -462,6 +474,21 @@ export function PrePhasePanel() {
     }
   }, [isUnregisteringAll, vmIp, vmPort, setPhase, router])
 
+  const handleHAMove = useCallback(async (target: 'primary' | 'secondary') => {
+    if (haBusy) return
+    setHaBusy(target)
+    setHaError(null)
+    try {
+      await moveHASubscriptionFor(vmIp, vmPort, target)
+      const m = await getMetricsFor(vmIp, vmPort)
+      updateUACMetrics(m)
+    } catch (err) {
+      setHaError(err instanceof Error ? err.message : 'HA subscription move failed')
+    } finally {
+      setHaBusy(null)
+    }
+  }, [haBusy, vmIp, vmPort, updateUACMetrics])
+
   const handleStartTraffic = useCallback(async () => {
     if (isStartingTraffic) return
     setIsStartingTraffic(true)
@@ -528,6 +555,16 @@ export function PrePhasePanel() {
   const total          = Math.max(extCount, 1)
   const displayPending = Math.max(0, total - regCount)
   const canStartTraffic = displayIdle >= 2
+  const transportTotal = uacMetrics?.transport_connect_total ?? 0
+  const transportConnected = uacMetrics?.transport_connect_done ?? 0
+  const transportFailed = uacMetrics?.transport_connect_failed ?? 0
+  const configuredExtensions = transportTotal > 0 ? transportTotal : total
+  const registerAttempted = regTotal > 0 ? regTotal : (transportConnected > 0 ? transportConnected : total)
+  const registerFailed = regDone ? Math.max(0, registerAttempted - regCount) : 0
+  const subscribeFailedAgents = regDone ? displayRegOnly : 0
+  const excludedFromTraffic = Math.max(0, configuredExtensions - displayIdle)
+  const registerFailureDetails = uacMetrics?.register_failed_details ?? []
+  const subscribeFailureDetails = uacMetrics?.subscribe_failed_details ?? []
   const regBarPct = useMemo(() => {
     const denom = regTotal > 0 ? regTotal : extCount
     return denom > 0 ? Math.round((regCount / denom) * 100) : 0
@@ -550,6 +587,7 @@ export function PrePhasePanel() {
   const regSubViewActive =
     regStarted ||
     regDone ||
+    (uacMetrics?.phase ?? '').toUpperCase() === 'CONNECTING_TRANSPORTS' ||
     regCount > 0 ||
     regTotal > 0 ||
     subCount > 0 ||
@@ -769,6 +807,69 @@ export function PrePhasePanel() {
             </div>
           )}
 
+          {pair?.uac.dual_registration_enabled && regDone && (
+            <div className="space-y-3 rounded-xl border border-sky-500/30 bg-sky-500/5 p-5">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-sky-100">Remote Server HA</h3>
+                  <p className="text-xs text-slate-400">
+                    Active controller: <span className="font-mono text-sky-300">{uacMetrics?.ha_active_controller ?? 'primary'}</span>
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Auto failovers: {uacMetrics?.ha_failover_events ?? 0}
+                    {(uacMetrics?.ha_failover_deferred ?? 0) > 0 ? ` · deferred ${uacMetrics?.ha_failover_deferred}` : ''}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!!haBusy || (uacMetrics?.ha_move_active ?? false)}
+                    onClick={() => handleHAMove('primary')}
+                    className="gap-1.5"
+                  >
+                    {haBusy === 'primary' && <Loader2 className="size-3 animate-spin" />}
+                    Move to Primary
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!!haBusy || (uacMetrics?.ha_move_active ?? false)}
+                    onClick={() => handleHAMove('secondary')}
+                    className="gap-1.5"
+                  >
+                    {haBusy === 'secondary' && <Loader2 className="size-3 animate-spin" />}
+                    Move to Secondary
+                  </Button>
+                </div>
+              </div>
+              <div className="grid gap-2 text-xs sm:grid-cols-2">
+                <div className="rounded-lg border border-slate-700/50 bg-slate-950/30 p-2">
+                  <div className="font-bold uppercase tracking-wide text-slate-400">Primary</div>
+                  <div className="mt-1 font-mono text-slate-200">Registered {uacMetrics?.ha_primary_registered ?? regCount}</div>
+                  <div className="font-mono text-slate-200">Subscribed {uacMetrics?.ha_primary_subscribed ?? subCount}</div>
+                </div>
+                <div className="rounded-lg border border-slate-700/50 bg-slate-950/30 p-2">
+                  <div className="font-bold uppercase tracking-wide text-slate-400">Secondary</div>
+                  <div className="mt-1 font-mono text-slate-200">Registered {uacMetrics?.ha_secondary_registered ?? 0}</div>
+                  <div className="font-mono text-slate-200">Subscribed {uacMetrics?.ha_secondary_subscribed ?? 0}</div>
+                </div>
+              </div>
+              {haError && (
+                <div className="rounded border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                  {haError}
+                </div>
+              )}
+              {uacMetrics?.ha_move_last_error && (
+                <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  Last HA move error: {uacMetrics.ha_move_last_error}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* ── Pool count badges ─────────────────────────────────────── */}
           {regSubViewActive && (
             <div className="grid grid-cols-3 gap-3">
@@ -800,6 +901,57 @@ export function PrePhasePanel() {
           {/* ── Completion summary ────────────────────────────────────── */}
           {regDone && (
             <div className="space-y-2">
+              <div className="rounded-xl border border-slate-700/50 bg-slate-950/30 p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-100">Readiness Decision</h3>
+                    <p className="text-xs text-slate-400">
+                      Traffic uses only fully subscribed idle extensions. Excluded extensions stay out of the ready pool.
+                    </p>
+                  </div>
+                  <span className={cn(
+                    'rounded-full px-2.5 py-1 text-xs font-semibold',
+                    canStartTraffic ? 'bg-emerald-500/10 text-emerald-300' : 'bg-amber-500/10 text-amber-300',
+                  )}>
+                    {canStartTraffic ? 'User can continue' : 'Blocked'}
+                  </span>
+                </div>
+                <div className="grid gap-2 text-xs sm:grid-cols-5">
+                  <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-2">
+                    <div className="text-slate-500">Configured</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-slate-100">{configuredExtensions.toLocaleString()}</div>
+                  </div>
+                  <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-2">
+                    <div className="text-slate-500">Connected</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-slate-100">{(transportTotal > 0 ? transportConnected : registerAttempted).toLocaleString()}</div>
+                    {transportFailed > 0 && <div className="mt-0.5 font-mono text-[11px] text-rose-300">-{transportFailed.toLocaleString()}</div>}
+                  </div>
+                  <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-2">
+                    <div className="text-slate-500">Registered</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-slate-100">{regCount.toLocaleString()}</div>
+                    {registerFailed > 0 && <div className="mt-0.5 font-mono text-[11px] text-rose-300">-{registerFailed.toLocaleString()}</div>}
+                  </div>
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2">
+                    <div className="text-emerald-400/80">Ready</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-emerald-300">{displayIdle.toLocaleString()}</div>
+                  </div>
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
+                    <div className="text-amber-400/80">Excluded</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-amber-300">{excludedFromTraffic.toLocaleString()}</div>
+                    {subscribeFailedAgents > 0 && <div className="mt-0.5 font-mono text-[11px] text-amber-200">sub failed {subscribeFailedAgents.toLocaleString()}</div>}
+                  </div>
+                </div>
+                {canStartTraffic ? (
+                  <p className="mt-3 text-xs text-slate-400">
+                    Continue only if you are comfortable running traffic with {displayIdle.toLocaleString()} fully ready extensions.
+                  </p>
+                ) : (
+                  <p className="mt-3 text-xs text-amber-300">
+                    At least 2 fully subscribed idle extensions are required before traffic can start.
+                  </p>
+                )}
+              </div>
+
               <div className={cn(
                 'flex items-start gap-3 rounded-lg border p-4',
                 canStartTraffic ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-amber-500/30 bg-amber-500/5'
@@ -823,12 +975,59 @@ export function PrePhasePanel() {
                 </div>
               </div>
 
-              {failedCount > 0 && (
+              {(failedCount > 0 || transportFailed > 0) && (
                 <div className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 px-4 py-2.5">
                   <XCircle className="size-3.5 shrink-0 text-rose-400" />
                   <p className="text-xs text-rose-300">
-                    <span className="font-semibold">{failedCount}</span> extension{failedCount === 1 ? '' : 's'} failed to register.
+                    {transportFailed > 0 && (
+                      <>
+                        <span className="font-semibold">{transportFailed}</span> transport connection failure{transportFailed === 1 ? '' : 's'}
+                      </>
+                    )}
+                    {transportFailed > 0 && failedCount > 0 && ' · '}
+                    {failedCount > 0 && (
+                      <>
+                        <span className="font-semibold">{failedCount}</span> extension{failedCount === 1 ? '' : 's'} failed to register.
+                      </>
+                    )}
                   </p>
+                </div>
+              )}
+
+              {(registerFailureDetails.length > 0 || subscribeFailureDetails.length > 0) && (
+                <div className="space-y-3 rounded-lg border border-rose-500/25 bg-rose-500/5 p-3 text-xs">
+                  <div className="font-semibold text-rose-300">Failure diagnostics</div>
+                  {registerFailureDetails.length > 0 && (
+                    <div>
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-rose-300/80">
+                        REGISTER failures
+                      </div>
+                      <div className="space-y-1">
+                        {registerFailureDetails.slice(0, 10).map((f) => (
+                          <div key={`reg-${f.ext}`} className="grid grid-cols-[90px_1fr] gap-2 font-mono text-[11px] text-rose-100">
+                            <span>{f.ext}</span>
+                            <span className="truncate" title={f.error}>{f.error || 'registration failed'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {subscribeFailureDetails.length > 0 && (
+                    <div>
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-rose-300/80">
+                        SUBSCRIBE failures
+                      </div>
+                      <div className="space-y-1">
+                        {subscribeFailureDetails.slice(0, 10).map((f) => (
+                          <div key={`sub-${f.ext}`} className="grid grid-cols-[90px_160px_1fr] gap-2 font-mono text-[11px] text-rose-100">
+                            <span>{f.ext}</span>
+                            <span className="truncate" title={f.events}>{f.events || 'events'}</span>
+                            <span className="truncate" title={f.error}>{f.error || 'subscription failed'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -872,7 +1071,7 @@ export function PrePhasePanel() {
                 {isStartingTraffic ? (
                   <><Loader2 className="size-4 animate-spin" /> Starting…</>
                 ) : (
-                  <>Start Traffic <ArrowRight className="size-4" /></>
+                  <>Start Traffic with {displayIdle.toLocaleString()} Ready <ArrowRight className="size-4" /></>
                 )}
               </Button>
             </div>

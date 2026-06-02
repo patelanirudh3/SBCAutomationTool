@@ -2,5 +2,5 @@ package version
 
 const (
 	ProductName = "Nexus Traffic Engine"
-	Version     = "1.6.1.1"
+	Version     = "1.7.3.8"
 )

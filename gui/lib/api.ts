@@ -528,6 +528,20 @@ export function abortRegSubFor(ip: string, port: number): Promise<{ status: stri
   return postNoBody(ip, port, '/api/regsub/abort')
 }
 
+export async function moveHASubscriptionFor(
+  ip: string,
+  port: number,
+  targetController: 'primary' | 'secondary'
+): Promise<{ status: string; target_controller: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/ha/move-subscription`, {
+    method: 'POST',
+    body: JSON.stringify({ target_controller: targetController }),
+    headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(60_000),
+  })
+  return parseJsonResponse<{ status: string; target_controller: string }>(res)
+}
+
 // restartTrafficFor — re-enter the traffic loop from CLEANUP_READY without
 // re-running prep / register / subscribe. Reuses the existing populated pool.
 export function restartTrafficFor(ip: string, port: number): Promise<{ status: string }> {

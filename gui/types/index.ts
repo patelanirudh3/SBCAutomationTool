@@ -11,6 +11,7 @@ export type RunPhase =
   | 'IDLE'
   | 'PRE_PHASE'        // legacy alias of REGSUB_RUNNING
   | 'PRE_REGISTER'     // legacy alias of REGSUB_RUNNING
+  | 'CONNECTING_TRANSPORTS'
   | 'REGSUB_READY'     // waiting for Start Reg/Sub click
   | 'REGSUB_RUNNING'   // REGISTER + SUBSCRIBE in flight (live progress)
   | 'REGSUB_DONE'      // all reg/sub done — gates Start Traffic
@@ -141,9 +142,11 @@ export interface VMConfig {
   tls_max_version?: 'auto' | '1.2' | '1.3'
 
   // SIP Connection (Secondary / Failover)
+  dual_registration_enabled?: boolean
   secondary_host?: string
   secondary_port?: number
   failover_enabled?: boolean
+  failover_mode?: 'graceful' | 'force'
   dns_servers?: string
 
   // Registration / Subscription
@@ -154,6 +157,7 @@ export interface VMConfig {
   subscribe_refresh_events?: string[]
   subscribe_unsubscribe_events?: string[]
   register_rate_cps?: number       // default: 10 — REGISTERs per second
+  cleanup_batch_size?: number      // default: 10 — cleanup-only unsubscribe/unregister batch size
 
   // SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
   // Both optional — backend uses RFC defaults when unset.
@@ -275,8 +279,10 @@ export interface TrafficMetrics {
   transport_connect_failed_details?: TransportConnectFailure[]
   registered_count: number
   registered_total?: number
+  register_failed_details?: RegisterFailure[]
   subscribed_count?: number
   subscribed_total?: number
+  subscribe_failed_details?: SubscribeFailure[]
   subscriptions_by_event?: Record<string, SubscriptionEventStats>
   // prep_status drives the corner Prep button visual state and the
   // disabled/enabled state of Start Reg/Sub. Backend defaults to 'idle'
@@ -342,6 +348,17 @@ export interface TrafficMetrics {
   process_cpu_core_max_percent?: number
   softirq_cpu_max_percent?: number
   iowait_cpu_max_percent?: number
+  ha_enabled?: boolean
+  ha_active_controller?: 'primary' | 'secondary' | string
+  ha_primary_registered?: number
+  ha_secondary_registered?: number
+  ha_primary_subscribed?: number
+  ha_secondary_subscribed?: number
+  ha_move_active?: boolean
+  ha_move_target?: 'primary' | 'secondary' | string
+  ha_move_last_error?: string
+  ha_failover_events?: number
+  ha_failover_deferred?: number
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -537,6 +554,17 @@ export interface TransportConnectFailure {
   ext: string
   local_ip?: string
   remote?: string
+  error?: string
+}
+
+export interface RegisterFailure {
+  ext: string
+  error?: string
+}
+
+export interface SubscribeFailure {
+  ext: string
+  events?: string
   error?: string
 }
 

@@ -71,12 +71,14 @@ export const VMConfigSchema = z
       .min(1, 'Remote SIP server host is required')
       .refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
     sbc_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
+    dual_registration_enabled: z.boolean().optional(),
     secondary_host: z
       .string()
       .refine((v) => !v || isValidIpOrHostname(v), 'Must be a valid IPv4 address or hostname')
       .optional(),
     secondary_port: z.number().int().min(1).max(65535, 'Port must be 1–65535').optional(),
     failover_enabled: z.boolean().optional(),
+    failover_mode: z.enum(['graceful', 'force']).optional(),
     dns_servers: z.string().optional(),
     sip_transport: SipTransportSchema,
     sip_scheme: SipSchemeSchema.optional(),
@@ -100,6 +102,7 @@ export const VMConfigSchema = z
     subscribe_refresh_events: z.array(SubscribeEventSchema).optional(),
     subscribe_unsubscribe_events: z.array(SubscribeEventSchema).optional(),
     register_rate_cps: z.number().positive('Rate must be positive').max(500, 'Cannot exceed 500 reg/s').optional(),
+    cleanup_batch_size: z.number().int().min(1, 'Minimum 1 extension').max(100, 'Maximum 100 extensions').optional(),
     t1_ms: z.number().int().min(100, 'Minimum 100 ms').max(5000, 'Maximum 5000 ms').optional(),
     timer_b_seconds: z.number().int().min(1, 'Minimum 1 s').max(300, 'Maximum 300 s').optional(),
 
@@ -186,6 +189,23 @@ export const VMConfigSchema = z
         path: ['sip_scheme'],
         message: 'SIPS requires TLS transport',
       })
+    }
+
+    if (data.dual_registration_enabled) {
+      if (!data.secondary_host) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['secondary_host'],
+          message: 'Secondary controller host is required when Dual Registration is on',
+        })
+      }
+      if (!data.secondary_port) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['secondary_port'],
+          message: 'Secondary controller port is required when Dual Registration is on',
+        })
+      }
     }
 
     const selected = new Set(data.subscribe_events ?? [])
@@ -290,6 +310,7 @@ export function getFieldWarnings(raw: {
   duration_hours: string
   traffic_mode: string
   register_rate_cps?: string
+  cleanup_batch_size?: string
 }): FieldWarnings {
   const w: FieldWarnings = {}
 

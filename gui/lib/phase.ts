@@ -19,6 +19,8 @@ export function mapBackendPhase(rawPhase: string | undefined | null): RunPhase {
       return 'CLEANUP_READY'
     case 'CLEANING_UP':
       return 'CLEANING_UP'
+    case 'CONNECTING_TRANSPORTS':
+      return 'CONNECTING_TRANSPORTS'
     case 'REGSUB_READY':
       return 'REGSUB_READY'
     case 'REGSUB_RUNNING':

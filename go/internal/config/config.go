@@ -28,14 +28,16 @@ type VMConfig struct {
 	// requires: (1) REGISTER on both primary and secondary during pre-phase,
 	// (2) SUBSCRIBE only on primary, (3) on primary failure during traffic run
 	// re-SUBSCRIBE to secondary (no re-REGISTER needed).
-	SecondaryHost   string `yaml:"secondary_host" json:"secondary_host"`
-	SecondaryPort   int    `yaml:"secondary_port" json:"secondary_port"`
-	FailoverEnabled bool   `yaml:"failover_enabled" json:"failover_enabled"`
-	DNSServers      string `yaml:"dns_servers" json:"dns_servers"`
-	SIPTransport    string `yaml:"sip_transport" json:"sip_transport"`
-	SIPScheme       string `yaml:"sip_scheme" json:"sip_scheme"`
-	Domain          string `yaml:"domain" json:"domain"`
-	SIPPassword     string `yaml:"sip_password" json:"sip_password"`
+	SecondaryHost           string `yaml:"secondary_host" json:"secondary_host"`
+	SecondaryPort           int    `yaml:"secondary_port" json:"secondary_port"`
+	FailoverEnabled         bool   `yaml:"failover_enabled" json:"failover_enabled"`
+	DualRegistrationEnabled bool   `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
+	FailoverMode            string `yaml:"failover_mode" json:"failover_mode"`
+	DNSServers              string `yaml:"dns_servers" json:"dns_servers"`
+	SIPTransport            string `yaml:"sip_transport" json:"sip_transport"`
+	SIPScheme               string `yaml:"sip_scheme" json:"sip_scheme"`
+	Domain                  string `yaml:"domain" json:"domain"`
+	SIPPassword             string `yaml:"sip_password" json:"sip_password"`
 
 	// TLS settings — only consulted when SIPTransport == "TLS".
 	// TLSMode controls verification policy and which other fields are required:
@@ -70,6 +72,7 @@ type VMConfig struct {
 	SubscribeEvents            []string `yaml:"subscribe_events" json:"subscribe_events"`
 	SubscribeRefreshEvents     []string `yaml:"subscribe_refresh_events" json:"subscribe_refresh_events"`
 	SubscribeUnsubscribeEvents []string `yaml:"subscribe_unsubscribe_events" json:"subscribe_unsubscribe_events"`
+	CleanupBatchSize           int      `yaml:"cleanup_batch_size" json:"cleanup_batch_size"`
 
 	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
 	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
@@ -423,6 +426,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RegisterTimeout == 0 {
 		cfg.RegisterTimeout = 5
 	}
+	if cfg.CleanupBatchSize == 0 {
+		cfg.CleanupBatchSize = 10
+	}
 	if cfg.T1Ms <= 0 {
 		cfg.T1Ms = 500
 	}
@@ -480,6 +486,9 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.SIPTransport == "" {
 		cfg.SIPTransport = "TCP"
+	}
+	if cfg.FailoverMode == "" {
+		cfg.FailoverMode = "graceful"
 	}
 	if cfg.LocalIPMode == "" {
 		cfg.LocalIPMode = "single"
@@ -744,6 +753,22 @@ func Validate(cfg *VMConfig) error {
 	if cfg.SBCHost == "" {
 		errs = append(errs, "sbc_host is required")
 	}
+	cfg.FailoverMode = strings.ToLower(strings.TrimSpace(cfg.FailoverMode))
+	if cfg.FailoverMode == "" {
+		cfg.FailoverMode = "graceful"
+	}
+	if cfg.FailoverMode != "graceful" && cfg.FailoverMode != "force" {
+		errs = append(errs, fmt.Sprintf("failover_mode must be 'graceful' or 'force', got %q", cfg.FailoverMode))
+	}
+	if cfg.DualRegistrationEnabled {
+		cfg.FailoverEnabled = true
+		if strings.TrimSpace(cfg.SecondaryHost) == "" {
+			errs = append(errs, "secondary_host is required when dual_registration_enabled=true")
+		}
+		if cfg.SecondaryPort <= 0 || cfg.SecondaryPort > 65535 {
+			errs = append(errs, fmt.Sprintf("secondary_port out of range when dual_registration_enabled=true: %d", cfg.SecondaryPort))
+		}
+	}
 
 	if cfg.ExtStart > cfg.ExtEnd {
 		errs = append(errs, fmt.Sprintf("ext_start (%d) > ext_end (%d)", cfg.ExtStart, cfg.ExtEnd))
@@ -796,6 +821,9 @@ func Validate(cfg *VMConfig) error {
 	}
 	if cfg.TimerBSeconds < 1 || cfg.TimerBSeconds > 300 {
 		errs = append(errs, fmt.Sprintf("timer_b_seconds must be 1..300 s, got %d", cfg.TimerBSeconds))
+	}
+	if cfg.CleanupBatchSize < 1 || cfg.CleanupBatchSize > 100 {
+		errs = append(errs, fmt.Sprintf("cleanup_batch_size must be 1..100, got %d", cfg.CleanupBatchSize))
 	}
 
 	if cfg.RTPBurstSeconds < 0 {
@@ -928,6 +956,7 @@ func Validate(cfg *VMConfig) error {
 		"subscribe_unsubscribe_events", cfg.SubscribeUnsubscribeEvents,
 		"register_batch_size", cfg.RegisterBatchSize,
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
+		"cleanup_batch_size", cfg.CleanupBatchSize,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
 		"register_timeout", cfg.RegisterTimeout,
 		"media_security", cfg.MediaSecurity,

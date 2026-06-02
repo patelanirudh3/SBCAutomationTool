@@ -187,16 +187,84 @@ func runLifecycle(
 		}
 	}()
 
+	collector.SetPhase("CONNECTING_TRANSPORTS")
+
 	// Create and connect agents
 	agents := createAgents(cfg)
 	agentSlice := agentsToSlice(agents)
+	var secondaryCfg *config.VMConfig
+	var secondaryAgents map[string]*agent.ExtensionAgent
+	var secondaryAgentSlice []*agent.ExtensionAgent
+	var secondaryRegisteredAg []*agent.ExtensionAgent
+	var activeSubscribedAg []*agent.ExtensionAgent
+	activeController := "primary"
+	var haMoveMu sync.Mutex
+	primaryDownCh := make(chan string, 1)
 	slog.Info("Connecting transports", "count", len(agents))
+	if cfg.DualRegistrationEnabled {
+		for _, ag := range agents {
+			ag.SetTransportDownHandler(func(ext string, err error) {
+				select {
+				case primaryDownCh <- ext:
+				default:
+				}
+				slog.Warn("Primary controller transport down", "ext", ext, "err", err)
+			})
+		}
+	}
 
-	if err := connectTransportsBatched(ctx, agents, cfg, collector); err != nil {
+	connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector)
+	if err != nil {
 		slog.Error("Transport connection failed", "err", err)
+		collector.SetPhase("FAILED")
+		if pctx != nil {
+			pctx.Mu.Lock()
+			pctx.State = "FAILED"
+			pctx.Mu.Unlock()
+		}
 		return 1
 	}
+	if len(connectedAgents) < len(agents) {
+		slog.Warn("Continuing with partial transport connectivity",
+			"configured", len(agents),
+			"connected", len(connectedAgents),
+			"failed", len(agents)-len(connectedAgents),
+		)
+	}
+	agents = connectedAgents
+	agentSlice = agentsToSlice(agents)
 	collector.UpdateCounts(0, len(agents), 0, 0)
+
+	if cfg.DualRegistrationEnabled {
+		secondaryCopy := *cfg
+		secondaryCopy.SBCHost = cfg.SecondaryHost
+		secondaryCopy.SBCPort = cfg.SecondaryPort
+		secondaryCfg = &secondaryCopy
+		secondaryAgents = createAgents(secondaryCfg)
+		secondaryAgentSlice = agentsToSlice(secondaryAgents)
+		slog.Info("Connecting secondary controller transports", "count", len(secondaryAgents), "host", cfg.SecondaryHost, "port", cfg.SecondaryPort)
+		connectedSecondaryAgents, err := connectTransportsBatched(ctx, secondaryAgents, secondaryCfg, nil)
+		if err != nil {
+			slog.Error("Secondary transport connection failed", "err", err)
+			collector.SetPhase("FAILED")
+			if pctx != nil {
+				pctx.Mu.Lock()
+				pctx.State = "FAILED"
+				pctx.Mu.Unlock()
+			}
+			return 1
+		}
+		if len(connectedSecondaryAgents) < len(secondaryAgents) {
+			slog.Warn("Continuing with partial secondary transport connectivity",
+				"configured", len(secondaryAgents),
+				"connected", len(connectedSecondaryAgents),
+				"failed", len(secondaryAgents)-len(connectedSecondaryAgents),
+			)
+		}
+		secondaryAgents = connectedSecondaryAgents
+		secondaryAgentSlice = agentsToSlice(secondaryAgents)
+	}
+	collector.SetHAStatus(cfg.DualRegistrationEnabled, activeController, 0, 0, 0, 0)
 
 	// Create pool engine and wire pool counts provider into the metrics collector
 	pool := engine.NewPoolEngine()
@@ -246,6 +314,9 @@ func runLifecycle(
 			slog.Info("Prep flush starting via API", "ext_count", len(agentSlice))
 			return prephase.RunPrep(ctx, agentSlice, cfg)
 		}
+		pctx.OnHAMoveSubscription = func(target string) error {
+			return fmt.Errorf("HA move is not ready until Reg/Sub completes")
+		}
 		pctx.Mu.Unlock()
 	}
 
@@ -254,12 +325,22 @@ func runLifecycle(
 	// Prep button is independent — see /api/prep/start handler in metrics.go).
 	// CLI mode: run the legacy one-shot RunPrePhase (Phase 0 + 1 + 2).
 	var (
-		registeredAg    []*agent.ExtensionAgent
-		failedRegister  []string
-		failedSubscribe []string
-		stopRegRefresh  = func() {}
-		stopSubRefresh  = func() {}
+		registeredAg            []*agent.ExtensionAgent
+		failedRegister          []string
+		failedSubscribe         []string
+		stopRegRefresh          = func() {}
+		stopSubRefresh          = func() {}
+		stopSecondaryRegRefresh = func() {}
 	)
+
+	cleanupAll := func(cleanupCtx context.Context, activeEngine *engine.CallEngine) {
+		shutdownCleanup(cleanupCtx, agents, pool, activeEngine, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+		if secondaryAgents != nil && secondaryCfg != nil && !noUnregister {
+			stopSecondaryRegRefresh()
+			stopSecondaryRegRefresh = func() {}
+			unregisterSecondaryRegistrations(cleanupCtx, secondaryAgents, secondaryCfg)
+		}
+	}
 
 	if pctx != nil {
 		// ── GUI mode: gated REG + SUB with live progress ─────────────────────
@@ -274,13 +355,13 @@ func runLifecycle(
 			slog.Info("Start Reg/Sub signal received via legacy /api/prephase/start")
 		case <-pctx.GracefulStopCh:
 			slog.Info("Graceful stop received before Reg/Sub started")
-			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			cleanupAll(ctx, nil)
 			collector.SetPhase("DONE")
 			return 0
 		case <-pctx.InterruptStopCh:
 			slog.Info("Interrupted stop received before Reg/Sub started")
 			stopNew.Store(true)
-			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			cleanupAll(ctx, nil)
 			collector.SetPhase("DONE")
 			return 0
 		case <-ctx.Done():
@@ -311,6 +392,21 @@ func runLifecycle(
 			"failed", len(failedRegister),
 			"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
 
+		if cfg.DualRegistrationEnabled && len(secondaryAgentSlice) > 0 {
+			secondaryRegStart := time.Now()
+			var secondaryFailed []string
+			secondaryRegisteredAg, secondaryFailed, stopSecondaryRegRefresh = prephase.RunRegister(
+				ctx, secondaryAgentSlice, secondaryCfg,
+				nil,
+				stopNew,
+			)
+			slog.Info("SECONDARY REGISTER phase complete",
+				"registered", len(secondaryRegisteredAg),
+				"failed", len(secondaryFailed),
+				"elapsed_s", fmt.Sprintf("%.1f", time.Since(secondaryRegStart).Seconds()))
+			collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), 0, 0)
+		}
+
 		// Live SUB progress (only if any agent registered)
 		if len(registeredAg) > 0 {
 			collector.SetSubscribeTotal(len(registeredAg) * len(cfg.SubscribeEvents))
@@ -328,6 +424,9 @@ func runLifecycle(
 				"subscribed", len(registeredAg)-len(failedSubscribe),
 				"failed", len(failedSubscribe),
 				"elapsed_s", fmt.Sprintf("%.1f", time.Since(subStart).Seconds()))
+			if cfg.DualRegistrationEnabled {
+				collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), len(registeredAg)-len(failedSubscribe), 0)
+			}
 		} else {
 			slog.Error("REG/SUB: no extensions registered — skipping SUBSCRIBE")
 		}
@@ -347,8 +446,17 @@ func runLifecycle(
 		failedSubscribe = preResult.FailedSubscribe
 	}
 
+	for _, ext := range failedRegister {
+		collector.RecordRegisterFailure(ext, fmt.Errorf("REGISTER failed after retry attempts"))
+	}
+	subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
+	for _, ext := range failedSubscribe {
+		collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
+	}
+
 	defer stopRegRefresh()
 	defer stopSubRefresh()
+	defer stopSecondaryRegRefresh()
 
 	registered := len(registeredAg)
 	if pctx == nil {
@@ -356,8 +464,12 @@ func runLifecycle(
 		registered = len(agents) - len(failedRegister)
 	}
 	subscribed := registered - len(failedSubscribe)
+	activeSubscribedAg = agentsExceptExts(registeredAg, failedSubscribe)
 
 	collector.UpdateCounts(0, len(agents), registered, subscribed)
+	if cfg.DualRegistrationEnabled {
+		collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(activeSubscribedAg), 0)
+	}
 
 	slog.Info("REG/SUB phase complete",
 		"total", len(agents),
@@ -367,13 +479,116 @@ func runLifecycle(
 		"failed_sub", len(failedSubscribe),
 	)
 
+	readyIdle, _, regOnly := pool.Counts()
+	if readyIdle < 2 {
+		slog.Error("REG/SUB complete but not enough fully subscribed agents are ready for traffic",
+			"ready_idle", readyIdle,
+			"reg_only", regOnly,
+			"registered", registered,
+			"subscribed", subscribed,
+			"failed_reg", len(failedRegister),
+			"failed_sub", len(failedSubscribe),
+		)
+		collector.SetPhase("FAILED")
+		if pctx != nil {
+			pctx.Mu.Lock()
+			pctx.State = "FAILED"
+			pctx.Mu.Unlock()
+		}
+		return 1
+	}
+
 	if prePhaseOnly {
 		slog.Info("PRE-PHASE-ONLY mode — waiting for signal to exit")
 		collector.SetPhase("READY_PRE_PHASE_ONLY")
 		<-ctx.Done()
-		shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+		cleanupAll(ctx, nil)
 		collector.SetPhase("DONE")
 		return 0
+	}
+
+	if pctx != nil && cfg.DualRegistrationEnabled && secondaryCfg != nil && len(secondaryRegisteredAg) > 0 {
+		moveToController := func(target string, automatic bool) error {
+			haMoveMu.Lock()
+			defer haMoveMu.Unlock()
+			idle, nonIdle, _ := pool.Counts()
+			if nonIdle > 0 {
+				if automatic {
+					collector.RecordHAFailover(true)
+				}
+				return fmt.Errorf("cannot move subscriptions while %d agents are in active/in-progress calls", nonIdle)
+			}
+			if target == activeController {
+				return nil
+			}
+			collector.SetHAMove(true, target, "")
+			defer collector.SetHAMove(false, target, "")
+			moveCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout*len(cfg.SubscribeEvents)+30)*time.Second)
+			defer cancel()
+			if target == "secondary" {
+				movedAgents, err := moveSubscriptions(moveCtx, activeSubscribedAg, secondaryRegisteredAg, secondaryCfg, cfg, true)
+				if err != nil {
+					collector.SetHAMove(false, target, err.Error())
+					return err
+				}
+				activeController = "secondary"
+				activeSubscribedAg = movedAgents
+				pool.ReplaceIdle(movedAgents)
+				for _, stop := range agentAutoAnswerStops {
+					stop()
+				}
+				agentAutoAnswerStops = make(map[string]func())
+				for _, ag := range movedAgents {
+					agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
+				}
+				collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), 0, len(movedAgents))
+				if automatic {
+					collector.RecordHAFailover(false)
+				}
+				slog.Info("HA subscription move complete", "target", target, "automatic", automatic, "agents", len(movedAgents), "idle_before", idle)
+				return nil
+			}
+			movedAgents, err := moveSubscriptions(moveCtx, activeSubscribedAg, registeredAg, cfg, secondaryCfg, false)
+			if err != nil {
+				collector.SetHAMove(false, target, err.Error())
+				return err
+			}
+			activeController = "primary"
+			activeSubscribedAg = movedAgents
+			pool.ReplaceIdle(movedAgents)
+			for _, stop := range agentAutoAnswerStops {
+				stop()
+			}
+			agentAutoAnswerStops = make(map[string]func())
+			for _, ag := range movedAgents {
+				agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
+			}
+			collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(movedAgents), 0)
+			slog.Info("HA subscription move complete", "target", target, "automatic", automatic, "agents", len(movedAgents), "idle_before", idle)
+			return nil
+		}
+		pctx.Mu.Lock()
+		pctx.OnHAMoveSubscription = func(target string) error {
+			return moveToController(target, false)
+		}
+		pctx.Mu.Unlock()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ext := <-primaryDownCh:
+					if activeController != "primary" {
+						continue
+					}
+					slog.Warn("Automatic graceful failover triggered by primary transport down", "ext", ext)
+					if err := moveToController("secondary", true); err != nil {
+						collector.SetHAMove(false, "secondary", err.Error())
+						slog.Warn("Automatic graceful failover deferred/failed", "ext", ext, "err", err)
+					}
+				}
+			}
+		}()
 	}
 
 	// ── Wait for "Start Traffic" gate (GUI mode) ─────────────────────────────
@@ -390,18 +605,18 @@ func runLifecycle(
 			// Operator clicked "Unregister All" from the REGSUB_DONE view —
 			// skip traffic entirely and go straight to cleanup.
 			slog.Info("Cleanup signal received from REGSUB_DONE — skipping traffic")
-			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			cleanupAll(ctx, nil)
 			collector.SetPhase("DONE")
 			return 0
 		case <-pctx.GracefulStopCh:
 			slog.Info("Graceful stop received before traffic started")
-			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			cleanupAll(ctx, nil)
 			collector.SetPhase("DONE")
 			return 0
 		case <-pctx.InterruptStopCh:
 			slog.Info("Interrupted stop received before traffic started")
 			stopNew.Store(true)
-			shutdownCleanup(ctx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+			cleanupAll(ctx, nil)
 			collector.SetPhase("DONE")
 			return 0
 		case <-ctx.Done():
@@ -533,9 +748,7 @@ trafficLoop:
 	// ── Cleanup ───────────────────────────────────────────────────────────────
 	// callEngine has already been stopped + drained by the traffic loop before
 	// breaking out, so we pass nil here (shutdownCleanup tolerates nil eng).
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer shutdownCancel()
-	shutdownCleanup(shutdownCtx, agents, pool, nil, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
+	cleanupAll(context.Background(), nil)
 
 	// Stop all per-agent auto-answer loops
 	for _, stop := range agentAutoAnswerStops {
@@ -631,20 +844,14 @@ func shutdownCleanup(
 	}
 
 	if !noUnregister {
-		concurrency := cfg.SubscribeConcurrency
-		if concurrency <= 0 {
-			concurrency = 10
-		}
-		perExtTimeout := time.Duration(cfg.RegisterTimeout) * time.Second
-		waves := (len(agents) + concurrency - 1) / concurrency
-		outerTimeout := time.Duration(waves)*perExtTimeout + 10*time.Second
-
 		var cleanupAgents []*agent.ExtensionAgent
 		if pool != nil {
 			cleanupAgents = pool.AllForCleanup()
 		} else {
 			cleanupAgents = agentsToSlice(agents)
 		}
+		batchSize := cleanupBatchSize(cfg)
+		batches := cleanupBatchCount(len(cleanupAgents), batchSize)
 
 		// Seed the cleanup-status counters now that we know the agent set.
 		// Phase was already flipped to CLEANING_UP at the top of this fn.
@@ -652,43 +859,32 @@ func shutdownCleanup(
 
 		slog.Info("Cleaning up extensions",
 			"count", len(cleanupAgents),
-			"concurrency", concurrency,
-			"waves", waves,
-			"outer_timeout_s", outerTimeout.Seconds(),
+			"batch_size", batchSize,
+			"batches", batches,
 		)
-		unregCtx, unregCancel := context.WithTimeout(ctx, outerTimeout)
-		defer unregCancel()
 
-		sem := make(chan struct{}, concurrency)
-		var wg sync.WaitGroup
-		for _, ag := range cleanupAgents {
-			wg.Add(1)
-			go func(a *agent.ExtensionAgent) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				unsubSkipped := !a.NeedsUnsubscribe()
-				unsubOK := true
-				if unsubSkipped {
-					slog.Debug("Unsubscribe skipped", "ext", a.Ext, "event", a.SubscriptionEvent())
-				} else {
-					unsubErr := a.UnsubscribeWithProgress(unregCtx, func(event string, ok bool) {
-						collector.RecordCleanupUnsubscribeEvent(event, ok)
-					})
-					unsubOK = unsubErr == nil
-					if unsubErr != nil {
-						slog.Debug("Unsubscribe error", "ext", a.Ext, "event", a.SubscriptionEvent(), "err", unsubErr)
-					}
+		runCleanupBatches(ctx, cleanupAgents, batchSize, "unsubscribe", func(a *agent.ExtensionAgent) {
+			unsubSkipped := !a.NeedsUnsubscribe()
+			unsubOK := true
+			if unsubSkipped {
+				slog.Debug("Unsubscribe skipped", "ext", a.Ext, "event", a.SubscriptionEvent())
+			} else {
+				unsubErr := cleanupUnsubscribeWithRetry(ctx, a, cfg, collector)
+				unsubOK = unsubErr == nil
+				if unsubErr != nil {
+					slog.Debug("Unsubscribe error", "ext", a.Ext, "event", a.SubscriptionEvent(), "err", unsubErr)
 				}
-				collector.IncrementCleanupUnsubscribe(a.Ext, unsubSkipped, unsubOK)
-				unregErr := a.Unregister(unregCtx)
-				if unregErr != nil {
-					slog.Debug("Unregister error", "ext", a.Ext, "err", unregErr)
-				}
-				collector.IncrementCleanupUnregister(a.Ext, unregErr == nil)
-			}(ag)
-		}
-		wg.Wait()
+			}
+			collector.IncrementCleanupUnsubscribe(a.Ext, unsubSkipped, unsubOK)
+		})
+
+		runCleanupBatches(ctx, cleanupAgents, batchSize, "unregister", func(a *agent.ExtensionAgent) {
+			unregErr := cleanupUnregisterWithRetry(ctx, a, cfg)
+			if unregErr != nil {
+				slog.Debug("Unregister error", "ext", a.Ext, "err", unregErr)
+			}
+			collector.IncrementCleanupUnregister(a.Ext, unregErr == nil)
+		})
 	} else {
 		slog.Info("--no-unregister: skipping unregistration")
 	}
@@ -698,12 +894,247 @@ func shutdownCleanup(
 		ag.Close()
 	}
 
-	snap := collector.Latest()
+	snap := collector.BuildSnapshot()
 	snapJSON, _ := json.Marshal(snap)
 	slog.Info("Final metrics: " + string(snapJSON))
 
 	writeTrafficSummary(collector, cfg, logDir, runID, pairID, eng, agents)
 	slog.Info("SIP cleanup complete — metrics server still serving")
+}
+
+func cleanupRetryCount(cfg *config.VMConfig) int {
+	maxRetries := cfg.RegisterRetry
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	return maxRetries
+}
+
+func cleanupBackoff(attempt int) time.Duration {
+	return time.Duration(float64(time.Second) * 0.5 * float64(attempt))
+}
+
+func cleanupBatchSize(cfg *config.VMConfig) int {
+	if cfg.CleanupBatchSize > 0 {
+		return cfg.CleanupBatchSize
+	}
+	return 10
+}
+
+func cleanupBatchCount(total, batchSize int) int {
+	if total <= 0 {
+		return 0
+	}
+	if batchSize <= 0 {
+		batchSize = 10
+	}
+	return (total + batchSize - 1) / batchSize
+}
+
+func batchMinExt(batch []*agent.ExtensionAgent) string {
+	min := math.MaxInt
+	minExt := ""
+	for _, a := range batch {
+		if n, err := strconv.Atoi(a.Ext); err == nil && n < min {
+			min = n
+			minExt = a.Ext
+		}
+	}
+	return minExt
+}
+
+func batchMaxExt(batch []*agent.ExtensionAgent) string {
+	max := math.MinInt
+	maxExt := ""
+	for _, a := range batch {
+		if n, err := strconv.Atoi(a.Ext); err == nil && n > max {
+			max = n
+			maxExt = a.Ext
+		}
+	}
+	return maxExt
+}
+
+func runCleanupBatches(ctx context.Context, agents []*agent.ExtensionAgent, batchSize int, phase string, fn func(*agent.ExtensionAgent)) {
+	if batchSize <= 0 {
+		batchSize = 10
+	}
+	total := len(agents)
+	for batchStart := 0; batchStart < total; batchStart += batchSize {
+		if ctx.Err() != nil {
+			slog.Warn("Cleanup phase stopped by context", "phase", phase, "completed", batchStart, "total", total, "err", ctx.Err())
+			return
+		}
+		batchEnd := batchStart + batchSize
+		if batchEnd > total {
+			batchEnd = total
+		}
+		batch := agents[batchStart:batchEnd]
+		batchNum := batchStart/batchSize + 1
+		slog.Info("Cleanup batch starting",
+			"phase", phase,
+			"batch", batchNum,
+			"from", batchMinExt(batch),
+			"to", batchMaxExt(batch),
+			"count", len(batch),
+		)
+
+		var wg sync.WaitGroup
+		wg.Add(len(batch))
+		for _, ag := range batch {
+			go func(a *agent.ExtensionAgent) {
+				defer wg.Done()
+				fn(a)
+			}(ag)
+		}
+		wg.Wait()
+
+		slog.Info("Cleanup batch complete",
+			"phase", phase,
+			"batch", batchNum,
+			"count", len(batch),
+		)
+	}
+}
+
+func cleanupUnsubscribeWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) error {
+	maxRetries := cleanupRetryCount(cfg)
+	eventResults := make(map[string]bool)
+	var lastErr error
+
+retryUnsubscribe:
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := ag.UnsubscribeWithProgress(ctx, func(event string, ok bool) {
+			eventResults[event] = ok
+		})
+		if err == nil {
+			for event, ok := range eventResults {
+				collector.RecordCleanupUnsubscribeEvent(event, ok)
+			}
+			return nil
+		}
+		lastErr = err
+		slog.Warn("UNSUBSCRIBE cleanup attempt failed",
+			"ext", ag.Ext,
+			"attempt", attempt,
+			"max", maxRetries,
+			"err", err)
+		if ctx.Err() != nil || attempt == maxRetries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break retryUnsubscribe
+		case <-time.After(cleanupBackoff(attempt)):
+		}
+	}
+
+	for event, ok := range eventResults {
+		collector.RecordCleanupUnsubscribeEvent(event, ok)
+	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return lastErr
+}
+
+func cleanupUnregisterWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig) error {
+	maxRetries := cleanupRetryCount(cfg)
+	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	var lastErr error
+retryUnregister:
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		regCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := ag.Unregister(regCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		slog.Warn("UNREGISTER cleanup attempt failed",
+			"ext", ag.Ext,
+			"attempt", attempt,
+			"max", maxRetries,
+			"err", err)
+		if ctx.Err() != nil || attempt == maxRetries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break retryUnregister
+		case <-time.After(cleanupBackoff(attempt)):
+		}
+	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return lastErr
+}
+
+func unregisterSecondaryRegistrations(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig) {
+	agentSlice := agentsToSlice(agents)
+	if len(agentSlice) == 0 {
+		return
+	}
+	batchSize := cleanupBatchSize(cfg)
+	slog.Info("Cleaning up secondary controller registrations", "count", len(agentSlice), "batch_size", batchSize)
+	runCleanupBatches(ctx, agentSlice, batchSize, "secondary_unregister", func(a *agent.ExtensionAgent) {
+		if err := cleanupUnregisterWithRetry(ctx, a, cfg); err != nil {
+			slog.Debug("Secondary unregister error", "ext", a.Ext, "err", err)
+		} else {
+			slog.Debug("Secondary unregistered", "ext", a.Ext)
+		}
+	})
+	for _, ag := range agentSlice {
+		_ = ag.Close()
+	}
+}
+
+func agentsExceptExts(agents []*agent.ExtensionAgent, failed []string) []*agent.ExtensionAgent {
+	if len(failed) == 0 {
+		return append([]*agent.ExtensionAgent(nil), agents...)
+	}
+	failedSet := make(map[string]struct{}, len(failed))
+	for _, ext := range failed {
+		failedSet[ext] = struct{}{}
+	}
+	out := make([]*agent.ExtensionAgent, 0, len(agents))
+	for _, ag := range agents {
+		if _, bad := failedSet[ag.Ext]; !bad {
+			out = append(out, ag)
+		}
+	}
+	return out
+}
+
+func moveSubscriptions(ctx context.Context, fromAgents, toAgents []*agent.ExtensionAgent, toCfg, fromCfg *config.VMConfig, fromDown bool) ([]*agent.ExtensionAgent, error) {
+	toByExt := make(map[string]*agent.ExtensionAgent, len(toAgents))
+	for _, ag := range toAgents {
+		toByExt[ag.Ext] = ag
+	}
+	moved := make([]*agent.ExtensionAgent, 0, len(fromAgents))
+	for _, from := range fromAgents {
+		to := toByExt[from.Ext]
+		if to == nil {
+			return moved, fmt.Errorf("no target controller agent for extension %s", from.Ext)
+		}
+		if !fromDown {
+			if err := from.Unsubscribe(ctx); err != nil {
+				return moved, fmt.Errorf("unsubscribe %s from %s:%d: %w", from.Ext, fromCfg.SBCHost, fromCfg.SBCPort, err)
+			}
+		}
+		if err := to.Subscribe(ctx); err != nil {
+			return moved, fmt.Errorf("subscribe %s to %s:%d: %w", to.Ext, toCfg.SBCHost, toCfg.SBCPort, err)
+		}
+		moved = append(moved, to)
+	}
+	if len(moved) < 2 {
+		return moved, fmt.Errorf("only %d target controller agents subscribed; need at least 2", len(moved))
+	}
+	return moved, nil
 }
 
 func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, runID, pairID, logDir string) {
@@ -964,9 +1395,10 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	return out
 }
 
-func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) error {
+func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) (map[string]*agent.ExtensionAgent, error) {
 	allAgents := agentsToSlice(agents)
 	total := len(allAgents)
+	connected := make(map[string]*agent.ExtensionAgent, total)
 	if collector != nil {
 		collector.ResetTransportConnect(total)
 		defer collector.FinishTransportConnect()
@@ -997,20 +1429,25 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 		)
 
 		var wg sync.WaitGroup
-		var firstErr error
-		var errOnce sync.Once
+		var mu sync.Mutex
+		batchFailures := 0
 		for _, ag := range batch {
 			wg.Add(1)
 			go func(a *agent.ExtensionAgent) {
 				defer wg.Done()
 				if err := a.Start(ctx); err != nil {
-					errOnce.Do(func() { firstErr = err })
+					mu.Lock()
+					batchFailures++
+					mu.Unlock()
 					slog.Error("Agent start failed", "ext", a.Ext, "err", err)
 					if collector != nil {
 						collector.RecordTransportConnectFailure(a.Ext, cfg.LocalHostForExtension(a.Ext), fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort), err)
 					}
 					return
 				}
+				mu.Lock()
+				connected[a.Ext] = a
+				mu.Unlock()
 				if collector != nil {
 					collector.RecordTransportConnectSuccess()
 				}
@@ -1018,21 +1455,36 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 		}
 		wg.Wait()
 
-		if firstErr != nil {
-			return firstErr
+		if batchFailures > 0 {
+			slog.Warn("Transport batch partially connected",
+				"batch", batchNum,
+				"connected", len(batch)-batchFailures,
+				"failed", batchFailures,
+				"count", len(batch),
+			)
+		} else {
+			slog.Info("Transport batch connected", "batch", batchNum, "count", len(batch))
 		}
-
-		slog.Info("Transport batch connected", "batch", batchNum, "count", len(batch))
 
 		if batchEnd < total {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return connected, ctx.Err()
 			case <-time.After(batchDelay):
 			}
 		}
 	}
-	return nil
+	if len(connected) == 0 {
+		return connected, fmt.Errorf("no transports connected out of %d configured agents", total)
+	}
+	if len(connected) < total {
+		slog.Warn("Transport connection completed with partial success",
+			"configured", total,
+			"connected", len(connected),
+			"failed", total-len(connected),
+		)
+	}
+	return connected, nil
 }
 
 func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
@@ -1122,6 +1574,8 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 		case "timed":
 			maxCalls = int(float64(cfg.CPS) * cfg.DurationHours * 3600)
 		}
+
+		collector.ResetForRun(cfg.VMID)
 
 		logFile := autoLogFile(runID, pairID, cfg.VMID, "logs")
 		setupFileLogging(logLevel, logFile)

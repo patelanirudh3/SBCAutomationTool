@@ -33,6 +33,7 @@ type Transport interface {
 	RecvChan() <-chan string
 	Close() error
 	LocalPort() int
+	SetDownHandler(func(error))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,8 @@ func (t *UDPTransport) Close() error {
 
 func (t *UDPTransport) LocalPort() int { return t.localPort }
 
+func (t *UDPTransport) SetDownHandler(func(error)) {}
+
 // ---------------------------------------------------------------------------
 // TCP / TLS
 // ---------------------------------------------------------------------------
@@ -144,6 +147,7 @@ type TCPTransport struct {
 	closed    atomic.Bool
 	mu        sync.Mutex
 	done      chan struct{} // signals readLoop to exit cleanly
+	onDown    func(error)
 }
 
 // NewTCPTransport returns an unconnected TCPTransport.
@@ -169,6 +173,10 @@ func (t *TCPTransport) Connect(ctx context.Context) error {
 	}
 	go t.readLoop()
 	return nil
+}
+
+func (t *TCPTransport) SetDownHandler(fn func(error)) {
+	t.onDown = fn
 }
 
 // dial establishes the TCP (or TLS) connection, binding to localHost.
@@ -283,6 +291,9 @@ func (t *TCPTransport) readLoop() {
 			}
 			slog.Warn("TCP read error, reconnecting", "err", err,
 				"remote", net.JoinHostPort(t.remoteHost, strconv.Itoa(t.remotePort)))
+			if t.onDown != nil {
+				t.onDown(err)
+			}
 			t.reconnect()
 			buf = buf[:0]
 		}

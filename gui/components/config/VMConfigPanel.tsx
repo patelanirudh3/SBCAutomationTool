@@ -47,15 +47,18 @@ export type RawVMFormValues = {
   subscribe_refresh_events: string[]
   subscribe_unsubscribe_events: string[]
   register_rate_cps: string
+  cleanup_batch_size: string
   // RFC 3261 INVITE client-transaction timers (UAC). Empty -> backend uses RFC defaults.
   t1_ms: string
   timer_b_seconds: string
   // SIP server
   sbc_host: string
   sbc_port: string
+  dual_registration_enabled: boolean
   secondary_host: string
   secondary_port: string
   failover_enabled: boolean
+  failover_mode: 'graceful' | 'force'
   dns_servers: string
   sip_transport: SipTransport
   sip_scheme: SipScheme
@@ -127,11 +130,11 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
     'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip',
     'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-    'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
+    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'dns_servers',
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
   ],
   signaling: [
-    'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps',
+    'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size',
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
@@ -151,6 +154,7 @@ const DEFAULTS_REGISTRATION = {
   subscribe_refresh_events: ['dialog'],
   subscribe_unsubscribe_events: ['dialog'],
   register_rate_cps: '10',
+  cleanup_batch_size: '10',
   t1_ms:             '500',
   timer_b_seconds:   '32',
 }
@@ -160,10 +164,10 @@ const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
   agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path', 'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-                   'secondary_host', 'secondary_port', 'failover_enabled', 'dns_servers',
+                   'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
-  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
@@ -745,107 +749,181 @@ export function VMConfigPanel({
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
 
-        {/* Endpoint row — Host : Port + Transport packed onto one line.
-            Reads naturally as "10.0.0.1 : 5060 TCP". */}
-        <FormRow
-          label="Endpoint"
-          hint="Target SBC, SIP proxy, or any SIP server receiving calls. Host accepts IP or FQDN."
-        >
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Input
-              value={raw.sbc_host}
-              onChange={(ev) => onChange('sbc_host', ev.target.value)}
-              onBlur={() => onBlur('sbc_host')}
-              placeholder="x.x.x.x"
-              className="w-36 font-mono"
-              aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
-            />
-            <span className="text-slate-500">:</span>
-            <Input
-              type="number"
-              value={raw.sbc_port}
-              onChange={(ev) => onChange('sbc_port', ev.target.value)}
-              onBlur={() => onBlur('sbc_port')}
-              placeholder="5060"
-              className="w-20 font-mono"
-              aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
-            />
-            <Select
-              value={raw.sip_transport}
-              onValueChange={(v) => {
-                const transport = v as SipTransport
-                onChange('sip_transport', transport)
-                if (transport === 'TLS') onChange('sbc_port', '5061')
-                if (transport === 'TCP') {
-                  onChange('sbc_port', '5060')
-                  onChange('sip_scheme', 'SIP')
-                  onBlur('sip_scheme')
-                }
-                onBlur('sip_transport')
-                onBlur('sbc_port')
-              }}
-            >
-              <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="TCP">TCP</SelectItem>
-                <SelectItem value="TLS">TLS</SelectItem>
-              </SelectContent>
-            </Select>
+        <div className="space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
+          <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-sky-300">
+            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+            Remote Server HA
           </div>
-          {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
-            <>
-              {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
-              {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
-              {e('sip_transport') && <FieldError error={e('sip_transport')} />}
-            </>
-          )}
-        </FormRow>
+          <div className="flex items-center gap-3 rounded-md border border-slate-700/50 bg-slate-950/20 px-3 py-2">
+            <Switch
+              checked={raw.dual_registration_enabled}
+              onCheckedChange={(checked) => {
+                onChange('dual_registration_enabled', checked)
+                onChange('failover_enabled', checked)
+              }}
+            />
+            <span className="text-xs font-semibold text-slate-300">
+              {raw.dual_registration_enabled ? 'Dual Registration mode' : 'Single Controller mode'}
+            </span>
+          </div>
 
-        {/* Identity row — Scheme + Domain packed onto one line. */}
-        <FormRow
-          label="Identity"
-          hint="Scheme: SIP = plain (port 5060). SIPS = secure (port 5061). Domain is the SIP realm sent in From/To URIs."
-        >
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Select
-              value={raw.sip_scheme}
-              onValueChange={(v) => {
-                const scheme = v as SipScheme
-                onChange('sip_scheme', scheme)
-                if (scheme === 'SIPS') {
-                  onChange('sip_transport', 'TLS')
-                  onChange('sbc_port', '5061')
-                  onBlur('sip_transport')
-                  onBlur('sbc_port')
-                }
-                onBlur('sip_scheme')
-              }}
-            >
-              <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="SIP">SIP</SelectItem>
-                <SelectItem value="SIPS">SIPS</SelectItem>
-              </SelectContent>
-            </Select>
-            <Input
-              value={raw.domain}
-              onChange={(ev) => onChange('domain', ev.target.value)}
-              onBlur={() => onBlur('domain')}
-              placeholder="avaya.com"
-              className="w-40 font-mono"
-              aria-invalid={t('domain') && !!errors.domain ? true : undefined}
-            />
+          <div className="grid gap-3 xl:grid-cols-2">
+            <div className="space-y-2 rounded-md border border-slate-700/50 bg-slate-950/20 p-2.5">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Primary Controller</div>
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-slate-400">Prim. Host</div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Input
+                    value={raw.sbc_host}
+                    onChange={(ev) => onChange('sbc_host', ev.target.value)}
+                    onBlur={() => onBlur('sbc_host')}
+                    placeholder="x.x.x.x"
+                    className="w-40 font-mono"
+                    aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+                  />
+                  <span className="text-slate-500">:</span>
+                  <Input
+                    type="number"
+                    value={raw.sbc_port}
+                    onChange={(ev) => onChange('sbc_port', ev.target.value)}
+                    onBlur={() => onBlur('sbc_port')}
+                    placeholder="5060"
+                    className="w-16 font-mono"
+                    aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+                  />
+                  <Select
+                    value={raw.sip_transport}
+                    onValueChange={(v) => {
+                      const transport = v as SipTransport
+                      onChange('sip_transport', transport)
+                      if (transport === 'TLS') onChange('sbc_port', '5061')
+                      if (transport === 'TCP') {
+                        onChange('sbc_port', '5060')
+                        onChange('sip_scheme', 'SIP')
+                        onBlur('sip_scheme')
+                      }
+                      onBlur('sip_transport')
+                      onBlur('sbc_port')
+                    }}
+                  >
+                    <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="TCP">TCP</SelectItem>
+                      <SelectItem value="TLS">TLS</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
+                  <>
+                    {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
+                    {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
+                    {e('sip_transport') && <FieldError error={e('sip_transport')} />}
+                  </>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-slate-400">Identity</div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Select
+                    value={raw.sip_scheme}
+                    onValueChange={(v) => {
+                      const scheme = v as SipScheme
+                      onChange('sip_scheme', scheme)
+                      if (scheme === 'SIPS') {
+                        onChange('sip_transport', 'TLS')
+                        onChange('sbc_port', '5061')
+                        onBlur('sip_transport')
+                        onBlur('sbc_port')
+                      }
+                      onBlur('sip_scheme')
+                    }}
+                  >
+                    <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="SIP">SIP</SelectItem>
+                      <SelectItem value="SIPS">SIPS</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Input
+                    value={raw.domain}
+                    onChange={(ev) => onChange('domain', ev.target.value)}
+                    onBlur={() => onBlur('domain')}
+                    placeholder="avaya.com"
+                    className="w-32 font-mono"
+                    aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+                  />
+                </div>
+                {(e('sip_scheme') || e('domain')) && (
+                  <>
+                    {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
+                    {e('domain')     && <FieldError error={e('domain')} />}
+                  </>
+                )}
+                {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
+                  <FieldError error="SIPS requires TLS transport." />
+                )}
+              </div>
+            </div>
+
+              <div className={cn(
+                'space-y-2 rounded-md border p-2.5',
+                raw.dual_registration_enabled
+                  ? 'border-slate-700/50 bg-slate-950/20'
+                  : 'border-slate-800/50 bg-slate-950/10 opacity-60',
+              )}>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Secondary Controller</div>
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-slate-400">Sec. Host</div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Input
+                    value={raw.secondary_host}
+                    onChange={(ev) => onChange('secondary_host', ev.target.value)}
+                    onBlur={() => onBlur('secondary_host')}
+                    placeholder="x.x.x.x"
+                    className="w-40 font-mono"
+                    disabled={!raw.dual_registration_enabled}
+                  />
+                  <span className="text-slate-500">:</span>
+                  <Input
+                    type="number"
+                    value={raw.secondary_port}
+                    onChange={(ev) => onChange('secondary_port', ev.target.value)}
+                    onBlur={() => onBlur('secondary_port')}
+                    placeholder={raw.sip_transport === 'TLS' ? '5061' : '5060'}
+                    className="w-16 font-mono"
+                    disabled={!raw.dual_registration_enabled}
+                  />
+                  <span className="rounded border border-slate-700 bg-slate-900/50 px-2.5 py-1 text-xs font-semibold text-slate-300">
+                    {raw.sip_transport}
+                  </span>
+                </div>
+                {(e('secondary_host') || e('secondary_port')) && (
+                  <>
+                    {e('secondary_host') && <FieldError error={e('secondary_host')} />}
+                    {e('secondary_port') && <FieldError error={e('secondary_port')} />}
+                  </>
+                )}
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-slate-400">Failover Mode</div>
+                <Select
+                  value={raw.failover_mode}
+                  onValueChange={(v) => onChange('failover_mode', v as 'graceful' | 'force')}
+                  disabled={!raw.dual_registration_enabled}
+                >
+                  <SelectTrigger className="w-40">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="graceful">Graceful Failover</SelectItem>
+                    <SelectItem value="force">Force Failover</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              </div>
           </div>
-          {(e('sip_scheme') || e('domain')) && (
-            <>
-              {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
-              {e('domain')     && <FieldError error={e('domain')} />}
-            </>
-          )}
-          {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
-            <FieldError error="SIPS requires TLS transport." />
-          )}
-        </FormRow>
+        </div>
 
         {raw.sip_transport === 'TLS' && (
           <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
@@ -1047,46 +1125,6 @@ export function VMConfigPanel({
           />
         </FormRow>
 
-        {/* Failover */}
-        <FormRow
-          label="Failover"
-          hint="Enable to add a secondary SBC host for failover during a run."
-        >
-          <div className="flex items-center gap-3">
-            <Switch
-              checked={raw.failover_enabled}
-              onCheckedChange={(checked) => onChange('failover_enabled', checked)}
-            />
-            <span className="text-xs text-slate-400">
-              {raw.failover_enabled ? 'Secondary host configured' : 'Single host — no failover'}
-            </span>
-          </div>
-        </FormRow>
-
-        {raw.failover_enabled && (
-          <>
-            <FormRow label="Secondary Host">
-              <Input
-                value={raw.secondary_host}
-                onChange={(ev) => onChange('secondary_host', ev.target.value)}
-                onBlur={() => onBlur('secondary_host')}
-                placeholder="x.x.x.x"
-                className="w-36 font-mono"
-              />
-            </FormRow>
-            <FormRow label="Secondary Port">
-              <Input
-                type="number"
-                value={raw.secondary_port}
-                onChange={(ev) => onChange('secondary_port', ev.target.value)}
-                onBlur={() => onBlur('secondary_port')}
-                placeholder="5060"
-                className="w-24 font-mono"
-              />
-            </FormRow>
-          </>
-        )}
-
         {/* DNS Servers — auto-hidden when sbc_host is a literal IP (no
             resolution needed). Surfaces automatically when an FQDN is used
             or when the user has previously set a value. */}
@@ -1258,6 +1296,7 @@ export function VMConfigPanel({
           raw.subscribe_refresh_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_refresh_events.join(',') ||
           raw.subscribe_unsubscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_unsubscribe_events.join(',') ||
           raw.register_rate_cps !== DEFAULTS_REGISTRATION.register_rate_cps ||
+          raw.cleanup_batch_size !== DEFAULTS_REGISTRATION.cleanup_batch_size ||
           raw.t1_ms !== DEFAULTS_REGISTRATION.t1_ms ||
           raw.timer_b_seconds !== DEFAULTS_REGISTRATION.timer_b_seconds
         return (
@@ -1335,6 +1374,28 @@ export function VMConfigPanel({
                   {e('register_rate_cps')  && <FieldError error={e('register_rate_cps')} />}
                 </>
               )}
+            </FormRow>
+
+            <FormRow
+              label="Cleanup Batch"
+              hint="Cleanup-only batch size for post-run unsubscribe and unregister. Default 10; use up to 100 when the SBC can handle a wider teardown batch."
+            >
+              <div className="flex items-center gap-1.5">
+                <Input
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={raw.cleanup_batch_size}
+                  onChange={(ev) => onChange('cleanup_batch_size', ev.target.value)}
+                  onBlur={() => onBlur('cleanup_batch_size')}
+                  placeholder="10"
+                  className="w-20 font-mono"
+                  aria-invalid={t('cleanup_batch_size') && !!errors.cleanup_batch_size ? true : undefined}
+                />
+                <span className="text-xs text-slate-400">extensions / cleanup batch</span>
+              </div>
+              {e('cleanup_batch_size') && <FieldError error={e('cleanup_batch_size')} />}
             </FormRow>
 
             <FormRow

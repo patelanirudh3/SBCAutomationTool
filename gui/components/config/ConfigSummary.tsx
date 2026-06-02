@@ -54,8 +54,10 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
   if (raw.sip_transport === 'TLS') {
     server.push({ label: 'TLS Mode', value: raw.tls_mode || 'insecure' })
   }
-  if (raw.failover_enabled) {
-    server.push({ label: 'Failover', value: `${raw.secondary_host || '—'}:${raw.secondary_port}` })
+  if (raw.dual_registration_enabled) {
+    server.push({ label: 'Dual Registration', value: 'On' })
+    server.push({ label: 'Secondary', value: `${raw.secondary_host || '—'}:${raw.secondary_port}` })
+    server.push({ label: 'Failover Mode', value: raw.failover_mode === 'force' ? 'Force' : 'Graceful' })
   }
   if (raw.dns_servers) {
     server.push({ label: 'DNS', value: raw.dns_servers })
@@ -101,6 +103,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     { label: 'REG Expires', value: `${raw.register_expires || '3600'}s` },
     { label: 'SUB Expires', value: `${raw.subscribe_expires || '3600'}s` },
     { label: 'Reg Rate', value: `${raw.register_rate_cps || '10'} reg/s` },
+    { label: 'Cleanup Batch', value: `${raw.cleanup_batch_size || '10'} ext/batch` },
     { label: 'T1 / Timer-B', value: `${raw.t1_ms || '500'}ms / ${raw.timer_b_seconds || '32'}s` },
   ]
 

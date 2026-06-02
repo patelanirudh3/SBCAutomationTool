@@ -65,8 +65,10 @@ type TrafficMetrics struct {
 	TransportConnectFailedDetails      []TransportConnectFailure         `json:"transport_connect_failed_details,omitempty"`
 	RegisteredCount                    int                               `json:"registered_count"`
 	RegisteredTotal                    int                               `json:"registered_total"`
+	RegisterFailedDetails              []RegisterFailure                 `json:"register_failed_details,omitempty"`
 	SubscribedCount                    int                               `json:"subscribed_count"`
 	SubscribedTotal                    int                               `json:"subscribed_total"`
+	SubscribeFailedDetails             []SubscribeFailure                `json:"subscribe_failed_details,omitempty"`
 	SubscriptionsByEvent               map[string]SubscriptionEventStats `json:"subscriptions_by_event,omitempty"`
 	// PrepStatus tracks the optional async unregister-flush invoked by the
 	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
@@ -134,6 +136,17 @@ type TrafficMetrics struct {
 	ProcessCPUCoreMaxPercent float64 `json:"process_cpu_core_max_percent"`
 	SoftIRQCPUMaxPercent     float64 `json:"softirq_cpu_max_percent"`
 	IOWaitCPUMaxPercent      float64 `json:"iowait_cpu_max_percent"`
+	HAEnabled                bool    `json:"ha_enabled"`
+	HAActiveController       string  `json:"ha_active_controller,omitempty"`
+	HAPrimaryRegistered      int     `json:"ha_primary_registered"`
+	HASecondaryRegistered    int     `json:"ha_secondary_registered"`
+	HAPrimarySubscribed      int     `json:"ha_primary_subscribed"`
+	HASecondarySubscribed    int     `json:"ha_secondary_subscribed"`
+	HAMoveActive             bool    `json:"ha_move_active"`
+	HAMoveTarget             string  `json:"ha_move_target,omitempty"`
+	HAMoveLastError          string  `json:"ha_move_last_error,omitempty"`
+	HAFailoverEvents         int     `json:"ha_failover_events"`
+	HAFailoverDeferred       int     `json:"ha_failover_deferred"`
 }
 
 const transportConnectFailureSampleLimit = 100
@@ -143,6 +156,17 @@ type TransportConnectFailure struct {
 	LocalIP string `json:"local_ip"`
 	Remote  string `json:"remote"`
 	Error   string `json:"error"`
+}
+
+type RegisterFailure struct {
+	Ext   string `json:"ext"`
+	Error string `json:"error"`
+}
+
+type SubscribeFailure struct {
+	Ext    string `json:"ext"`
+	Events string `json:"events,omitempty"`
+	Error  string `json:"error"`
 }
 
 // SubscriptionEventStats exposes per-event-package subscription progress.
@@ -265,8 +289,10 @@ type MetricsCollector struct {
 	transportConnectFailedDetails []TransportConnectFailure
 	registeredCount               int
 	registeredTotal               int
+	registerFailedDetails         []RegisterFailure
 	subscribedCount               int
 	subscribedTotal               int
+	subscribeFailedDetails        []SubscribeFailure
 	subscriptionsByEvent          map[string]SubscriptionEventStats
 	prepStatus                    string // "idle" | "running" | "done" | "failed"
 	phase                         string
@@ -274,20 +300,31 @@ type MetricsCollector struct {
 	running                       bool
 	runStartSet                   bool
 
-	callResults        []CallResultData
-	rawEvents          []map[string]any
-	callSpines         []json.RawMessage
-	callMilestones     map[string]*callMilestoneState
-	concurrentProvider func() int
-	poolCountsProvider func() (idle, nonIdle, regOnly int)
-	hostHealth         *HostHealthCollector
-	hostHealthSamples  int
-	hostCPUSum         float64
-	hostCPUMax         float64
-	processCPUCoreSum  float64
-	processCPUCoreMax  float64
-	softIRQCPUMax      float64
-	iowaitCPUMax       float64
+	callResults           []CallResultData
+	rawEvents             []map[string]any
+	callSpines            []json.RawMessage
+	callMilestones        map[string]*callMilestoneState
+	concurrentProvider    func() int
+	poolCountsProvider    func() (idle, nonIdle, regOnly int)
+	hostHealth            *HostHealthCollector
+	hostHealthSamples     int
+	hostCPUSum            float64
+	hostCPUMax            float64
+	processCPUCoreSum     float64
+	processCPUCoreMax     float64
+	softIRQCPUMax         float64
+	iowaitCPUMax          float64
+	haEnabled             bool
+	haActiveController    string
+	haPrimaryRegistered   int
+	haSecondaryRegistered int
+	haPrimarySubscribed   int
+	haSecondarySubscribed int
+	haMoveActive          bool
+	haMoveTarget          string
+	haMoveLastError       string
+	haFailoverEvents      int
+	haFailoverDeferred    int
 
 	rtpHealthCounts map[string]int
 
@@ -626,6 +663,34 @@ func (c *MetricsCollector) FinishTransportConnect() {
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) SetHAStatus(enabled bool, active string, primaryRegistered, secondaryRegistered, primarySubscribed, secondarySubscribed int) {
+	c.mu.Lock()
+	c.haEnabled = enabled
+	c.haActiveController = active
+	c.haPrimaryRegistered = primaryRegistered
+	c.haSecondaryRegistered = secondaryRegistered
+	c.haPrimarySubscribed = primarySubscribed
+	c.haSecondarySubscribed = secondarySubscribed
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) SetHAMove(active bool, target, lastErr string) {
+	c.mu.Lock()
+	c.haMoveActive = active
+	c.haMoveTarget = target
+	c.haMoveLastError = lastErr
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) RecordHAFailover(deferred bool) {
+	c.mu.Lock()
+	c.haFailoverEvents++
+	if deferred {
+		c.haFailoverDeferred++
+	}
+	c.mu.Unlock()
+}
+
 func (c *MetricsCollector) PerformanceDiagnosticsMode() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -658,6 +723,7 @@ func (c *MetricsCollector) SetRegisterTotal(total int) {
 	c.mu.Lock()
 	c.registeredTotal = total
 	c.registeredCount = 0
+	c.registerFailedDetails = nil
 	c.mu.Unlock()
 }
 
@@ -667,6 +733,7 @@ func (c *MetricsCollector) SetSubscribeTotal(total int) {
 	c.mu.Lock()
 	c.subscribedTotal = total
 	c.subscribedCount = 0
+	c.subscribeFailedDetails = nil
 	c.mu.Unlock()
 }
 
@@ -694,12 +761,45 @@ func (c *MetricsCollector) IncrementRegistered() {
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) RecordRegisterFailure(ext string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.registerFailedDetails) >= transportConnectFailureSampleLimit {
+		return
+	}
+	msg := "registration failed"
+	if err != nil {
+		msg = err.Error()
+	}
+	c.registerFailedDetails = append(c.registerFailedDetails, RegisterFailure{
+		Ext:   ext,
+		Error: msg,
+	})
+}
+
 // IncrementSubscribed bumps the live SUBSCRIBE progress counter by one.
 // Called from SubscribeAll's per-agent goroutine.
 func (c *MetricsCollector) IncrementSubscribed() {
 	c.mu.Lock()
 	c.subscribedCount++
 	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) RecordSubscribeFailure(ext, events string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.subscribeFailedDetails) >= transportConnectFailureSampleLimit {
+		return
+	}
+	msg := "subscription failed"
+	if err != nil {
+		msg = err.Error()
+	}
+	c.subscribeFailedDetails = append(c.subscribeFailedDetails, SubscribeFailure{
+		Ext:    ext,
+		Events: events,
+		Error:  msg,
+	})
 }
 
 // RecordSubscriptionEvent records the outcome of one event-package subscription
@@ -1093,8 +1193,10 @@ func (c *MetricsCollector) Reset() {
 	c.transportConnectFailedDetails = nil
 	c.registeredCount = 0
 	c.registeredTotal = 0
+	c.registerFailedDetails = nil
 	c.subscribedCount = 0
 	c.subscribedTotal = 0
+	c.subscribeFailedDetails = nil
 	c.subscriptionsByEvent = make(map[string]SubscriptionEventStats)
 	c.prepStatus = "idle"
 	c.phase = "IDLE"
@@ -1137,6 +1239,17 @@ func (c *MetricsCollector) Reset() {
 	c.processCPUCoreMax = 0
 	c.softIRQCPUMax = 0
 	c.iowaitCPUMax = 0
+	c.haEnabled = false
+	c.haActiveController = ""
+	c.haPrimaryRegistered = 0
+	c.haSecondaryRegistered = 0
+	c.haPrimarySubscribed = 0
+	c.haSecondarySubscribed = 0
+	c.haMoveActive = false
+	c.haMoveTarget = ""
+	c.haMoveLastError = ""
+	c.haFailoverEvents = 0
+	c.haFailoverDeferred = 0
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
@@ -1145,6 +1258,19 @@ func (c *MetricsCollector) Reset() {
 		RTPHealth:          map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0},
 		MediaQualityCounts: map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0},
 	}
+}
+
+// ResetForRun clears stale metrics before a new GUI-driven lifecycle starts
+// while preserving the configured VM identity for immediate /metrics reads.
+func (c *MetricsCollector) ResetForRun(vmID string) {
+	c.Reset()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if vmID == "" {
+		return
+	}
+	c.vmID = vmID
+	c.latest.VMID = vmID
 }
 
 // Latest returns the most recent snapshot without rebuilding.
@@ -1291,8 +1417,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		TransportConnectFailedDetails:      append([]TransportConnectFailure(nil), c.transportConnectFailedDetails...),
 		RegisteredCount:                    c.registeredCount,
 		RegisteredTotal:                    c.registeredTotal,
+		RegisterFailedDetails:              append([]RegisterFailure(nil), c.registerFailedDetails...),
 		SubscribedCount:                    c.subscribedCount,
 		SubscribedTotal:                    c.subscribedTotal,
+		SubscribeFailedDetails:             append([]SubscribeFailure(nil), c.subscribeFailedDetails...),
 		SubscriptionsByEvent:               copySubscriptionEventStats(c.subscriptionsByEvent),
 		PrepStatus:                         c.prepStatus,
 		RunElapsedSec:                      runElapsed,
@@ -1338,6 +1466,17 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		ProcessCPUCoreMaxPercent: round2(c.processCPUCoreMax),
 		SoftIRQCPUMaxPercent:     round2(c.softIRQCPUMax),
 		IOWaitCPUMaxPercent:      round2(c.iowaitCPUMax),
+		HAEnabled:                c.haEnabled,
+		HAActiveController:       c.haActiveController,
+		HAPrimaryRegistered:      c.haPrimaryRegistered,
+		HASecondaryRegistered:    c.haSecondaryRegistered,
+		HAPrimarySubscribed:      c.haPrimarySubscribed,
+		HASecondarySubscribed:    c.haSecondarySubscribed,
+		HAMoveActive:             c.haMoveActive,
+		HAMoveTarget:             c.haMoveTarget,
+		HAMoveLastError:          c.haMoveLastError,
+		HAFailoverEvents:         c.haFailoverEvents,
+		HAFailoverDeferred:       c.haFailoverDeferred,
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],
@@ -1536,6 +1675,10 @@ type ProcessContext struct {
 	// returns immediately. The handler updates collector.PrepStatus().
 	// Injected by main.go to avoid importing the prephase package from metrics.
 	OnPrepStart func() error
+
+	// OnHAMoveSubscription is invoked by POST /api/ha/move-subscription.
+	// It is wired by main.go when a GUI-driven lifecycle is active.
+	OnHAMoveSubscription func(target string) error
 
 	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
 	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
@@ -2488,6 +2631,36 @@ func BuildMux(
 		default:
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "abort already in flight"})
 		}
+	})
+
+	mux.HandleFunc("POST /api/ha/move-subscription", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		body, err := readJSONBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		target, _ := body["target_controller"].(string)
+		target = strings.ToLower(strings.TrimSpace(target))
+		if target != "primary" && target != "secondary" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_controller must be primary or secondary"})
+			return
+		}
+		processCtx.Mu.Lock()
+		fn := processCtx.OnHAMoveSubscription
+		processCtx.Mu.Unlock()
+		if fn == nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "HA move is not available in the current engine state"})
+			return
+		}
+		if err := fn(target); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "target_controller": target})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "subscription_move_complete", "target_controller": target})
 	})
 
 	// POST /api/prep/start — fire-and-forget unregister flush. Returns 200

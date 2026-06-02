@@ -51,6 +51,37 @@ func TestNonInviteTransactionTimeoutDerivesFromT1(t *testing.T) {
 	}
 }
 
+func TestCleanupBatchSizeDefaultsAndValidation(t *testing.T) {
+	cfg := &VMConfig{}
+	ApplyDefaults(cfg)
+	if cfg.CleanupBatchSize != 10 {
+		t.Fatalf("default cleanup_batch_size=%d, want 10", cfg.CleanupBatchSize)
+	}
+
+	bad := &VMConfig{
+		VMID:             "traffic-local",
+		ExtStart:         1000,
+		ExtEnd:           1001,
+		SBCHost:          "10.0.0.1",
+		SBCPort:          5060,
+		SIPTransport:     "TCP",
+		Domain:           "avaya.com",
+		CPS:              1,
+		HoldTimeSeconds:  1,
+		RTPBurstPPS:      50,
+		RTPPtime:         20,
+		RTPMode:          "3phase",
+		TrafficMode:      "unlimited",
+		MediaEnabled:     true,
+		MediaSecurity:    "rtp",
+		CleanupBatchSize: 101,
+	}
+	ApplyDefaults(bad)
+	if err := Validate(bad); err == nil {
+		t.Fatal("Validate succeeded with cleanup_batch_size > 100")
+	}
+}
+
 func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
 	cfg := &VMConfig{}
 	ApplyDefaults(cfg)
@@ -180,6 +211,38 @@ func TestVIPConfigValidationAndMapping(t *testing.T) {
 	cfg.VIPCount = 2
 	if got := cfg.LocalHostForExtension("6000002"); got != "10.71.17.101" {
 		t.Fatalf("pooled LocalHostForExtension=%q, want round-robin first VIP", got)
+	}
+}
+
+func TestDualRegistrationValidation(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:                    "traffic-local",
+		ExtStart:                1000,
+		ExtEnd:                  1001,
+		SBCHost:                 "10.0.0.1",
+		SBCPort:                 5060,
+		SIPTransport:            "TCP",
+		Domain:                  "avaya.com",
+		CPS:                     1,
+		HoldTimeSeconds:         1,
+		RTPBurstPPS:             50,
+		RTPPtime:                20,
+		RTPMode:                 "3phase",
+		TrafficMode:             "unlimited",
+		DualRegistrationEnabled: true,
+		FailoverMode:            "graceful",
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err == nil {
+		t.Fatal("Validate succeeded with dual registration enabled and no secondary host")
+	}
+	cfg.SecondaryHost = "10.0.0.2"
+	cfg.SecondaryPort = 5060
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed with valid dual registration config: %v", err)
+	}
+	if !cfg.FailoverEnabled {
+		t.Fatal("dual registration should enable failover compatibility flag")
 	}
 }
 

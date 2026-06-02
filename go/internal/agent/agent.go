@@ -122,6 +122,7 @@ type ExtensionAgent struct {
 	localPort         int
 	localHost         string
 	assignedLocalHost string
+	transportDown     func(ext string, err error)
 
 	Registered     chan struct{}
 	Subscribed     chan struct{}
@@ -251,6 +252,10 @@ func (a *ExtensionAgent) SetAssignedLocalHost(ip string) {
 	a.assignedLocalHost = strings.TrimSpace(ip)
 }
 
+func (a *ExtensionAgent) SetTransportDownHandler(fn func(ext string, err error)) {
+	a.transportDown = fn
+}
+
 // Start creates the SIP transport, connects, and starts the dispatch goroutine.
 func (a *ExtensionAgent) Start(ctx context.Context) error {
 	if a.assignedLocalHost != "" {
@@ -279,6 +284,11 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 	if err := t.Connect(ctx); err != nil {
 		return fmt.Errorf("ext=%s connect: %w", a.Ext, err)
 	}
+	t.SetDownHandler(func(err error) {
+		if a.transportDown != nil {
+			a.transportDown(a.Ext, err)
+		}
+	})
 	a.transport = t
 	a.localPort = t.LocalPort()
 

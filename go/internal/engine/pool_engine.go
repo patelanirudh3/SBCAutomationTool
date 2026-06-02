@@ -113,6 +113,22 @@ func (p *PoolEngine) AllForCleanup() []*agent.ExtensionAgent {
 	return all
 }
 
+// ReplaceIdle swaps the ready pool after a controlled HA subscription move.
+// It is intentionally conservative: callers must ensure no calls are active.
+func (p *PoolEngine) ReplaceIdle(agents []*agent.ExtensionAgent) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.idleList {
+		a.SetAutoAnswer(false)
+	}
+	p.idleList = append([]*agent.ExtensionAgent(nil), agents...)
+	p.nonIdleList = nil
+	p.regOnlyList = nil
+	for _, a := range p.idleList {
+		a.SetAutoAnswer(true)
+	}
+}
+
 // Counts returns current list sizes for metrics reporting.
 func (p *PoolEngine) Counts() (idle, nonIdle, regOnly int) {
 	p.mu.Lock()
