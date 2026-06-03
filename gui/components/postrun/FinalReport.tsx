@@ -73,6 +73,8 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 // FinalReport
 // ---------------------------------------------------------------------------
 
+const CLEANUP_AUTO_START_SECONDS = 45
+
 interface FinalReportProps {
   /** Elapsed seconds captured at the moment traffic stopped — shown as Total Run Time */
   frozenElapsed?: number | null
@@ -156,7 +158,7 @@ export function FinalReport({
                     ?? (hasAckEvents
                       ? callEvents.filter((e) => e.direction !== 'uas' && e.acknowledged === true).length
                       : completed)
-  const failed     = aggregate?.total_failed     ?? uacMetrics?.calls_failed     ?? 0
+  const failed     = Math.max(aggregate?.total_failed ?? 0, uacMetrics?.calls_failed ?? 0)
   const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
   const csr        = uacMetrics?.csr
                     ?? (attempted > 0 ? Math.round((completed / attempted) * 10000) / 100 : 0)
@@ -170,7 +172,7 @@ export function FinalReport({
     : '—'
 
   const isFailed = phase === 'FAILED'
-  const [cleanupCountdown, setCleanupCountdown] = useState(20)
+  const [cleanupCountdown, setCleanupCountdown] = useState(CLEANUP_AUTO_START_SECONDS)
   const [autoCleanupFired, setAutoCleanupFired] = useState(false)
   const onUnregisterRef = useRef(onUnregister)
   const cleanupPending = phase === 'CLEANUP_READY' && !cleanedUp
@@ -182,7 +184,7 @@ export function FinalReport({
 
   useEffect(() => {
     if (!cleanupPending || !onUnregisterRef.current || cleanupLocked) return
-    let remaining = 20
+    let remaining = CLEANUP_AUTO_START_SECONDS
     const id = setInterval(() => {
       remaining -= 1
       setCleanupCountdown(remaining)

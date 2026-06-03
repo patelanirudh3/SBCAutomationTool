@@ -535,7 +535,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	if e.metrics != nil {
 		e.metrics.IncrementSIPCounter("invites_sent")
 	}
-	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee})
+	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee, "auth": "none"})
 
 	// ── RFC 3261 §17.1.1 INVITE client transaction timers ──────────
 	// Timer B: overall transaction timeout (default 64*T1 = 32s) covering
@@ -612,18 +612,28 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		case code == "401_INVITE":
 			emit("AUTH_401", 401, 0, nil)
 			if err := ag.Handle401Invite(dialog, raw, rtpPort); err != nil {
+				emit("AUTH_INVITE_FAILED", 401, 0, map[string]any{"error": err.Error()})
 				result := fail(fmt.Sprintf("401 handling: %v", err))
 				e.complete(result)
 				return
 			}
+			emit("ACK_401_SENT", 401, 0, nil)
+			emit("AUTH_INVITE_SENT", 401, 0, map[string]any{"auth": "authorization", "after": "ACK_401_SENT"})
 
 		case code == "407_INVITE":
 			emit("AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Invite(dialog, raw, rtpPort); err != nil {
+				emit("AUTH_INVITE_FAILED", 407, 0, map[string]any{"error": err.Error()})
 				result := fail(fmt.Sprintf("407 handling: %v", err))
 				e.complete(result)
 				return
 			}
+			emit("ACK_407_SENT", 407, 0, nil)
+			emit("AUTH_INVITE_SENT", 407, 0, map[string]any{"auth": "proxy-authorization", "after": "ACK_407_SENT"})
+			slog.Info("ACK for 407 INVITE sent; authenticated INVITE sent",
+				"ext", ag.Ext,
+				"callee", callee,
+				"call_id", callID)
 
 		default:
 			if isFinalFailure(code) {
@@ -753,20 +763,30 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		if okEv.Code == "401_INVITE" {
 			emit("AUTH_401", 401, 0, nil)
 			if err := ag.Handle401Invite(dialog, raw200, rtpPort); err != nil {
+				emit("AUTH_INVITE_FAILED", 401, 0, map[string]any{"error": err.Error()})
 				result := fail(fmt.Sprintf("401 handling while awaiting 200 INVITE: %v", err))
 				e.complete(result)
 				return
 			}
+			emit("ACK_401_SENT", 401, 0, nil)
+			emit("AUTH_INVITE_SENT", 401, 0, map[string]any{"auth": "authorization", "after": "ACK_401_SENT"})
 			raw200 = ""
 			continue
 		}
 		if okEv.Code == "407_INVITE" {
 			emit("AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Invite(dialog, raw200, rtpPort); err != nil {
+				emit("AUTH_INVITE_FAILED", 407, 0, map[string]any{"error": err.Error()})
 				result := fail(fmt.Sprintf("407 handling while awaiting 200 INVITE: %v", err))
 				e.complete(result)
 				return
 			}
+			emit("ACK_407_SENT", 407, 0, nil)
+			emit("AUTH_INVITE_SENT", 407, 0, map[string]any{"auth": "proxy-authorization", "after": "ACK_407_SENT"})
+			slog.Info("ACK for 407 INVITE sent; authenticated INVITE sent",
+				"ext", ag.Ext,
+				"callee", callee,
+				"call_id", callID)
 			raw200 = ""
 			continue
 		}

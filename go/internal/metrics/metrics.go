@@ -94,6 +94,7 @@ type TrafficMetrics struct {
 	// Split cleanup results let the GUI distinguish subscription cleanup from
 	// registration cleanup. Legacy cleanup_* fields remain unregister-focused.
 	CleanupUnsubscribeCount   int                               `json:"cleanup_unsubscribe_count"`
+	CleanupUnsubscribeTotal   int                               `json:"cleanup_unsubscribe_total_expected"`
 	CleanupUnsubscribeSkipped int                               `json:"cleanup_unsubscribe_skipped"`
 	CleanupUnsubscribeFailed  []string                          `json:"cleanup_unsubscribe_failed,omitempty"`
 	CleanupUnsubscribeByEvent map[string]SubscriptionEventStats `json:"cleanup_unsubscribe_by_event,omitempty"`
@@ -362,6 +363,7 @@ type MetricsCollector struct {
 	cleanupTotal              int
 	cleanupFailed             []string
 	cleanupUnsubscribeCount   int
+	cleanupUnsubscribeTotal   int
 	cleanupUnsubscribeSkipped int
 	cleanupUnsubscribeFailed  []string
 	cleanupUnsubscribeByEvent map[string]SubscriptionEventStats
@@ -523,11 +525,21 @@ func (c *MetricsCollector) ResetCleanup(total int) {
 	c.cleanupTotal = total
 	c.cleanupFailed = nil
 	c.cleanupUnsubscribeCount = 0
+	c.cleanupUnsubscribeTotal = 0
 	c.cleanupUnsubscribeSkipped = 0
 	c.cleanupUnsubscribeFailed = nil
 	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
 	c.cleanupUnregisterFailed = nil
+	c.mu.Unlock()
+}
+
+// SetCleanupUnsubscribeTotal seeds the expected number of SUBSCRIBE Expires:0
+// event-package teardowns. This is the denominator for cleanup progress; it can
+// be larger than the attempted event count when an extension fails early.
+func (c *MetricsCollector) SetCleanupUnsubscribeTotal(total int) {
+	c.mu.Lock()
+	c.cleanupUnsubscribeTotal = total
 	c.mu.Unlock()
 }
 
@@ -591,6 +603,7 @@ type CleanupDetails struct {
 	Total              int
 	Failed             []string
 	UnsubscribeCount   int
+	UnsubscribeTotal   int
 	UnsubscribeSkipped int
 	UnsubscribeFailed  []string
 	UnsubscribeByEvent map[string]SubscriptionEventStats
@@ -607,6 +620,7 @@ func (c *MetricsCollector) CleanupDetailsSnapshot() CleanupDetails {
 		Total:              c.cleanupTotal,
 		Failed:             append([]string(nil), c.cleanupFailed...),
 		UnsubscribeCount:   c.cleanupUnsubscribeCount,
+		UnsubscribeTotal:   c.cleanupUnsubscribeTotal,
 		UnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
 		UnsubscribeFailed:  append([]string(nil), c.cleanupUnsubscribeFailed...),
 		UnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
@@ -1275,6 +1289,7 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupTotal = 0
 	c.cleanupFailed = nil
 	c.cleanupUnsubscribeCount = 0
+	c.cleanupUnsubscribeTotal = 0
 	c.cleanupUnsubscribeSkipped = 0
 	c.cleanupUnsubscribeFailed = nil
 	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
@@ -1491,6 +1506,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CleanupCount:              c.cleanupCount,
 		CleanupTotal:              c.cleanupTotal,
 		CleanupUnsubscribeCount:   c.cleanupUnsubscribeCount,
+		CleanupUnsubscribeTotal:   c.cleanupUnsubscribeTotal,
 		CleanupUnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
 		CleanupUnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
 		CleanupUnregisterCount:    c.cleanupUnregisterCount,
@@ -2829,6 +2845,7 @@ func BuildMux(
 			"total":                         details.Total,
 			"failed_extensions":             details.Failed,
 			"unsubscribe_count":             details.UnsubscribeCount,
+			"unsubscribe_total_expected":    details.UnsubscribeTotal,
 			"unsubscribe_skipped":           details.UnsubscribeSkipped,
 			"unsubscribe_failed_extensions": details.UnsubscribeFailed,
 			"unsubscribe_by_event":          details.UnsubscribeByEvent,

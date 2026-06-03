@@ -333,6 +333,17 @@ func (a *ExtensionAgent) SubscriptionEvent() string {
 	return strings.Join(events, ",")
 }
 
+// SubscriptionEvents returns established subscription event packages.
+func (a *ExtensionAgent) SubscriptionEvents() []string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	events := make([]string, 0, len(a.subscriptions))
+	for event := range a.subscriptions {
+		events = append(events, event)
+	}
+	return events
+}
+
 // NeedsUnsubscribe reports whether cleanup should send SUBSCRIBE Expires:0 for
 // any established subscription whose event policy requires explicit teardown.
 func (a *ExtensionAgent) NeedsUnsubscribe() bool {

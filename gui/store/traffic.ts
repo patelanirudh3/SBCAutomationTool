@@ -270,7 +270,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
       const eventUnsubscribeCount = unsubscribeByEvent
         ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.total ?? 0), 0)
         : undefined
-      const unsubscribeCount = eventUnsubscribeCount ?? m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
+      const unsubscribeCount = m.cleanup_unsubscribe_total_expected ?? cleanupStatus?.unsubscribe_total_expected ?? eventUnsubscribeCount ?? m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
       const unsubscribeSkipped = m.cleanup_unsubscribe_skipped ?? cleanupStatus?.unsubscribe_skipped ?? 0
       if (
         total > 0 ||
@@ -285,6 +285,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
           total: Math.max(total, cleanupStatus?.total ?? 0),
           failed_extensions: unregisterFailed,
           unsubscribe_count: unsubscribeCount,
+          unsubscribe_total_expected: unsubscribeCount,
           unsubscribe_skipped: unsubscribeSkipped,
           unsubscribe_failed_extensions: unsubscribeFailed,
           unsubscribe_by_event: unsubscribeByEvent,

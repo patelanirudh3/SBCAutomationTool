@@ -307,6 +307,7 @@ export interface TrafficMetrics {
   cleanup_total?: number
   cleanup_failed?: string[]
   cleanup_unsubscribe_count?: number
+  cleanup_unsubscribe_total_expected?: number
   cleanup_unsubscribe_skipped?: number
   cleanup_unsubscribe_failed?: string[]
   cleanup_unsubscribe_by_event?: Record<string, SubscriptionEventStats>
@@ -475,6 +476,7 @@ export interface CleanupStatus {
   total: number
   failed_extensions: string[]
   unsubscribe_count?: number
+  unsubscribe_total_expected?: number
   unsubscribe_skipped?: number
   unsubscribe_failed_extensions?: string[]
   unsubscribe_by_event?: Record<string, SubscriptionEventStats>
@@ -520,6 +522,7 @@ export interface CallEvent {
   // result=FAILED if media or BYE handshake failed afterwards.
   acknowledged?: boolean
   failure_reason?: string
+  sip_code?: number
   sip_local_ip?: string
   sip_local_port?: number
   pdd_ms: number

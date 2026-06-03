@@ -290,12 +290,15 @@ func runLifecycle(
 	// Start a per-agent auto-answer loop for every agent added to the idle pool.
 	// The loop checks ag.AutoAnswerEnabled() before answering, so callers
 	// (agents selected by PoolEngine.NextPair) won't pick up their own INVITE.
+	var agentAutoAnswerStopsMu sync.Mutex
 	agentAutoAnswerStops := make(map[string]func())
 
 	onIdle := func(ag *agent.ExtensionAgent) {
 		pool.AddToIdle(ag)
 		stop := uasEngine.StartAutoAnswerForAgent(ctx, ag)
+		agentAutoAnswerStopsMu.Lock()
 		agentAutoAnswerStops[ag.Ext] = stop
+		agentAutoAnswerStopsMu.Unlock()
 		slog.Debug("Agent added to idle pool", "ext", ag.Ext)
 	}
 
@@ -552,6 +555,7 @@ func runLifecycle(
 				activeController = "secondary"
 				activeSubscribedAg = movedAgents
 				pool.ReplaceIdle(movedAgents)
+				agentAutoAnswerStopsMu.Lock()
 				for _, stop := range agentAutoAnswerStops {
 					stop()
 				}
@@ -559,6 +563,7 @@ func runLifecycle(
 				for _, ag := range movedAgents {
 					agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
 				}
+				agentAutoAnswerStopsMu.Unlock()
 				collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), 0, len(movedAgents))
 				protected, degraded, notUsable := haReadinessCounts(movedAgents, registeredAg, len(agents))
 				collector.SetHAReadiness(protected, degraded, notUsable)
@@ -579,6 +584,7 @@ func runLifecycle(
 			activeSubscribedAg = movedAgents
 			primaryRecoveredAt = ""
 			pool.ReplaceIdle(movedAgents)
+			agentAutoAnswerStopsMu.Lock()
 			for _, stop := range agentAutoAnswerStops {
 				stop()
 			}
@@ -586,6 +592,7 @@ func runLifecycle(
 			for _, ag := range movedAgents {
 				agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
 			}
+			agentAutoAnswerStopsMu.Unlock()
 			collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(movedAgents), 0)
 			protected, degraded, notUsable := haReadinessCounts(movedAgents, secondaryRegisteredAg, len(agents))
 			collector.SetHAReadiness(protected, degraded, notUsable)
@@ -819,9 +826,11 @@ trafficLoop:
 	cleanupAll(context.Background(), nil)
 
 	// Stop all per-agent auto-answer loops
+	agentAutoAnswerStopsMu.Lock()
 	for _, stop := range agentAutoAnswerStops {
 		stop()
 	}
+	agentAutoAnswerStopsMu.Unlock()
 
 	elapsed := time.Since(overallStart).Seconds()
 	snap := collector.Latest()
@@ -924,6 +933,7 @@ func shutdownCleanup(
 		// Seed the cleanup-status counters now that we know the agent set.
 		// Phase was already flipped to CLEANING_UP at the top of this fn.
 		collector.ResetCleanup(len(cleanupAgents))
+		collector.SetCleanupUnsubscribeTotal(cleanupUnsubscribeTotal(cleanupAgents, cfg))
 
 		slog.Info("Cleaning up extensions",
 			"count", len(cleanupAgents),
@@ -1104,6 +1114,18 @@ retryUnsubscribe:
 		lastErr = ctx.Err()
 	}
 	return lastErr
+}
+
+func cleanupUnsubscribeTotal(agents []*agent.ExtensionAgent, cfg *config.VMConfig) int {
+	total := 0
+	for _, ag := range agents {
+		for _, event := range ag.SubscriptionEvents() {
+			if cfg.ShouldUnsubscribeSubscribeEvent(event) {
+				total++
+			}
+		}
+	}
+	return total
 }
 
 func cleanupUnregisterWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig) error {
@@ -1298,6 +1320,7 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		"total":                         cleanupDetails.Total,
 		"failed_extensions":             cleanupDetails.Failed,
 		"unsubscribe_count":             cleanupDetails.UnsubscribeCount,
+		"unsubscribe_total_expected":    cleanupDetails.UnsubscribeTotal,
 		"unsubscribe_skipped":           cleanupDetails.UnsubscribeSkipped,
 		"unsubscribe_failed_extensions": cleanupDetails.UnsubscribeFailed,
 		"unregister_count":              cleanupDetails.UnregisterCount,

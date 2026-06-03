@@ -75,12 +75,15 @@ export function UnregisterProgressCard({
     ? Object.values(unsubscribeByEvent).reduce((sum, stats) => sum + (stats.failed ?? 0), 0)
     : 0
   const unsubscribeCount = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
+  const unsubscribeExpected = cleanupStatus?.unsubscribe_total_expected ?? unsubscribeCount
   const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
   const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
   const unsubscribeOk = eventUnsubscribeTotal > 0 ? eventUnsubscribeOk : Math.max(0, unsubscribeCount - unsubscribeFailed.length)
   const unsubscribeFailedCount = eventUnsubscribeTotal > 0 ? eventUnsubscribeFailed : unsubscribeFailed.length
-  const unsubscribePct = unsubscribeCount > 0 ? Math.min(100, Math.round((unsubscribeOk / unsubscribeCount) * 100)) : 0
-  const hasUnsubscribeWork = unsubscribeCount > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
+  const unsubscribeAttempted = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
+  const unsubscribeNotAttempted = Math.max(0, unsubscribeExpected - unsubscribeAttempted)
+  const unsubscribePct = unsubscribeExpected > 0 ? Math.min(100, Math.round((unsubscribeOk / unsubscribeExpected) * 100)) : 0
+  const hasUnsubscribeWork = unsubscribeExpected > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
 
   // ── Live unreg-rate (mirrors the reg/s tile in PrePhasePanel) ──
   const [rate, setRate] = useState<number | null>(null)
@@ -192,7 +195,7 @@ export function UnregisterProgressCard({
             <div className="space-y-1">
               <div className="flex items-center justify-between text-[11px] font-mono text-sky-300/80">
                 <span>Unsubscribe</span>
-                <span>{unsubscribeOk.toLocaleString()} / {unsubscribeCount.toLocaleString()}</span>
+                <span>{unsubscribeOk.toLocaleString()} / {unsubscribeExpected.toLocaleString()}</span>
               </div>
               <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-700/60">
                 <div
@@ -210,8 +213,11 @@ export function UnregisterProgressCard({
           <div className="flex items-center gap-3">
             {rate != null && rate > 0 && <span>~{rate} unreg/s</span>}
             {eta != null && eta > 0 && <span>~{eta}s left</span>}
-            {(failed.length > 0 || unsubscribeFailedCount > 0) && (
-              <span className="text-rose-400">{failed.length + unsubscribeFailedCount} failed</span>
+            {(failed.length > 0 || unsubscribeFailedCount > 0 || unsubscribeNotAttempted > 0) && (
+              <span className="text-rose-400">
+                {failed.length + unsubscribeFailedCount} failed
+                {unsubscribeNotAttempted > 0 ? ` · ${unsubscribeNotAttempted.toLocaleString()} not attempted` : ''}
+              </span>
             )}
           </div>
         </div>
@@ -244,7 +250,7 @@ export function UnregisterProgressCard({
             <div className="mt-1 font-mono text-[11px] text-emerald-300/80">
               {unsubscribeSkipped > 0
                 ? `Unsubscribe skipped ${unsubscribeSkipped.toLocaleString()} / ${total.toLocaleString()} (not enabled)`
-                : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${Math.max(unsubscribeCount, total).toLocaleString()}`}
+                : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${unsubscribeExpected.toLocaleString()}`}
             </div>
           )}
         </div>
@@ -307,12 +313,15 @@ export function UnregisterProgressCard({
 
         {hasUnsubscribeWork && (
           <div className="rounded-md border border-amber-500/20 bg-slate-900/30 px-2.5 py-2 font-mono text-[11px] text-amber-100/90">
-            <div>Unsubscribed {unsubscribeOk.toLocaleString()} / {Math.max(unsubscribeCount, total).toLocaleString()}</div>
+            <div>Unsubscribed {unsubscribeOk.toLocaleString()} / {unsubscribeExpected.toLocaleString()}</div>
             {unsubscribeSkipped > 0 && (
               <div>Unsubscribe skipped {unsubscribeSkipped.toLocaleString()} / {total.toLocaleString()} (not enabled)</div>
             )}
             {unsubscribeFailedCount > 0 && (
-              <div className="text-rose-300">Unsubscribe failed {unsubscribeFailedCount.toLocaleString()} / {Math.max(unsubscribeCount, total).toLocaleString()}</div>
+              <div className="text-rose-300">Unsubscribe failed {unsubscribeFailedCount.toLocaleString()} / {unsubscribeExpected.toLocaleString()}</div>
+            )}
+            {unsubscribeNotAttempted > 0 && (
+              <div className="text-amber-300">Unsubscribe not attempted {unsubscribeNotAttempted.toLocaleString()} / {unsubscribeExpected.toLocaleString()}</div>
             )}
           </div>
         )}
