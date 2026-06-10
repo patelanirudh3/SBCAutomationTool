@@ -196,7 +196,7 @@ function LiveDashboard({
         </div>
       )}
 
-      {/* Re-Run preamble banner — non-blocking warning when some agents
+      {/* Restart preamble banner — non-blocking warning when some agents
           could not refresh their REGISTER binding before traffic resumed.
           Hidden when failed=0 (happy path: no banner clutter). */}
       {uacMetrics.reregister_status &&
@@ -214,7 +214,7 @@ function LiveDashboard({
               <span className="font-bold text-rose-300">
                 {uacMetrics.reregister_status.failed} could not refresh
               </span>{' '}
-              and were evicted from the pool. Re-Run proceeding with reduced
+              and were evicted from the pool. Restart proceeding with reduced
               pool — click <strong>Unregister</strong> for a fresh start if
               this matters.
             </p>
@@ -549,7 +549,7 @@ export default function RunPage() {
   const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
   const vmPort = pair?.uac.metrics_port ?? 8082
 
-  // Bind for ESLint. The full reset path is no longer used inside Re-Run
+  // Bind for ESLint. The full reset path is no longer used inside restart
   // but is still imported for potential future "Hard Reset" affordance.
   void resetTestFor
 
@@ -769,7 +769,7 @@ export default function RunPage() {
   // FinalReport surfaces as soon as traffic calls finish (CLEANUP_READY),
   // remains while the user runs unregister (CLEANING_UP), and stays
   // for COMPLETE / FAILED.
-  const isPostRun      = phase === 'CLEANUP_READY' || phase === 'CLEANING_UP' || phase === 'COMPLETE' || phase === 'FAILED'
+  const isPostRun      = phase === 'CLEANUP_READY' || phase === 'CLEANING_UP' || phase === 'COMPLETE' || phase === 'DONE' || phase === 'FAILED'
   const showReconnectBanner =
     !IS_MOCK &&
     isTraffic &&

@@ -579,6 +579,17 @@ export async function resetTestFor(
   return parseJsonResponse<{ status: string; state?: string }>(res)
 }
 
+export async function startNewRunFor(
+  ip: string,
+  port: number
+): Promise<{ status: string; state?: string; preserved_config?: boolean }> {
+  const res = await fetch(`http://${ip}:${port}/api/run/new`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  return parseJsonResponse<{ status: string; state?: string; preserved_config?: boolean }>(res)
+}
+
 // ---------------------------------------------------------------------------
 // Per-VM shutdown — POST /api/shutdown on a specific VM backend
 // ---------------------------------------------------------------------------

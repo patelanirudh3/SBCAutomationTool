@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -156,6 +157,8 @@ type ExtensionAgent struct {
 	regOpaque     string // [FIX-4] echo opaque from 401 challenge
 	regCSeq       int
 	regGrantedExp int // server-granted Expires from REGISTER 200 OK
+	regUncertain  atomic.Bool
+	regMu         sync.Mutex
 	// regNonceCount tracks the RFC 2617 §3.3 nonce-count for the active
 	// REGISTER nonce. Reset to 0 whenever regNonce is replaced; the
 	// helpers nextRegNC / resetRegNonce ensure increment-and-use semantics.
@@ -170,6 +173,8 @@ type SubscriptionState struct {
 	CallID            string
 	FromHeader        string
 	ToHeader          string
+	LocalTag          string
+	RemoteTag         string
 	Contact           string
 	RemoteTarget      string
 	RouteSet          []string
@@ -179,8 +184,12 @@ type SubscriptionState struct {
 	Opaque            string
 	CSeq              int
 	NonceCount        int
+	RequestedExpires  int
+	GrantedExpires    int
 	NotifyReceived    bool
 	SubscriptionState string
+	Terminated        bool
+	TerminationReason string
 }
 
 // nextRegNC returns the next nonce-count for REGISTER digest auth as the
@@ -214,6 +223,16 @@ func (s *SubscriptionState) resetNonce(nonce, realm, opaque string) {
 	}
 	s.Opaque = opaque
 	s.NonceCount = 0
+}
+
+// SubscriptionSnapshot is a read-only copy used by refresh/cleanup orchestration.
+type SubscriptionSnapshot struct {
+	Event             string
+	RequestedExpires  int
+	GrantedExpires    int
+	SubscriptionState string
+	Terminated        bool
+	TerminationReason string
 }
 
 // NewExtensionAgent creates a new agent for the given extension.
@@ -260,6 +279,15 @@ func (a *ExtensionAgent) IsTransportConnected() bool {
 	return a.transport != nil && a.transport.IsConnected()
 }
 
+func (a *ExtensionAgent) IsRegistrationUsable() bool {
+	return a.IsTransportConnected() && !a.regUncertain.Load()
+}
+
+func (a *ExtensionAgent) MarkRegistrationUncertain(err error) {
+	a.regUncertain.Store(true)
+	slog.Warn("registration marked uncertain after transport down", "ext", a.Ext, "err", err)
+}
+
 // Start creates the SIP transport, connects, and starts the dispatch goroutine.
 func (a *ExtensionAgent) Start(ctx context.Context) error {
 	if a.assignedLocalHost != "" {
@@ -289,9 +317,11 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		return fmt.Errorf("ext=%s connect: %w", a.Ext, err)
 	}
 	t.SetDownHandler(func(err error) {
+		a.MarkRegistrationUncertain(err)
 		if a.transportDown != nil {
 			a.transportDown(a.Ext, err)
 		}
+		go a.reregisterAfterTransportRecovery(context.Background())
 	})
 	a.transport = t
 	a.localPort = t.LocalPort()
@@ -304,6 +334,43 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		"tls_mode", a.Config.TLSMode,
 	)
 	return nil
+}
+
+func (a *ExtensionAgent) reregisterAfterTransportRecovery(ctx context.Context) {
+	timer := time.NewTimer(250 * time.Millisecond)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		timer.Stop()
+		return
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if a.closed.Load() || ctx.Err() != nil {
+			return
+		}
+		if a.IsTransportConnected() {
+			timeout := time.Duration(a.Config.RegisterTimeout) * time.Second
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			rCtx, cancel := context.WithTimeout(ctx, timeout)
+			err := a.Reregister(rCtx)
+			cancel()
+			if err == nil {
+				slog.Info("registration restored after transport recovery", "ext", a.Ext, "granted_exp", a.GrantedRegisterExpiry())
+				return
+			}
+			slog.Warn("registration restore after transport recovery failed", "ext", a.Ext, "err", err)
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Close stops the dispatch loop and closes the transport.
@@ -327,7 +394,10 @@ func (a *ExtensionAgent) SubscriptionEvent() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	events := make([]string, 0, len(a.subscriptions))
-	for event := range a.subscriptions {
+	for event, st := range a.subscriptions {
+		if st.Terminated {
+			continue
+		}
 		events = append(events, event)
 	}
 	return strings.Join(events, ",")
@@ -338,8 +408,40 @@ func (a *ExtensionAgent) SubscriptionEvents() []string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	events := make([]string, 0, len(a.subscriptions))
-	for event := range a.subscriptions {
+	for event, st := range a.subscriptions {
+		if st.Terminated {
+			continue
+		}
 		events = append(events, event)
+	}
+	return events
+}
+
+func (a *ExtensionAgent) SubscriptionSnapshots() []SubscriptionSnapshot {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]SubscriptionSnapshot, 0, len(a.subscriptions))
+	for _, st := range a.subscriptions {
+		out = append(out, SubscriptionSnapshot{
+			Event:             st.Event,
+			RequestedExpires:  st.RequestedExpires,
+			GrantedExpires:    st.GrantedExpires,
+			SubscriptionState: st.SubscriptionState,
+			Terminated:        st.Terminated,
+			TerminationReason: st.TerminationReason,
+		})
+	}
+	return out
+}
+
+func (a *ExtensionAgent) TerminatedSubscriptionEvents() []string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	events := make([]string, 0)
+	for event, st := range a.subscriptions {
+		if st.Terminated {
+			events = append(events, event)
+		}
 	}
 	return events
 }
@@ -349,7 +451,10 @@ func (a *ExtensionAgent) SubscriptionEvents() []string {
 func (a *ExtensionAgent) NeedsUnsubscribe() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	for event := range a.subscriptions {
+	for event, st := range a.subscriptions {
+		if st.Terminated {
+			continue
+		}
 		if a.Config.ShouldUnsubscribeSubscribeEvent(event) {
 			return true
 		}
@@ -402,6 +507,9 @@ func (a *ExtensionAgent) contactURI(user string) string {
 // between attempts (buffered in earlyResponses) is consumed immediately
 // instead of being silently dropped when no handler was registered.
 func (a *ExtensionAgent) Register(ctx context.Context) error {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
@@ -417,31 +525,33 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	a.regCSeq = 1
 
 	timeout := time.Duration(a.Config.RegisterTimeout) * time.Second
+	tCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	a.RegisterDialogQueue(callID)
+	defer a.RemoveDialogQueue(callID)
 
 	if err := a.Send(msg, ""); err != nil {
 		return err
 	}
 
-	// Wait for either 401 (challenge) or 200 (no-auth path).
-	// WaitForSIPEvent scans earlyResponses first, so a 200 that arrived
-	// while no handler was registered (e.g. late response from a previous
-	// attempt) is picked up immediately.
-	raw, err := a.WaitForSIPEvent(ctx, timeout, "401", "200")
+	resp, err := a.waitForRegisterResponse(tCtx, callID, a.regCSeq, "401", "200", "_FINAL_FAIL")
 	if err != nil {
 		return err
 	}
 
-	eventCode, _ := sip.ClassifyMessage(raw)
-	if eventCode == "200" {
-		parsed, _, _ := sip.ParseMessage(raw)
-		a.regGrantedExp = parsed.GetGrantedExpiry()
+	if resp.Code == "200" {
+		a.regGrantedExp = resp.Msg.GetGrantedExpiry()
+		a.regUncertain.Store(false)
 		slog.Info("registered (no auth)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 		a.registeredOnce.Do(func() { close(a.Registered) })
 		return nil
 	}
+	if resp.Code != "401" {
+		return registerResponseError(resp, "register rejected")
+	}
 
 	// eventCode == "401": build and send authenticated REGISTER.
-	challenge := sip.Parse401Challenge(raw)
+	challenge := sip.Parse401Challenge(resp.Raw)
 	a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque) // [FIX-4]
 	if a.regRealm == "" {
 		a.regRealm = a.Config.Domain
@@ -462,14 +572,15 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 		return err
 	}
 
-	// Wait for the final 200 OK after sending the authenticated REGISTER.
-	// Again uses WaitForSIPEvent to catch any already-buffered 200.
-	raw200, err := a.WaitForSIPEvent(ctx, timeout, "200")
+	resp, err = a.waitForRegisterResponse(tCtx, callID, a.regCSeq, "200", "401", "_FINAL_FAIL")
 	if err != nil {
 		return err
 	}
-	parsed, _, _ := sip.ParseMessage(raw200)
-	a.regGrantedExp = parsed.GetGrantedExpiry()
+	if resp.Code != "200" {
+		return registerResponseError(resp, "authenticated register rejected")
+	}
+	a.regGrantedExp = resp.Msg.GetGrantedExpiry()
+	a.regUncertain.Store(false)
 	slog.Info("registered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 	a.registeredOnce.Do(func() { close(a.Registered) })
 	return nil
@@ -477,13 +588,20 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 
 // GrantedRegisterExpiry returns the server-granted Expires value from the last
 // successful REGISTER 200 OK, or 0 if not yet registered.
-func (a *ExtensionAgent) GrantedRegisterExpiry() int { return a.regGrantedExp }
+func (a *ExtensionAgent) GrantedRegisterExpiry() int {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+	return a.regGrantedExp
+}
 
 // Reregister sends a REGISTER refresh using the same Call-ID and From tag as
 // the original registration (in-dialog re-REGISTER per RFC 3261 §10.2.2).
 // It reuses cached credentials so no new 401 round-trip is needed when the
 // nonce is still valid, and falls back to a fresh 401 challenge if required.
 func (a *ExtensionAgent) Reregister(ctx context.Context) error {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+
 	a.syncLocalPort()
 	if a.regCallID == "" {
 		return fmt.Errorf("ext=%s: no registration state; Register must be called first", a.Ext)
@@ -497,6 +615,8 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	msg.ReplaceHeader(sip.HdrFrom, a.regFromHeader)
 	msg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
 	msg.ReplaceHeader(sip.HdrExpires, expiresVal)
+	callID := a.regCallID
+	initialCSeq := a.regCSeq
 
 	// Include cached credentials proactively to avoid an extra 401 round-trip.
 	if a.regNonce != "" {
@@ -506,21 +626,22 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
-	ch401 := a.waitForEvent("401")
-	ch200 := a.waitForEvent("200")
-	defer a.deregisterCh(ch401, "401")
-	defer a.deregisterCh(ch200, "200")
+	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	defer cancel()
+	a.RegisterDialogQueue(callID)
+	defer a.RemoveDialogQueue(callID)
 
 	if err := a.Send(msg, ""); err != nil {
 		return err
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
-	defer cancel()
-
-	select {
-	case raw401 := <-ch401:
-		challenge := sip.Parse401Challenge(raw401)
+	resp, err := a.waitForRegisterResponse(tCtx, callID, initialCSeq, "401", "200", "_FINAL_FAIL")
+	if err != nil {
+		return err
+	}
+	switch resp.Code {
+	case "401":
+		challenge := sip.Parse401Challenge(resp.Raw)
 		a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque)
 		a.regCSeq++
 		cnonce := sip.GenCNonce()
@@ -534,35 +655,40 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 		if err := a.Send(retryMsg, ""); err != nil {
 			return err
 		}
-		ch200r := a.waitForEvent("200")
-		defer a.deregisterCh(ch200r, "200")
-		select {
-		case raw200 := <-ch200r:
-			parsed, _, _ := sip.ParseMessage(raw200)
-			a.regGrantedExp = parsed.GetGrantedExpiry()
-			slog.Debug("reregistered (after 401)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
-			return nil
-		case <-tCtx.Done():
-			return tCtx.Err()
+		resp, err = a.waitForRegisterResponse(tCtx, callID, a.regCSeq, "200", "401", "_FINAL_FAIL")
+		if err != nil {
+			return err
 		}
-	case raw200 := <-ch200:
-		parsed, _, _ := sip.ParseMessage(raw200)
-		a.regGrantedExp = parsed.GetGrantedExpiry()
+		if resp.Code != "200" {
+			return registerResponseError(resp, "authenticated reregister rejected")
+		}
+		a.regGrantedExp = resp.Msg.GetGrantedExpiry()
+		a.regUncertain.Store(false)
+		slog.Debug("reregistered (after 401)", "ext", a.Ext, "granted_exp", a.regGrantedExp)
+		return nil
+	case "200":
+		a.regGrantedExp = resp.Msg.GetGrantedExpiry()
+		a.regUncertain.Store(false)
 		slog.Debug("reregistered", "ext", a.Ext, "granted_exp", a.regGrantedExp)
 		return nil
-	case <-tCtx.Done():
-		return tCtx.Err()
+	default:
+		return registerResponseError(resp, "reregister rejected")
 	}
 }
 
 // Unregister sends REGISTER with Expires:0.
 func (a *ExtensionAgent) Unregister(ctx context.Context) error {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+
 	a.syncLocalPort()
 	a.regCSeq++
+	callID := a.regCallID
+	cseq := a.regCSeq
 
 	msg := sip.NewSipMessage()
 	msg.SetRequestLine(fmt.Sprintf("REGISTER %s SIP/2.0", a.domainURI()))
-	msg.AddHeader(sip.HdrCallID, a.regCallID)
+	msg.AddHeader(sip.HdrCallID, callID)
 	msg.AddHeader(sip.HdrFrom, a.regFromHeader)
 	msg.AddHeader(sip.HdrTo, a.nameAddr(a.Ext, a.Config.Domain))
 	msg.AddHeader(sip.HdrVia, fmt.Sprintf("SIP/2.0/%s %s:%d;branch=%s", a.Config.SIPTransport, a.localHost, a.localPort, sip.CreateBranchID()))
@@ -579,24 +705,25 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 		msg.AddHeader(sip.HdrAuthorization, authHdr)
 	}
 
-	ch200 := a.waitForEvent("200")
-	ch401 := a.waitForEvent("401")
-	defer a.deregisterCh(ch200, "200")
-	defer a.deregisterCh(ch401, "401")
+	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	defer cancel()
+	a.RegisterDialogQueue(callID)
+	defer a.RemoveDialogQueue(callID)
 
 	if err := a.Send(msg, ""); err != nil {
 		return err
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
-	defer cancel()
-
-	select {
-	case <-ch200:
+	resp, err := a.waitForRegisterResponse(tCtx, callID, cseq, "200", "401", "_FINAL_FAIL")
+	if err != nil {
+		return err
+	}
+	switch resp.Code {
+	case "200":
 		slog.Info("unregistered", "ext", a.Ext)
 		return nil
-	case raw401 := <-ch401:
-		challenge := sip.Parse401Challenge(raw401)
+	case "401":
+		challenge := sip.Parse401Challenge(resp.Raw)
 		a.resetRegNonce(challenge.Nonce, challenge.Realm, challenge.Opaque) // [FIX-4]
 		a.regCSeq++
 		retryMsg := sip.CloneSipMessage(msg)
@@ -610,22 +737,25 @@ func (a *ExtensionAgent) Unregister(ctx context.Context) error {
 		if err := a.Send(retryMsg, ""); err != nil {
 			return err
 		}
-		ch200r := a.waitForEvent("200")
-		defer a.deregisterCh(ch200r, "200")
-		select {
-		case <-ch200r:
-			slog.Info("unregistered (after 401)", "ext", a.Ext)
-			return nil
-		case <-tCtx.Done():
-			return tCtx.Err()
+		resp, err = a.waitForRegisterResponse(tCtx, callID, a.regCSeq, "200", "401", "_FINAL_FAIL")
+		if err != nil {
+			return err
 		}
-	case <-tCtx.Done():
-		return tCtx.Err()
+		if resp.Code != "200" {
+			return registerResponseError(resp, "authenticated unregister rejected")
+		}
+		slog.Info("unregistered (after 401)", "ext", a.Ext)
+		return nil
+	default:
+		return registerResponseError(resp, "unregister rejected")
 	}
 }
 
 // FlushRegister sends REGISTER(Expires:0) to clear stale bindings.
 func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+
 	a.syncLocalPort()
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
@@ -642,24 +772,24 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 	msg.AddHeader(sip.HdrCSeq, "1 REGISTER")
 	msg.AddHeader(sip.HdrContentLength, "0")
 
-	doneCodes := []string{"200", "404", "403", "481"}
-	chDone := a.waitForEvent(doneCodes...)
-	ch401 := a.waitForEvent("401")
-	defer a.deregisterCh(chDone, doneCodes...)
-	defer a.deregisterCh(ch401, "401")
+	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
+	defer cancel()
+	a.RegisterDialogQueue(callID)
+	defer a.RemoveDialogQueue(callID)
 
 	if err := a.Send(msg, ""); err != nil {
 		return nil // swallow
 	}
 
-	tCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Config.RegisterTimeout)*time.Second)
-	defer cancel()
-
-	select {
-	case <-chDone:
+	resp, err := a.waitForRegisterResponse(tCtx, callID, 1, "200", "404", "403", "481", "401", "_FINAL_FAIL")
+	if err != nil {
 		return nil
-	case raw401 := <-ch401:
-		challenge := sip.Parse401Challenge(raw401)
+	}
+	switch resp.Code {
+	case "200", "404", "403", "481":
+		return nil
+	case "401":
+		challenge := sip.Parse401Challenge(resp.Raw)
 		cnonce := sip.GenCNonce()
 		uri := a.domainURI()
 		realm := challenge.Realm
@@ -676,14 +806,9 @@ func (a *ExtensionAgent) FlushRegister(ctx context.Context) error {
 		authMsg.ReplaceHeader(sip.HdrCSeq, "2 REGISTER")
 		authMsg.AddHeader(sip.HdrAuthorization, authHdr)
 		_ = a.Send(authMsg, "")
-		chDone2 := a.waitForEvent(doneCodes...)
-		defer a.deregisterCh(chDone2, doneCodes...)
-		select {
-		case <-chDone2:
-		case <-tCtx.Done():
-		}
+		_, _ = a.waitForRegisterResponse(tCtx, callID, 2, "200", "404", "403", "481", "_FINAL_FAIL")
 		return nil
-	case <-tCtx.Done():
+	default:
 		return nil
 	}
 }
@@ -734,25 +859,22 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) (*Sub
 		return nil, fmt.Errorf("unsupported subscribe event %q", event)
 	}
 
+	localTag := sip.CreateFromTag()
 	st := &SubscriptionState{
-		Event:      event,
-		CallID:     sip.CreateCallID(),
-		FromHeader: fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), sip.CreateFromTag()),
-		ToHeader:   a.nameAddr(a.Ext, a.Config.Domain),
-		Contact:    fmt.Sprintf("<%s>", a.contactURI(a.Ext)),
-		CSeq:       1,
+		Event:            event,
+		CallID:           sip.CreateCallID(),
+		FromHeader:       fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), localTag),
+		ToHeader:         a.nameAddr(a.Ext, a.Config.Domain),
+		LocalTag:         localTag,
+		Contact:          fmt.Sprintf("<%s>", a.contactURI(a.Ext)),
+		CSeq:             1,
+		RequestedExpires: a.Config.SubscribeExpires,
 	}
 
 	msg := a.buildSubscribeMessage(st, a.Config.SubscribeExpires)
-	ch407 := a.waitForEvent("407")
-	ch401 := a.waitForEvent("401")
-	ch200 := a.waitForEvent("200")
-	ch202 := a.waitForEvent("202")
+	responseQ := a.RegisterWildcardListener()
 	notifyQ := a.RegisterWildcardListener()
-	defer a.deregisterCh(ch407, "407")
-	defer a.deregisterCh(ch401, "401")
-	defer a.deregisterCh(ch200, "200")
-	defer a.deregisterCh(ch202, "202")
+	defer a.DeregisterWildcardListener(responseQ)
 	defer a.DeregisterWildcardListener(notifyQ)
 
 	if err := a.Send(msg, ""); err != nil {
@@ -762,57 +884,15 @@ func (a *ExtensionAgent) SubscribeEvent(ctx context.Context, event string) (*Sub
 	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
-	sendAuthRetry := func(rawChallenge string, use401 bool) error {
-		return a.sendSubscribeAuthRetry(msg, st, rawChallenge, use401)
-	}
-
-	var finalRaw string
-	select {
-	case raw407 := <-ch407:
-		if err := sendAuthRetry(raw407, false); err != nil {
-			return nil, err
-		}
-		select {
-		case finalRaw = <-ch200:
-		case finalRaw = <-ch202:
-		case <-tCtx.Done():
-			return nil, tCtx.Err()
-		}
-	case raw401 := <-ch401:
-		if err := sendAuthRetry(raw401, true); err != nil {
-			return nil, err
-		}
-		select {
-		case finalRaw = <-ch200:
-		case finalRaw = <-ch202:
-		case <-tCtx.Done():
-			return nil, tCtx.Err()
-		}
-	case finalRaw = <-ch200:
-	case finalRaw = <-ch202:
-	case <-tCtx.Done():
-		return nil, tCtx.Err()
-	}
-
-	if finalRaw != "" {
-		parsed, _, _ := sip.ParseMessage(finalRaw)
-		if toResp := parsed.GetHeader(sip.HdrTo); len(toResp) > 0 {
-			st.ToHeader = toResp[0]
-		}
-		st.RemoteTarget = firstURIFromHeader(parsed.GetHeader(sip.HdrContact))
-		st.RouteSet = parsed.GetRecordRoutes(true)
-	}
-	notifyState, err := a.waitForSubscriptionNotify(tCtx, notifyQ, st, false)
+	notifyState, err := a.completeSubscribeTransaction(tCtx, responseQ, notifyQ, st, msg, a.Config.SubscribeExpires, false, false, false, true, true)
 	if err != nil {
 		return nil, err
 	}
-	st.NotifyReceived = true
-	st.SubscriptionState = notifyState
-
 	a.mu.Lock()
 	a.subscriptions[event] = st
 	a.mu.Unlock()
-	slog.Info("subscribed", "ext", a.Ext, "event", event, "subscription_state", notifyState)
+	a.drainSubscriptionNotify(notifyQ, st)
+	slog.Info("subscribed", "ext", a.Ext, "event", event, "subscription_state", notifyState, "granted_exp", st.GrantedExpires)
 	return st, nil
 }
 
@@ -822,6 +902,9 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 	a.mu.RLock()
 	states := make([]*SubscriptionState, 0, len(a.subscriptions))
 	for _, st := range a.subscriptions {
+		if st.Terminated {
+			continue
+		}
 		cp := *st
 		states = append(states, &cp)
 	}
@@ -842,6 +925,9 @@ func (a *ExtensionAgent) Resubscribe(ctx context.Context) error {
 }
 
 func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionState) error {
+	if a.subscriptionTerminatedOrReplaced(st.Event, st.CallID) {
+		return nil
+	}
 	st.CSeq++
 	msg := a.buildSubscribeMessage(st, a.Config.SubscribeExpires)
 	if st.Nonce != "" {
@@ -851,14 +937,10 @@ func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionS
 		addSubscriptionAuth(msg, st, authHdr)
 	}
 
-	ch401 := a.waitForEvent("401")
-	ch407 := a.waitForEvent("407")
-	ch200 := a.waitForEvent("200")
-	ch202 := a.waitForEvent("202")
-	defer a.deregisterCh(ch401, "401")
-	defer a.deregisterCh(ch407, "407")
-	defer a.deregisterCh(ch200, "200")
-	defer a.deregisterCh(ch202, "202")
+	responseQ := a.RegisterWildcardListener()
+	notifyQ := a.RegisterWildcardListener()
+	defer a.DeregisterWildcardListener(responseQ)
+	defer a.DeregisterWildcardListener(notifyQ)
 
 	if err := a.Send(msg, ""); err != nil {
 		return err
@@ -867,38 +949,29 @@ func (a *ExtensionAgent) resubscribeEvent(ctx context.Context, st *SubscriptionS
 	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
-	select {
-	case raw401 := <-ch401:
-		if err := a.sendSubscribeAuthRetry(msg, st, raw401, true); err != nil {
-			return err
-		}
-		select {
-		case <-ch200:
-		case <-ch202:
-		case <-tCtx.Done():
-			return tCtx.Err()
-		}
-	case raw407 := <-ch407:
-		if err := a.sendSubscribeAuthRetry(msg, st, raw407, false); err != nil {
-			return err
-		}
-		select {
-		case <-ch200:
-		case <-ch202:
-		case <-tCtx.Done():
-			return tCtx.Err()
-		}
-	case <-ch200:
-	case <-ch202:
-	case <-tCtx.Done():
-		return tCtx.Err()
+	state, err := a.completeSubscribeTransaction(tCtx, responseQ, notifyQ, st, msg, a.Config.SubscribeExpires, true, false, true, true, true)
+	if err != nil {
+		return err
 	}
 
 	a.mu.Lock()
+	current := a.subscriptions[st.Event]
+	if current == nil || current.CallID != st.CallID || current.Terminated {
+		a.mu.Unlock()
+		slog.Debug("resubscribe result ignored because subscription changed", "ext", a.Ext, "event", st.Event, "call_id", st.CallID)
+		return nil
+	}
 	a.subscriptions[st.Event] = st
 	a.mu.Unlock()
-	slog.Debug("resubscribed", "ext", a.Ext, "event", st.Event, "expires", a.Config.SubscribeExpires)
+	slog.Debug("resubscribed", "ext", a.Ext, "event", st.Event, "subscription_state", state, "requested_exp", st.RequestedExpires, "granted_exp", st.GrantedExpires)
 	return nil
+}
+
+func (a *ExtensionAgent) subscriptionTerminatedOrReplaced(event, callID string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	current := a.subscriptions[event]
+	return current == nil || current.CallID != callID || current.Terminated
 }
 
 // Unsubscribe tears down every active subscription whose event policy requires
@@ -914,6 +987,9 @@ func (a *ExtensionAgent) UnsubscribeWithProgress(ctx context.Context, cb func(ev
 	a.mu.RLock()
 	states := make([]*SubscriptionState, 0, len(a.subscriptions))
 	for _, st := range a.subscriptions {
+		if st.Terminated {
+			continue
+		}
 		cp := *st
 		states = append(states, &cp)
 	}
@@ -949,15 +1025,9 @@ func (a *ExtensionAgent) unsubscribeEvent(ctx context.Context, st *SubscriptionS
 		addSubscriptionAuth(msg, st, authHdr)
 	}
 
-	ch401 := a.waitForEvent("401")
-	ch407 := a.waitForEvent("407")
-	ch200 := a.waitForEvent("200")
-	ch202 := a.waitForEvent("202")
+	responseQ := a.RegisterWildcardListener()
 	notifyQ := a.RegisterWildcardListener()
-	defer a.deregisterCh(ch401, "401")
-	defer a.deregisterCh(ch407, "407")
-	defer a.deregisterCh(ch200, "200")
-	defer a.deregisterCh(ch202, "202")
+	defer a.DeregisterWildcardListener(responseQ)
 	defer a.DeregisterWildcardListener(notifyQ)
 
 	if err := a.Send(msg, ""); err != nil {
@@ -967,34 +1037,7 @@ func (a *ExtensionAgent) unsubscribeEvent(ctx context.Context, st *SubscriptionS
 	tCtx, cancel := context.WithTimeout(ctx, a.Config.NonInviteTransactionTimeout())
 	defer cancel()
 
-	select {
-	case raw401 := <-ch401:
-		if err := a.sendSubscribeAuthRetry(msg, st, raw401, true); err != nil {
-			return err
-		}
-		select {
-		case <-ch200:
-		case <-ch202:
-		case <-tCtx.Done():
-			return tCtx.Err()
-		}
-	case raw407 := <-ch407:
-		if err := a.sendSubscribeAuthRetry(msg, st, raw407, false); err != nil {
-			return err
-		}
-		select {
-		case <-ch200:
-		case <-ch202:
-		case <-tCtx.Done():
-			return tCtx.Err()
-		}
-	case <-ch200:
-	case <-ch202:
-	case <-tCtx.Done():
-		return tCtx.Err()
-	}
-
-	state, err := a.waitForSubscriptionNotify(tCtx, notifyQ, st, true)
+	state, err := a.completeSubscribeTransaction(tCtx, responseQ, notifyQ, st, msg, 0, true, true, true, false, false)
 	if err != nil {
 		return err
 	}
@@ -1094,6 +1137,215 @@ func (a *ExtensionAgent) sendSubscribeAuthRetry(msg *sip.SipMessage, st *Subscri
 		retryMsg.AddHeader(sip.HdrProxyAuthorization, authHdr)
 	}
 	return a.Send(retryMsg, "")
+}
+
+type subscribeResponse struct {
+	Code string
+	Raw  string
+	Msg  *sip.SipMessage
+}
+
+func (a *ExtensionAgent) completeSubscribeTransaction(ctx context.Context, responseQ, notifyQ chan WildcardEvent, st *SubscriptionState, msg *sip.SipMessage, requestedExpires int, waitNotify, requireTerminated, allow481Success, allow423Retry, allowMissingNotify bool) (string, error) {
+	st.RequestedExpires = requestedExpires
+	for {
+		resp, err := a.waitForSubscribeResponse(ctx, responseQ, st, st.CSeq, "401", "407", "200", "202", "423", "481", "_FINAL_FAIL")
+		if err != nil {
+			return "", err
+		}
+
+		switch resp.Code {
+		case "401", "407":
+			if err := a.sendSubscribeAuthRetry(msg, st, resp.Raw, resp.Code == "401"); err != nil {
+				return "", err
+			}
+		case "423":
+			if !allow423Retry || requestedExpires == 0 {
+				return "", subscribeResponseError(resp, st, "interval too brief")
+			}
+			minExpires := resp.Msg.GetMinExpires()
+			if minExpires <= 0 {
+				return "", subscribeResponseError(resp, st, "interval too brief without Min-Expires")
+			}
+			if minExpires < requestedExpires {
+				minExpires = requestedExpires
+			}
+			st.CSeq++
+			st.RequestedExpires = minExpires
+			msg = a.buildSubscribeMessage(st, minExpires)
+			if st.Nonce != "" {
+				cnonce := sip.GenCNonce()
+				uri := subscribeRequestURI(a, st)
+				authHdr := sip.CalcDigestResponse(a.Ext, a.Config.SIPPassword, st.Realm, st.Nonce, uri, "SUBSCRIBE", cnonce, st.nextNC(), "auth", st.Opaque)
+				addSubscriptionAuth(msg, st, authHdr)
+			}
+			if err := a.Send(msg, ""); err != nil {
+				return "", err
+			}
+			requestedExpires = minExpires
+		case "481":
+			st.SubscriptionState = "terminated"
+			st.Terminated = true
+			st.TerminationReason = "481"
+			if allow481Success {
+				slog.Warn("SUBSCRIBE dialog no longer exists", "ext", a.Ext, "event", st.Event, "call_id", st.CallID, "cseq", st.CSeq, "operation_exp", requestedExpires)
+				return st.SubscriptionState, nil
+			}
+			return "", subscribeResponseError(resp, st, "subscription dialog does not exist")
+		case "200", "202":
+			a.applySubscribeResponse(st, resp.Msg, requestedExpires)
+			if st.SubscriptionState == "" {
+				if resp.Code == "202" {
+					st.SubscriptionState = "pending"
+				} else {
+					st.SubscriptionState = "active"
+				}
+			}
+			if !waitNotify {
+				return st.SubscriptionState, nil
+			}
+			info, err := a.waitForSubscriptionNotify(ctx, notifyQ, st, requireTerminated)
+			if err != nil {
+				if allowMissingNotify && isContextDeadline(err) {
+					slog.Warn("SUBSCRIBE accepted but NOTIFY not received; keeping subscription without retry",
+						"ext", a.Ext,
+						"event", st.Event,
+						"call_id", st.CallID,
+						"cseq", st.CSeq,
+						"subscription_state", st.SubscriptionState,
+						"err", err)
+					return st.SubscriptionState, nil
+				}
+				return "", err
+			}
+			return info.State, nil
+		default:
+			return "", subscribeResponseError(resp, st, "final failure")
+		}
+	}
+}
+
+func (a *ExtensionAgent) waitForSubscribeResponse(ctx context.Context, wq chan WildcardEvent, st *SubscriptionState, expectedCSeq int, codes ...string) (subscribeResponse, error) {
+	for {
+		code, raw, err := a.WaitWildcard(ctx, wq, time.Until(deadlineFromContext(ctx)))
+		if err != nil {
+			return subscribeResponse{}, fmt.Errorf("subscribe event %s: wait response: %w", st.Event, err)
+		}
+		if code == "NOTIFY" {
+			continue
+		}
+		msg, _, err := sip.ParseMessage(raw)
+		if err != nil {
+			slog.Debug("SUBSCRIBE response parse skipped", "ext", a.Ext, "event", st.Event, "code", code, "err", err)
+			continue
+		}
+		if !subscribeCodeWanted(code, codes...) {
+			continue
+		}
+		if !matchesSubscribeResponse(msg, st, expectedCSeq) {
+			slog.Debug("SUBSCRIBE response mismatch",
+				"ext", a.Ext,
+				"event", st.Event,
+				"code", code,
+				"call_id", msg.GetCallID(),
+				"expected_call_id", st.CallID,
+				"cseq", msg.GetCSeq(),
+				"expected_cseq", expectedCSeq,
+				"method", msg.GetMethod())
+			continue
+		}
+		slog.Debug("SUBSCRIBE response accepted", "ext", a.Ext, "event", st.Event, "code", code, "call_id", st.CallID, "cseq", msg.GetCSeq())
+		return subscribeResponse{Code: code, Raw: raw, Msg: msg}, nil
+	}
+}
+
+func subscribeCodeWanted(code string, codes ...string) bool {
+	for _, wanted := range codes {
+		if code == wanted || (wanted == "_FINAL_FAIL" && sip.IsFinalFailureCode(code)) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesSubscribeResponse(msg *sip.SipMessage, st *SubscriptionState, expectedCSeq int) bool {
+	if msg.GetCallID() != st.CallID {
+		return false
+	}
+	if !strings.EqualFold(msg.GetMethod(), "SUBSCRIBE") {
+		return false
+	}
+	if expectedCSeq > 0 && msg.GetCSeq() != expectedCSeq {
+		return false
+	}
+	return true
+}
+
+func (a *ExtensionAgent) applySubscribeResponse(st *SubscriptionState, msg *sip.SipMessage, requestedExpires int) {
+	if toResp := msg.GetHeader(sip.HdrTo); len(toResp) > 0 {
+		st.ToHeader = toResp[0]
+		st.RemoteTag = tagFromHeader(toResp[0])
+	}
+	if target := firstURIFromHeader(msg.GetHeader(sip.HdrContact)); target != "" {
+		st.RemoteTarget = target
+	}
+	if routes := msg.GetRecordRoutes(true); len(routes) > 0 {
+		st.RouteSet = routes
+	}
+	st.RequestedExpires = requestedExpires
+	if exp := msg.GetGrantedExpiry(); exp > 0 {
+		st.GrantedExpires = exp
+	}
+}
+
+func subscribeResponseError(resp subscribeResponse, st *SubscriptionState, reason string) error {
+	return fmt.Errorf("subscribe event %s: %s response code=%s text=%q call_id=%s cseq=%d method=%s",
+		st.Event, reason, resp.Code, resp.Msg.GetResponseText(), resp.Msg.GetCallID(), resp.Msg.GetCSeq(), resp.Msg.GetMethod())
+}
+
+type registerResponse struct {
+	Code string
+	Raw  string
+	Msg  *sip.SipMessage
+}
+
+func (a *ExtensionAgent) waitForRegisterResponse(ctx context.Context, callID string, expectedCSeq int, codes ...string) (registerResponse, error) {
+	for {
+		ev, err := a.WaitForDialogEvent(ctx, callID, time.Until(deadlineFromContext(ctx)), codes...)
+		if err != nil {
+			return registerResponse{}, fmt.Errorf("register wait response: %w", err)
+		}
+		msg, _, err := sip.ParseMessage(ev.Raw)
+		if err != nil {
+			slog.Debug("REGISTER response parse skipped", "ext", a.Ext, "code", ev.Code, "call_id", callID, "err", err)
+			continue
+		}
+		if !strings.EqualFold(msg.GetMethod(), "REGISTER") {
+			slog.Debug("REGISTER response method mismatch",
+				"ext", a.Ext,
+				"call_id", callID,
+				"method", msg.GetMethod(),
+				"expected_method", "REGISTER")
+			continue
+		}
+		if expectedCSeq > 0 && msg.GetCSeq() != expectedCSeq {
+			slog.Debug("REGISTER response CSeq mismatch",
+				"ext", a.Ext,
+				"call_id", callID,
+				"cseq", msg.GetCSeq(),
+				"expected_cseq", expectedCSeq)
+			continue
+		}
+		return registerResponse{Code: ev.Code, Raw: ev.Raw, Msg: msg}, nil
+	}
+}
+
+func registerResponseError(resp registerResponse, reason string) error {
+	return fmt.Errorf("%s: code=%s text=%q call_id=%s cseq=%d method=%s",
+		reason, resp.Code, resp.Msg.GetResponseText(), resp.Msg.GetCallID(), resp.Msg.GetCSeq(), resp.Msg.GetMethod())
+}
+
+func isContextDeadline(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // SendInvite builds and sends an INVITE with SDP.
@@ -2104,6 +2356,7 @@ func (a *ExtensionAgent) dispatchLoop() {
 			}
 
 			if eventCode == "NOTIFY" {
+				go a.handleSubscriptionNotify(raw)
 				go a.respond200ToNotify(raw)
 			}
 
@@ -2146,26 +2399,55 @@ func (a *ExtensionAgent) respond200ToNotify(raw string) {
 	}
 }
 
-func (a *ExtensionAgent) waitForSubscriptionNotify(ctx context.Context, wq chan WildcardEvent, st *SubscriptionState, requireTerminated bool) (string, error) {
+func (a *ExtensionAgent) waitForSubscriptionNotify(ctx context.Context, wq chan WildcardEvent, st *SubscriptionState, requireTerminated bool) (sip.SubscriptionStateInfo, error) {
 	for {
 		code, raw, err := a.WaitWildcard(ctx, wq, time.Until(deadlineFromContext(ctx)))
 		if err != nil {
-			return "", fmt.Errorf("subscribe event %s: wait NOTIFY: %w", st.Event, err)
+			return sip.SubscriptionStateInfo{}, fmt.Errorf("subscribe event %s: wait NOTIFY: %w", st.Event, err)
 		}
 		if code != "NOTIFY" {
 			continue
 		}
-		if !matchesSubscriptionNotify(raw, st) {
+		msg, _, err := sip.ParseMessage(raw)
+		if err != nil {
+			slog.Debug("SUBSCRIBE NOTIFY parse skipped", "ext", a.Ext, "event", st.Event, "err", err)
 			continue
 		}
-		state := parseSubscriptionState(raw)
-		if state == "" {
-			return "", fmt.Errorf("subscribe event %s: NOTIFY missing Subscription-State", st.Event)
-		}
-		if requireTerminated && !strings.EqualFold(state, "terminated") {
+		if !matchesSubscriptionNotifyMessage(msg, st) {
+			slog.Debug("SUBSCRIBE NOTIFY mismatch", "ext", a.Ext, "event", st.Event, "call_id", msg.GetCallID(), "expected_call_id", st.CallID, "cseq_method", msg.GetMethod())
 			continue
 		}
-		return state, nil
+		info := msg.GetSubscriptionState()
+		if info.State == "" {
+			return sip.SubscriptionStateInfo{}, fmt.Errorf("subscribe event %s: NOTIFY missing Subscription-State", st.Event)
+		}
+		if requireTerminated && !strings.EqualFold(info.State, "terminated") {
+			continue
+		}
+		a.applySubscriptionNotify(st, msg, info)
+		return info, nil
+	}
+}
+
+func (a *ExtensionAgent) drainSubscriptionNotify(wq chan WildcardEvent, st *SubscriptionState) {
+	for {
+		select {
+		case ev := <-wq:
+			if ev.EventCode != "NOTIFY" {
+				continue
+			}
+			msg, _, err := sip.ParseMessage(ev.RawMsg)
+			if err != nil || !matchesSubscriptionNotifyMessage(msg, st) {
+				continue
+			}
+			info := msg.GetSubscriptionState()
+			if info.State == "" {
+				continue
+			}
+			a.applySubscriptionNotify(st, msg, info)
+		default:
+			return
+		}
 	}
 }
 
@@ -2177,23 +2459,37 @@ func deadlineFromContext(ctx context.Context) time.Time {
 }
 
 func matchesSubscriptionNotify(raw string, st *SubscriptionState) bool {
-	msg, _, _ := sip.ParseMessage(raw)
+	msg, _, err := sip.ParseMessage(raw)
+	if err != nil {
+		return false
+	}
+	return matchesSubscriptionNotifyMessage(msg, st)
+}
+
+func matchesSubscriptionNotifyMessage(msg *sip.SipMessage, st *SubscriptionState) bool {
 	if !strings.EqualFold(msg.GetMethod(), "NOTIFY") {
 		return false
 	}
 	if msg.GetCallID() != st.CallID {
 		return false
 	}
-	return normalizeEventToken(msg.GetEvent()) == normalizeEventToken(st.Event)
+	if normalizeEventToken(msg.GetEvent()) != normalizeEventToken(st.Event) {
+		return false
+	}
+	fromTag := msg.GetFromTag()
+	if st.RemoteTag != "" && fromTag != "" && fromTag != st.RemoteTag {
+		return false
+	}
+	toTag := msg.GetToTag()
+	if st.LocalTag != "" && toTag != "" && toTag != st.LocalTag {
+		return false
+	}
+	return true
 }
 
 func parseSubscriptionState(raw string) string {
 	msg, _, _ := sip.ParseMessage(raw)
-	vals := msg.GetHeader(sip.HdrSubscriptionState)
-	if len(vals) == 0 {
-		return ""
-	}
-	return normalizeEventToken(vals[0])
+	return msg.GetSubscriptionState().State
 }
 
 func normalizeEventToken(v string) string {
@@ -2202,6 +2498,71 @@ func normalizeEventToken(v string) string {
 		token = strings.TrimSpace(before)
 	}
 	return token
+}
+
+func (a *ExtensionAgent) handleSubscriptionNotify(raw string) {
+	msg, _, err := sip.ParseMessage(raw)
+	if err != nil {
+		return
+	}
+	info := msg.GetSubscriptionState()
+	if info.State == "" {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, st := range a.subscriptions {
+		if !matchesSubscriptionNotifyMessage(msg, st) {
+			continue
+		}
+		a.applySubscriptionNotifyLocked(st, msg, info)
+		slog.Debug("subscription state updated from NOTIFY",
+			"ext", a.Ext,
+			"event", st.Event,
+			"subscription_state", st.SubscriptionState,
+			"termination_reason", st.TerminationReason,
+			"granted_exp", st.GrantedExpires)
+		return
+	}
+}
+
+func (a *ExtensionAgent) applySubscriptionNotify(st *SubscriptionState, msg *sip.SipMessage, info sip.SubscriptionStateInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.applySubscriptionNotifyLocked(st, msg, info)
+}
+
+func (a *ExtensionAgent) applySubscriptionNotifyLocked(st *SubscriptionState, msg *sip.SipMessage, info sip.SubscriptionStateInfo) {
+	if fromTag := msg.GetFromTag(); fromTag != "" {
+		st.RemoteTag = fromTag
+	}
+	if toTag := msg.GetToTag(); toTag != "" {
+		st.LocalTag = toTag
+	}
+	if toHdr := msg.GetHeader(sip.HdrTo); len(toHdr) > 0 && st.ToHeader == "" {
+		st.ToHeader = toHdr[0]
+	}
+	st.NotifyReceived = true
+	st.SubscriptionState = info.State
+	if info.Expires > 0 {
+		st.GrantedExpires = info.Expires
+	}
+	st.TerminationReason = info.Reason
+	st.Terminated = strings.EqualFold(info.State, "terminated")
+}
+
+func tagFromHeader(header string) string {
+	const prefix = "tag="
+	idx := strings.Index(strings.ToLower(header), prefix)
+	if idx < 0 {
+		return ""
+	}
+	tag := header[idx+len(prefix):]
+	if semi := strings.IndexByte(tag, ';'); semi >= 0 {
+		tag = tag[:semi]
+	}
+	return strings.TrimSpace(tag)
 }
 
 func (a *ExtensionAgent) respond200ToRequest(raw string) {

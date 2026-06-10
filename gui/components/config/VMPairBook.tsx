@@ -10,6 +10,7 @@ import {
   Loader2,
   Trash2,
   Pencil,
+  RotateCcw,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
@@ -19,7 +20,7 @@ import { ConfigSummaryStrip, ConfigSummaryDrawer, ConfigSummarySidebar } from '.
 import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
-import { checkHealth, getMetricsFor, putConfigFor } from '@/lib/api'
+import { checkHealth, getMetricsFor, putConfigFor, startNewRunFor } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { HostHealth, VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
@@ -386,7 +387,12 @@ function InlineVMIdEditor({
 
 export function VMPairBook() {
   const router = useRouter()
-  const { updatePair, activePairIndex, pairs, hydrateConfig } = useTrafficStore()
+  const {
+    updatePair, activePairIndex, pairs, hydrateConfig,
+    setPhase, setPrePhaseStatus, setCleanupStatus,
+    setCallEvents, setCallSpines, setAggregate, updateUACMetrics,
+    resetRunState, uacMetrics,
+  } = useTrafficStore()
 
   const [raw, setRaw] = useState<RawVMFormValues>(DEFAULTS)
   const [touched, setTouched] = useState<Set<string>>(new Set())
@@ -394,6 +400,7 @@ export function VMPairBook() {
   const [configHostHealth, setConfigHostHealth] = useState<HostHealth | null>(null)
   const [validationPassed, setValidationPassed] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [isStartingNewRun, setIsStartingNewRun] = useState(false)
   const [configPushError, setConfigPushError] = useState<string | null>(null)
   const [summaryOpen, setSummaryOpen] = useState(false)
   // Active config tab. Defaults to "server" — the most-edited group on a
@@ -451,6 +458,85 @@ export function VMPairBook() {
   const warnings = useMemo(() => getFieldWarnings(raw), [raw])
 
   const isValid = Object.keys(errors).length === 0
+  const backendPhase = (uacMetrics?.phase ?? '').toUpperCase()
+  const requiresNewRun =
+    backendPhase === 'DONE' ||
+    backendPhase === 'COMPLETE' ||
+    backendPhase === 'FAILED' ||
+    backendPhase === 'CLEANUP_READY' ||
+    backendPhase === 'CLEANING_UP'
+  const newRunErrorActive =
+    !!configPushError &&
+    (configPushError.toLowerCase().includes('start new run') ||
+      configPushError.toLowerCase().includes('previous run'))
+  const newRunBlocked = requiresNewRun || newRunErrorActive
+  const cleanupInProgress = backendPhase === 'CLEANING_UP'
+
+  const waitForRunDone = useCallback(async (ip: string, port: number) => {
+    const deadline = Date.now() + 35 * 60 * 1000
+    while (Date.now() < deadline) {
+      const m = await getMetricsFor(ip, port)
+      const phase = (m.phase ?? '').toUpperCase()
+      if (phase === 'DONE' || phase === 'COMPLETE' || phase === 'FAILED') {
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    throw new Error('Timed out waiting for cleanup to complete')
+  }, [])
+
+  const handleStartNewRun = useCallback(async () => {
+    if (isStartingNewRun) return
+    const vmIp = raw.vm_ip || '127.0.0.1'
+    const metricsPort = parseInt(raw.metrics_port) || 8082
+    setIsStartingNewRun(true)
+    setConfigPushError(null)
+    try {
+      if (!IS_MOCK) {
+        const res = await startNewRunFor(vmIp, metricsPort)
+        if (res.status === 'cleanup_started') {
+          await waitForRunDone(vmIp, metricsPort)
+          await startNewRunFor(vmIp, metricsPort)
+        }
+      }
+      resetRunState()
+      setPhase('IDLE')
+      setPrePhaseStatus({
+        vm_id: raw.vm_id || 'traffic-local',
+        register_complete: false,
+        register_count: 0,
+        register_total: 0,
+        subscribe_complete: false,
+        subscribe_count: 0,
+        subscribe_total: 0,
+        extensions_ready: false,
+        idle_count: 0,
+        reg_only_count: 0,
+      })
+      setCleanupStatus(null)
+      setCallEvents([])
+      setCallSpines([])
+      setAggregate(null)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to start new run'
+      setConfigPushError(msg)
+    } finally {
+      setIsStartingNewRun(false)
+    }
+  }, [
+    isStartingNewRun,
+    raw.vm_ip,
+    raw.metrics_port,
+    raw.vm_id,
+    resetRunState,
+    setPhase,
+    setPrePhaseStatus,
+    setCleanupStatus,
+    setCallEvents,
+    setCallSpines,
+    setAggregate,
+    waitForRunDone,
+  ])
 
   // Reachability
   const checkReachability = useCallback(
@@ -577,6 +663,10 @@ export function VMPairBook() {
 
   const handleSaveAndContinue = async () => {
     if (!validationPassed || isSaving) return
+    if (newRunBlocked) {
+      setConfigPushError('Previous run is still active or complete. Click Start New Run before continuing.')
+      return
+    }
     setIsSaving(true)
     setConfigPushError(null)
 
@@ -607,6 +697,66 @@ export function VMPairBook() {
     }
 
     updatePair(activePairIndex, { ...currentPair, uac, advancedSettings: adv, validated: true, saved: true })
+    updateUACMetrics({
+      vm_id: uac.vm_id ?? 'traffic-local',
+      phase: 'IDLE',
+      running: false,
+      cps_actual: 0,
+      concurrent_calls: 0,
+      calls_invite_sent: 0,
+      calls_attempted: 0,
+      calls_answered: 0,
+      calls_acknowledged: 0,
+      calls_completed: 0,
+      calls_failed: 0,
+      asr: 0,
+      avg_pdd_ms: 0,
+      min_pdd_ms: 0,
+      max_pdd_ms: 0,
+      avg_hold_ms: 0,
+      socket_count: 0,
+      transport_connect_total: 0,
+      transport_connect_done: 0,
+      transport_connect_failed: 0,
+      transport_connect_active: false,
+      registered_count: 0,
+      registered_total: 0,
+      subscribed_count: 0,
+      subscribed_total: 0,
+      idle_count: 0,
+      non_idle_count: 0,
+      reg_only_count: 0,
+      uac_idle_count: 0,
+      uas_idle_count: 0,
+      uac_assigned_count: 0,
+      uas_assigned_count: 0,
+      regsub_ready_count: 0,
+      required_ready_count: 0,
+      regsub_background_active: false,
+      regsub_complete: false,
+      run_elapsed_seconds: 0,
+      media_quality_counts: { OK: 0, WARNING: 0, CRITICAL: 0, UNKNOWN: 0 },
+      host_health: {},
+      parser_health: {},
+      media_security: uac.media_security ?? 'rtp',
+    })
+    setPhase('IDLE')
+    setPrePhaseStatus({
+      vm_id: uac.vm_id ?? 'traffic-local',
+      register_complete: false,
+      register_count: 0,
+      register_total: 0,
+      subscribe_complete: false,
+      subscribe_count: 0,
+      subscribe_total: 0,
+      extensions_ready: false,
+      idle_count: 0,
+      reg_only_count: 0,
+    })
+    setCleanupStatus(null)
+    setCallEvents([])
+    setCallSpines([])
+    setAggregate(null)
     setIsSaving(false)
     router.push('/launch')
   }
@@ -657,6 +807,37 @@ export function VMPairBook() {
           {configHostHealth && (
             <div className="mb-5">
               <VMHealthPanel health={configHostHealth} variant="compact" />
+            </div>
+          )}
+          {newRunBlocked && (
+            <div className="mb-5 rounded-lg border border-amber-500/35 bg-amber-500/10 p-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="flex gap-3">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-300" />
+                  <div>
+                    <p className="text-sm font-semibold text-amber-200">Previous run state is still active</p>
+                    <p className="mt-1 text-xs text-amber-100/80">
+                      Click <span className="font-semibold">Start New Run</span> to clear counters, cleanup status, and ready-pool state before continuing. Your config values will be kept.
+                    </p>
+                    {cleanupInProgress && (
+                      <p className="mt-1 text-xs text-amber-100/70">Cleanup is in progress. New Run will be available after cleanup completes.</p>
+                    )}
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={cleanupInProgress || isStartingNewRun}
+                  onClick={handleStartNewRun}
+                  className="gap-2 border-amber-500/50 text-amber-100 hover:bg-amber-500/10"
+                >
+                  {isStartingNewRun ? (
+                    <><Loader2 className="size-3.5 animate-spin" />Starting…</>
+                  ) : (
+                    <><RotateCcw className="size-3.5" />Start New Run</>
+                  )}
+                </Button>
+              </div>
             </div>
           )}
 
@@ -851,12 +1032,12 @@ export function VMPairBook() {
 
           <Button
             size="sm"
-            disabled={!validationPassed || isSaving}
+            disabled={!validationPassed || isSaving || newRunBlocked}
             onClick={handleSaveAndContinue}
             title="Save & Continue (⌘/Ctrl + S)"
             className={cn(
               'transition-opacity',
-              (!validationPassed || isSaving) && 'cursor-not-allowed opacity-40'
+              (!validationPassed || isSaving || newRunBlocked) && 'cursor-not-allowed opacity-40'
             )}
           >
             {isSaving ? (

@@ -86,7 +86,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     },
     { label: 'Mode', value: raw.traffic_mode || '—' },
     ...(raw.traffic_mode === 'smoke' ? [{ label: 'Calls', value: raw.call_count }] : []),
-    ...(raw.traffic_mode === 'timed' ? [{ label: 'Duration', value: `${raw.duration_hours}h` }] : []),
+    ...(raw.traffic_mode === 'timed' ? [{ label: 'Duration', value: formatDurationHours(raw.duration_hours) }] : []),
     { label: 'Local IP Mode', value: vipModeLabel },
     ...(raw.local_ip_mode === 'single'
       ? [{ label: 'Source IP', value: raw.local_host || 'auto-detect', muted: !raw.local_host }]
@@ -147,6 +147,17 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
     : []
 
   return { server, extensions, traffic, registration, media, advanced, extCount, bhcc }
+}
+
+function formatDurationHours(value: string): string {
+  const hours = Number(value)
+  if (!Number.isFinite(hours) || hours <= 0) return '—'
+  const totalMinutes = Math.round(hours * 60)
+  const wholeHours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (wholeHours <= 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`
+  if (minutes === 0) return `${wholeHours} hour${wholeHours === 1 ? '' : 's'}`
+  return `${wholeHours} hour${wholeHours === 1 ? '' : 's'} ${minutes} minute${minutes === 1 ? '' : 's'}`
 }
 
 function addIPv4(ip: string, offset: number): string | null {

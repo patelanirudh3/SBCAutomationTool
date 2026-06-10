@@ -87,3 +87,53 @@ func TestBuildMessageComputesContentLengthAndPreservesHeaderOrder(t *testing.T) 
 		t.Fatalf("Via order not preserved:\n%s", raw)
 	}
 }
+
+func TestParseSubscriptionStateHeader(t *testing.T) {
+	info := ParseSubscriptionState(`active;expires=3600;reason="deactivated";retry-after=30;unknown=value`)
+	if info.State != "active" {
+		t.Fatalf("state=%q, want active", info.State)
+	}
+	if info.Expires != 3600 {
+		t.Fatalf("expires=%d, want 3600", info.Expires)
+	}
+	if info.Reason != "deactivated" {
+		t.Fatalf("reason=%q, want deactivated", info.Reason)
+	}
+	if info.RetryAfter != 30 {
+		t.Fatalf("retry-after=%d, want 30", info.RetryAfter)
+	}
+	if info.Params["unknown"] != "value" {
+		t.Fatalf("unknown param=%q, want value", info.Params["unknown"])
+	}
+}
+
+func TestParseSubscriptionStateHeaderMalformedValues(t *testing.T) {
+	info := ParseSubscriptionState("terminated;expires=bad;retry-after=-5;reason=timeout")
+	if info.State != "terminated" {
+		t.Fatalf("state=%q, want terminated", info.State)
+	}
+	if info.Expires != 0 {
+		t.Fatalf("expires=%d, want 0", info.Expires)
+	}
+	if info.RetryAfter != 0 {
+		t.Fatalf("retry-after=%d, want 0", info.RetryAfter)
+	}
+	if info.Reason != "timeout" {
+		t.Fatalf("reason=%q, want timeout", info.Reason)
+	}
+}
+
+func TestSubscriptionHeadersFromMessage(t *testing.T) {
+	raw := "SIP/2.0 423 Interval Too Brief\r\nSubscription-State: pending;expires=120\r\nmin-expires: 300\r\nContent-Length: 0\r\n\r\n"
+	msg, _, err := ParseMessage(raw)
+	if err != nil {
+		t.Fatalf("ParseMessage err=%v", err)
+	}
+	info := msg.GetSubscriptionState()
+	if info.State != "pending" || info.Expires != 120 {
+		t.Fatalf("subscription state=%+v, want pending expires=120", info)
+	}
+	if got := msg.GetMinExpires(); got != 300 {
+		t.Fatalf("Min-Expires=%d, want 300", got)
+	}
+}

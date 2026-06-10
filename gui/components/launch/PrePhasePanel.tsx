@@ -16,7 +16,7 @@ import {
   APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import type { HAEvent, PrepStatus, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
+import type { HAEvent, PrepStatus, RegisterExpirySummary, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
 
 const POLL_INTERVAL_MS = 1_000
 
@@ -27,10 +27,19 @@ interface RegSubMetrics {
   registered_total?: number
   subscribed_count?: number
   subscribed_total?: number
+  register_expiry?: RegisterExpirySummary
   subscriptions_by_event?: Record<string, SubscriptionEventStats>
+  regsub_background_active?: boolean
+  regsub_complete?: boolean
   idle_count?: number
   non_idle_count?: number
   reg_only_count?: number
+  uac_idle_count?: number
+  uas_idle_count?: number
+  uac_assigned_count?: number
+  uas_assigned_count?: number
+  regsub_ready_count?: number
+  required_ready_count?: number
   transport_connect_total?: number
   transport_connect_done?: number
   transport_connect_failed?: number
@@ -208,6 +217,13 @@ function formatElapsed(secs: number) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
+function formatSeconds(v?: number | null) {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return '—'
+  if (v >= 3600) return `${(v / 3600).toFixed(1)}h`
+  if (v >= 60) return `${Math.round(v / 60)}m`
+  return `${Math.round(v)}s`
+}
+
 // ---------------------------------------------------------------------------
 // Main PrePhasePanel — handles REGSUB_READY, REGSUB_RUNNING, REGSUB_DONE
 // states inside a single component. The optional Prep button lives in the
@@ -341,7 +357,10 @@ export function PrePhasePanel() {
             subscribe_complete: true,
             subscribe_count: m.subscribed_count ?? 0,
             subscribe_total: subscribeTxnFallback,
-            extensions_ready: (m.idle_count ?? 0) >= 2,
+            extensions_ready:
+              (m.idle_count ?? 0) >= (m.required_ready_count ?? Math.max(2, Math.ceil(extCount * 0.25))) &&
+              (m.uac_idle_count ?? 0) >= 1 &&
+              (m.uas_idle_count ?? 0) >= 1,
             idle_count: m.idle_count,
             reg_only_count: m.reg_only_count,
           })
@@ -587,7 +606,10 @@ export function PrePhasePanel() {
   const displayRegOnly = isMock ? localRegOnlyCount : (regOnlyCount > 0 ? regOnlyCount : localRegOnlyCount)
   const total          = Math.max(extCount, 1)
   const displayPending = Math.max(0, total - regCount)
-  const canStartTraffic = displayIdle >= 2
+  const requiredReady = uacMetrics?.required_ready_count ?? Math.max(2, Math.ceil(total * 0.25))
+  const displayUACIdle = uacMetrics?.uac_idle_count ?? Math.floor(displayIdle / 2)
+  const displayUASIdle = uacMetrics?.uas_idle_count ?? Math.ceil(displayIdle / 2)
+  const canStartTraffic = displayIdle >= requiredReady && displayUACIdle >= 1 && displayUASIdle >= 1
   const transportTotal = uacMetrics?.transport_connect_total ?? 0
   const transportConnected = uacMetrics?.transport_connect_done ?? 0
   const transportFailed = uacMetrics?.transport_connect_failed ?? 0
@@ -596,8 +618,10 @@ export function PrePhasePanel() {
   const registerFailed = regDone ? Math.max(0, registerAttempted - regCount) : 0
   const subscribeFailedAgents = regDone ? displayRegOnly : 0
   const excludedFromTraffic = Math.max(0, configuredExtensions - displayIdle)
+  const registerExpiry = uacMetrics?.register_expiry
   const registerFailureDetails = uacMetrics?.register_failed_details ?? []
   const subscribeFailureDetails = uacMetrics?.subscribe_failed_details ?? []
+  const regSubBackgroundActive = uacMetrics?.regsub_background_active ?? false
   const haActiveController = uacMetrics?.ha_active_controller ?? 'primary'
   const haPrimaryReachable = uacMetrics?.ha_primary_reachable ?? haActiveController === 'primary'
   const primaryFailbackBlocked = haActiveController === 'secondary' && !haPrimaryReachable
@@ -644,8 +668,9 @@ export function PrePhasePanel() {
       <div className="flex items-center gap-2 border-b border-sky-500/20 bg-sky-500/5 px-5 py-2.5">
         <Users className="size-3.5 shrink-0 text-sky-400" />
         <p className="flex-1 text-xs text-sky-300">
-          Reg / Sub — register and subscribe all extensions. Each successful Reg+Sub adds the user to the
-          idle pool. Once <span className="font-bold">≥ 2</span> users are idle, you can start traffic.
+          Reg / Sub — register and subscribe all extensions. Reg/Sub-ready users are split into UAC and UAS
+          ready pools. Once <span className="font-bold">25%</span> of configured users are ready with both roles,
+          you can start traffic.
         </p>
         <PrepButton
           status={prepStatus}
@@ -843,6 +868,56 @@ export function PrePhasePanel() {
             </div>
           )}
 
+          {registerExpiry && (registerExpiry.granted_min ?? 0) > 0 && (
+            <div className="space-y-3 rounded-xl border border-slate-700/50 bg-card p-5">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground">REGISTER Expiry</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Requested <span className="font-mono text-slate-200">{formatSeconds(registerExpiry.requested_expires)}</span>; server-granted values drive per-user refresh.
+                  </p>
+                </div>
+                {(registerExpiry.warning_count ?? 0) > 0 && (
+                  <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                    {registerExpiry.warning_count} lower grants
+                  </span>
+                )}
+              </div>
+              <div className="grid gap-2 text-xs sm:grid-cols-3">
+                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-2">
+                  <div className="font-bold uppercase tracking-wide text-slate-400">Granted</div>
+                  <div className="mt-1 font-mono text-slate-200">
+                    min {formatSeconds(registerExpiry.granted_min)} · avg {formatSeconds(registerExpiry.granted_avg)} · max {formatSeconds(registerExpiry.granted_max)}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-2">
+                  <div className="font-bold uppercase tracking-wide text-slate-400">Refresh In</div>
+                  <div className="mt-1 font-mono text-slate-200">
+                    min {formatSeconds(registerExpiry.refresh_min)} · avg {formatSeconds(registerExpiry.refresh_avg)} · max {formatSeconds(registerExpiry.refresh_max)}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-2">
+                  <div className="font-bold uppercase tracking-wide text-slate-400">Policy</div>
+                  <div className="mt-1 font-mono text-slate-200">per-agent granted_exp x 0.5</div>
+                </div>
+              </div>
+              {(registerExpiry.details?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-2 text-[11px]">
+                  <div className="mb-1 font-semibold text-slate-300">Sample grants</div>
+                  <div className="grid gap-1">
+                    {registerExpiry.details?.slice(0, 6).map((d) => (
+                      <div key={`${d.ext}-${d.granted_expires}`} className="grid grid-cols-[80px_1fr_1fr] gap-2 font-mono text-slate-300">
+                        <span>{d.ext}</span>
+                        <span>grant {formatSeconds(d.granted_expires)}</span>
+                        <span>refresh {formatSeconds(d.refresh_in_seconds)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {pair?.uac.dual_registration_enabled && regDone && (
             <div className="space-y-3 rounded-xl border border-sky-500/30 bg-sky-500/5 p-5">
               <div className="flex items-center justify-between gap-3">
@@ -1022,7 +1097,10 @@ export function PrePhasePanel() {
                   </div>
                   <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2">
                     <div className="text-emerald-400/80">Ready</div>
-                    <div className="mt-1 font-mono text-base font-semibold text-emerald-300">{displayIdle.toLocaleString()}</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-emerald-300">
+                      {displayIdle.toLocaleString()}
+                      {regSubBackgroundActive && <span className="text-amber-300">+</span>}
+                    </div>
                   </div>
                   <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
                     <div className="text-amber-400/80">Excluded</div>
@@ -1032,11 +1110,12 @@ export function PrePhasePanel() {
                 </div>
                 {canStartTraffic ? (
                   <p className="mt-3 text-xs text-slate-400">
-                    Continue only if you are comfortable running traffic with {displayIdle.toLocaleString()} fully ready extensions.
+                    Continue only if you are comfortable running traffic with {displayIdle.toLocaleString()} fully ready extensions
+                    ({displayUACIdle.toLocaleString()} UAC / {displayUASIdle.toLocaleString()} UAS).
                   </p>
                 ) : (
                   <p className="mt-3 text-xs text-amber-300">
-                    At least 2 fully subscribed idle extensions are required before traffic can start.
+                    At least {requiredReady.toLocaleString()} fully ready extensions are required, with at least one UAC and one UAS.
                   </p>
                 )}
               </div>
@@ -1053,8 +1132,8 @@ export function PrePhasePanel() {
                 <div>
                   <p className={cn('text-sm font-semibold', canStartTraffic ? 'text-emerald-300' : 'text-amber-300')}>
                     {canStartTraffic
-                      ? `${displayIdle} users in idle pool — ready for traffic`
-                      : `Only ${displayIdle} idle user${displayIdle === 1 ? '' : 's'} — need at least 2 to start traffic`}
+                      ? `${displayIdle} users ready (${displayUACIdle} UAC / ${displayUASIdle} UAS) — ready for traffic`
+                      : `Only ${displayIdle} ready user${displayIdle === 1 ? '' : 's'} (${displayUACIdle} UAC / ${displayUASIdle} UAS) — need ${requiredReady}`}
                   </p>
                   {displayRegOnly > 0 && (
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -1131,7 +1210,7 @@ export function PrePhasePanel() {
           )}
 
           {/* ── Action buttons (Unregister All + Start Traffic) ──────── */}
-          {(regDone || (regStarted && displayIdle >= 2)) && (
+          {(regDone || (regStarted && canStartTraffic)) && (
             <div className="flex justify-between gap-3">
               <Button
                 size="lg"

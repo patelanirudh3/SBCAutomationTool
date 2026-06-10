@@ -150,6 +150,7 @@ type TCPTransport struct {
 	closed    atomic.Bool
 	mu        sync.Mutex
 	done      chan struct{} // signals readLoop to exit cleanly
+	closeOnce sync.Once
 	onDown    func(error)
 }
 
@@ -191,6 +192,11 @@ func (t *TCPTransport) dial(ctx context.Context) error {
 	}
 
 	netDialer := &net.Dialer{LocalAddr: localAddr, Resolver: t.resolver}
+	if deadline, ok := ctx.Deadline(); ok {
+		if timeout := time.Until(deadline); timeout > 0 {
+			netDialer.Timeout = timeout
+		}
+	}
 
 	if t.useTLS {
 		dialer := &tls.Dialer{
@@ -222,10 +228,18 @@ func (t *TCPTransport) dial(ctx context.Context) error {
 }
 
 func (t *TCPTransport) setConn(conn net.Conn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.conn = conn
 	if addr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
 		t.localPort = addr.Port
 	}
+}
+
+func (t *TCPTransport) currentConn() net.Conn {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn
 }
 
 func (t *TCPTransport) Send(message string) error {
@@ -242,7 +256,7 @@ func (t *TCPTransport) RecvChan() <-chan string { return t.recvCh }
 
 func (t *TCPTransport) Close() error {
 	t.closed.Store(true)
-	close(t.done)
+	t.closeOnce.Do(func() { close(t.done) })
 	t.mu.Lock()
 	conn := t.conn
 	t.mu.Unlock()
@@ -272,7 +286,16 @@ func (t *TCPTransport) readLoop() {
 			return
 		}
 
-		n, err := t.conn.Read(tmp)
+		conn := t.currentConn()
+		if conn == nil {
+			if t.closed.Load() {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		n, err := conn.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 		}

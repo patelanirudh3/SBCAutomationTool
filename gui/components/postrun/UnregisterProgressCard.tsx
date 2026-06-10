@@ -34,7 +34,7 @@ interface UnregisterProgressCardProps {
   /** True while the start-cleanup POST is in flight (before the engine
    *  flips its phase to CLEANING_UP). Renders an indeterminate spinner. */
   starting?: boolean
-  /** Disabled when a Re-Run navigation is in flight. */
+  /** Disabled when a Start New Run navigation is in flight. */
   disabled?: boolean
   /** Called when the user clicks Unregister (CLEANUP_READY phase). */
   onUnregister?: () => void
@@ -77,13 +77,14 @@ export function UnregisterProgressCard({
   const unsubscribeCount = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
   const unsubscribeExpected = cleanupStatus?.unsubscribe_total_expected ?? unsubscribeCount
   const unsubscribeSkipped = cleanupStatus?.unsubscribe_skipped ?? 0
+  const unsubscribeAlreadyTerminated = cleanupStatus?.unsubscribe_already_terminated ?? 0
   const unsubscribeFailed = cleanupStatus?.unsubscribe_failed_extensions ?? []
   const unsubscribeOk = eventUnsubscribeTotal > 0 ? eventUnsubscribeOk : Math.max(0, unsubscribeCount - unsubscribeFailed.length)
   const unsubscribeFailedCount = eventUnsubscribeTotal > 0 ? eventUnsubscribeFailed : unsubscribeFailed.length
   const unsubscribeAttempted = eventUnsubscribeTotal || cleanupStatus?.unsubscribe_count || 0
   const unsubscribeNotAttempted = Math.max(0, unsubscribeExpected - unsubscribeAttempted)
   const unsubscribePct = unsubscribeExpected > 0 ? Math.min(100, Math.round((unsubscribeOk / unsubscribeExpected) * 100)) : 0
-  const hasUnsubscribeWork = unsubscribeExpected > 0 || unsubscribeSkipped > 0 || unsubscribeFailedCount > 0
+  const hasUnsubscribeWork = unsubscribeExpected > 0 || unsubscribeSkipped > 0 || unsubscribeAlreadyTerminated > 0 || unsubscribeFailedCount > 0
 
   // ── Live unreg-rate (mirrors the reg/s tile in PrePhasePanel) ──
   const [rate, setRate] = useState<number | null>(null)
@@ -213,6 +214,9 @@ export function UnregisterProgressCard({
           <div className="flex items-center gap-3">
             {rate != null && rate > 0 && <span>~{rate} unreg/s</span>}
             {eta != null && eta > 0 && <span>~{eta}s left</span>}
+            {unsubscribeAlreadyTerminated > 0 && (
+              <span className="text-sky-300">{unsubscribeAlreadyTerminated.toLocaleString()} already terminated</span>
+            )}
             {(failed.length > 0 || unsubscribeFailedCount > 0 || unsubscribeNotAttempted > 0) && (
               <span className="text-rose-400">
                 {failed.length + unsubscribeFailedCount} failed
@@ -250,6 +254,8 @@ export function UnregisterProgressCard({
             <div className="mt-1 font-mono text-[11px] text-emerald-300/80">
               {unsubscribeSkipped > 0
                 ? `Unsubscribe skipped ${unsubscribeSkipped.toLocaleString()} / ${total.toLocaleString()} (not enabled)`
+                : unsubscribeAlreadyTerminated > 0
+                  ? `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${unsubscribeExpected.toLocaleString()} · already terminated ${unsubscribeAlreadyTerminated.toLocaleString()}`
                 : `Unsubscribed ${unsubscribeOk.toLocaleString()} / ${unsubscribeExpected.toLocaleString()}`}
             </div>
           )}
@@ -268,7 +274,7 @@ export function UnregisterProgressCard({
           </div>
           <p className="text-xs text-muted-foreground">
             The SBC may be unreachable. Inspect the engine logs and retry,
-            or use the Re-Run button to start over with fresh registrations.
+            or use Start New Run to start over with fresh registrations.
           </p>
           {onRetryFailed && (
             <button

@@ -35,9 +35,13 @@ export type RtpMode = '3phase' | '3phase_coverage' | 'continuous'
 export interface AdvancedSettings {
   register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
   register_batch_delay_ms: number      // default: 500 — delay (ms) between TCP socket / REGISTER batches
+  connect_timeout: number              // default: 1 — per TCP/TLS connection attempt timeout (s)
   register_timeout: number             // default: 5 — per-REGISTER and per-SUBSCRIBE response wait (s)
   register_retry: number               // default: 3 — retry attempts for REGISTER and SUBSCRIBE
   subscribe_concurrency: number        // default: 10 — max concurrent SUBSCRIBE operations
+  cleanup_unsubscribe_rate_per_sec: number // default: 20 — max concurrent unsubscribe agents
+  cleanup_unregister_rate_per_sec: number  // default: 20 — max concurrent unregister agents
+  cleanup_audit_timeout_minutes: number    // default: 30 — force unregister after audit timeout
   rtp_mode: RtpMode                    // default: '3phase'
   rtp_burst_seconds: number            // default: 2
   rtp_keepalive_interval: number       // default: 3
@@ -74,9 +78,13 @@ export interface AdvancedSettings {
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   register_batch_size: 10,
   register_batch_delay_ms: 500,
+  connect_timeout: 1,
   register_timeout: 5,
   register_retry: 3,
   subscribe_concurrency: 10,
+  cleanup_unsubscribe_rate_per_sec: 20,
+  cleanup_unregister_rate_per_sec: 20,
+  cleanup_audit_timeout_minutes: 30,
   rtp_mode: '3phase',
   rtp_burst_seconds: 2,
   rtp_keepalive_interval: 3,
@@ -154,6 +162,10 @@ export interface VMConfig {
   // Registration / Subscription
   register_expires?: number        // default: 3600 (seconds)
   subscribe_expires?: number       // default: 3600 (seconds)
+  connect_timeout?: number         // default: 1 (seconds)
+  cleanup_unsubscribe_rate_per_sec?: number
+  cleanup_unregister_rate_per_sec?: number
+  cleanup_audit_timeout_minutes?: number
   subscribe_event?: string         // legacy single-event alias
   subscribe_events?: string[]      // default: ['dialog']
   subscribe_refresh_events?: string[]
@@ -282,10 +294,13 @@ export interface TrafficMetrics {
   registered_count: number
   registered_total?: number
   register_failed_details?: RegisterFailure[]
+  register_expiry?: RegisterExpirySummary
   subscribed_count?: number
   subscribed_total?: number
   subscribe_failed_details?: SubscribeFailure[]
   subscriptions_by_event?: Record<string, SubscriptionEventStats>
+  regsub_background_active?: boolean
+  regsub_complete?: boolean
   // prep_status drives the corner Prep button visual state and the
   // disabled/enabled state of Start Reg/Sub. Backend defaults to 'idle'
   // until the operator clicks Start Prep.
@@ -301,6 +316,12 @@ export interface TrafficMetrics {
   setting_up_count?: number
   established_count?: number
   reg_only_count?: number
+  uac_idle_count?: number
+  uas_idle_count?: number
+  uac_assigned_count?: number
+  uas_assigned_count?: number
+  regsub_ready_count?: number
+  required_ready_count?: number
   // Cleanup (unregister) progress, populated during CLEANING_UP and frozen
   // at completion so the post-run UI can render the result strip.
   cleanup_count?: number
@@ -309,9 +330,11 @@ export interface TrafficMetrics {
   cleanup_unsubscribe_count?: number
   cleanup_unsubscribe_total_expected?: number
   cleanup_unsubscribe_skipped?: number
+  cleanup_unsubscribe_already_terminated?: number
   cleanup_unsubscribe_failed?: string[]
   cleanup_unsubscribe_by_event?: Record<string, SubscriptionEventStats>
   cleanup_unregister_count?: number
+  cleanup_unregister_forced?: number
   cleanup_unregister_failed?: string[]
 
   // QoS / Media aggregates (Phase 1) — averages over calls that produced
@@ -377,7 +400,7 @@ export interface TrafficMetrics {
   graceful_drain_total_seconds?: number
   graceful_drain_seconds_remaining?: number
 
-  // Re-Run pre-flight REGISTER refresh result. Surfaces a non-blocking
+  // Restart pre-flight REGISTER refresh result. Surfaces a non-blocking
   // warning banner during the iteration when some agents could not refresh
   // their SBC binding before traffic resumed.
   reregister_status?: {
@@ -391,7 +414,7 @@ export interface TrafficMetrics {
 
   // Post-drain pool reconciliation result. When `failed` is true, the GUI
   // renders a red alert in the Final Report advising the operator to
-  // Unregister rather than Re-Run with stuck agents.
+  // Unregister rather than continue with stuck agents.
   reconciliation_status?: {
     expected_idle: number
     actual_idle: number
@@ -440,6 +463,8 @@ export interface HostHealth {
   udp_in_datagrams?: number
   udp_in_errors?: number
   udp_rcvbuf_errors?: number
+  udp_in_errors_delta?: number
+  udp_rcvbuf_errors_delta?: number
   net_rx_bytes?: number
   net_tx_bytes?: number
   goroutines?: number
@@ -478,9 +503,11 @@ export interface CleanupStatus {
   unsubscribe_count?: number
   unsubscribe_total_expected?: number
   unsubscribe_skipped?: number
+  unsubscribe_already_terminated?: number
   unsubscribe_failed_extensions?: string[]
   unsubscribe_by_event?: Record<string, SubscriptionEventStats>
   unregister_count?: number
+  unregister_forced?: number
   unregister_failed_extensions?: string[]
   in_progress: boolean
   complete: boolean
@@ -571,6 +598,27 @@ export interface TransportConnectFailure {
 export interface RegisterFailure {
   ext: string
   error?: string
+}
+
+export interface RegisterExpirySummary {
+  requested_expires?: number
+  granted_min?: number
+  granted_max?: number
+  granted_avg?: number
+  refresh_min?: number
+  refresh_max?: number
+  refresh_avg?: number
+  warning_count?: number
+  details_sample_limit?: number
+  details?: RegisterExpiryDetail[]
+}
+
+export interface RegisterExpiryDetail {
+  ext: string
+  requested_expires?: number
+  granted_expires?: number
+  refresh_in_seconds?: number
+  warning?: string
 }
 
 export interface SubscribeFailure {

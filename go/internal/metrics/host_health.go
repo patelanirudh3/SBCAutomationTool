@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -40,6 +41,8 @@ type HostHealth struct {
 	UDPInDatagrams        uint64               `json:"udp_in_datagrams"`
 	UDPInErrors           uint64               `json:"udp_in_errors"`
 	UDPRcvbufErrors       uint64               `json:"udp_rcvbuf_errors"`
+	UDPInErrorsDelta      uint64               `json:"udp_in_errors_delta"`
+	UDPRcvbufErrorsDelta  uint64               `json:"udp_rcvbuf_errors_delta"`
 	NetRXBytes            uint64               `json:"net_rx_bytes"`
 	NetTXBytes            uint64               `json:"net_tx_bytes"`
 	ProcessCPUPercent     float64              `json:"process_cpu_percent"`
@@ -88,11 +91,14 @@ type HostHealthCollector struct {
 	prevProcCPU uint64
 	hasProcCPU  bool
 
-	topProcessMode     string
-	lastTopProcessScan time.Time
-	lastTopProcesses   []TopProcessSnapshot
-	prevTopProcessCPU  map[int]uint64
-	prevTopProcessWall time.Time
+	topProcessMode      string
+	lastTopProcessScan  time.Time
+	lastTopProcesses    []TopProcessSnapshot
+	prevTopProcessCPU   map[int]uint64
+	prevTopProcessWall  time.Time
+	udpBaselineSet      bool
+	udpInErrorsBase     uint64
+	udpRcvbufErrorsBase uint64
 }
 
 func NewHostHealthCollector() *HostHealthCollector {
@@ -120,6 +126,13 @@ func (c *HostHealthCollector) TopProcessMode() string {
 	return c.topProcessMode
 }
 
+func (c *HostHealthCollector) ResetUDPBaseline() {
+	_, inErrors, rcvbufErrors := readUDPStats()
+	c.udpInErrorsBase = inErrors
+	c.udpRcvbufErrorsBase = rcvbufErrors
+	c.udpBaselineSet = true
+}
+
 func (c *HostHealthCollector) Snapshot() HostHealth {
 	h := HostHealth{
 		Goroutines:     runtime.NumGoroutine(),
@@ -134,6 +147,10 @@ func (c *HostHealthCollector) Snapshot() HostHealth {
 	h.ProcessReadBytes, h.ProcessWriteBytes, h.ProcessReadSyscalls, h.ProcessWriteSyscalls = readProcessIO()
 	h.DiskTotalBytes, h.DiskFreeBytes, h.DiskUsedPercent = readDiskUsage(".")
 	h.UDPInDatagrams, h.UDPInErrors, h.UDPRcvbufErrors = readUDPStats()
+	if c.udpBaselineSet {
+		h.UDPInErrorsDelta = safeDelta(h.UDPInErrors, c.udpInErrorsBase)
+		h.UDPRcvbufErrorsDelta = safeDelta(h.UDPRcvbufErrors, c.udpRcvbufErrorsBase)
+	}
 	h.NetRXBytes, h.NetTXBytes = readNetDev()
 	if cpu, ok := readCPUStat(); ok {
 		procCPU := readProcessCPUJiffies()
@@ -143,7 +160,7 @@ func (c *HostHealthCollector) Snapshot() HostHealth {
 			if c.hasProcCPU && procCPU >= c.prevProcCPU {
 				h.ProcessCPUPercentVM = round2(float64(procCPU-c.prevProcCPU) / float64(totalDelta) * 100)
 				h.ProcessCPUPercent = h.ProcessCPUPercentVM
-				h.ProcessCPUPercentCore = round2(h.ProcessCPUPercentVM * float64(runtime.NumCPU()))
+				h.ProcessCPUPercentCore = round2(math.Min(h.ProcessCPUPercentVM*float64(runtime.NumCPU()), float64(runtime.NumCPU()*100)))
 			}
 		}
 		c.prevCPU = cpu
@@ -378,8 +395,8 @@ func performanceWarnings(h HostHealth) []string {
 	if h.CPUSoftIRQPercent > 10 {
 		warnings = append(warnings, "SoftIRQ CPU is elevated; kernel network processing is significant.")
 	}
-	if h.UDPInErrors > 0 || h.UDPRcvbufErrors > 0 {
-		warnings = append(warnings, "UDP errors detected; packet receive buffers or host networking may be stressed.")
+	if h.UDPInErrorsDelta > 0 || h.UDPRcvbufErrorsDelta > 0 {
+		warnings = append(warnings, "UDP errors increased during this run; packet receive buffers or host networking may be stressed.")
 	}
 	return warnings
 }

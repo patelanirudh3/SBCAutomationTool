@@ -185,6 +185,7 @@ interface TrafficStore {
 
   // Reset
   reset: () => void
+  resetRunState: () => void
 }
 
 const initialState = {
@@ -272,11 +273,13 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
         : undefined
       const unsubscribeCount = m.cleanup_unsubscribe_total_expected ?? cleanupStatus?.unsubscribe_total_expected ?? eventUnsubscribeCount ?? m.cleanup_unsubscribe_count ?? cleanupStatus?.unsubscribe_count ?? 0
       const unsubscribeSkipped = m.cleanup_unsubscribe_skipped ?? cleanupStatus?.unsubscribe_skipped ?? 0
+      const unsubscribeAlreadyTerminated = m.cleanup_unsubscribe_already_terminated ?? cleanupStatus?.unsubscribe_already_terminated ?? 0
       if (
         total > 0 ||
         count > 0 ||
         unsubscribeCount > 0 ||
         unsubscribeSkipped > 0 ||
+        unsubscribeAlreadyTerminated > 0 ||
         unregisterFailed.length > 0 ||
         unsubscribeFailed.length > 0
       ) {
@@ -287,9 +290,11 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
           unsubscribe_count: unsubscribeCount,
           unsubscribe_total_expected: unsubscribeCount,
           unsubscribe_skipped: unsubscribeSkipped,
+          unsubscribe_already_terminated: unsubscribeAlreadyTerminated,
           unsubscribe_failed_extensions: unsubscribeFailed,
           unsubscribe_by_event: unsubscribeByEvent,
           unregister_count: count,
+          unregister_forced: m.cleanup_unregister_forced ?? cleanupStatus?.unregister_forced ?? 0,
           unregister_failed_extensions: unregisterFailed,
           in_progress: mappedPhase === 'CLEANING_UP',
           complete: total > 0 && count >= total,
@@ -350,5 +355,18 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
   reset: () => {
     const { runMode, pairs } = get()
     set({ ...initialState, runMode, pairs })
+  },
+
+  resetRunState: () => {
+    const { runMode, pairs, activePairIndex, reachability, chatPanelOpen, wsStatus } = get()
+    set({
+      ...initialState,
+      runMode,
+      pairs,
+      activePairIndex,
+      reachability,
+      chatPanelOpen,
+      wsStatus,
+    })
   },
 }))

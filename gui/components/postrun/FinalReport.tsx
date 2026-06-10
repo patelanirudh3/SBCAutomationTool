@@ -138,28 +138,28 @@ export function FinalReport({
     typeof uacMetrics?.calls_invite_sent === 'number'
       ? Math.max(uacMetrics.calls_invite_sent - (uacMetrics.calls_attempted ?? 0), 0)
       : null
-  const attempted  = aggregate?.total_attempted  ?? uacMetrics?.calls_attempted  ?? 0
-  // Prefer aggregate, fall back to live metric, then derive from event list
-  // as a last resort. UAC-only filtering keeps the totals correct (events
-  // contain both UAC and UAS legs).
+  const attempted  = uacMetrics?.calls_attempted ?? aggregate?.total_attempted ?? 0
+  // Prefer backend aggregate metrics. Since long-run call details are now
+  // bounded in memory, locally built aggregates from /api/calls can be partial
+  // samples and must not override the authoritative counters.
   //
   // answered = 200 OK seen (RFC 3261 §13.2.2.4); independent of ACK.
   // acknowledged = full INV/200/ACK three-way handshake completed.
   // The gap between them surfaces 100rel/PRACK or SBC 200-OK delivery
   // problems at a glance.
-  const answered     = aggregate?.total_answered
-                    ?? uacMetrics?.calls_answered
+  const answered     = uacMetrics?.calls_answered
+                    ?? aggregate?.total_answered
                     ?? callEvents.filter((e) => e.direction !== 'uas' && e.answered === true).length
   const hasAckMetric = typeof uacMetrics?.calls_acknowledged === 'number'
   const hasAckEvents = callEvents.some((e) => e.direction !== 'uas' && typeof e.acknowledged === 'boolean')
-  const completed  = aggregate?.total_completed  ?? uacMetrics?.calls_completed  ?? 0
-  const acknowledged = aggregate?.total_acknowledged
-                    ?? uacMetrics?.calls_acknowledged
+  const completed  = uacMetrics?.calls_completed ?? aggregate?.total_completed ?? 0
+  const acknowledged = uacMetrics?.calls_acknowledged
+                    ?? aggregate?.total_acknowledged
                     ?? (hasAckEvents
                       ? callEvents.filter((e) => e.direction !== 'uas' && e.acknowledged === true).length
                       : completed)
-  const failed     = Math.max(aggregate?.total_failed ?? 0, uacMetrics?.calls_failed ?? 0)
-  const asr        = aggregate?.aggregate_asr    ?? uacMetrics?.asr              ?? 0
+  const failed     = uacMetrics?.calls_failed ?? aggregate?.total_failed ?? 0
+  const asr        = uacMetrics?.asr ?? aggregate?.aggregate_asr ?? 0
   const csr        = uacMetrics?.csr
                     ?? (attempted > 0 ? Math.round((completed / attempted) * 10000) / 100 : 0)
   const avgPdd     = uacMetrics?.avg_pdd_ms      ?? null
@@ -233,7 +233,7 @@ export function FinalReport({
       {/* Pool reconciliation alert — surfaced when post-drain reconciliation
           could not return all agents to idle within the 3 × 60s budget.
           Block-level red banner advises the operator to Unregister rather
-          than Re-Run with stuck agents (which would compound the problem). */}
+          than continue with stuck agents (which would compound the problem). */}
       {uacMetrics?.reconciliation_status?.failed && (
         <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 flex items-start gap-3">
           <AlertTriangle className="size-5 text-rose-400 shrink-0 mt-0.5" />
@@ -250,7 +250,7 @@ export function FinalReport({
             </p>
             <p className="text-xs text-rose-300/80">
               <strong>Recommended:</strong> click <strong>Unregister / Unsubscribe</strong>{' '}
-              for a clean slate before the next run. Re-Run is unlikely to behave
+              for a clean slate before the next run. Continuing is unlikely to behave
               correctly with stuck agents.
             </p>
           </div>
@@ -382,8 +382,9 @@ export function FinalReport({
         />
       </div>
 
-      {/* Download */}
-      <DownloadReport showNewRun={false} />
+      {/* Download / New Run. Restart Traffic is intentionally unavailable after
+          cleanup because registrations/subscriptions have been torn down. */}
+      <DownloadReport showNewRun={phase === 'COMPLETE' || phase === 'DONE' || phase === 'FAILED'} />
     </motion.div>
   )
 }

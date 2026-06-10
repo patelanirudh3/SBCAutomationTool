@@ -35,6 +35,7 @@ const (
 	HdrAllow              = "Allow"
 	HdrEvent              = "Event"
 	HdrSubscriptionState  = "Subscription-State"
+	HdrMinExpires         = "Min-Expires"
 	HdrUserAgent          = "User-Agent"
 	HdrServer             = "Server"
 )

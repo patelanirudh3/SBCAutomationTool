@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -66,10 +67,13 @@ type TrafficMetrics struct {
 	RegisteredCount                    int                               `json:"registered_count"`
 	RegisteredTotal                    int                               `json:"registered_total"`
 	RegisterFailedDetails              []RegisterFailure                 `json:"register_failed_details,omitempty"`
+	RegisterExpiry                     RegisterExpirySummary             `json:"register_expiry,omitempty"`
 	SubscribedCount                    int                               `json:"subscribed_count"`
 	SubscribedTotal                    int                               `json:"subscribed_total"`
 	SubscribeFailedDetails             []SubscribeFailure                `json:"subscribe_failed_details,omitempty"`
 	SubscriptionsByEvent               map[string]SubscriptionEventStats `json:"subscriptions_by_event,omitempty"`
+	RegSubBackgroundActive             bool                              `json:"regsub_background_active"`
+	RegSubComplete                     bool                              `json:"regsub_complete"`
 	// PrepStatus tracks the optional async unregister-flush invoked by the
 	// GUI's "Start Prep" corner button. One of: "idle" | "running" | "done"
 	// | "failed". The GUI reads this to drive the corner-button visual state
@@ -79,9 +83,15 @@ type TrafficMetrics struct {
 	Running       bool           `json:"running"`
 	RTPHealth     map[string]int `json:"rtp_health"`
 	// Single-pool agent counts (new model)
-	IdleCount    int `json:"idle_count"`
-	NonIdleCount int `json:"non_idle_count"`
-	RegOnlyCount int `json:"reg_only_count"`
+	IdleCount     int `json:"idle_count"`
+	NonIdleCount  int `json:"non_idle_count"`
+	RegOnlyCount  int `json:"reg_only_count"`
+	UACIdleCount  int `json:"uac_idle_count"`
+	UASIdleCount  int `json:"uas_idle_count"`
+	UACAssigned   int `json:"uac_assigned_count"`
+	UASAssigned   int `json:"uas_assigned_count"`
+	RegSubReady   int `json:"regsub_ready_count"`
+	RequiredReady int `json:"required_ready_count"`
 	// InviteRetransmits counts UDP INVITE retransmissions triggered by
 	// RFC 3261 Timer A. Useful for diagnosing UDP packet loss / SBC stress.
 	InviteRetransmits int `json:"invite_retransmits"`
@@ -93,13 +103,15 @@ type TrafficMetrics struct {
 	CleanupFailed []string `json:"cleanup_failed,omitempty"`
 	// Split cleanup results let the GUI distinguish subscription cleanup from
 	// registration cleanup. Legacy cleanup_* fields remain unregister-focused.
-	CleanupUnsubscribeCount   int                               `json:"cleanup_unsubscribe_count"`
-	CleanupUnsubscribeTotal   int                               `json:"cleanup_unsubscribe_total_expected"`
-	CleanupUnsubscribeSkipped int                               `json:"cleanup_unsubscribe_skipped"`
-	CleanupUnsubscribeFailed  []string                          `json:"cleanup_unsubscribe_failed,omitempty"`
-	CleanupUnsubscribeByEvent map[string]SubscriptionEventStats `json:"cleanup_unsubscribe_by_event,omitempty"`
-	CleanupUnregisterCount    int                               `json:"cleanup_unregister_count"`
-	CleanupUnregisterFailed   []string                          `json:"cleanup_unregister_failed,omitempty"`
+	CleanupUnsubscribeCount      int                               `json:"cleanup_unsubscribe_count"`
+	CleanupUnsubscribeTotal      int                               `json:"cleanup_unsubscribe_total_expected"`
+	CleanupUnsubscribeSkipped    int                               `json:"cleanup_unsubscribe_skipped"`
+	CleanupUnsubscribeTerminated int                               `json:"cleanup_unsubscribe_already_terminated"`
+	CleanupUnsubscribeFailed     []string                          `json:"cleanup_unsubscribe_failed,omitempty"`
+	CleanupUnsubscribeByEvent    map[string]SubscriptionEventStats `json:"cleanup_unsubscribe_by_event,omitempty"`
+	CleanupUnregisterCount       int                               `json:"cleanup_unregister_count"`
+	CleanupUnregisterForced      int                               `json:"cleanup_unregister_forced"`
+	CleanupUnregisterFailed      []string                          `json:"cleanup_unregister_failed,omitempty"`
 
 	// QoS / Media aggregate metrics (Phase 1).
 	// AvgJitterMs / AvgMOSScore are simple means over calls that produced
@@ -154,9 +166,33 @@ type TrafficMetrics struct {
 	HAFailoverEvents         int       `json:"ha_failover_events"`
 	HAFailoverDeferred       int       `json:"ha_failover_deferred"`
 	HAEvents                 []HAEvent `json:"ha_events,omitempty"`
+
+	CallDetailLog      string            `json:"call_detail_log,omitempty"`
+	CallDetailDropped  int               `json:"call_detail_dropped"`
+	CallResultsKept    int               `json:"call_results_kept"`
+	CallMilestonesKept int               `json:"call_milestones_kept"`
+	Memory             MemoryDiagnostics `json:"memory"`
+}
+
+type MemoryDiagnostics struct {
+	HeapAllocBytes  uint64 `json:"heap_alloc_bytes"`
+	HeapSysBytes    uint64 `json:"heap_sys_bytes"`
+	HeapObjects     uint64 `json:"heap_objects"`
+	SysBytes        uint64 `json:"sys_bytes"`
+	NumGC           uint32 `json:"num_gc"`
+	Goroutines      int    `json:"goroutines"`
+	CallResultsKept int    `json:"call_results_kept"`
+	RawEventsKept   int    `json:"raw_events_kept"`
+	MilestonesKept  int    `json:"milestones_kept"`
 }
 
 const transportConnectFailureSampleLimit = 100
+const recentSuccessfulCallRetention = 5000
+const failedCallRetention = 10000
+const sampleRetention = 10000
+const rawEventRetention = 10000
+const milestoneRetention = 20000
+const callDetailQueueSize = 10000
 
 type TransportConnectFailure struct {
 	Ext     string `json:"ext"`
@@ -168,6 +204,27 @@ type TransportConnectFailure struct {
 type RegisterFailure struct {
 	Ext   string `json:"ext"`
 	Error string `json:"error"`
+}
+
+type RegisterExpirySummary struct {
+	RequestedExpires   int                    `json:"requested_expires"`
+	GrantedMin         int                    `json:"granted_min"`
+	GrantedMax         int                    `json:"granted_max"`
+	GrantedAvg         float64                `json:"granted_avg"`
+	RefreshMin         int                    `json:"refresh_min"`
+	RefreshMax         int                    `json:"refresh_max"`
+	RefreshAvg         float64                `json:"refresh_avg"`
+	WarningCount       int                    `json:"warning_count"`
+	DetailsSampleLimit int                    `json:"details_sample_limit"`
+	Details            []RegisterExpiryDetail `json:"details,omitempty"`
+}
+
+type RegisterExpiryDetail struct {
+	Ext              string `json:"ext"`
+	RequestedExpires int    `json:"requested_expires"`
+	GrantedExpires   int    `json:"granted_expires"`
+	RefreshInSeconds int    `json:"refresh_in_seconds"`
+	Warning          string `json:"warning,omitempty"`
 }
 
 type SubscribeFailure struct {
@@ -304,10 +361,13 @@ type MetricsCollector struct {
 	registeredCount               int
 	registeredTotal               int
 	registerFailedDetails         []RegisterFailure
+	registerExpiry                RegisterExpirySummary
 	subscribedCount               int
 	subscribedTotal               int
 	subscribeFailedDetails        []SubscribeFailure
 	subscriptionsByEvent          map[string]SubscriptionEventStats
+	regSubBackgroundActive        bool
+	regSubComplete                bool
 	prepStatus                    string // "idle" | "running" | "done" | "failed"
 	phase                         string
 	runStart                      time.Time
@@ -315,11 +375,18 @@ type MetricsCollector struct {
 	runStartSet                   bool
 
 	callResults           []CallResultData
+	successfulResultsKept int
+	failedResultsKept     int
 	rawEvents             []map[string]any
 	callSpines            []json.RawMessage
 	callMilestones        map[string]*callMilestoneState
+	callDetailWriter      *callDetailWriter
+	callDetailPath        string
+	callDetailDropped     int
+	lastMemoryLog         time.Time
 	concurrentProvider    func() int
 	poolCountsProvider    func() (idle, nonIdle, regOnly int)
+	roleCountsProvider    func() (uacIdle, uasIdle, nonIdle, regOnly, uacAssigned, uasAssigned, regSubReady, requiredReady int)
 	hostHealth            *HostHealthCollector
 	hostHealthSamples     int
 	hostCPUSum            float64
@@ -356,19 +423,28 @@ type MetricsCollector struct {
 	packetLossSamples  []float64
 	rttSamples         []float64
 	mediaQualityCounts map[string]int
+	totalRTPTxPkts     int
+	totalRTPRxPkts     int
+	totalRTPRxFromSBC  int
+	totalRTPExpected   int
+	totalRTPLostPkts   int
+	totalRTPSSRCCount  int
+	rtpSampleCount     int
 
 	// Cleanup progress, populated during shutdownCleanup so the GUI can render
 	// split unsubscribe/unregister status and final failure lists.
-	cleanupCount              int
-	cleanupTotal              int
-	cleanupFailed             []string
-	cleanupUnsubscribeCount   int
-	cleanupUnsubscribeTotal   int
-	cleanupUnsubscribeSkipped int
-	cleanupUnsubscribeFailed  []string
-	cleanupUnsubscribeByEvent map[string]SubscriptionEventStats
-	cleanupUnregisterCount    int
-	cleanupUnregisterFailed   []string
+	cleanupCount                 int
+	cleanupTotal                 int
+	cleanupFailed                []string
+	cleanupUnsubscribeCount      int
+	cleanupUnsubscribeTotal      int
+	cleanupUnsubscribeSkipped    int
+	cleanupUnsubscribeTerminated int
+	cleanupUnsubscribeFailed     []string
+	cleanupUnsubscribeByEvent    map[string]SubscriptionEventStats
+	cleanupUnregisterCount       int
+	cleanupUnregisterForced      int
+	cleanupUnregisterFailed      []string
 
 	// SIP message counters — UAC side
 	invitesSent       int
@@ -385,6 +461,56 @@ type MetricsCollector struct {
 	// WebSocket subscribers
 	wsMu      sync.Mutex
 	wsClients map[*websocket.Conn]struct{}
+}
+
+type callDetailWriter struct {
+	path string
+	ch   chan CallResultData
+	done chan struct{}
+}
+
+func newCallDetailWriter(path string) (*callDetailWriter, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	w := &callDetailWriter{
+		path: path,
+		ch:   make(chan CallResultData, callDetailQueueSize),
+		done: make(chan struct{}),
+	}
+	go func() {
+		defer close(w.done)
+		defer f.Close()
+		bw := bufio.NewWriterSize(f, 1<<20)
+		defer bw.Flush()
+		enc := json.NewEncoder(bw)
+		flushTicker := time.NewTicker(2 * time.Second)
+		defer flushTicker.Stop()
+		for {
+			select {
+			case r, ok := <-w.ch:
+				if !ok {
+					return
+				}
+				_ = enc.Encode(callResultToDetailMap(r))
+			case <-flushTicker.C:
+				_ = bw.Flush()
+			}
+		}
+	}()
+	return w, nil
+}
+
+func (w *callDetailWriter) stop() {
+	if w == nil {
+		return
+	}
+	close(w.ch)
+	<-w.done
 }
 
 // NewMetricsCollector creates a new collector for the given VM.
@@ -407,6 +533,45 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		hostHealth:                NewHostHealthCollector(),
 		wsClients:                 make(map[*websocket.Conn]struct{}),
 	}
+}
+
+func (c *MetricsCollector) StartCallDetailLog(logDir, runID, pairID, vmID string) {
+	if runID == "" {
+		return
+	}
+	path := filepath.Join(logDir, fmt.Sprintf("%s_%s_%s_calls.ndjson", runID, pairID, vmID))
+	writer, err := newCallDetailWriter(path)
+	if err != nil {
+		slog.Warn("Could not start call detail log", "path", path, "err", err)
+		return
+	}
+	c.mu.Lock()
+	oldWriter := c.callDetailWriter
+	c.callDetailWriter = writer
+	c.callDetailPath = path
+	c.callDetailDropped = 0
+	c.mu.Unlock()
+	if oldWriter != nil {
+		oldWriter.stop()
+	}
+	slog.Info("Call detail log started", "path", path)
+}
+
+func (c *MetricsCollector) StopCallDetailLog() {
+	c.mu.Lock()
+	writer := c.callDetailWriter
+	c.callDetailWriter = nil
+	c.mu.Unlock()
+	if writer != nil {
+		writer.stop()
+		slog.Info("Call detail log stopped", "path", writer.path)
+	}
+}
+
+func (c *MetricsCollector) CallDetailLogPath() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.callDetailPath
 }
 
 // ---------------------------------------------------------------------------
@@ -444,8 +609,8 @@ func (c *MetricsCollector) RecordRawEvent(payload map[string]any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rawEvents = append(c.rawEvents, payload)
-	if len(c.rawEvents) > 10000 {
-		c.rawEvents = c.rawEvents[len(c.rawEvents)-10000:]
+	if len(c.rawEvents) > rawEventRetention {
+		c.rawEvents = c.rawEvents[len(c.rawEvents)-rawEventRetention:]
 	}
 	c.recordMilestoneLocked(payload)
 }
@@ -466,6 +631,7 @@ func (c *MetricsCollector) recordMilestoneLocked(payload map[string]any) {
 	if state == nil {
 		state = &callMilestoneState{}
 		c.callMilestones[key] = state
+		c.pruneMilestonesLocked(key)
 	}
 
 	switch event {
@@ -503,6 +669,27 @@ func (c *MetricsCollector) recordMilestoneLocked(payload map[string]any) {
 			c.callsFailed++
 		}
 	}
+	switch event {
+	case "CALL_COMPLETE", "UAS_CALL_COMPLETE", "UAS_CALL_TIMEOUT":
+		delete(c.callMilestones, key)
+	}
+}
+
+func (c *MetricsCollector) pruneMilestonesLocked(protect string) {
+	for len(c.callMilestones) > milestoneRetention {
+		removed := false
+		for k := range c.callMilestones {
+			if k == protect {
+				continue
+			}
+			delete(c.callMilestones, k)
+			removed = true
+			break
+		}
+		if !removed {
+			return
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +714,11 @@ func (c *MetricsCollector) ResetCleanup(total int) {
 	c.cleanupUnsubscribeCount = 0
 	c.cleanupUnsubscribeTotal = 0
 	c.cleanupUnsubscribeSkipped = 0
+	c.cleanupUnsubscribeTerminated = 0
 	c.cleanupUnsubscribeFailed = nil
 	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
+	c.cleanupUnregisterForced = 0
 	c.cleanupUnregisterFailed = nil
 	c.mu.Unlock()
 }
@@ -576,12 +765,28 @@ func (c *MetricsCollector) IncrementCleanupUnsubscribe(ext string, skipped, ok b
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) IncrementCleanupUnsubscribeAlreadyTerminated(count int) {
+	if count <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.cleanupUnsubscribeTerminated += count
+	c.mu.Unlock()
+}
+
 // IncrementCleanupUnregister records the result of a single Unregister attempt.
 // The legacy cleanup_count/cleanup_failed fields intentionally mirror unregister.
 func (c *MetricsCollector) IncrementCleanupUnregister(ext string, ok bool) {
+	c.IncrementCleanupUnregisterWithForce(ext, ok, false)
+}
+
+func (c *MetricsCollector) IncrementCleanupUnregisterWithForce(ext string, ok bool, forced bool) {
 	c.mu.Lock()
 	c.cleanupUnregisterCount++
 	c.cleanupCount = c.cleanupUnregisterCount
+	if forced {
+		c.cleanupUnregisterForced++
+	}
 	if !ok {
 		c.cleanupUnregisterFailed = append(c.cleanupUnregisterFailed, ext)
 		c.cleanupFailed = append(c.cleanupFailed, ext)
@@ -599,16 +804,18 @@ func (c *MetricsCollector) CleanupSnapshot() (count, total int, failed []string)
 }
 
 type CleanupDetails struct {
-	Count              int
-	Total              int
-	Failed             []string
-	UnsubscribeCount   int
-	UnsubscribeTotal   int
-	UnsubscribeSkipped int
-	UnsubscribeFailed  []string
-	UnsubscribeByEvent map[string]SubscriptionEventStats
-	UnregisterCount    int
-	UnregisterFailed   []string
+	Count                 int
+	Total                 int
+	Failed                []string
+	UnsubscribeCount      int
+	UnsubscribeTotal      int
+	UnsubscribeSkipped    int
+	UnsubscribeTerminated int
+	UnsubscribeFailed     []string
+	UnsubscribeByEvent    map[string]SubscriptionEventStats
+	UnregisterCount       int
+	UnregisterForced      int
+	UnregisterFailed      []string
 }
 
 // CleanupDetailsSnapshot returns split cleanup progress for status/reporting.
@@ -616,16 +823,18 @@ func (c *MetricsCollector) CleanupDetailsSnapshot() CleanupDetails {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return CleanupDetails{
-		Count:              c.cleanupCount,
-		Total:              c.cleanupTotal,
-		Failed:             append([]string(nil), c.cleanupFailed...),
-		UnsubscribeCount:   c.cleanupUnsubscribeCount,
-		UnsubscribeTotal:   c.cleanupUnsubscribeTotal,
-		UnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
-		UnsubscribeFailed:  append([]string(nil), c.cleanupUnsubscribeFailed...),
-		UnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
-		UnregisterCount:    c.cleanupUnregisterCount,
-		UnregisterFailed:   append([]string(nil), c.cleanupUnregisterFailed...),
+		Count:                 c.cleanupCount,
+		Total:                 c.cleanupTotal,
+		Failed:                append([]string(nil), c.cleanupFailed...),
+		UnsubscribeCount:      c.cleanupUnsubscribeCount,
+		UnsubscribeTotal:      c.cleanupUnsubscribeTotal,
+		UnsubscribeSkipped:    c.cleanupUnsubscribeSkipped,
+		UnsubscribeTerminated: c.cleanupUnsubscribeTerminated,
+		UnsubscribeFailed:     append([]string(nil), c.cleanupUnsubscribeFailed...),
+		UnsubscribeByEvent:    copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
+		UnregisterCount:       c.cleanupUnregisterCount,
+		UnregisterForced:      c.cleanupUnregisterForced,
+		UnregisterFailed:      append([]string(nil), c.cleanupUnregisterFailed...),
 	}
 }
 
@@ -636,6 +845,9 @@ func (c *MetricsCollector) SetRunning(running bool) {
 	if running {
 		c.runStart = time.Now()
 		c.runStartSet = true
+		if c.hostHealth != nil {
+			c.hostHealth.ResetUDPBaseline()
+		}
 		c.hostHealthSamples = 0
 		c.hostCPUSum = 0
 		c.hostCPUMax = 0
@@ -778,6 +990,12 @@ func (c *MetricsCollector) UpdateCounts(concurrent, sockets, registered, subscri
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) SetSocketCount(sockets int) {
+	c.mu.Lock()
+	c.socketCount = sockets
+	c.mu.Unlock()
+}
+
 // SetRegisterTotal sets the expected total for the live REGISTER progress
 // counter. Called once before RunRegister starts so the GUI knows the
 // denominator for the progress bar.
@@ -786,6 +1004,13 @@ func (c *MetricsCollector) SetRegisterTotal(total int) {
 	c.registeredTotal = total
 	c.registeredCount = 0
 	c.registerFailedDetails = nil
+	c.registerExpiry = RegisterExpirySummary{}
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) SetRegisterExpirySummary(summary RegisterExpirySummary) {
+	c.mu.Lock()
+	c.registerExpiry = summary
 	c.mu.Unlock()
 }
 
@@ -814,6 +1039,13 @@ func (c *MetricsCollector) SetSubscribeEventTotals(events []string, perEventTota
 	}
 }
 
+func (c *MetricsCollector) SetRegSubBackground(active, complete bool) {
+	c.mu.Lock()
+	c.regSubBackgroundActive = active
+	c.regSubComplete = complete
+	c.mu.Unlock()
+}
+
 // IncrementRegistered bumps the live REGISTER progress counter by one. Called
 // from RegisterAll's per-agent goroutine once the agent's REGISTER attempt
 // finishes (regardless of success).
@@ -821,6 +1053,12 @@ func (c *MetricsCollector) IncrementRegistered() {
 	c.mu.Lock()
 	c.registeredCount++
 	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) RegSubCounts() (registered, subscribed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registeredCount, c.subscribedCount
 }
 
 func (c *MetricsCollector) RecordRegisterFailure(ext string, err error) {
@@ -919,6 +1157,15 @@ func (c *MetricsCollector) SetPoolCountsProvider(fn func() (idle, nonIdle, regOn
 	c.mu.Unlock()
 }
 
+// SetRoleCountsProvider sets a callable that returns role-specific ready pool
+// counts. The aggregate idle_count fields remain populated through
+// SetPoolCountsProvider for backward compatibility.
+func (c *MetricsCollector) SetRoleCountsProvider(fn func() (uacIdle, uasIdle, nonIdle, regOnly, uacAssigned, uasAssigned, regSubReady, requiredReady int)) {
+	c.mu.Lock()
+	c.roleCountsProvider = fn
+	c.mu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // Call result ingestion
 // ---------------------------------------------------------------------------
@@ -928,17 +1175,24 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.callResults = append(c.callResults, result)
+	if c.callDetailWriter != nil {
+		select {
+		case c.callDetailWriter.ch <- result:
+		default:
+			c.callDetailDropped++
+		}
+	}
+	c.appendCallResultLocked(result)
 
 	if result.Success {
 		if result.PDDMs > 0 {
-			c.pddSamples = append(c.pddSamples, result.PDDMs)
+			c.pddSamples = appendBoundedFloat(c.pddSamples, result.PDDMs, sampleRetention)
 		}
 		if result.HoldMs > 0 {
-			c.holdSamples = append(c.holdSamples, result.HoldMs)
+			c.holdSamples = appendBoundedFloat(c.holdSamples, result.HoldMs, sampleRetention)
 		}
 		if result.TotalMs > 0 {
-			c.totalSamples = append(c.totalSamples, result.TotalMs)
+			c.totalSamples = appendBoundedFloat(c.totalSamples, result.TotalMs, sampleRetention)
 		}
 	}
 
@@ -953,22 +1207,77 @@ func (c *MetricsCollector) RecordCall(result CallResultData) {
 	// dominant SSRC; calls with no media contribute UNKNOWN to the bucket
 	// histogram but no sample to the average.
 	if result.JitterMs > 0 {
-		c.jitterSamples = append(c.jitterSamples, result.JitterMs)
+		c.jitterSamples = appendBoundedFloat(c.jitterSamples, result.JitterMs, sampleRetention)
 	}
 	if result.MOSScore > 0 {
-		c.mosSamples = append(c.mosSamples, result.MOSScore)
+		c.mosSamples = appendBoundedFloat(c.mosSamples, result.MOSScore, sampleRetention)
 	}
 	if result.PacketLossPct > 0 {
-		c.packetLossSamples = append(c.packetLossSamples, result.PacketLossPct)
+		c.packetLossSamples = appendBoundedFloat(c.packetLossSamples, result.PacketLossPct, sampleRetention)
 	}
 	if result.RTTMs > 0 {
-		c.rttSamples = append(c.rttSamples, result.RTTMs)
+		c.rttSamples = appendBoundedFloat(c.rttSamples, result.RTTMs, sampleRetention)
 	}
 	if result.MediaQualityFlag != "" {
 		if _, ok := c.mediaQualityCounts[result.MediaQualityFlag]; ok {
 			c.mediaQualityCounts[result.MediaQualityFlag]++
 		}
 	}
+	c.totalRTPTxPkts += result.RTPTxPkts
+	c.totalRTPRxPkts += result.RTPRxPkts
+	c.totalRTPRxFromSBC += result.RTPRxFromSBCPkts
+	c.totalRTPExpected += result.RTPExpectedPkts
+	c.totalRTPLostPkts += result.LostPackets
+	c.totalRTPSSRCCount += result.RTPSSRCCount
+	if result.RTPTxPkts > 0 || result.RTPRxPkts > 0 || result.LostPackets > 0 {
+		c.rtpSampleCount++
+	}
+}
+
+func (c *MetricsCollector) appendCallResultLocked(result CallResultData) {
+	c.callResults = append(c.callResults, result)
+	if result.Success {
+		c.successfulResultsKept++
+	} else {
+		c.failedResultsKept++
+	}
+	for c.successfulResultsKept > recentSuccessfulCallRetention || c.failedResultsKept > failedCallRetention {
+		idx := -1
+		if c.successfulResultsKept > recentSuccessfulCallRetention {
+			for i, r := range c.callResults {
+				if r.Success {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				c.successfulResultsKept--
+			}
+		} else {
+			for i, r := range c.callResults {
+				if !r.Success {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				c.failedResultsKept--
+			}
+		}
+		if idx < 0 {
+			return
+		}
+		c.callResults = append(c.callResults[:idx], c.callResults[idx+1:]...)
+	}
+}
+
+func appendBoundedFloat(in []float64, v float64, limit int) []float64 {
+	in = append(in, v)
+	if limit > 0 && len(in) > limit {
+		copy(in, in[len(in)-limit:])
+		in = in[:limit]
+	}
+	return in
 }
 
 // RecordAttempt increments the windowed attempt counter (for CPS calculation).
@@ -1047,6 +1356,64 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+func callResultToDetailMap(r CallResultData) map[string]any {
+	m := map[string]any{
+		"call_id":               r.CallID,
+		"caller":                r.Caller,
+		"callee":                r.Callee,
+		"success":               r.Success,
+		"answered":              r.Answered,
+		"acknowledged":          r.Answered,
+		"failure_reason":        r.FailureReason,
+		"pdd_ms":                r.PDDMs,
+		"hold_ms":               r.HoldMs,
+		"total_ms":              r.TotalMs,
+		"rtp_tx_pkts":           r.RTPTxPkts,
+		"rtp_rx_pkts":           r.RTPRxPkts,
+		"sip_local_ip":          r.SIPLocalIP,
+		"sip_local_port":        r.SIPLocalPort,
+		"media_verified":        r.MediaVerified,
+		"rtp_local_port":        r.RTPLocalPort,
+		"media_security":        r.MediaSecurity,
+		"srtp_crypto_suite":     r.SRTPCryptoSuite,
+		"srtp_decrypt_failures": r.SRTPDecryptFailures,
+		"srtp_auth_failures":    r.SRTPAuthFailures,
+		"srtp_replay_failures":  r.SRTPReplayFailures,
+		"pool_wrap_index":       r.PoolWrapIndex,
+		"peer_ext":              r.PeerExt,
+		"ts_utc":                r.TsUTC,
+		"direction":             r.Direction,
+		"sbc_rtp_relay_ip":      r.SBCRTPRelayIP,
+		"sbc_rtp_relay_port":    r.SBCRTPRelayPort,
+		"rtp_rx_from_sbc_pkts":  r.RTPRxFromSBCPkts,
+		"rtp_rx_other_pkts":     r.RTPRxOtherPkts,
+		"rtcp_rx_pkts":          r.RTCPRxPkts,
+		"rtp_asymmetry_flag":    r.RTPAsymmetryFlag,
+		"markers_sent":          r.MarkersSent,
+		"markers_received":      r.MarkersReceived,
+		"rtp_expected_pkts":     r.RTPExpectedPkts,
+		"rtp_ssrc_count":        r.RTPSSRCCount,
+		"scenario":              r.Scenario,
+		"jitter_ms":             r.JitterMs,
+		"packet_loss_pct":       r.PacketLossPct,
+		"lost_packets":          r.LostPackets,
+		"ooo_packets":           r.OOOPackets,
+		"rtt_ms":                r.RTTMs,
+		"remote_jitter_ms":      r.RemoteJitterMs,
+		"remote_loss_pct":       r.RemoteLossPct,
+		"mos_score":             r.MOSScore,
+		"media_quality_flag":    r.MediaQualityFlag,
+		"call_setup_ms":         r.CallSetupMs,
+		"prack_rtt_ms":          r.PrackRTTMs,
+		"sip_txn_rtt_ms":        r.SipTransactionRTTMs,
+		"bye_completion_ms":     r.ByeCompletionMs,
+	}
+	if len(r.SipMilestones) > 0 {
+		m["sip_milestones"] = r.SipMilestones
+	}
+	return m
 }
 
 // GetCallEvents returns call results in the formatted call-events style (same as GET /api/calls).
@@ -1233,6 +1600,14 @@ func (c *MetricsCollector) GetFinalSummary() map[string]any {
 // Reset clears all accumulated metrics so a new run starts from zero.
 func (c *MetricsCollector) Reset() {
 	c.mu.Lock()
+	writer := c.callDetailWriter
+	c.callDetailWriter = nil
+	c.mu.Unlock()
+	if writer != nil {
+		writer.stop()
+	}
+
+	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.callsAttempted = 0
@@ -1256,22 +1631,38 @@ func (c *MetricsCollector) Reset() {
 	c.registeredCount = 0
 	c.registeredTotal = 0
 	c.registerFailedDetails = nil
+	c.registerExpiry = RegisterExpirySummary{}
 	c.subscribedCount = 0
 	c.subscribedTotal = 0
 	c.subscribeFailedDetails = nil
 	c.subscriptionsByEvent = make(map[string]SubscriptionEventStats)
+	c.regSubBackgroundActive = false
+	c.regSubComplete = false
 	c.prepStatus = "idle"
 	c.phase = "IDLE"
 	c.runStart = time.Time{}
 	c.runStartSet = false
 	c.running = false
 	c.callResults = nil
+	c.successfulResultsKept = 0
+	c.failedResultsKept = 0
 	c.rawEvents = nil
 	c.callSpines = nil
 	c.callMilestones = make(map[string]*callMilestoneState)
+	c.callDetailPath = ""
+	c.callDetailDropped = 0
 	c.concurrentProvider = nil
+	c.poolCountsProvider = nil
+	c.roleCountsProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
 	c.mediaQualityCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}
+	c.totalRTPTxPkts = 0
+	c.totalRTPRxPkts = 0
+	c.totalRTPRxFromSBC = 0
+	c.totalRTPExpected = 0
+	c.totalRTPLostPkts = 0
+	c.totalRTPSSRCCount = 0
+	c.rtpSampleCount = 0
 	c.jitterSamples = nil
 	c.mosSamples = nil
 	c.packetLossSamples = nil
@@ -1291,9 +1682,11 @@ func (c *MetricsCollector) Reset() {
 	c.cleanupUnsubscribeCount = 0
 	c.cleanupUnsubscribeTotal = 0
 	c.cleanupUnsubscribeSkipped = 0
+	c.cleanupUnsubscribeTerminated = 0
 	c.cleanupUnsubscribeFailed = nil
 	c.cleanupUnsubscribeByEvent = make(map[string]SubscriptionEventStats)
 	c.cleanupUnregisterCount = 0
+	c.cleanupUnregisterForced = 0
 	c.cleanupUnregisterFailed = nil
 	c.hostHealthSamples = 0
 	c.hostCPUSum = 0
@@ -1391,6 +1784,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	if c.poolCountsProvider != nil {
 		idleCount, nonIdleCount, regOnlyCount = c.poolCountsProvider()
 	}
+	var uacIdleCount, uasIdleCount, uacAssigned, uasAssigned, regSubReady, requiredReady int
+	if c.roleCountsProvider != nil {
+		uacIdleCount, uasIdleCount, _, _, uacAssigned, uasAssigned, regSubReady, requiredReady = c.roleCountsProvider()
+	}
 	mediaSecurity := "rtp"
 	cryptoSuites := map[string]struct{}{}
 	for _, r := range c.callResults {
@@ -1414,18 +1811,13 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		c.recordHostHealthAggregate(hostHealth)
 	}
 
-	var totalRTPTx, totalRTPRx, totalRTPRxFromSBC, totalRTPExpected, totalRTPLost, totalRTPSSRCCount, rtpSampleCount int
-	for _, r := range c.callResults {
-		totalRTPTx += r.RTPTxPkts
-		totalRTPRx += r.RTPRxPkts
-		totalRTPRxFromSBC += r.RTPRxFromSBCPkts
-		totalRTPExpected += r.RTPExpectedPkts
-		totalRTPLost += r.LostPackets
-		totalRTPSSRCCount += r.RTPSSRCCount
-		if r.RTPTxPkts > 0 || r.RTPRxPkts > 0 || r.LostPackets > 0 {
-			rtpSampleCount++
-		}
-	}
+	totalRTPTx := c.totalRTPTxPkts
+	totalRTPRx := c.totalRTPRxPkts
+	totalRTPRxFromSBC := c.totalRTPRxFromSBC
+	totalRTPExpected := c.totalRTPExpected
+	totalRTPLost := c.totalRTPLostPkts
+	totalRTPSSRCCount := c.totalRTPSSRCCount
+	rtpSampleCount := c.rtpSampleCount
 	avgRTPTx, avgRTPRxFromSBC := 0.0, 0.0
 	if rtpSampleCount > 0 {
 		avgRTPTx = math.Round(float64(totalRTPTx)/float64(rtpSampleCount)*100) / 100
@@ -1457,6 +1849,19 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 			}
 		}
 	}
+	memory := c.memoryDiagnosticsLocked()
+	if c.running && time.Since(c.lastMemoryLog) >= time.Minute {
+		c.lastMemoryLog = time.Now()
+		slog.Info("Memory health",
+			"heap_alloc_mb", memory.HeapAllocBytes/1024/1024,
+			"heap_sys_mb", memory.HeapSysBytes/1024/1024,
+			"sys_mb", memory.SysBytes/1024/1024,
+			"goroutines", memory.Goroutines,
+			"call_results_kept", memory.CallResultsKept,
+			"raw_events_kept", memory.RawEventsKept,
+			"milestones_kept", memory.MilestonesKept,
+			"detail_dropped", c.callDetailDropped)
+	}
 
 	snap := TrafficMetrics{
 		Timestamp:                          float64(time.Now().UnixMilli()) / 1000.0,
@@ -1487,10 +1892,13 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		RegisteredCount:                    c.registeredCount,
 		RegisteredTotal:                    c.registeredTotal,
 		RegisterFailedDetails:              append([]RegisterFailure(nil), c.registerFailedDetails...),
+		RegisterExpiry:                     copyRegisterExpirySummary(c.registerExpiry),
 		SubscribedCount:                    c.subscribedCount,
 		SubscribedTotal:                    c.subscribedTotal,
 		SubscribeFailedDetails:             append([]SubscribeFailure(nil), c.subscribeFailedDetails...),
 		SubscriptionsByEvent:               copySubscriptionEventStats(c.subscriptionsByEvent),
+		RegSubBackgroundActive:             c.regSubBackgroundActive,
+		RegSubComplete:                     c.regSubComplete,
 		PrepStatus:                         c.prepStatus,
 		RunElapsedSec:                      runElapsed,
 		Running:                            c.running,
@@ -1499,17 +1907,25 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 			"WARNING":  c.rtpHealthCounts["WARNING"],
 			"CRITICAL": c.rtpHealthCounts["CRITICAL"],
 		},
-		IdleCount:                 idleCount,
-		NonIdleCount:              nonIdleCount,
-		RegOnlyCount:              regOnlyCount,
-		InviteRetransmits:         c.inviteRetransmits,
-		CleanupCount:              c.cleanupCount,
-		CleanupTotal:              c.cleanupTotal,
-		CleanupUnsubscribeCount:   c.cleanupUnsubscribeCount,
-		CleanupUnsubscribeTotal:   c.cleanupUnsubscribeTotal,
-		CleanupUnsubscribeSkipped: c.cleanupUnsubscribeSkipped,
-		CleanupUnsubscribeByEvent: copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
-		CleanupUnregisterCount:    c.cleanupUnregisterCount,
+		IdleCount:                    idleCount,
+		NonIdleCount:                 nonIdleCount,
+		RegOnlyCount:                 regOnlyCount,
+		UACIdleCount:                 uacIdleCount,
+		UASIdleCount:                 uasIdleCount,
+		UACAssigned:                  uacAssigned,
+		UASAssigned:                  uasAssigned,
+		RegSubReady:                  regSubReady,
+		RequiredReady:                requiredReady,
+		InviteRetransmits:            c.inviteRetransmits,
+		CleanupCount:                 c.cleanupCount,
+		CleanupTotal:                 c.cleanupTotal,
+		CleanupUnsubscribeCount:      c.cleanupUnsubscribeCount,
+		CleanupUnsubscribeTotal:      c.cleanupUnsubscribeTotal,
+		CleanupUnsubscribeSkipped:    c.cleanupUnsubscribeSkipped,
+		CleanupUnsubscribeTerminated: c.cleanupUnsubscribeTerminated,
+		CleanupUnsubscribeByEvent:    copySubscriptionEventStats(c.cleanupUnsubscribeByEvent),
+		CleanupUnregisterCount:       c.cleanupUnregisterCount,
+		CleanupUnregisterForced:      c.cleanupUnregisterForced,
 
 		AvgJitterMs:              roundAvg(c.jitterSamples),
 		AvgMOSScore:              roundAvg(c.mosSamples),
@@ -1553,6 +1969,11 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		HAFailoverEvents:         c.haFailoverEvents,
 		HAFailoverDeferred:       c.haFailoverDeferred,
 		HAEvents:                 append([]HAEvent(nil), c.haEvents...),
+		CallDetailLog:            c.callDetailPath,
+		CallDetailDropped:        c.callDetailDropped,
+		CallResultsKept:          len(c.callResults),
+		CallMilestonesKept:       len(c.callMilestones),
+		Memory:                   memory,
 		MediaQualityCounts: map[string]int{
 			"OK":       c.mediaQualityCounts["OK"],
 			"WARNING":  c.mediaQualityCounts["WARNING"],
@@ -1601,6 +2022,28 @@ func avgFromSum(sum float64, count int) float64 {
 	return sum / float64(count)
 }
 
+func (c *MetricsCollector) memoryDiagnosticsLocked() MemoryDiagnostics {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return MemoryDiagnostics{
+		HeapAllocBytes:  ms.HeapAlloc,
+		HeapSysBytes:    ms.HeapSys,
+		HeapObjects:     ms.HeapObjects,
+		SysBytes:        ms.Sys,
+		NumGC:           ms.NumGC,
+		Goroutines:      runtime.NumGoroutine(),
+		CallResultsKept: len(c.callResults),
+		RawEventsKept:   len(c.rawEvents),
+		MilestonesKept:  len(c.callMilestones),
+	}
+}
+
+func (c *MetricsCollector) MemoryDiagnostics() MemoryDiagnostics {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.memoryDiagnosticsLocked()
+}
+
 func roundAvg(samples []float64) float64 {
 	if len(samples) == 0 {
 		return 0
@@ -1620,6 +2063,12 @@ func copySubscriptionEventStats(in map[string]SubscriptionEventStats) map[string
 	for event, stats := range in {
 		out[event] = stats
 	}
+	return out
+}
+
+func copyRegisterExpirySummary(in RegisterExpirySummary) RegisterExpirySummary {
+	out := in
+	out.Details = append([]RegisterExpiryDetail(nil), in.Details...)
 	return out
 }
 
@@ -2090,6 +2539,10 @@ func BuildMux(
 		writeJSON(w, http.StatusOK, snap)
 	})
 
+	mux.HandleFunc("GET /api/debug/memory", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, collector.MemoryDiagnostics())
+	})
+
 	// WS /metrics/stream
 	mux.HandleFunc("/metrics/stream", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
@@ -2234,13 +2687,13 @@ func BuildMux(
 
 		processCtx.Mu.Lock()
 		if processCtx.State == "COMPLETE" || processCtx.State == "FAILED" {
-			select {
-			case <-processCtx.StopEvent:
-			default:
-			}
-			processCtx.StopEvent = make(chan struct{}, 1)
-			collector.Reset()
-			slog.Info("Auto-reset from previous state to CONFIGURED", "prev", processCtx.State)
+			prev := processCtx.State
+			processCtx.Mu.Unlock()
+			slog.Warn("Config push rejected — previous run requires New Run reset", "state", prev)
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": "Previous run is complete. Click Start New Run before saving or continuing.",
+			})
+			return
 		}
 
 		processCtx.Config = parsedCfg
@@ -2459,6 +2912,71 @@ func BuildMux(
 			"status": "reset",
 			"state":  "IDLE",
 		})
+	})
+
+	// POST /api/run/new — clear run-only state while preserving the current config.
+	// If the lifecycle is waiting at CLEANUP_READY, this first triggers cleanup;
+	// callers should poll until DONE/COMPLETE and invoke this endpoint again to reset.
+	mux.HandleFunc("POST /api/run/new", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		latest := collector.BuildSnapshot()
+		processCtx.Mu.Lock()
+		prevState := processCtx.State
+		hasConfig := processCtx.Config != nil
+		vmid := processCtx.VMID
+		if vmid == "" {
+			vmid = latest.VMID
+		}
+		switch {
+		case latest.Phase == "CLEANUP_READY":
+			select {
+			case processCtx.CleanupStartCh <- struct{}{}:
+			default:
+			}
+			processCtx.Mu.Unlock()
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "cleanup_started", "state": prevState})
+			return
+		case latest.Phase == "CLEANING_UP":
+			processCtx.Mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "Cleanup is in progress. New Run is available after cleanup completes."})
+			return
+		case latest.Phase == "TRAFFIC" || latest.Phase == "STOPPING" || (prevState == "RUNNING" && latest.Phase != "DONE" && latest.Phase != "FAILED"):
+			processCtx.Mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "Traffic lifecycle is still active. Stop/cleanup before starting a new run."})
+			return
+		}
+
+		processCtx.PrePhaseStartCh = make(chan struct{}, 1)
+		processCtx.RegSubStartCh = make(chan struct{}, 1)
+		processCtx.RegSubAbortCh = make(chan struct{}, 1)
+		processCtx.TrafficStartCh = make(chan struct{}, 1)
+		processCtx.RestartTrafficCh = make(chan struct{}, 1)
+		processCtx.CleanupStartCh = make(chan struct{}, 1)
+		processCtx.GracefulStopCh = make(chan struct{}, 1)
+		processCtx.InterruptStopCh = make(chan struct{}, 1)
+		processCtx.StopEvent = make(chan struct{}, 1)
+		processCtx.RunID = ""
+		processCtx.PairID = ""
+		if hasConfig {
+			processCtx.State = "CONFIGURED"
+		} else {
+			processCtx.State = "IDLE"
+		}
+		newState := processCtx.State
+		processCtx.Mu.Unlock()
+
+		collector.Reset()
+		if vmid != "" {
+			collector.mu.Lock()
+			collector.vmID = vmid
+			collector.latest.VMID = vmid
+			collector.mu.Unlock()
+		}
+		slog.Info("New run reset complete", "prev_state", prevState, "state", newState, "preserved_config", hasConfig)
+		writeJSON(w, http.StatusOK, map[string]any{"status": "reset", "state": newState, "preserved_config": hasConfig})
 	})
 
 	// POST /api/shutdown
@@ -2840,19 +3358,21 @@ func BuildMux(
 		details := collector.CleanupDetailsSnapshot()
 		latest := collector.Latest()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"phase":                         latest.Phase,
-			"count":                         details.Count,
-			"total":                         details.Total,
-			"failed_extensions":             details.Failed,
-			"unsubscribe_count":             details.UnsubscribeCount,
-			"unsubscribe_total_expected":    details.UnsubscribeTotal,
-			"unsubscribe_skipped":           details.UnsubscribeSkipped,
-			"unsubscribe_failed_extensions": details.UnsubscribeFailed,
-			"unsubscribe_by_event":          details.UnsubscribeByEvent,
-			"unregister_count":              details.UnregisterCount,
-			"unregister_failed_extensions":  details.UnregisterFailed,
-			"in_progress":                   latest.Phase == "CLEANING_UP",
-			"complete":                      details.Total > 0 && details.Count >= details.Total,
+			"phase":                          latest.Phase,
+			"count":                          details.Count,
+			"total":                          details.Total,
+			"failed_extensions":              details.Failed,
+			"unsubscribe_count":              details.UnsubscribeCount,
+			"unsubscribe_total_expected":     details.UnsubscribeTotal,
+			"unsubscribe_skipped":            details.UnsubscribeSkipped,
+			"unsubscribe_already_terminated": details.UnsubscribeTerminated,
+			"unsubscribe_failed_extensions":  details.UnsubscribeFailed,
+			"unsubscribe_by_event":           details.UnsubscribeByEvent,
+			"unregister_count":               details.UnregisterCount,
+			"unregister_forced":              details.UnregisterForced,
+			"unregister_failed_extensions":   details.UnregisterFailed,
+			"in_progress":                    latest.Phase == "CLEANING_UP",
+			"complete":                       details.Total > 0 && details.Count >= details.Total,
 		})
 	})
 

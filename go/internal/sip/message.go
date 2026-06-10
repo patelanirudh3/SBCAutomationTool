@@ -21,6 +21,15 @@ type sipHeader struct {
 	value string
 }
 
+// SubscriptionStateInfo is the parsed form of a Subscription-State header.
+type SubscriptionStateInfo struct {
+	State      string
+	Expires    int
+	Reason     string
+	RetryAfter int
+	Params     map[string]string
+}
+
 // NewSipMessage creates an empty SipMessage defaulting to a request.
 func NewSipMessage() *SipMessage {
 	return &SipMessage{
@@ -391,6 +400,16 @@ func (m *SipMessage) GetGrantedExpiry() int {
 	return 0
 }
 
+// GetMinExpires reads the Min-Expires header used by 423 Interval Too Brief.
+func (m *SipMessage) GetMinExpires() int {
+	if vals := m.headers[HdrMinExpires]; len(vals) > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(vals[0])); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
 // GetEvent returns the first Event header value, or empty string.
 func (m *SipMessage) GetEvent() string {
 	vals := m.headers[HdrEvent]
@@ -398,6 +417,50 @@ func (m *SipMessage) GetEvent() string {
 		return ""
 	}
 	return vals[0]
+}
+
+// GetSubscriptionState parses the first Subscription-State header.
+func (m *SipMessage) GetSubscriptionState() SubscriptionStateInfo {
+	vals := m.headers[HdrSubscriptionState]
+	if len(vals) == 0 {
+		return SubscriptionStateInfo{}
+	}
+	return ParseSubscriptionState(vals[0])
+}
+
+// ParseSubscriptionState parses RFC 3265/6665 Subscription-State parameters.
+func ParseSubscriptionState(value string) SubscriptionStateInfo {
+	info := SubscriptionStateInfo{Params: make(map[string]string)}
+	parts := strings.Split(value, ";")
+	if len(parts) == 0 {
+		return info
+	}
+	info.State = strings.TrimSpace(strings.ToLower(parts[0]))
+	for _, part := range parts[1:] {
+		key, val, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		val = strings.Trim(strings.TrimSpace(val), `"`)
+		if key == "" {
+			continue
+		}
+		info.Params[key] = val
+		switch key {
+		case "expires":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				info.Expires = n
+			}
+		case "reason":
+			info.Reason = val
+		case "retry-after":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				info.RetryAfter = n
+			}
+		}
+	}
+	return info
 }
 
 // NormalizeHeaderName maps a raw header name to its canonical constant using
@@ -473,6 +536,8 @@ func NormalizeHeaderName(name string) string {
 		return HdrEvent
 	case strings.HasPrefix(lower, "subscription-state"):
 		return HdrSubscriptionState
+	case strings.HasPrefix(lower, "min-expires"):
+		return HdrMinExpires
 	case strings.HasPrefix(lower, "expires"):
 		return HdrExpires
 	case strings.HasPrefix(lower, "user-agent"):

@@ -187,11 +187,15 @@ func runLifecycle(
 		}
 	}()
 
+	collector.StartCallDetailLog(logDir, runID, pairID, cfg.VMID)
+	defer collector.StopCallDetailLog()
+
 	collector.SetPhase("CONNECTING_TRANSPORTS")
 
 	// Create and connect agents
 	agents := createAgents(cfg)
 	agentSlice := agentsToSlice(agents)
+	configuredAgentTotal := len(agents)
 	var secondaryCfg *config.VMConfig
 	var secondaryAgents map[string]*agent.ExtensionAgent
 	var secondaryAgentSlice []*agent.ExtensionAgent
@@ -201,7 +205,8 @@ func runLifecycle(
 	var haMoveMu sync.Mutex
 	primaryDownCh := make(chan string, 1)
 	var primaryRecoveredAt string
-	slog.Info("Connecting transports", "count", len(agents))
+	streamConnectRegSub := pctx != nil && !cfg.DualRegistrationEnabled
+	slog.Info("Connecting transports", "count", len(agents), "streaming_regsub", streamConnectRegSub)
 	if cfg.DualRegistrationEnabled {
 		for _, ag := range agents {
 			ag.SetTransportDownHandler(func(ext string, err error) {
@@ -216,27 +221,31 @@ func runLifecycle(
 		}
 	}
 
-	connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector)
-	if err != nil {
-		slog.Error("Transport connection failed", "err", err)
-		collector.SetPhase("FAILED")
-		if pctx != nil {
-			pctx.Mu.Lock()
-			pctx.State = "FAILED"
-			pctx.Mu.Unlock()
+	if !streamConnectRegSub {
+		connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector)
+		if err != nil {
+			slog.Error("Transport connection failed", "err", err)
+			collector.SetPhase("FAILED")
+			if pctx != nil {
+				pctx.Mu.Lock()
+				pctx.State = "FAILED"
+				pctx.Mu.Unlock()
+			}
+			return 1
 		}
-		return 1
+		if len(connectedAgents) < len(agents) {
+			slog.Warn("Continuing with partial transport connectivity",
+				"configured", len(agents),
+				"connected", len(connectedAgents),
+				"failed", len(agents)-len(connectedAgents),
+			)
+		}
+		agents = connectedAgents
+		agentSlice = agentsToSlice(agents)
+		collector.UpdateCounts(0, len(agents), 0, 0)
+	} else {
+		collector.UpdateCounts(0, 0, 0, 0)
 	}
-	if len(connectedAgents) < len(agents) {
-		slog.Warn("Continuing with partial transport connectivity",
-			"configured", len(agents),
-			"connected", len(connectedAgents),
-			"failed", len(agents)-len(connectedAgents),
-		)
-	}
-	agents = connectedAgents
-	agentSlice = agentsToSlice(agents)
-	collector.UpdateCounts(0, len(agents), 0, 0)
 
 	if cfg.DualRegistrationEnabled {
 		secondaryCopy := *cfg
@@ -274,8 +283,13 @@ func runLifecycle(
 
 	// Create pool engine and wire pool counts provider into the metrics collector
 	pool := engine.NewPoolEngine()
+	requiredReady := requiredTrafficReadyCount(configuredAgentTotal)
 	collector.SetPoolCountsProvider(func() (idle, nonIdle, regOnly int) {
 		return pool.Counts()
+	})
+	collector.SetRoleCountsProvider(func() (uacIdle, uasIdle, nonIdle, regOnly, uacAssigned, uasAssigned, regSubReady, requiredReadyOut int) {
+		counts := pool.RoleCounts()
+		return counts.UACIdle, counts.UASIdle, counts.NonIdle, counts.RegOnly, counts.UACAssigned, counts.UASAssigned, counts.RegSubReady, requiredReady
 	})
 
 	// Create the UAS auto-answer engine (used for all agents in the new single-pool model)
@@ -294,12 +308,24 @@ func runLifecycle(
 	agentAutoAnswerStops := make(map[string]func())
 
 	onIdle := func(ag *agent.ExtensionAgent) {
-		pool.AddToIdle(ag)
-		stop := uasEngine.StartAutoAnswerForAgent(ctx, ag)
-		agentAutoAnswerStopsMu.Lock()
-		agentAutoAnswerStops[ag.Ext] = stop
-		agentAutoAnswerStopsMu.Unlock()
-		slog.Debug("Agent added to idle pool", "ext", ag.Ext)
+		role := pool.AssignRegSubReady(ag)
+		switch role {
+		case engine.RoleUAS:
+			stop, ready := uasEngine.StartAutoAnswerForAgentReady(ctx, ag)
+			select {
+			case <-ready:
+				agentAutoAnswerStopsMu.Lock()
+				agentAutoAnswerStops[ag.Ext] = stop
+				agentAutoAnswerStopsMu.Unlock()
+				pool.AddToUASIdle(ag)
+				slog.Debug("Agent added to UAS idle pool", "ext", ag.Ext)
+			case <-ctx.Done():
+				stop()
+			}
+		case engine.RoleUAC:
+			pool.AddToUACIdle(ag)
+			slog.Debug("Agent added to UAC idle pool", "ext", ag.Ext)
+		}
 	}
 
 	onRegOnly := func(ag *agent.ExtensionAgent) {
@@ -320,6 +346,9 @@ func runLifecycle(
 	if pctx != nil {
 		pctx.Mu.Lock()
 		pctx.OnPrepStart = func() error {
+			if streamConnectRegSub {
+				return fmt.Errorf("prep flush is unavailable before streaming connect/reg/sub starts")
+			}
 			slog.Info("Prep flush starting via API", "ext_count", len(agentSlice))
 			return prephase.RunPrep(ctx, agentSlice, cfg)
 		}
@@ -340,9 +369,14 @@ func runLifecycle(
 		stopRegRefresh          = func() {}
 		stopSubRefresh          = func() {}
 		stopSecondaryRegRefresh = func() {}
+		pipelineMode            bool
 	)
 
 	cleanupAll := func(cleanupCtx context.Context, activeEngine *engine.CallEngine) {
+		stopRegRefresh()
+		stopRegRefresh = func() {}
+		stopSubRefresh()
+		stopSubRefresh = func() {}
 		shutdownCleanup(cleanupCtx, agents, pool, activeEngine, uasEngine, collector, cfg, runID, pairID, logDir, noUnregister)
 		if secondaryAgents != nil && secondaryCfg != nil && !noUnregister {
 			stopSecondaryRegRefresh()
@@ -388,18 +422,98 @@ func runLifecycle(
 			}
 		}()
 
-		// Live REG progress
-		collector.SetRegisterTotal(len(agentSlice))
-		regStart := time.Now()
-		registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
-			ctx, agentSlice, cfg,
-			func() { collector.IncrementRegistered() },
-			stopNew,
-		)
-		slog.Info("REGISTER phase complete",
-			"registered", len(registeredAg),
-			"failed", len(failedRegister),
-			"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
+		if !cfg.DualRegistrationEnabled {
+			pipelineMode = true
+			collector.SetRegisterTotal(len(agentSlice))
+			collector.SetSubscribeTotal(len(agentSlice) * len(cfg.SubscribeEvents))
+			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(agentSlice))
+			collector.SetRegSubBackground(true, false)
+			regSubStart := time.Now()
+			var connectedSoFar atomic.Int32
+			collector.ResetTransportConnect(len(agentSlice))
+			pipeline := prephase.RunConnectRegSubPipeline(
+				ctx, agentSlice, cfg, skipSubscribe,
+				func(progress prephase.ConnectProgress) {
+					if progress.OK {
+						current := int(connectedSoFar.Add(1))
+						collector.RecordTransportConnectSuccess()
+						collector.SetSocketCount(current)
+						return
+					}
+					collector.RecordTransportConnectFailure(progress.Ext, progress.LocalIP, progress.Remote, progress.Err)
+				},
+				func(connected, failed int) {
+					collector.SetSocketCount(connected)
+					collector.FinishTransportConnect()
+					if connected == 0 {
+						slog.Error("Transport connection completed with no connected agents", "configured", len(agentSlice), "failed", failed)
+					} else if failed > 0 {
+						slog.Warn("Transport connection completed with partial success",
+							"configured", len(agentSlice),
+							"connected", connected,
+							"failed", failed)
+					}
+				},
+				func() { collector.IncrementRegistered() },
+				func(event string, ok bool, notifyReceived bool) {
+					collector.RecordSubscriptionEvent(event, ok, notifyReceived)
+				},
+				onIdle, onRegOnly, stopNew,
+			)
+			stopRegRefresh = pipeline.Stop
+			doneCh := pipeline.Done
+			ready := false
+			for !ready && doneCh != nil {
+				select {
+				case res := <-doneCh:
+					doneCh = nil
+					if res != nil {
+						failedRegister = res.FailedRegister
+						failedSubscribe = res.FailedSubscribe
+						registeredAg = append([]*agent.ExtensionAgent(nil), res.RegisteredAgents...)
+						collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
+					}
+					collector.SetRegSubBackground(false, true)
+					ready = trafficReady(pool.RoleCounts(), requiredReady)
+				case <-time.After(500 * time.Millisecond):
+					ready = trafficReady(pool.RoleCounts(), requiredReady)
+				case <-ctx.Done():
+					return 0
+				}
+			}
+			if ready && doneCh != nil {
+				go func() {
+					if res := <-doneCh; res != nil {
+						collector.SetRegisterExpirySummary(buildRegisterExpirySummary(res.RegisteredAgents, cfg))
+						for _, ext := range res.FailedRegister {
+							collector.RecordRegisterFailure(ext, fmt.Errorf("REGISTER failed after retry attempts"))
+						}
+						subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
+						for _, ext := range res.FailedSubscribe {
+							collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
+						}
+					}
+					collector.SetRegSubBackground(false, true)
+					slog.Info("Background Reg/Sub pipeline complete", "elapsed_s", fmt.Sprintf("%.1f", time.Since(regSubStart).Seconds()))
+				}()
+			}
+			slog.Info("REG/SUB pipeline ready gate reached",
+				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regSubStart).Seconds()))
+		} else {
+			// Live REG progress
+			collector.SetRegisterTotal(len(agentSlice))
+			regStart := time.Now()
+			registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
+				ctx, agentSlice, cfg,
+				func() { collector.IncrementRegistered() },
+				stopNew,
+			)
+			slog.Info("REGISTER phase complete",
+				"registered", len(registeredAg),
+				"failed", len(failedRegister),
+				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
+			collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
+		}
 
 		if cfg.DualRegistrationEnabled && len(secondaryAgentSlice) > 0 {
 			secondaryRegStart := time.Now()
@@ -417,7 +531,7 @@ func runLifecycle(
 		}
 
 		// Live SUB progress (only if any agent registered)
-		if len(registeredAg) > 0 {
+		if cfg.DualRegistrationEnabled && len(registeredAg) > 0 {
 			collector.SetSubscribeTotal(len(registeredAg) * len(cfg.SubscribeEvents))
 			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(registeredAg))
 			subStart := time.Now()
@@ -436,7 +550,7 @@ func runLifecycle(
 			if cfg.DualRegistrationEnabled {
 				collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), len(registeredAg)-len(failedSubscribe), 0)
 			}
-		} else {
+		} else if cfg.DualRegistrationEnabled {
 			slog.Error("REG/SUB: no extensions registered — skipping SUBSCRIBE")
 		}
 	} else {
@@ -458,6 +572,9 @@ func runLifecycle(
 	for _, ext := range failedRegister {
 		collector.RecordRegisterFailure(ext, fmt.Errorf("REGISTER failed after retry attempts"))
 	}
+	if !pipelineMode {
+		collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
+	}
 	subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
 	for _, ext := range failedSubscribe {
 		collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
@@ -474,8 +591,11 @@ func runLifecycle(
 	}
 	subscribed := registered - len(failedSubscribe)
 	activeSubscribedAg = agentsExceptExts(registeredAg, failedSubscribe)
-
-	collector.UpdateCounts(0, len(agents), registered, subscribed)
+	if pipelineMode {
+		registered, subscribed = collector.RegSubCounts()
+	} else {
+		collector.UpdateCounts(0, len(agents), registered, subscribed)
+	}
 	if cfg.DualRegistrationEnabled {
 		collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(activeSubscribedAg), 0)
 		protected, degraded, notUsable := haReadinessCounts(activeSubscribedAg, secondaryRegisteredAg, len(agents))
@@ -490,10 +610,15 @@ func runLifecycle(
 		"failed_sub", len(failedSubscribe),
 	)
 
-	readyIdle, _, regOnly := pool.Counts()
-	if readyIdle < 2 {
+	roleCounts := pool.RoleCounts()
+	readyIdle := roleCounts.UACIdle + roleCounts.UASIdle
+	regOnly := roleCounts.RegOnly
+	if !trafficReady(roleCounts, requiredReady) {
 		slog.Error("REG/SUB complete but not enough fully subscribed agents are ready for traffic",
 			"ready_idle", readyIdle,
+			"uac_idle", roleCounts.UACIdle,
+			"uas_idle", roleCounts.UASIdle,
+			"required_ready", requiredReady,
 			"reg_only", regOnly,
 			"registered", registered,
 			"subscribed", subscribed,
@@ -554,16 +679,22 @@ func runLifecycle(
 				}
 				activeController = "secondary"
 				activeSubscribedAg = movedAgents
-				pool.ReplaceIdle(movedAgents)
 				agentAutoAnswerStopsMu.Lock()
 				for _, stop := range agentAutoAnswerStops {
 					stop()
 				}
 				agentAutoAnswerStops = make(map[string]func())
 				for _, ag := range movedAgents {
-					agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
+					stop, ready := uasEngine.StartAutoAnswerForAgentReady(ctx, ag)
+					select {
+					case <-ready:
+						agentAutoAnswerStops[ag.Ext] = stop
+					case <-ctx.Done():
+						stop()
+					}
 				}
 				agentAutoAnswerStopsMu.Unlock()
+				pool.ReplaceIdle(movedAgents)
 				collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), 0, len(movedAgents))
 				protected, degraded, notUsable := haReadinessCounts(movedAgents, registeredAg, len(agents))
 				collector.SetHAReadiness(protected, degraded, notUsable)
@@ -583,16 +714,22 @@ func runLifecycle(
 			activeController = "primary"
 			activeSubscribedAg = movedAgents
 			primaryRecoveredAt = ""
-			pool.ReplaceIdle(movedAgents)
 			agentAutoAnswerStopsMu.Lock()
 			for _, stop := range agentAutoAnswerStops {
 				stop()
 			}
 			agentAutoAnswerStops = make(map[string]func())
 			for _, ag := range movedAgents {
-				agentAutoAnswerStops[ag.Ext] = uasEngine.StartAutoAnswerForAgent(ctx, ag)
+				stop, ready := uasEngine.StartAutoAnswerForAgentReady(ctx, ag)
+				select {
+				case <-ready:
+					agentAutoAnswerStops[ag.Ext] = stop
+				case <-ctx.Done():
+					stop()
+				}
 			}
 			agentAutoAnswerStopsMu.Unlock()
+			pool.ReplaceIdle(movedAgents)
 			collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(movedAgents), 0)
 			protected, degraded, notUsable := haReadinessCounts(movedAgents, secondaryRegisteredAg, len(agents))
 			collector.SetHAReadiness(protected, degraded, notUsable)
@@ -668,8 +805,13 @@ func runLifecycle(
 
 	// ── Wait for "Start Traffic" gate (GUI mode) ─────────────────────────────
 	collector.SetPhase("REGSUB_DONE")
-	idle, _, _ := pool.Counts()
-	slog.Info("REGSUB_DONE — waiting for Start Traffic signal", "idle_agents", idle)
+	roleCounts = pool.RoleCounts()
+	idle := roleCounts.UACIdle + roleCounts.UASIdle
+	slog.Info("REGSUB_DONE — waiting for Start Traffic signal",
+		"idle_agents", idle,
+		"uac_idle", roleCounts.UACIdle,
+		"uas_idle", roleCounts.UASIdle,
+		"required_ready", requiredReady)
 
 	if pctx != nil {
 		// GUI mode: block until either traffic is started or a stop is requested
@@ -737,7 +879,7 @@ trafficLoop:
 			"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
 			"max_concurrent", cfg.EffectiveMaxConcurrent(),
 			"ramp_s", cfg.RampUpSeconds, "max_calls", maxCalls,
-			"idle_agents", idle,
+			"idle_agents", func() int { c := pool.RoleCounts(); return c.UACIdle + c.UASIdle }(),
 		)
 
 		engineDone := make(chan error, 1)
@@ -844,6 +986,9 @@ trafficLoop:
 	)
 	slog.Info("============================================================")
 
+	// Flush the bounded-memory call detail stream before publishing final
+	// reports or DONE, so disk-backed details are complete when the GUI reads.
+	collector.StopCallDetailLog()
 	writeRunJSON(collector, cfg, runID, pairID, logDir)
 
 	collector.SetPhase("DONE")
@@ -927,9 +1072,6 @@ func shutdownCleanup(
 		} else {
 			cleanupAgents = agentsToSlice(agents)
 		}
-		batchSize := cleanupBatchSize(cfg)
-		batches := cleanupBatchCount(len(cleanupAgents), batchSize)
-
 		// Seed the cleanup-status counters now that we know the agent set.
 		// Phase was already flipped to CLEANING_UP at the top of this fn.
 		collector.ResetCleanup(len(cleanupAgents))
@@ -937,32 +1079,11 @@ func shutdownCleanup(
 
 		slog.Info("Cleaning up extensions",
 			"count", len(cleanupAgents),
-			"batch_size", batchSize,
-			"batches", batches,
+			"unsubscribe_rate_per_sec", cleanupUnsubscribeRate(cfg),
+			"unregister_rate_per_sec", cleanupUnregisterRate(cfg),
+			"audit_timeout_min", cleanupAuditTimeoutMinutes(cfg),
 		)
-
-		runCleanupBatches(ctx, cleanupAgents, batchSize, "unsubscribe", func(a *agent.ExtensionAgent) {
-			unsubSkipped := !a.NeedsUnsubscribe()
-			unsubOK := true
-			if unsubSkipped {
-				slog.Debug("Unsubscribe skipped", "ext", a.Ext, "event", a.SubscriptionEvent())
-			} else {
-				unsubErr := cleanupUnsubscribeWithRetry(ctx, a, cfg, collector)
-				unsubOK = unsubErr == nil
-				if unsubErr != nil {
-					slog.Debug("Unsubscribe error", "ext", a.Ext, "event", a.SubscriptionEvent(), "err", unsubErr)
-				}
-			}
-			collector.IncrementCleanupUnsubscribe(a.Ext, unsubSkipped, unsubOK)
-		})
-
-		runCleanupBatches(ctx, cleanupAgents, batchSize, "unregister", func(a *agent.ExtensionAgent) {
-			unregErr := cleanupUnregisterWithRetry(ctx, a, cfg)
-			if unregErr != nil {
-				slog.Debug("Unregister error", "ext", a.Ext, "err", unregErr)
-			}
-			collector.IncrementCleanupUnregister(a.Ext, unregErr == nil)
-		})
+		runCleanupPipeline(ctx, cleanupAgents, cfg, collector)
 	} else {
 		slog.Info("--no-unregister: skipping unregistration")
 	}
@@ -1007,6 +1128,212 @@ func cleanupBatchCount(total, batchSize int) int {
 		batchSize = 10
 	}
 	return (total + batchSize - 1) / batchSize
+}
+
+func cleanupUnsubscribeRate(cfg *config.VMConfig) int {
+	if cfg.CleanupUnsubscribeRate > 0 {
+		return cfg.CleanupUnsubscribeRate
+	}
+	if cfg.CleanupBatchSize > 0 {
+		return cfg.CleanupBatchSize
+	}
+	return 20
+}
+
+func cleanupUnregisterRate(cfg *config.VMConfig) int {
+	if cfg.CleanupUnregisterRate > 0 {
+		return cfg.CleanupUnregisterRate
+	}
+	if cfg.CleanupBatchSize > 0 {
+		return cfg.CleanupBatchSize
+	}
+	return 20
+}
+
+func cleanupAuditTimeoutMinutes(cfg *config.VMConfig) int {
+	if cfg.CleanupAuditTimeoutMinutes > 0 {
+		return cfg.CleanupAuditTimeoutMinutes
+	}
+	return 30
+}
+
+type cleanupUnregisterJob struct {
+	agent  *agent.ExtensionAgent
+	forced bool
+	reason string
+}
+
+func runCleanupPipeline(ctx context.Context, agents []*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) {
+	unsubRate := cleanupUnsubscribeRate(cfg)
+	unregRate := cleanupUnregisterRate(cfg)
+	if unsubRate <= 0 {
+		unsubRate = 20
+	}
+	if unregRate <= 0 {
+		unregRate = 20
+	}
+
+	unsubCtx, cancelUnsub := context.WithCancel(ctx)
+	defer cancelUnsub()
+
+	unsubscribeQueue := make(chan *agent.ExtensionAgent, unsubRate*2)
+	unregisterQueue := make(chan cleanupUnregisterJob, unregRate*2)
+	unsubTicker := cleanupRateTicker(unsubRate)
+	defer unsubTicker.Stop()
+	unregTicker := cleanupRateTicker(unregRate)
+	defer unregTicker.Stop()
+
+	var stateMu sync.Mutex
+	queuedUnregister := make(map[string]bool, len(agents))
+	doneUnregister := make(map[string]bool, len(agents))
+
+	queueUnregister := func(ag *agent.ExtensionAgent, forced bool, reason string) {
+		if ag == nil {
+			return
+		}
+		stateMu.Lock()
+		if queuedUnregister[ag.Ext] || doneUnregister[ag.Ext] {
+			stateMu.Unlock()
+			return
+		}
+		queuedUnregister[ag.Ext] = true
+		stateMu.Unlock()
+
+		if forced {
+			slog.Warn("Cleanup audit forcing unregister", "ext", ag.Ext, "reason", reason)
+		} else {
+			slog.Debug("Cleanup unsubscribe complete; queued unregister", "ext", ag.Ext)
+		}
+		select {
+		case unregisterQueue <- cleanupUnregisterJob{agent: ag, forced: forced, reason: reason}:
+		case <-ctx.Done():
+		}
+	}
+
+	var unregWG sync.WaitGroup
+	for i := 0; i < unregRate; i++ {
+		unregWG.Add(1)
+		go func() {
+			defer unregWG.Done()
+			for job := range unregisterQueue {
+				select {
+				case <-unregTicker.C:
+				case <-ctx.Done():
+					return
+				}
+				unregErr := cleanupUnregisterWithRetry(ctx, job.agent, cfg)
+				ok := unregErr == nil
+				if unregErr != nil {
+					slog.Debug("Unregister error", "ext", job.agent.Ext, "forced", job.forced, "err", unregErr)
+				}
+				collector.IncrementCleanupUnregisterWithForce(job.agent.Ext, ok, job.forced)
+				stateMu.Lock()
+				doneUnregister[job.agent.Ext] = true
+				stateMu.Unlock()
+			}
+		}()
+	}
+
+	var unsubWG sync.WaitGroup
+	for i := 0; i < unsubRate; i++ {
+		unsubWG.Add(1)
+		go func() {
+			defer unsubWG.Done()
+			for ag := range unsubscribeQueue {
+				select {
+				case <-unsubTicker.C:
+				case <-unsubCtx.Done():
+					return
+				}
+				terminatedEvents := ag.TerminatedSubscriptionEvents()
+				if len(terminatedEvents) > 0 {
+					collector.IncrementCleanupUnsubscribeAlreadyTerminated(len(terminatedEvents))
+					for _, event := range terminatedEvents {
+						collector.RecordCleanupUnsubscribeEvent(event, true)
+					}
+					slog.Debug("Unsubscribe already terminated", "ext", ag.Ext, "events", strings.Join(terminatedEvents, ","))
+				}
+				unsubSkipped := !ag.NeedsUnsubscribe()
+				unsubOK := true
+				if unsubSkipped {
+					slog.Debug("Unsubscribe skipped", "ext", ag.Ext, "event", ag.SubscriptionEvent())
+				} else {
+					unsubErr := cleanupUnsubscribeWithRetry(unsubCtx, ag, cfg, collector)
+					unsubOK = unsubErr == nil
+					if unsubErr != nil {
+						slog.Debug("Unsubscribe error", "ext", ag.Ext, "event", ag.SubscriptionEvent(), "err", unsubErr)
+					}
+				}
+				collector.IncrementCleanupUnsubscribe(ag.Ext, unsubSkipped, unsubOK)
+				if unsubOK {
+					queueUnregister(ag, false, "")
+				} else {
+					slog.Warn("Cleanup unsubscribe incomplete; withholding unregister until audit timeout", "ext", ag.Ext)
+				}
+			}
+		}()
+	}
+
+	auditTimer := time.NewTimer(time.Duration(cleanupAuditTimeoutMinutes(cfg)) * time.Minute)
+	defer auditTimer.Stop()
+	auditCh := auditTimer.C
+	auditTimedOut := false
+	unsubDone := make(chan struct{})
+	go func() {
+		unsubWG.Wait()
+		close(unsubDone)
+	}()
+
+producer:
+	for _, ag := range agents {
+		select {
+		case unsubscribeQueue <- ag:
+		case <-auditCh:
+			auditTimedOut = true
+			auditCh = nil
+			cancelUnsub()
+			slog.Warn("Cleanup audit timeout reached while queueing unsubscribe work; forcing unregister for incomplete agents", "timeout_min", cleanupAuditTimeoutMinutes(cfg))
+			break producer
+		case <-ctx.Done():
+			break producer
+		}
+	}
+	close(unsubscribeQueue)
+
+	if !auditTimedOut {
+		select {
+		case <-unsubDone:
+		case <-auditCh:
+			auditTimedOut = true
+			cancelUnsub()
+			slog.Warn("Cleanup audit timeout reached; forcing unregister for incomplete agents", "timeout_min", cleanupAuditTimeoutMinutes(cfg))
+			<-unsubDone
+		case <-ctx.Done():
+			cancelUnsub()
+			<-unsubDone
+		}
+	} else {
+		<-unsubDone
+	}
+
+	if auditTimedOut {
+		for _, ag := range agents {
+			queueUnregister(ag, true, "audit_timeout")
+		}
+	}
+	close(unregisterQueue)
+	unregWG.Wait()
+}
+
+func cleanupRateTicker(ratePerSec int) *time.Ticker {
+	if ratePerSec <= 0 {
+		ratePerSec = 1
+	}
+	interval := time.Second / time.Duration(ratePerSec)
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	return time.NewTicker(interval)
 }
 
 func batchMinExt(batch []*agent.ExtensionAgent) string {
@@ -1124,6 +1451,11 @@ func cleanupUnsubscribeTotal(agents []*agent.ExtensionAgent, cfg *config.VMConfi
 				total++
 			}
 		}
+		for _, event := range ag.TerminatedSubscriptionEvents() {
+			if cfg.ShouldUnsubscribeSubscribeEvent(event) {
+				total++
+			}
+		}
 	}
 	return total
 }
@@ -1198,6 +1530,23 @@ func agentsExceptExts(agents []*agent.ExtensionAgent, failed []string) []*agent.
 		}
 	}
 	return out
+}
+
+func requiredTrafficReadyCount(configuredTotal int) int {
+	if configuredTotal <= 0 {
+		return 2
+	}
+	required := int(math.Ceil(float64(configuredTotal) * 0.25))
+	if required < 2 {
+		return 2
+	}
+	return required
+}
+
+func trafficReady(counts engine.PoolRoleCounts, requiredReady int) bool {
+	return counts.UACIdle >= 1 &&
+		counts.UASIdle >= 1 &&
+		counts.UACIdle+counts.UASIdle >= requiredReady
 }
 
 func countConnectedAgents(activeAgents, candidateAgents []*agent.ExtensionAgent) int {
@@ -1316,28 +1665,30 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 
 	cleanupDetails := collector.CleanupDetailsSnapshot()
 	cleanup := map[string]any{
-		"count":                         cleanupDetails.Count,
-		"total":                         cleanupDetails.Total,
-		"failed_extensions":             cleanupDetails.Failed,
-		"unsubscribe_count":             cleanupDetails.UnsubscribeCount,
-		"unsubscribe_total_expected":    cleanupDetails.UnsubscribeTotal,
-		"unsubscribe_skipped":           cleanupDetails.UnsubscribeSkipped,
-		"unsubscribe_failed_extensions": cleanupDetails.UnsubscribeFailed,
-		"unregister_count":              cleanupDetails.UnregisterCount,
-		"unregister_failed_extensions":  cleanupDetails.UnregisterFailed,
+		"count":                          cleanupDetails.Count,
+		"total":                          cleanupDetails.Total,
+		"failed_extensions":              cleanupDetails.Failed,
+		"unsubscribe_count":              cleanupDetails.UnsubscribeCount,
+		"unsubscribe_total_expected":     cleanupDetails.UnsubscribeTotal,
+		"unsubscribe_skipped":            cleanupDetails.UnsubscribeSkipped,
+		"unsubscribe_already_terminated": cleanupDetails.UnsubscribeTerminated,
+		"unsubscribe_failed_extensions":  cleanupDetails.UnsubscribeFailed,
+		"unregister_count":               cleanupDetails.UnregisterCount,
+		"unregister_failed_extensions":   cleanupDetails.UnregisterFailed,
 	}
 
 	output := map[string]any{
-		"generated_at":  time.Now().UTC().Format(time.RFC3339Nano),
-		"run_id":        runID,
-		"pair_id":       pairID,
-		"vm_id":         cfg.VMID,
-		"aggregate":     aggregate,
-		"final_metrics": snap,
-		"config":        cfgMap,
-		"call_events":   callEvents,
-		"call_spines":   callSpines,
-		"cleanup":       cleanup,
+		"generated_at":    time.Now().UTC().Format(time.RFC3339Nano),
+		"run_id":          runID,
+		"pair_id":         pairID,
+		"vm_id":           cfg.VMID,
+		"aggregate":       aggregate,
+		"final_metrics":   snap,
+		"config":          cfgMap,
+		"call_events":     callEvents,
+		"call_spines":     callSpines,
+		"call_detail_log": collector.CallDetailLogPath(),
+		"cleanup":         cleanup,
 	}
 
 	data, err := json.MarshalIndent(output, "", "  ")
@@ -1386,12 +1737,15 @@ func writeTrafficSummary(
 		}
 	}
 
-	var mediaVerified, mediaTotal int
-	for _, r := range results {
-		if r.Success {
-			mediaTotal++
-			if r.MediaVerified {
-				mediaVerified++
+	mediaVerified := snap.MediaQualityCounts["OK"]
+	mediaTotal := snap.MediaQualityCounts["OK"] + snap.MediaQualityCounts["WARNING"] + snap.MediaQualityCounts["CRITICAL"]
+	if mediaTotal == 0 {
+		for _, r := range results {
+			if r.Success {
+				mediaTotal++
+				if r.MediaVerified {
+					mediaVerified++
+				}
 			}
 		}
 	}
@@ -1454,7 +1808,7 @@ func writeTrafficSummary(
 			lines = append(lines, fmt.Sprintf("  %s -> %s: port %d", rp.caller, rp.callee, rp.port))
 		}
 		if len(rtpPorts) > limit {
-			lines = append(lines, fmt.Sprintf("  ... and %d more", len(rtpPorts)-limit))
+			lines = append(lines, fmt.Sprintf("  ... and %d more retained samples (full call detail in %s)", len(rtpPorts)-limit, collector.CallDetailLogPath()))
 		}
 	} else {
 		lines = append(lines, "  (none recorded)")
@@ -1532,11 +1886,13 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 		batchSize = 10
 	}
 	batchDelay := cfg.BatchDelay()
+	connectTimeout := transportConnectTimeout(cfg)
 
 	slog.Info("Connecting transports in batches",
 		"total", total,
 		"batch_size", batchSize,
 		"batch_delay_ms", batchDelay.Milliseconds(),
+		"connect_timeout_ms", connectTimeout.Milliseconds(),
 	)
 
 	for batchStart := 0; batchStart < total; batchStart += batchSize {
@@ -1559,7 +1915,9 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 			wg.Add(1)
 			go func(a *agent.ExtensionAgent) {
 				defer wg.Done()
-				if err := a.Start(ctx); err != nil {
+				connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+				defer cancel()
+				if err := a.Start(connectCtx); err != nil {
 					mu.Lock()
 					batchFailures++
 					mu.Unlock()
@@ -1609,6 +1967,86 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 		)
 	}
 	return connected, nil
+}
+
+func transportConnectTimeout(cfg *config.VMConfig) time.Duration {
+	timeoutSeconds := cfg.ConnectTimeout
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1
+	}
+	return time.Duration(timeoutSeconds) * time.Second
+}
+
+func buildRegisterExpirySummary(agents []*agent.ExtensionAgent, cfg *config.VMConfig) metrics.RegisterExpirySummary {
+	requested := cfg.RegisterExpires
+	if requested <= 0 {
+		requested = 3600
+	}
+	summary := metrics.RegisterExpirySummary{
+		RequestedExpires:   requested,
+		DetailsSampleLimit: 100,
+	}
+	if len(agents) == 0 {
+		return summary
+	}
+
+	const sampleLimit = 100
+	var grantedSum, refreshSum int
+	for _, ag := range agents {
+		granted := ag.GrantedRegisterExpiry()
+		if granted <= 0 {
+			granted = requested
+		}
+		refresh := granted / 2
+		if refresh < 1 {
+			refresh = 1
+		}
+		if summary.GrantedMin == 0 || granted < summary.GrantedMin {
+			summary.GrantedMin = granted
+		}
+		if granted > summary.GrantedMax {
+			summary.GrantedMax = granted
+		}
+		if summary.RefreshMin == 0 || refresh < summary.RefreshMin {
+			summary.RefreshMin = refresh
+		}
+		if refresh > summary.RefreshMax {
+			summary.RefreshMax = refresh
+		}
+		grantedSum += granted
+		refreshSum += refresh
+
+		warning := ""
+		if granted < requested {
+			summary.WarningCount++
+			if granted <= requested/2 {
+				warning = "server granted less than half requested expiry"
+			} else {
+				warning = "server granted less than requested expiry"
+			}
+		}
+		if len(summary.Details) < sampleLimit {
+			summary.Details = append(summary.Details, metrics.RegisterExpiryDetail{
+				Ext:              ag.Ext,
+				RequestedExpires: requested,
+				GrantedExpires:   granted,
+				RefreshInSeconds: refresh,
+				Warning:          warning,
+			})
+		}
+	}
+	summary.GrantedAvg = math.Round((float64(grantedSum)/float64(len(agents)))*100) / 100
+	summary.RefreshAvg = math.Round((float64(refreshSum)/float64(len(agents)))*100) / 100
+	if summary.WarningCount > 0 {
+		slog.Warn("Server granted lower REGISTER expiry than requested",
+			"requested_exp", summary.RequestedExpires,
+			"affected", summary.WarningCount,
+			"agents", len(agents),
+			"granted_min", summary.GrantedMin,
+			"granted_avg", summary.GrantedAvg,
+			"refresh_min_s", summary.RefreshMin)
+	}
+	return summary
 }
 
 func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
@@ -1722,6 +2160,8 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 			}
 		}()
 
+		drainProcessSignals(pctx)
+
 		lifecycleRunning.Lock()
 		exitCode := runLifecycle(cfg, false, maxCalls, false, false, 0, runID, pairID, "logs", collector, stopCtx, pctx, &stopNew)
 		lifecycleRunning.Unlock()
@@ -1810,6 +2250,30 @@ func runAPIOnly(port int, logLevel string, guiDrainSeconds int) int {
 	close(stopCh)
 	slog.Info("API-only shutdown complete")
 	return 0
+}
+
+func drainProcessSignals(pctx *metrics.ProcessContext) {
+	if pctx == nil {
+		return
+	}
+	drainSignal(pctx.PrePhaseStartCh)
+	drainSignal(pctx.RegSubStartCh)
+	drainSignal(pctx.RegSubAbortCh)
+	drainSignal(pctx.TrafficStartCh)
+	drainSignal(pctx.RestartTrafficCh)
+	drainSignal(pctx.CleanupStartCh)
+	drainSignal(pctx.GracefulStopCh)
+	drainSignal(pctx.InterruptStopCh)
+}
+
+func drainSignal(ch chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 func callResultToMetrics(r engine.CallResult) metrics.CallResultData {

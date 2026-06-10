@@ -60,14 +60,21 @@ func batchMaxExt(batch []*agent.ExtensionAgent) string {
 
 // PrePhaseResult holds success/failure counts from the pre-phase pipeline.
 type PrePhaseResult struct {
-	Total           int
-	Registered      int
-	Subscribed      int
-	IdleCount       int // reg + sub OK
-	RegOnlyCount    int // reg OK, sub failed
-	FailedRegister  []string
-	FailedSubscribe []string
-	DurationSeconds float64
+	Total            int
+	Registered       int
+	Subscribed       int
+	IdleCount        int // reg + sub OK
+	RegOnlyCount     int // reg OK, sub failed
+	FailedRegister   []string
+	FailedSubscribe  []string
+	RegisteredAgents []*agent.ExtensionAgent
+	DurationSeconds  float64
+}
+
+type PipelineHandle struct {
+	Done   <-chan *PrePhaseResult
+	Stop   func()
+	Result func() *PrePhaseResult
 }
 
 // RegisterSuccessRate returns the percentage of extensions that registered
@@ -375,121 +382,281 @@ func subscribeOne(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMC
 	return false
 }
 
-// StartRegisterRefreshLoop starts a background goroutine that re-registers all
-// agents at half the register_expires interval, preventing SBC registration
-// bindings from expiring during long test runs. The returned stop function must
-// be called (e.g. via defer) to cleanly terminate the loop.
+// StartRegisterRefreshLoop starts one refresh worker per registered agent.
+// Each worker uses the server-granted REGISTER expiry from that agent's latest
+// 200 OK and refreshes at granted_exp * 0.5. The interval is recalculated after
+// each successful refresh because the registrar can grant a different expiry
+// on every REGISTER transaction.
 func StartRegisterRefreshLoop(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 ) func() {
-	expires := cfg.RegisterExpires
-	if expires <= 0 {
-		expires = 3600
-	}
-	interval := time.Duration(expires/2) * time.Second
-
 	concurrency := cfg.RegisterBatchSize
 	if concurrency <= 0 {
 		concurrency = 10
 	}
 
 	stopCh := make(chan struct{})
+	sem := make(chan struct{}, concurrency)
+	var stopOnce sync.Once
 
-	go func() {
-		slog.Info("Register refresh loop started",
-			"interval_s", interval.Seconds(), "register_expires", expires)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopCh:
-				slog.Info("Register refresh loop stopped")
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				slog.Debug("Register refresh: firing", "agents", len(agents))
-				sem := make(chan struct{}, concurrency)
-				var wg sync.WaitGroup
-				wg.Add(len(agents))
-				for _, ag := range agents {
-					go func(a *agent.ExtensionAgent) {
-						defer wg.Done()
-						sem <- struct{}{}
-						defer func() { <-sem }()
-						rCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.RegisterTimeout)*time.Second)
-						defer cancel()
-						if err := a.Reregister(rCtx); err != nil {
-							slog.Warn("Reregister failed", "ext", a.Ext, "err", err)
-						}
-					}(ag)
-				}
-				wg.Wait()
-				slog.Debug("Register refresh: complete", "agents", len(agents))
-			}
-		}
-	}()
+	slog.Info("Register refresh loop started",
+		"agents", len(agents),
+		"strategy", "per_agent_granted_exp_half",
+		"configured_register_expires", cfg.RegisterExpires,
+		"concurrency", concurrency)
 
-	return func() { close(stopCh) }
+	for _, ag := range agents {
+		go runAgentRegisterRefresh(ctx, stopCh, sem, ag, cfg)
+	}
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			slog.Info("Register refresh loop stopped")
+		})
+	}
 }
 
-// StartSubscribeRefreshLoop starts a background goroutine that re-subscribes
-// all agents at half the subscribe_expires interval, keeping SBC subscription
-// state alive for the duration of the run. The returned stop function must be
-// called (e.g. via defer) to cleanly terminate the loop.
+func runAgentRegisterRefresh(ctx context.Context, stopCh <-chan struct{}, sem chan struct{}, ag *agent.ExtensionAgent, cfg *config.VMConfig) {
+	for {
+		granted := ag.GrantedRegisterExpiry()
+		interval := registerRefreshInterval(granted, cfg)
+		slog.Debug("Register refresh scheduled",
+			"ext", ag.Ext,
+			"granted_exp", granted,
+			"refresh_in_s", int(interval.Seconds()))
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-stopCh:
+			timer.Stop()
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+
+		timeout := time.Duration(cfg.RegisterTimeout) * time.Second
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		rCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := ag.Reregister(rCtx)
+		cancel()
+		<-sem
+
+		if err != nil {
+			ag.MarkRegistrationUncertain(err)
+			slog.Warn("Reregister failed",
+				"ext", ag.Ext,
+				"granted_exp", granted,
+				"err", err)
+			retryRegisterRefreshUntilUsable(ctx, stopCh, sem, ag, cfg, err)
+			continue
+		}
+		slog.Debug("Reregister refreshed",
+			"ext", ag.Ext,
+			"granted_exp", ag.GrantedRegisterExpiry())
+	}
+}
+
+func retryRegisterRefreshUntilUsable(ctx context.Context, stopCh <-chan struct{}, sem chan struct{}, ag *agent.ExtensionAgent, cfg *config.VMConfig, firstErr error) {
+	backoffs := []time.Duration{
+		100 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		32 * time.Second,
+	}
+	lastErr := firstErr
+	for attempt := 1; ; attempt++ {
+		delay := backoffs[len(backoffs)-1]
+		if attempt <= len(backoffs) {
+			delay = backoffs[attempt-1]
+		}
+		slog.Warn("REGISTER refresh retry scheduled",
+			"ext", ag.Ext,
+			"attempt", attempt,
+			"retry_in_ms", delay.Milliseconds(),
+			"last_err", lastErr)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-stopCh:
+			timer.Stop()
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		if !ag.IsTransportConnected() {
+			lastErr = fmt.Errorf("transport not connected")
+			ag.MarkRegistrationUncertain(lastErr)
+			continue
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+
+		timeout := time.Duration(cfg.RegisterTimeout) * time.Second
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		rCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := ag.Reregister(rCtx)
+		cancel()
+		<-sem
+
+		if err == nil {
+			slog.Info("REGISTER refresh recovered",
+				"ext", ag.Ext,
+				"attempt", attempt,
+				"granted_exp", ag.GrantedRegisterExpiry())
+			return
+		}
+		lastErr = err
+		ag.MarkRegistrationUncertain(err)
+	}
+}
+
+func registerRefreshInterval(granted int, cfg *config.VMConfig) time.Duration {
+	expires := granted
+	if expires <= 0 {
+		expires = cfg.RegisterExpires
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	interval := time.Duration(expires) * time.Second / 2
+	if interval < time.Second {
+		return time.Second
+	}
+	return interval
+}
+
+// StartSubscribeRefreshLoop starts one refresh worker per subscribed agent.
+// Each worker refreshes at half of that agent's shortest active granted
+// subscription expiry, recalculating after every successful resubscribe.
 func StartSubscribeRefreshLoop(
 	ctx context.Context,
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 ) func() {
-	expires := cfg.SubscribeExpires
-	if expires <= 0 {
-		expires = 3600
-	}
-	interval := time.Duration(expires/2) * time.Second
-
 	stopCh := make(chan struct{})
 	concurrency := cfg.SubscribeConcurrency
 	if concurrency <= 0 {
 		concurrency = 10
 	}
+	sem := make(chan struct{}, concurrency)
+	var stopOnce sync.Once
 
-	go func() {
-		slog.Info("Subscribe refresh loop started",
-			"interval_s", interval.Seconds(), "subscribe_expires", expires)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopCh:
-				slog.Info("Subscribe refresh loop stopped")
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				slog.Debug("Subscribe refresh: firing", "agents", len(agents))
-				sem := make(chan struct{}, concurrency)
-				var wg sync.WaitGroup
-				wg.Add(len(agents))
-				for _, ag := range agents {
-					go func(a *agent.ExtensionAgent) {
-						defer wg.Done()
-						sem <- struct{}{}
-						defer func() { <-sem }()
-						if err := a.Resubscribe(ctx); err != nil {
-							slog.Warn("Resubscribe failed", "ext", a.Ext, "err", err)
-						}
-					}(ag)
-				}
-				wg.Wait()
-				slog.Debug("Subscribe refresh: complete", "agents", len(agents))
-			}
+	slog.Info("Subscribe refresh loop started",
+		"agents", len(agents),
+		"strategy", "per_agent_min_granted_exp_half",
+		"configured_subscribe_expires", cfg.SubscribeExpires,
+		"concurrency", concurrency)
+
+	for _, ag := range agents {
+		go runAgentSubscribeRefresh(ctx, stopCh, sem, ag, cfg)
+	}
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			slog.Info("Subscribe refresh loop stopped")
+		})
+	}
+}
+
+func runAgentSubscribeRefresh(ctx context.Context, stopCh <-chan struct{}, sem chan struct{}, ag *agent.ExtensionAgent, cfg *config.VMConfig) {
+	for {
+		interval, granted := subscribeRefreshInterval(ag, cfg)
+		slog.Debug("Subscribe refresh scheduled",
+			"ext", ag.Ext,
+			"min_granted_exp", granted,
+			"refresh_in_s", int(interval.Seconds()))
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-stopCh:
+			timer.Stop()
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
-	}()
 
-	return func() { close(stopCh) }
+		select {
+		case sem <- struct{}{}:
+		case <-stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+
+		err := ag.Resubscribe(ctx)
+		<-sem
+		if err != nil {
+			slog.Warn("Resubscribe failed", "ext", ag.Ext, "min_granted_exp", granted, "err", err)
+			continue
+		}
+		slog.Debug("Subscribe refresh complete", "ext", ag.Ext)
+	}
+}
+
+func subscribeRefreshInterval(ag *agent.ExtensionAgent, cfg *config.VMConfig) (time.Duration, int) {
+	expires := 0
+	for _, st := range ag.SubscriptionSnapshots() {
+		if st.Terminated || !cfg.ShouldRefreshSubscribeEvent(st.Event) {
+			continue
+		}
+		granted := st.GrantedExpires
+		if granted <= 0 {
+			granted = st.RequestedExpires
+		}
+		if granted <= 0 {
+			granted = cfg.SubscribeExpires
+		}
+		if granted <= 0 {
+			granted = 3600
+		}
+		if expires == 0 || granted < expires {
+			expires = granted
+		}
+	}
+	if expires <= 0 {
+		expires = cfg.SubscribeExpires
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	interval := time.Duration(expires) * time.Second / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval, expires
 }
 
 // FlushStaleRegistrations sends REGISTER(Expires:0) for every extension to
@@ -792,4 +959,451 @@ func RunSubscribe(
 
 	stopRefresh = StartSubscribeRefreshLoop(ctx, registered, cfg)
 	return failed, stopRefresh
+}
+
+func RunRegSubPipeline(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+	skipSubscribe bool,
+	onRegisterProgress func(),
+	onSubscribeProgress func(event string, ok bool, notifyReceived bool),
+	onIdle func(ag *agent.ExtensionAgent),
+	onRegOnly func(ag *agent.ExtensionAgent),
+	stopNew *atomic.Bool,
+) *PipelineHandle {
+	if stopNew == nil {
+		var sn atomic.Bool
+		stopNew = &sn
+	}
+	done := make(chan *PrePhaseResult, 1)
+	subQueue := make(chan *agent.ExtensionAgent, cfg.SubscribeConcurrency*2+1)
+	start := time.Now()
+	total := len(agents)
+	var mu sync.Mutex
+	var registeredAg []*agent.ExtensionAgent
+	var failedReg []string
+	var failedSub []string
+	var stopFuncs []func()
+	var result *PrePhaseResult
+	var stopOnce sync.Once
+
+	addStop := func(fn func()) {
+		if fn == nil {
+			return
+		}
+		mu.Lock()
+		stopFuncs = append(stopFuncs, fn)
+		mu.Unlock()
+	}
+	stopAllRefresh := func() {
+		mu.Lock()
+		funcs := append([]func(){}, stopFuncs...)
+		stopFuncs = nil
+		mu.Unlock()
+		for _, fn := range funcs {
+			fn()
+		}
+	}
+
+	subConcurrency := cfg.SubscribeConcurrency
+	if subConcurrency <= 0 {
+		subConcurrency = 10
+	}
+	subQueue = make(chan *agent.ExtensionAgent, subConcurrency*2+1)
+	var subWG sync.WaitGroup
+	for i := 0; i < subConcurrency; i++ {
+		subWG.Add(1)
+		go func() {
+			defer subWG.Done()
+			for ag := range subQueue {
+				if skipSubscribe {
+					if onRegOnly != nil {
+						onRegOnly(ag)
+					}
+					continue
+				}
+				ok := subscribeOne(ctx, ag, cfg, onSubscribeProgress)
+				if ok {
+					if onIdle != nil {
+						onIdle(ag)
+					}
+					addStop(StartSubscribeRefreshLoop(ctx, []*agent.ExtensionAgent{ag}, cfg))
+				} else {
+					mu.Lock()
+					failedSub = append(failedSub, ag.Ext)
+					mu.Unlock()
+					if onRegOnly != nil {
+						onRegOnly(ag)
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer func() {
+			close(subQueue)
+			subWG.Wait()
+			mu.Lock()
+			registered := len(registeredAg)
+			subscribed := registered - len(failedSub)
+			idleCount := subscribed
+			regOnlyCount := len(failedSub)
+			if skipSubscribe {
+				idleCount = 0
+				regOnlyCount = registered
+			}
+			result = &PrePhaseResult{
+				Total:            total,
+				Registered:       registered,
+				Subscribed:       subscribed,
+				IdleCount:        idleCount,
+				RegOnlyCount:     regOnlyCount,
+				FailedRegister:   append([]string(nil), failedReg...),
+				FailedSubscribe:  append([]string(nil), failedSub...),
+				RegisteredAgents: append([]*agent.ExtensionAgent(nil), registeredAg...),
+				DurationSeconds:  time.Since(start).Seconds(),
+			}
+			mu.Unlock()
+			done <- result
+			close(done)
+		}()
+		batchSize := cfg.RegisterBatchSize
+		if batchSize <= 0 {
+			batchSize = 10
+		}
+		batchDelay := cfg.BatchDelay()
+		slog.Info("REG/SUB pipelined pre-phase starting", "total", total, "register_batch_size", batchSize, "subscribe_concurrency", subConcurrency)
+		for batchStart := 0; batchStart < total; batchStart += batchSize {
+			if stopNew.Load() || ctx.Err() != nil {
+				slog.Info("Reg/Sub pipeline stopped before next register batch", "completed", batchStart, "total", total)
+				return
+			}
+			batchEnd := batchStart + batchSize
+			if batchEnd > total {
+				batchEnd = total
+			}
+			batch := agents[batchStart:batchEnd]
+			batchNum := batchStart/batchSize + 1
+			slog.Info("REGISTER batch", "batch", batchNum, "from", batchMinExt(batch), "to", batchMaxExt(batch), "count", len(batch))
+			var wg sync.WaitGroup
+			wg.Add(len(batch))
+			for _, ag := range batch {
+				go func(a *agent.ExtensionAgent) {
+					defer wg.Done()
+					ok := registerOne(ctx, a, cfg)
+					if onRegisterProgress != nil {
+						onRegisterProgress()
+					}
+					if !ok {
+						mu.Lock()
+						failedReg = append(failedReg, a.Ext)
+						mu.Unlock()
+						return
+					}
+					mu.Lock()
+					registeredAg = append(registeredAg, a)
+					mu.Unlock()
+					addStop(StartRegisterRefreshLoop(ctx, []*agent.ExtensionAgent{a}, cfg))
+					if stopNew.Load() || ctx.Err() != nil {
+						return
+					}
+					select {
+					case subQueue <- a:
+					case <-ctx.Done():
+					}
+				}(ag)
+			}
+			wg.Wait()
+			if batchEnd < total {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(batchDelay):
+				}
+			}
+		}
+	}()
+
+	return &PipelineHandle{
+		Done: done,
+		Stop: func() {
+			stopOnce.Do(func() {
+				stopNew.Store(true)
+				stopAllRefresh()
+				select {
+				case <-done:
+				case <-time.After(time.Duration(cfg.RegisterTimeout*len(cfg.SubscribeEvents)+10) * time.Second):
+					slog.Warn("Reg/Sub pipeline stop timed out")
+				}
+			})
+		},
+		Result: func() *PrePhaseResult {
+			mu.Lock()
+			defer mu.Unlock()
+			return result
+		},
+	}
+}
+
+type ConnectProgress struct {
+	Ext     string
+	LocalIP string
+	Remote  string
+	Err     error
+	OK      bool
+}
+
+func RunConnectRegSubPipeline(
+	ctx context.Context,
+	agents []*agent.ExtensionAgent,
+	cfg *config.VMConfig,
+	skipSubscribe bool,
+	onConnectProgress func(ConnectProgress),
+	onConnectComplete func(connected, failed int),
+	onRegisterProgress func(),
+	onSubscribeProgress func(event string, ok bool, notifyReceived bool),
+	onIdle func(ag *agent.ExtensionAgent),
+	onRegOnly func(ag *agent.ExtensionAgent),
+	stopNew *atomic.Bool,
+) *PipelineHandle {
+	if stopNew == nil {
+		var sn atomic.Bool
+		stopNew = &sn
+	}
+	done := make(chan *PrePhaseResult, 1)
+	start := time.Now()
+	total := len(agents)
+	var mu sync.Mutex
+	var registeredAg []*agent.ExtensionAgent
+	var failedReg []string
+	var failedSub []string
+	var connectedCount int
+	var connectFailed int
+	var stopFuncs []func()
+	var result *PrePhaseResult
+	var stopOnce sync.Once
+
+	addStop := func(fn func()) {
+		if fn == nil {
+			return
+		}
+		mu.Lock()
+		stopFuncs = append(stopFuncs, fn)
+		mu.Unlock()
+	}
+	stopAllRefresh := func() {
+		mu.Lock()
+		funcs := append([]func(){}, stopFuncs...)
+		stopFuncs = nil
+		mu.Unlock()
+		for _, fn := range funcs {
+			fn()
+		}
+	}
+
+	subConcurrency := cfg.SubscribeConcurrency
+	if subConcurrency <= 0 {
+		subConcurrency = 10
+	}
+	connectBatchSize := cfg.RegisterBatchSize
+	if connectBatchSize <= 0 {
+		connectBatchSize = 10
+	}
+	subQueue := make(chan *agent.ExtensionAgent, subConcurrency*2+1)
+	regQueue := make(chan *agent.ExtensionAgent, connectBatchSize*2+1)
+	var regWG sync.WaitGroup
+	for i := 0; i < connectBatchSize; i++ {
+		regWG.Add(1)
+		go func() {
+			defer regWG.Done()
+			for ag := range regQueue {
+				ok := registerOne(ctx, ag, cfg)
+				if onRegisterProgress != nil {
+					onRegisterProgress()
+				}
+				if !ok {
+					mu.Lock()
+					failedReg = append(failedReg, ag.Ext)
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				registeredAg = append(registeredAg, ag)
+				mu.Unlock()
+				addStop(StartRegisterRefreshLoop(ctx, []*agent.ExtensionAgent{ag}, cfg))
+				if stopNew.Load() || ctx.Err() != nil {
+					continue
+				}
+				select {
+				case subQueue <- ag:
+				case <-ctx.Done():
+				}
+			}
+		}()
+	}
+	var subWG sync.WaitGroup
+	for i := 0; i < subConcurrency; i++ {
+		subWG.Add(1)
+		go func() {
+			defer subWG.Done()
+			for ag := range subQueue {
+				if skipSubscribe {
+					if onRegOnly != nil {
+						onRegOnly(ag)
+					}
+					continue
+				}
+				ok := subscribeOne(ctx, ag, cfg, onSubscribeProgress)
+				if ok {
+					if onIdle != nil {
+						onIdle(ag)
+					}
+					addStop(StartSubscribeRefreshLoop(ctx, []*agent.ExtensionAgent{ag}, cfg))
+				} else {
+					mu.Lock()
+					failedSub = append(failedSub, ag.Ext)
+					mu.Unlock()
+					if onRegOnly != nil {
+						onRegOnly(ag)
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer func() {
+			close(regQueue)
+			regWG.Wait()
+			close(subQueue)
+			subWG.Wait()
+			mu.Lock()
+			registered := len(registeredAg)
+			subscribed := registered - len(failedSub)
+			idleCount := subscribed
+			regOnlyCount := len(failedSub)
+			if skipSubscribe {
+				idleCount = 0
+				regOnlyCount = registered
+			}
+			result = &PrePhaseResult{
+				Total:            total,
+				Registered:       registered,
+				Subscribed:       subscribed,
+				IdleCount:        idleCount,
+				RegOnlyCount:     regOnlyCount,
+				FailedRegister:   append([]string(nil), failedReg...),
+				FailedSubscribe:  append([]string(nil), failedSub...),
+				RegisteredAgents: append([]*agent.ExtensionAgent(nil), registeredAg...),
+				DurationSeconds:  time.Since(start).Seconds(),
+			}
+			mu.Unlock()
+			done <- result
+			close(done)
+		}()
+		defer func() {
+			if onConnectComplete != nil {
+				mu.Lock()
+				connected, failed := connectedCount, connectFailed
+				mu.Unlock()
+				onConnectComplete(connected, failed)
+			}
+		}()
+
+		batchDelay := cfg.BatchDelay()
+		connectTimeout := connectTimeoutFromConfig(cfg)
+		slog.Info("Connect/Register/Subscribe streaming pre-phase starting",
+			"total", total,
+			"connect_batch_size", connectBatchSize,
+			"register_concurrency", connectBatchSize,
+			"subscribe_concurrency", subConcurrency,
+			"connect_timeout_ms", connectTimeout.Milliseconds())
+
+		for batchStart := 0; batchStart < total; batchStart += connectBatchSize {
+			if stopNew.Load() || ctx.Err() != nil {
+				slog.Info("Connect/Reg/Sub pipeline stopped before next connect batch", "completed", batchStart, "total", total)
+				return
+			}
+			batchEnd := batchStart + connectBatchSize
+			if batchEnd > total {
+				batchEnd = total
+			}
+			batch := agents[batchStart:batchEnd]
+			batchNum := batchStart/connectBatchSize + 1
+			slog.Info("Transport/Register batch", "batch", batchNum, "from", batchMinExt(batch), "to", batchMaxExt(batch), "count", len(batch))
+
+			var wg sync.WaitGroup
+			for _, ag := range batch {
+				wg.Add(1)
+				go func(a *agent.ExtensionAgent) {
+					defer wg.Done()
+					connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+					err := a.Start(connectCtx)
+					cancel()
+					if err != nil {
+						mu.Lock()
+						connectFailed++
+						mu.Unlock()
+						slog.Error("Agent start failed", "ext", a.Ext, "err", err)
+						if onConnectProgress != nil {
+							onConnectProgress(ConnectProgress{Ext: a.Ext, LocalIP: cfg.LocalHostForExtension(a.Ext), Remote: fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort), Err: err})
+						}
+						return
+					}
+					mu.Lock()
+					connectedCount++
+					mu.Unlock()
+					if onConnectProgress != nil {
+						onConnectProgress(ConnectProgress{Ext: a.Ext, LocalIP: cfg.LocalHostForExtension(a.Ext), Remote: fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort), OK: true})
+					}
+					if stopNew.Load() || ctx.Err() != nil {
+						return
+					}
+					select {
+					case regQueue <- a:
+					case <-ctx.Done():
+					}
+				}(ag)
+			}
+			wg.Wait()
+
+			if batchEnd < total {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(batchDelay):
+				}
+			}
+		}
+	}()
+
+	return &PipelineHandle{
+		Done: done,
+		Stop: func() {
+			stopOnce.Do(func() {
+				stopNew.Store(true)
+				stopAllRefresh()
+				select {
+				case <-done:
+				case <-time.After(time.Duration(cfg.RegisterTimeout*len(cfg.SubscribeEvents)+10) * time.Second):
+					slog.Warn("Connect/Reg/Sub pipeline stop timed out")
+				}
+			})
+		},
+		Result: func() *PrePhaseResult {
+			mu.Lock()
+			defer mu.Unlock()
+			return result
+		},
+	}
+}
+
+func connectTimeoutFromConfig(cfg *config.VMConfig) time.Duration {
+	timeoutSeconds := cfg.ConnectTimeout
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1
+	}
+	return time.Duration(timeoutSeconds) * time.Second
 }

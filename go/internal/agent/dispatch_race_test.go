@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/cci/traffic-engine/internal/sip"
 )
 
 // mockTransport is a minimal in-process SIP transport used by tests.
@@ -135,5 +137,86 @@ func TestDialogQueue_100Then407_SameMs(t *testing.T) {
 	}
 	if got2.Raw != raw407 || got2.Code != "407_INVITE" {
 		t.Fatalf("expected 407_INVITE event, got code=%q raw=%q", got2.Code, got2.Raw)
+	}
+}
+
+func TestSubscribeResponseCorrelationSkipsWrongDialog(t *testing.T) {
+	tr := newMockTransport()
+	a := newTestAgent(t, tr)
+	st := &SubscriptionState{Event: "dialog", CallID: "sub-call", CSeq: 2}
+	wq := a.RegisterWildcardListener()
+	defer a.DeregisterWildcardListener(wq)
+
+	tr.ch <- "SIP/2.0 200 OK\r\nCall-ID: wrong-call\r\nCSeq: 2 SUBSCRIBE\r\nContent-Length: 0\r\n\r\n"
+	tr.ch <- "SIP/2.0 200 OK\r\nCall-ID: sub-call\r\nCSeq: 2 REGISTER\r\nContent-Length: 0\r\n\r\n"
+	tr.ch <- "SIP/2.0 202 Accepted\r\nCall-ID: sub-call\r\nCSeq: 2 SUBSCRIBE\r\nExpires: 600\r\nContent-Length: 0\r\n\r\n"
+
+	resp, err := a.waitForSubscribeResponse(context.Background(), wq, st, 2, "200", "202")
+	if err != nil {
+		t.Fatalf("waitForSubscribeResponse err=%v", err)
+	}
+	if resp.Code != "202" || resp.Msg.GetCallID() != "sub-call" || resp.Msg.GetMethod() != "SUBSCRIBE" {
+		t.Fatalf("unexpected response: code=%q callID=%q method=%q", resp.Code, resp.Msg.GetCallID(), resp.Msg.GetMethod())
+	}
+}
+
+func TestSubscriptionNotifyUpdatesState(t *testing.T) {
+	msg, _, err := sip.ParseMessage("NOTIFY sip:6000000@example.com SIP/2.0\r\nCall-ID: sub-call\r\nFrom: <sip:6000000@example.com>;tag=remote\r\nTo: <sip:6000000@example.com>;tag=local\r\nCSeq: 7 NOTIFY\r\nEvent: dialog\r\nSubscription-State: active;expires=300\r\nContent-Length: 0\r\n\r\n")
+	if err != nil {
+		t.Fatalf("ParseMessage err=%v", err)
+	}
+	a := &ExtensionAgent{Ext: "6000000"}
+	st := &SubscriptionState{
+		Event:     "dialog",
+		CallID:    "sub-call",
+		LocalTag:  "local",
+		RemoteTag: "remote",
+	}
+
+	a.applySubscriptionNotify(st, msg, msg.GetSubscriptionState())
+	if !st.NotifyReceived {
+		t.Fatal("NotifyReceived=false, want true")
+	}
+	if st.SubscriptionState != "active" {
+		t.Fatalf("SubscriptionState=%q, want active", st.SubscriptionState)
+	}
+	if st.GrantedExpires != 300 {
+		t.Fatalf("GrantedExpires=%d, want 300", st.GrantedExpires)
+	}
+	if st.Terminated {
+		t.Fatal("Terminated=true, want false")
+	}
+}
+
+func TestBackgroundNotifyMarksSubscriptionTerminated(t *testing.T) {
+	tr := newMockTransport()
+	a := newTestAgent(t, tr)
+	a.subscriptions["dialog"] = &SubscriptionState{
+		Event:     "dialog",
+		CallID:    "sub-call",
+		LocalTag:  "local",
+		RemoteTag: "remote",
+	}
+
+	tr.ch <- "NOTIFY sip:6000000@example.com SIP/2.0\r\nCall-ID: sub-call\r\nFrom: <sip:6000000@example.com>;tag=remote\r\nTo: <sip:6000000@example.com>;tag=local\r\nCSeq: 8 NOTIFY\r\nEvent: dialog\r\nSubscription-State: terminated;reason=timeout\r\nContent-Length: 0\r\n\r\n"
+
+	deadline := time.After(time.Second)
+	for {
+		a.mu.RLock()
+		st := a.subscriptions["dialog"]
+		terminated := st.Terminated
+		reason := st.TerminationReason
+		a.mu.RUnlock()
+		if terminated && reason == "timeout" {
+			return
+		}
+		select {
+		case <-deadline:
+			a.mu.RLock()
+			finalState := *a.subscriptions["dialog"]
+			a.mu.RUnlock()
+			t.Fatalf("subscription not terminated: %+v", finalState)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

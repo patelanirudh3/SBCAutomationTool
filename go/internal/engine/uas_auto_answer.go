@@ -99,13 +99,16 @@ func (u *UasAutoAnswer) stopped() bool {
 // a handleCall goroutine for each one. It checks AutoAnswerEnabled() before
 // spawning to avoid answering calls when the agent has been selected as a caller.
 func (u *UasAutoAnswer) uasLoop(ctx context.Context, ag *agent.ExtensionAgent) {
-	u.uasLoopWithStop(ctx, ag, nil)
+	u.uasLoopWithStop(ctx, ag, nil, nil)
 }
 
 // uasLoopWithStop is the internal loop; stopCh (if non-nil) allows stopping
 // a single agent's loop independently from the global StopEvent.
-func (u *UasAutoAnswer) uasLoopWithStop(ctx context.Context, ag *agent.ExtensionAgent, stopCh <-chan struct{}) {
+func (u *UasAutoAnswer) uasLoopWithStop(ctx context.Context, ag *agent.ExtensionAgent, stopCh <-chan struct{}, ready chan<- struct{}) {
 	wq := ag.RegisterWildcardListener()
+	if ready != nil {
+		close(ready)
+	}
 	defer ag.DeregisterWildcardListener(wq)
 
 	for {
@@ -149,19 +152,30 @@ func (u *UasAutoAnswer) uasLoopWithStop(ctx context.Context, ag *agent.Extension
 // agent. Called for every agent that successfully completes Reg+Sub during
 // pre-phase. Returns a stop function that terminates only this agent's loop.
 func (u *UasAutoAnswer) StartAutoAnswerForAgent(ctx context.Context, ag *agent.ExtensionAgent) func() {
+	stop, _ := u.StartAutoAnswerForAgentReady(ctx, ag)
+	return stop
+}
+
+// StartAutoAnswerForAgentReady starts a per-agent UAS loop and returns a ready
+// channel that is closed after the wildcard listener is registered. Callers use
+// this to ensure a UAS agent is not added to the callee pool before inbound
+// INVITEs can be observed.
+func (u *UasAutoAnswer) StartAutoAnswerForAgentReady(ctx context.Context, ag *agent.ExtensionAgent) (func(), <-chan struct{}) {
 	stopCh := make(chan struct{})
+	ready := make(chan struct{})
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
-		u.uasLoopWithStop(ctx, ag, stopCh)
+		u.uasLoopWithStop(ctx, ag, stopCh, ready)
 	}()
-	return func() {
+	stop := func() {
 		select {
 		case <-stopCh:
 		default:
 			close(stopCh)
 		}
 	}
+	return stop, ready
 }
 
 // handleCall runs the full UAS SIP+RTP sequence for one inbound call.

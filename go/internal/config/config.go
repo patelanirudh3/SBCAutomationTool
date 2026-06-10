@@ -68,6 +68,7 @@ type VMConfig struct {
 	RegisterExpires            int      `yaml:"register_expires" json:"register_expires"`
 	RegisterRetry              int      `yaml:"register_retry" json:"register_retry"`
 	RegisterTimeout            int      `yaml:"register_timeout" json:"register_timeout"`
+	ConnectTimeout             int      `yaml:"connect_timeout" json:"connect_timeout"`
 	SubscribeConcurrency       int      `yaml:"subscribe_concurrency" json:"subscribe_concurrency"`
 	SubscribeExpires           int      `yaml:"subscribe_expires" json:"subscribe_expires"`
 	SubscribeEvent             string   `yaml:"subscribe_event,omitempty" json:"subscribe_event,omitempty"` // legacy single-event alias
@@ -75,6 +76,9 @@ type VMConfig struct {
 	SubscribeRefreshEvents     []string `yaml:"subscribe_refresh_events" json:"subscribe_refresh_events"`
 	SubscribeUnsubscribeEvents []string `yaml:"subscribe_unsubscribe_events" json:"subscribe_unsubscribe_events"`
 	CleanupBatchSize           int      `yaml:"cleanup_batch_size" json:"cleanup_batch_size"`
+	CleanupUnsubscribeRate     int      `yaml:"cleanup_unsubscribe_rate_per_sec" json:"cleanup_unsubscribe_rate_per_sec"`
+	CleanupUnregisterRate      int      `yaml:"cleanup_unregister_rate_per_sec" json:"cleanup_unregister_rate_per_sec"`
+	CleanupAuditTimeoutMinutes int      `yaml:"cleanup_audit_timeout_minutes" json:"cleanup_audit_timeout_minutes"`
 
 	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
 	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
@@ -428,8 +432,20 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.RegisterTimeout == 0 {
 		cfg.RegisterTimeout = 5
 	}
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = 1
+	}
 	if cfg.CleanupBatchSize == 0 {
 		cfg.CleanupBatchSize = 10
+	}
+	if cfg.CleanupUnsubscribeRate == 0 {
+		cfg.CleanupUnsubscribeRate = 20
+	}
+	if cfg.CleanupUnregisterRate == 0 {
+		cfg.CleanupUnregisterRate = 20
+	}
+	if cfg.CleanupAuditTimeoutMinutes == 0 {
+		cfg.CleanupAuditTimeoutMinutes = 30
 	}
 	if cfg.FailbackDelaySeconds == 0 {
 		cfg.FailbackDelaySeconds = 30
@@ -967,6 +983,10 @@ func Validate(cfg *VMConfig) error {
 		"cleanup_batch_size", cfg.CleanupBatchSize,
 		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
 		"register_timeout", cfg.RegisterTimeout,
+		"connect_timeout", cfg.ConnectTimeout,
+		"cleanup_unsubscribe_rate_per_sec", cfg.CleanupUnsubscribeRate,
+		"cleanup_unregister_rate_per_sec", cfg.CleanupUnregisterRate,
+		"cleanup_audit_timeout_minutes", cfg.CleanupAuditTimeoutMinutes,
 		"media_security", cfg.MediaSecurity,
 		"srtp_crypto_suites", cfg.SRTPCryptoSuites,
 		"rtp_mode", cfg.RTPMode,

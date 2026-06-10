@@ -155,9 +155,13 @@ function TokenRow({ s, tab = 'all' }: { s: AdvancedSettingsType; tab?: AdvancedT
   const signalingTokens = [
     `batch_size: ${s.register_batch_size}`,
     `batch_delay: ${s.register_batch_delay_ms}ms`,
+    `connect_timeout: ${s.connect_timeout}s`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
     `subscribe: ${s.subscribe_concurrency}`,
+    `cleanup_unsub: ${s.cleanup_unsubscribe_rate_per_sec}/s`,
+    `cleanup_unreg: ${s.cleanup_unregister_rate_per_sec}/s`,
+    `cleanup_audit: ${s.cleanup_audit_timeout_minutes}m`,
     `tcp_keepalive: ${s.tcp_keepalive_seconds === 0 ? 'off' : `${s.tcp_keepalive_seconds}s`}`,
     `100rel: ${s.use_100rel ? 'on' : 'off'}`,
   ]
@@ -472,6 +476,14 @@ export function AdvancedSettings({
                     onChange={set('register_batch_delay_ms')}
                   />
                   <AdvancedField
+                    label="Connect Timeout (s)"
+                    value={draft.connect_timeout}
+                    disabled={disabled}
+                    error={errors.connect_timeout}
+                    tooltip="Max wait for each TCP/TLS socket connection attempt before marking that extension failed and continuing."
+                    onChange={set('connect_timeout')}
+                  />
+                  <AdvancedField
                     label="Timeout (s)"
                     value={draft.register_timeout}
                     disabled={disabled}
@@ -495,6 +507,30 @@ export function AdvancedSettings({
                     error={errors.subscribe_concurrency}
                     tooltip="Max concurrent SUBSCRIBE operations."
                     onChange={set('subscribe_concurrency')}
+                  />
+                  <AdvancedField
+                    label="Cleanup Unsubscribe/sec"
+                    value={draft.cleanup_unsubscribe_rate_per_sec}
+                    disabled={disabled}
+                    error={errors.cleanup_unsubscribe_rate_per_sec}
+                    tooltip="Max number of extensions concurrently performing unsubscribe cleanup. Each extension still unsubscribes its events sequentially."
+                    onChange={set('cleanup_unsubscribe_rate_per_sec')}
+                  />
+                  <AdvancedField
+                    label="Cleanup Unregister/sec"
+                    value={draft.cleanup_unregister_rate_per_sec}
+                    disabled={disabled}
+                    error={errors.cleanup_unregister_rate_per_sec}
+                    tooltip="Max number of extensions concurrently performing unregister cleanup after unsubscribe completes."
+                    onChange={set('cleanup_unregister_rate_per_sec')}
+                  />
+                  <AdvancedField
+                    label="Cleanup Audit Timeout (m)"
+                    value={draft.cleanup_audit_timeout_minutes}
+                    disabled={disabled}
+                    error={errors.cleanup_audit_timeout_minutes}
+                    tooltip="After this many minutes, remaining agents are force-unregistered even if unsubscribe did not complete."
+                    onChange={set('cleanup_audit_timeout_minutes')}
                   />
                 </div>
                 )}
