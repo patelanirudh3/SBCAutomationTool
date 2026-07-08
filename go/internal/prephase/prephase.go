@@ -167,7 +167,7 @@ func RegisterAll(
 				if agentCb != nil {
 					agentCb(ag, ok)
 				}
-				if onProgress != nil {
+				if ok && onProgress != nil {
 					onProgress()
 				}
 			}(a)
@@ -1093,14 +1093,14 @@ func RunRegSubPipeline(
 				go func(a *agent.ExtensionAgent) {
 					defer wg.Done()
 					ok := registerOne(ctx, a, cfg)
-					if onRegisterProgress != nil {
-						onRegisterProgress()
-					}
 					if !ok {
 						mu.Lock()
 						failedReg = append(failedReg, a.Ext)
 						mu.Unlock()
 						return
+					}
+					if onRegisterProgress != nil {
+						onRegisterProgress()
 					}
 					mu.Lock()
 					registeredAg = append(registeredAg, a)
@@ -1109,6 +1109,7 @@ func RunRegSubPipeline(
 					if stopNew.Load() || ctx.Err() != nil {
 						return
 					}
+					slog.Debug("REGISTER success queued for SUBSCRIBE", "ext", a.Ext)
 					select {
 					case subQueue <- a:
 					case <-ctx.Done():
@@ -1166,6 +1167,8 @@ func RunConnectRegSubPipeline(
 	onSubscribeProgress func(event string, ok bool, notifyReceived bool),
 	onIdle func(ag *agent.ExtensionAgent),
 	onRegOnly func(ag *agent.ExtensionAgent),
+	startRegSub <-chan struct{},
+	regSubRequested func() bool,
 	stopNew *atomic.Bool,
 ) *PipelineHandle {
 	if stopNew == nil {
@@ -1184,6 +1187,13 @@ func RunConnectRegSubPipeline(
 	var stopFuncs []func()
 	var result *PrePhaseResult
 	var stopOnce sync.Once
+	var gateMu sync.Mutex
+	gateOpen := startRegSub == nil
+	gateOpened := make(chan struct{})
+	var gateOnce sync.Once
+	pendingConnected := make([]*agent.ExtensionAgent, 0)
+	queuedForRegister := make(map[string]bool, total)
+	var gateOpenRequested atomic.Bool
 
 	addStop := func(fn func()) {
 		if fn == nil {
@@ -1213,6 +1223,67 @@ func RunConnectRegSubPipeline(
 	}
 	subQueue := make(chan *agent.ExtensionAgent, subConcurrency*2+1)
 	regQueue := make(chan *agent.ExtensionAgent, connectBatchSize*2+1)
+	enqueueRegister := func(ag *agent.ExtensionAgent) {
+		if ag == nil {
+			return
+		}
+		gateMu.Lock()
+		if queuedForRegister[ag.Ext] {
+			gateMu.Unlock()
+			return
+		}
+		queuedForRegister[ag.Ext] = true
+		gateMu.Unlock()
+		select {
+		case regQueue <- ag:
+		case <-ctx.Done():
+		}
+	}
+	openGate := func() {
+		gateMu.Lock()
+		if gateOpen {
+			gateMu.Unlock()
+			return
+		}
+		gateOpen = true
+		drain := append([]*agent.ExtensionAgent(nil), pendingConnected...)
+		pendingConnected = nil
+		gateMu.Unlock()
+		gateOnce.Do(func() { close(gateOpened) })
+		slog.Info("Reg/Sub connector opened", "pending_connected", len(drain))
+		for _, ag := range drain {
+			enqueueRegister(ag)
+		}
+	}
+	isGateOpen := func() bool {
+		gateMu.Lock()
+		defer gateMu.Unlock()
+		return gateOpen
+	}
+	if gateOpen {
+		gateOnce.Do(func() { close(gateOpened) })
+	} else {
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-startRegSub:
+					gateOpenRequested.Store(true)
+					slog.Info("Reg/Sub connector open requested - pausing before next TCP/TLS batch")
+					return
+				case <-ticker.C:
+					if regSubRequested != nil && regSubRequested() {
+						gateOpenRequested.Store(true)
+						slog.Info("Reg/Sub connector open request observed from process state - pausing before next TCP/TLS batch")
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 	var regWG sync.WaitGroup
 	for i := 0; i < connectBatchSize; i++ {
 		regWG.Add(1)
@@ -1220,14 +1291,14 @@ func RunConnectRegSubPipeline(
 			defer regWG.Done()
 			for ag := range regQueue {
 				ok := registerOne(ctx, ag, cfg)
-				if onRegisterProgress != nil {
-					onRegisterProgress()
-				}
 				if !ok {
 					mu.Lock()
 					failedReg = append(failedReg, ag.Ext)
 					mu.Unlock()
 					continue
+				}
+				if onRegisterProgress != nil {
+					onRegisterProgress()
 				}
 				mu.Lock()
 				registeredAg = append(registeredAg, ag)
@@ -1361,19 +1432,48 @@ func RunConnectRegSubPipeline(
 					if stopNew.Load() || ctx.Err() != nil {
 						return
 					}
-					select {
-					case regQueue <- a:
-					case <-ctx.Done():
+					gateMu.Lock()
+					open := gateOpen
+					if !open {
+						pendingConnected = append(pendingConnected, a)
+					}
+					gateMu.Unlock()
+					if open {
+						enqueueRegister(a)
 					}
 				}(ag)
 			}
 			wg.Wait()
+
+			if gateOpenRequested.Load() && !isGateOpen() {
+				slog.Info("TCP/TLS producer paused at batch boundary to open Reg/Sub connector", "batch", batchNum)
+				openGate()
+				slog.Info("TCP/TLS producer resumed after Reg/Sub connector opened", "batch", batchNum)
+			}
 
 			if batchEnd < total {
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(batchDelay):
+				}
+			}
+		}
+		if !isGateOpen() {
+			slog.Info("TCP/TLS connection phase complete - waiting for Start Reg/Sub", "connected", connectedCount, "failed", connectFailed)
+		waitForGate:
+			for {
+				if gateOpenRequested.Load() {
+					slog.Info("Opening Reg/Sub connector after TCP/TLS completion")
+					openGate()
+					break waitForGate
+				}
+				select {
+				case <-gateOpened:
+					break waitForGate
+				case <-ctx.Done():
+					return
+				case <-time.After(200 * time.Millisecond):
 				}
 			}
 		}
@@ -1403,7 +1503,7 @@ func RunConnectRegSubPipeline(
 func connectTimeoutFromConfig(cfg *config.VMConfig) time.Duration {
 	timeoutSeconds := cfg.ConnectTimeout
 	if timeoutSeconds <= 0 {
-		timeoutSeconds = 1
+		timeoutSeconds = 5
 	}
 	return time.Duration(timeoutSeconds) * time.Second
 }

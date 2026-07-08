@@ -34,7 +34,8 @@ export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
 export const LocalIPModeSchema = z.enum(['single', 'unique_vip', 'vip_pool'])
 export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
-export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'OPUS'])
+export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729'])
+export const RtpUnsupportedCodecPolicySchema = z.enum(['fallback_g711', 'reject_488'])
 export const MediaSecuritySchema = z.enum(['rtp', 'srtp_sdes'])
 export const SRTPCryptoSuiteSchema = z.enum(['AES_CM_128_HMAC_SHA1_80', 'AES_CM_128_HMAC_SHA1_32'])
 export const SubscribeEventSchema = z.enum(SUBSCRIBE_EVENT_VALUES)
@@ -72,11 +73,26 @@ export const VMConfigSchema = z
       .refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
     sbc_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
     dual_registration_enabled: z.boolean().optional(),
+    ha_mode: z.enum(['single', 'dual', 'multi_zone']).optional(),
+    failover_trigger: z.enum(['per_agent', 'min_agents', 'pct_agents']).optional(),
+    failover_trigger_count: z.number().int().min(2).max(10000).optional(),
+    failover_trigger_pct: z.number().int().min(1).max(100).optional(),
+    failover_trigger_window_ms: z.number().int().min(100).max(60000).optional(),
     secondary_host: z
       .string()
       .refine((v) => !v || isValidIpOrHostname(v), 'Must be a valid IPv4 address or hostname')
       .optional(),
     secondary_port: z.number().int().min(1).max(65535, 'Port must be 1–65535').optional(),
+    zone_config: z.object({
+      zones: z.array(z.object({
+        zone_id: z.string().min(1),
+        controllers: z.array(z.object({
+          host: z.string().min(1).refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
+          port: z.number().int().min(1).max(65535),
+        })).min(1, 'Each zone needs at least 1 controller'),
+      })).length(2, 'Exactly 2 zones required'),
+      zone_distribution_pct: z.number().int().min(1).max(99),
+    }).optional(),
     failover_enabled: z.boolean().optional(),
     failover_mode: z.enum(['graceful', 'force']).optional(),
     auto_failback_enabled: z.boolean().optional(),
@@ -119,6 +135,7 @@ export const VMConfigSchema = z
     srtp_crypto_suites: z.array(SRTPCryptoSuiteSchema).optional(),
     srtp_key_mode: z.literal('auto').optional(),
     rtp_codec: RtpCodecSchema.optional(),
+    rtp_unsupported_codec_policy: RtpUnsupportedCodecPolicySchema.optional(),
     rtp_ptime: z.number().int().min(10).max(80).optional(),
     metrics_port: z.number().int().min(1).max(65535, 'Port must be 1–65535'),
 
@@ -206,6 +223,68 @@ export const VMConfigSchema = z
           code: z.ZodIssueCode.custom,
           path: ['secondary_port'],
           message: 'Secondary controller port is required when Dual Registration is on',
+        })
+      }
+    }
+
+    if (data.ha_mode === 'multi_zone') {
+      if (!data.zone_config || !data.zone_config.zones || data.zone_config.zones.length !== 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['zone_config'],
+          message: 'Multi-Zone HA requires exactly 2 zones configured',
+        })
+      } else {
+        for (let zi = 0; zi < data.zone_config.zones.length; zi++) {
+          const zone = data.zone_config.zones[zi]
+          if (!zone.controllers || zone.controllers.length === 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['zone_config', 'zones', zi, 'controllers'],
+              message: `Zone ${zone.zone_id || zi + 1} must have at least 1 controller`,
+            })
+          }
+        }
+        const pct = data.zone_config.zone_distribution_pct
+        if (pct < 1 || pct > 99) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['zone_config', 'zone_distribution_pct'],
+            message: 'Zone distribution must be between 1% and 99%',
+          })
+        }
+      }
+    }
+
+    if (data.failover_trigger === 'min_agents') {
+      if (!data.failover_trigger_count || data.failover_trigger_count < 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['failover_trigger_count'],
+          message: 'Minimum agent count must be at least 2',
+        })
+      }
+      if (!data.failover_trigger_window_ms || data.failover_trigger_window_ms < 100) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['failover_trigger_window_ms'],
+          message: 'Time window must be at least 100ms',
+        })
+      }
+    }
+    if (data.failover_trigger === 'pct_agents') {
+      if (!data.failover_trigger_pct || data.failover_trigger_pct < 1 || data.failover_trigger_pct > 100) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['failover_trigger_pct'],
+          message: 'Agent percentage must be 1-100 (whole number)',
+        })
+      }
+      if (!data.failover_trigger_window_ms || data.failover_trigger_window_ms < 100) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['failover_trigger_window_ms'],
+          message: 'Time window must be at least 100ms',
         })
       }
     }

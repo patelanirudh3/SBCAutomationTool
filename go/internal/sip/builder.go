@@ -65,7 +65,7 @@ func BuildInitialRegisterWithScheme(fromUser, domain, scheme, transport, localIP
 	m.AddHeader(HdrExpires, strconv.Itoa(expires))
 	m.AddHeader(HdrAllow, "INVITE,ACK,OPTIONS,BYE,CANCEL,SUBSCRIBE,NOTIFY,MESSAGE,REFER,INFO,PUBLISH,UPDATE")
 	m.AddHeader(HdrSupported, "eventlist,feature-ref,replaces,sdp-anat,tdialog")
-	m.AddHeader(HdrUserAgent, "Avaya J179 IP Phone 4.0.11.0.1 10981904bda0")
+	m.SetDefaultUserAgent()
 	m.AddHeader(HdrMaxForwards, "70")
 	m.AddHeader(HdrContentLength, "0")
 	m.AddHeader(HdrCSeq, "1 REGISTER")
@@ -116,6 +116,7 @@ func BuildSubscribe(callID, fromHeader, toHeader, domain, transport, localIP, co
 	if supportedTags != "" {
 		m.AddHeader(HdrSupported, supportedTags)
 	}
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -141,6 +142,7 @@ func BuildInvite(fromUser, toUser, domain, transport, localIP string, localPort 
 	if sdpBody != "" {
 		m.AddContent(sdpBody)
 	}
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -182,6 +184,7 @@ func BuildAck(invite *SipMessage, resp *SipMessage, transport, localIP string, r
 	m.AddHeader(HdrCSeq, fmt.Sprintf("%d ACK", invite.GetCSeq()))
 	m.AddHeader(HdrMaxForwards, "70")
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -216,6 +219,7 @@ func BuildPrack(invite *SipMessage, resp *SipMessage, transport, localIP string,
 	m.AddHeader(HdrRAck, fmt.Sprintf("%d %d INVITE", rseq, invCSeq))
 	m.AddHeader(HdrMaxForwards, "70")
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -237,6 +241,7 @@ func BuildBye(callID, fromHeader, toHeader, transport, localIP string, cseq int,
 	m.AddHeader(HdrMaxForwards, "70")
 	m.AddHeader(HdrCSeq, fmt.Sprintf("%d BYE", cseq))
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -268,6 +273,7 @@ func Build200OK(req *SipMessage, localIP string, localPort int, sdpBody string) 
 	} else {
 		m.AddHeader(HdrContentLength, "0")
 	}
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -292,6 +298,7 @@ func Build180Ringing(req *SipMessage, localIP string, toTag string, rseq int) *S
 	m.AddHeader(HdrRequire, "100rel")
 	m.AddHeader(HdrRSeq, strconv.Itoa(rseq))
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -308,6 +315,7 @@ func Build100Trying(req *SipMessage) *SipMessage {
 	m.AddHeader(HdrCallID, req.GetCallID())
 	m.AddHeader(HdrCSeq, firstHeader(req, HdrCSeq))
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -323,6 +331,7 @@ func Build200Bye(req *SipMessage) *SipMessage {
 	m.AddHeader(HdrCallID, req.GetCallID())
 	m.AddHeader(HdrCSeq, firstHeader(req, HdrCSeq))
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }
@@ -338,6 +347,7 @@ func Build200Prack(req *SipMessage) *SipMessage {
 	m.AddHeader(HdrCallID, req.GetCallID())
 	m.AddHeader(HdrCSeq, firstHeader(req, HdrCSeq))
 	m.AddHeader(HdrContentLength, "0")
+	m.SetDefaultUserAgent()
 
 	return m
 }

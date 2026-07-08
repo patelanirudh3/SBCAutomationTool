@@ -85,8 +85,8 @@ func TestCleanupBatchSizeDefaultsAndValidation(t *testing.T) {
 func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
 	cfg := &VMConfig{}
 	ApplyDefaults(cfg)
-	if cfg.MediaSecurity != "rtp" || cfg.SRTPKeyMode != "auto" || len(cfg.SRTPCryptoSuites) != 1 {
-		t.Fatalf("media security defaults got security=%q key_mode=%q suites=%v", cfg.MediaSecurity, cfg.SRTPKeyMode, cfg.SRTPCryptoSuites)
+	if cfg.MediaSecurity != "rtp" || cfg.SRTPKeyMode != "auto" || len(cfg.SRTPCryptoSuites) != 1 || cfg.RTPUnsupportedCodecPolicy != "fallback_g711" {
+		t.Fatalf("media security defaults got security=%q key_mode=%q suites=%v codec_policy=%q", cfg.MediaSecurity, cfg.SRTPKeyMode, cfg.SRTPCryptoSuites, cfg.RTPUnsupportedCodecPolicy)
 	}
 
 	bad := &VMConfig{
@@ -115,6 +115,12 @@ func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
 	bad.SRTPCryptoSuites = []string{"BAD_SUITE"}
 	if err := Validate(bad); err == nil {
 		t.Fatal("Validate succeeded with unsupported SRTP crypto suite")
+	}
+
+	bad.SRTPCryptoSuites = []string{"AES_CM_128_HMAC_SHA1_80"}
+	bad.RTPUnsupportedCodecPolicy = "bad_policy"
+	if err := Validate(bad); err == nil {
+		t.Fatal("Validate succeeded with unsupported RTP codec policy")
 	}
 }
 

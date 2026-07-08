@@ -349,6 +349,7 @@ export function FinalReport({
           rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
           rtpFlow={{
             mediaSecurity: uacMetrics?.media_security ?? pair?.uac.media_security ?? 'rtp',
+            rtpCodec: pair?.uac.rtp_codec ?? null,
             srtpCryptoSuites: uacMetrics?.srtp_crypto_suites ?? pair?.uac.srtp_crypto_suites ?? null,
             configuredPacketsPerDirection: computeConfiguredRtpPacketsPerDirection(
               pair?.uac.hold_time_seconds,

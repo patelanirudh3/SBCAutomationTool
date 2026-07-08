@@ -34,6 +34,7 @@ type poolCommand struct {
 	caller  *agent.ExtensionAgent
 	callee  *agent.ExtensionAgent
 	agents  []*agent.ExtensionAgent
+	ext     string
 	resp    chan poolResponse
 	respAll chan []*agent.ExtensionAgent
 }
@@ -200,6 +201,70 @@ func (p *PoolEngine) run() {
 				readySeq++
 			}
 
+		case "remove_from_idle":
+			found := false
+			for i, a := range uacIdle {
+				if a.Ext == cmd.ext {
+					uacIdle = append(uacIdle[:i], uacIdle[i+1:]...)
+					delete(roles, a)
+					found = true
+					break
+				}
+			}
+			if !found {
+				for i, a := range uasIdle {
+					if a.Ext == cmd.ext {
+						a.SetAutoAnswer(false)
+						uasIdle = append(uasIdle[:i], uasIdle[i+1:]...)
+						delete(roles, a)
+						found = true
+						break
+					}
+				}
+			}
+			cmd.resp <- poolResponse{ok: found}
+
+		case "add_to_idle":
+			role := RoleUAS
+			if readySeq%2 == 1 {
+				role = RoleUAC
+			}
+			readySeq++
+			roles[cmd.agent] = role
+			if role == RoleUAC {
+				cmd.agent.SetAutoAnswer(false)
+				uacIdle = append(uacIdle, cmd.agent)
+			} else {
+				cmd.agent.SetAutoAnswer(true)
+				uasIdle = append(uasIdle, cmd.agent)
+			}
+
+		case "is_non_idle":
+			found := false
+			for _, a := range nonIdle {
+				if a.Ext == cmd.ext {
+					found = true
+					break
+				}
+			}
+			cmd.resp <- poolResponse{ok: found}
+
+		case "return_pair_filtered":
+			nonIdle = removeAgent(nonIdle, cmd.caller)
+			nonIdle = removeAgent(nonIdle, cmd.callee)
+			if cmd.caller.IsTransportConnected() {
+				cmd.caller.SetAutoAnswer(false)
+				uacIdle = append(uacIdle, cmd.caller)
+			} else {
+				delete(roles, cmd.caller)
+			}
+			if cmd.callee.IsTransportConnected() {
+				cmd.callee.SetAutoAnswer(true)
+				uasIdle = append(uasIdle, cmd.callee)
+			} else {
+				delete(roles, cmd.callee)
+			}
+
 		case "counts":
 			cmd.resp <- poolResponse{counts: snapshot()}
 		}
@@ -268,6 +333,34 @@ func (p *PoolEngine) AllForCleanup() []*agent.ExtensionAgent {
 // It is intentionally conservative: callers must ensure no calls are active.
 func (p *PoolEngine) ReplaceIdle(agents []*agent.ExtensionAgent) {
 	p.cmdCh <- poolCommand{op: "replace_idle", agents: append([]*agent.ExtensionAgent(nil), agents...)}
+}
+
+// RemoveFromIdle removes a single agent from the idle pool by extension.
+// Returns true if the agent was found and removed.
+func (p *PoolEngine) RemoveFromIdle(ext string) bool {
+	resp := make(chan poolResponse, 1)
+	p.cmdCh <- poolCommand{op: "remove_from_idle", ext: ext, resp: resp}
+	return (<-resp).ok
+}
+
+// AddToIdle adds a single agent back into the idle pool with automatic role assignment.
+func (p *PoolEngine) AddToIdle(a *agent.ExtensionAgent) {
+	p.cmdCh <- poolCommand{op: "add_to_idle", agent: a}
+}
+
+// IsNonIdle checks if an agent with the given extension is currently in an active call.
+func (p *PoolEngine) IsNonIdle(ext string) bool {
+	resp := make(chan poolResponse, 1)
+	p.cmdCh <- poolCommand{op: "is_non_idle", ext: ext, resp: resp}
+	return (<-resp).ok
+}
+
+// ReturnPairFiltered moves a completed pair back to idle, but only if their
+// transport is still connected. Dead agents (transport down) are dropped from
+// the pool entirely. Used in multi-zone mode to prevent dead failover agents
+// from re-entering the idle pool.
+func (p *PoolEngine) ReturnPairFiltered(caller, callee *agent.ExtensionAgent) {
+	p.cmdCh <- poolCommand{op: "return_pair_filtered", caller: caller, callee: callee}
 }
 
 // Counts returns current list sizes for metrics reporting.

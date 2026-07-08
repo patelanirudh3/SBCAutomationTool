@@ -4,7 +4,7 @@ import { useEffect, useCallback, useState, useRef, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   AlertTriangle, Play, ArrowRight, Users, CheckCircle2, XCircle,
-  Loader2, Sparkles, RotateCcw, ShieldOff, Download,
+  Loader2, Sparkles, RotateCcw, ShieldOff, Download, ArrowDown,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -266,6 +266,7 @@ export function PrePhasePanel() {
   // so the operator knows the button isn't hung. null = no request in flight.
   const PREP_START_TIMEOUT_S = 10
   const [prepCountdown, setPrepCountdown] = useState<number | null>(null)
+  const [isStartingTransport, setIsStartingTransport] = useState(false)
   const [isStartingReg, setIsStartingReg] = useState(false)
   const [isStartingTraffic, setIsStartingTraffic] = useState(false)
   const [isAborting, setIsAborting] = useState(false)
@@ -353,10 +354,10 @@ export function PrePhasePanel() {
             vm_id: pair?.uac.vm_id ?? 'traffic-local',
             register_complete: true,
             register_count: m.registered_count ?? 0,
-            register_total: extCount,
+            register_total: m.registered_total ?? extCount,
             subscribe_complete: true,
             subscribe_count: m.subscribed_count ?? 0,
-            subscribe_total: subscribeTxnFallback,
+            subscribe_total: m.subscribed_total ?? subscribeTxnFallback,
             extensions_ready:
               (m.idle_count ?? 0) >= (m.required_ready_count ?? Math.max(2, Math.ceil(extCount * 0.25))) &&
               (m.uac_idle_count ?? 0) >= 1 &&
@@ -409,7 +410,11 @@ export function PrePhasePanel() {
     setIsResetting(false)
   }, [vmIp, vmPort, checkEngineReady])
 
-  const engineIsReady = !engineCheckDone || enginePhase === 'IDLE' || enginePhase === null
+  const engineIsReady =
+    !engineCheckDone ||
+    enginePhase === 'IDLE' ||
+    enginePhase === 'REGSUB_READY' ||
+    enginePhase === null
 
   // ------------------------------------------------------------------
   // Handlers
@@ -448,15 +453,26 @@ export function PrePhasePanel() {
     }
   }, [isStartingPrep, prepStatus, vmIp, vmPort, ensureRunIdAndStartTest])
 
+  const handleStartTransport = useCallback(async () => {
+    if (isStartingTransport) return
+    setIsStartingTransport(true)
+    setError(null)
+    try {
+      await ensureRunIdAndStartTest()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to start TCP/TLS'
+      setError(`Could not start TCP/TLS at http://${vmIp}:${vmPort} — ${msg}`)
+    } finally {
+      setIsStartingTransport(false)
+    }
+  }, [isStartingTransport, ensureRunIdAndStartTest, vmIp, vmPort])
+
   const handleStartRegSub = useCallback(async () => {
     if (isStartingReg) return
     if (prepStatus === 'running') return // defensive — UI also disables
     setIsStartingReg(true)
     setError(null)
     try {
-      // ensureRunIdAndStartTest is idempotent — if Prep already kicked it
-      // off the second call returns 409 which we swallow.
-      try { await ensureRunIdAndStartTest() } catch { /* already started */ }
       await startRegSubFor(vmIp, vmPort)
       setRegStarted(true)
       setPhase('REGSUB_RUNNING')
@@ -477,7 +493,7 @@ export function PrePhasePanel() {
     } finally {
       setIsStartingReg(false)
     }
-  }, [isStartingReg, prepStatus, vmIp, vmPort, ensureRunIdAndStartTest, setPhase])
+  }, [isStartingReg, prepStatus, vmIp, vmPort, setPhase])
 
   const handleAbortRegSub = useCallback(async () => {
     if (isAborting) return
@@ -485,13 +501,14 @@ export function PrePhasePanel() {
     setError(null)
     try {
       await abortRegSubFor(vmIp, vmPort)
+      setPhase('CLEANING_UP')
+      router.push('/run')
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Abort failed'
       setError(`Abort failed: ${msg}`)
-    } finally {
       setIsAborting(false)
     }
-  }, [isAborting, vmIp, vmPort])
+  }, [isAborting, vmIp, vmPort, setPhase, router])
 
   const handleUnregisterAll = useCallback(async () => {
     if (isUnregisteringAll) return
@@ -605,7 +622,6 @@ export function PrePhasePanel() {
   const displayIdle    = isMock ? localIdleCount    : (idleCount    > 0 ? idleCount    : localIdleCount)
   const displayRegOnly = isMock ? localRegOnlyCount : (regOnlyCount > 0 ? regOnlyCount : localRegOnlyCount)
   const total          = Math.max(extCount, 1)
-  const displayPending = Math.max(0, total - regCount)
   const requiredReady = uacMetrics?.required_ready_count ?? Math.max(2, Math.ceil(total * 0.25))
   const displayUACIdle = uacMetrics?.uac_idle_count ?? Math.floor(displayIdle / 2)
   const displayUASIdle = uacMetrics?.uas_idle_count ?? Math.ceil(displayIdle / 2)
@@ -613,8 +629,11 @@ export function PrePhasePanel() {
   const transportTotal = uacMetrics?.transport_connect_total ?? 0
   const transportConnected = uacMetrics?.transport_connect_done ?? 0
   const transportFailed = uacMetrics?.transport_connect_failed ?? 0
+  const transportPending = Math.max(0, transportTotal - transportConnected - transportFailed)
+  const backendPhase = (uacMetrics?.phase ?? '').toUpperCase()
   const configuredExtensions = transportTotal > 0 ? transportTotal : total
   const registerAttempted = regTotal > 0 ? regTotal : (transportConnected > 0 ? transportConnected : total)
+  const displayPending = Math.max(0, registerAttempted - regCount)
   const registerFailed = regDone ? Math.max(0, registerAttempted - regCount) : 0
   const subscribeFailedAgents = regDone ? displayRegOnly : 0
   const excludedFromTraffic = Math.max(0, configuredExtensions - displayIdle)
@@ -633,8 +652,8 @@ export function PrePhasePanel() {
     const denom = subTotal > 0 ? subTotal : subscribeTxnFallback
     return denom > 0 ? Math.round((subCount / denom) * 100) : 0
   }, [subCount, subTotal, subscribeTxnFallback])
-  const subAmberPct = Math.round((displayRegOnly / total) * 100)
-  const failedCount = regDone ? Math.max(0, total - regCount) : 0
+  const subAmberPct = Math.round((displayRegOnly / Math.max(registerAttempted, 1)) * 100)
+  const failedCount = registerFailed
 
   // regSubViewActive — derived flag that tells us "the Reg/Sub flow is in
   // progress or has produced data, so render the progress card and pool
@@ -647,7 +666,8 @@ export function PrePhasePanel() {
   const regSubViewActive =
     regStarted ||
     regDone ||
-    (uacMetrics?.phase ?? '').toUpperCase() === 'CONNECTING_TRANSPORTS' ||
+    backendPhase === 'CONNECTING_TRANSPORTS' ||
+    backendPhase === 'REGSUB_RUNNING' ||
     regCount > 0 ||
     regTotal > 0 ||
     subCount > 0 ||
@@ -659,7 +679,7 @@ export function PrePhasePanel() {
   // Start Reg/Sub is disabled while Prep is running (defensive — backend
   // also returns 409). Also disabled while engine is in a non-clean state.
   const startRegSubBlocked = prepStatus === 'running'
-  const startRegSubDisabled = isStartingReg || !engineIsReady || isResetting || startRegSubBlocked
+  const startTransportDisabled = isStartingTransport || !engineIsReady || isResetting || startRegSubBlocked
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -727,8 +747,9 @@ export function PrePhasePanel() {
           {!regSubViewActive && (
             <div className="flex flex-col items-center gap-3">
               <p className="text-sm text-muted-foreground text-center">
-                Click <span className="font-semibold text-foreground">Start Reg / Sub</span> to register
-                and subscribe all {extCount > 0 ? extCount : '…'} extensions.
+                Click <span className="font-semibold text-foreground">Start TCP/TLS</span> to connect
+                all {extCount > 0 ? extCount : '…'} extensions. Registration and subscription will wait
+                until you click <span className="font-semibold text-foreground">Start Reg / Sub</span>.
                 {prepStatus === 'idle' && (
                   <>
                     <br />
@@ -745,16 +766,16 @@ export function PrePhasePanel() {
                   <span className="inline-block">
                     <Button
                       size="lg"
-                      onClick={isMock ? () => { hasStartedRef.current = false; handleStartRegSub() } : handleStartRegSub}
-                      disabled={startRegSubDisabled}
+                      onClick={isMock ? () => { hasStartedRef.current = false; handleStartRegSub() } : handleStartTransport}
+                      disabled={startTransportDisabled}
                       className="gap-2 bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50"
                     >
-                      {isStartingReg ? (
+                      {isStartingTransport ? (
                         <><Loader2 className="size-4 animate-spin" /> Starting…</>
                       ) : !engineCheckDone ? (
                         <><Loader2 className="size-4 animate-spin" /> Checking engine…</>
                       ) : (
-                        <><Play className="size-4" /> Start Reg / Sub</>
+                        <><Play className="size-4" /> Start TCP/TLS</>
                       )}
                     </Button>
                   </span>
@@ -768,21 +789,40 @@ export function PrePhasePanel() {
             </div>
           )}
 
-          {uacMetrics && (uacMetrics.transport_connect_total ?? 0) > 0 && (
+          {uacMetrics && (transportTotal > 0 || backendPhase === 'CONNECTING_TRANSPORTS') && (
             <div className="space-y-3 rounded-xl border border-slate-700/50 bg-card p-5">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-foreground">TCP/TLS Connections</h3>
                 <span className="font-mono text-xs text-muted-foreground">
-                  {(uacMetrics.transport_connect_done ?? 0).toLocaleString()} / {(uacMetrics.transport_connect_total ?? 0).toLocaleString()} connected
-                  {(uacMetrics.transport_connect_failed ?? 0) > 0 ? ` · ${(uacMetrics.transport_connect_failed ?? 0).toLocaleString()} failed` : ''}
+                  {transportConnected.toLocaleString()} / {transportTotal.toLocaleString()} complete
+                  {transportPending > 0 ? ` · ${transportPending.toLocaleString()} pending` : ''}
+                  {transportFailed > 0 ? ` · ${transportFailed.toLocaleString()} failed` : ''}
                 </span>
               </div>
+              <div className="grid grid-cols-4 gap-2 text-[11px] font-mono text-slate-300">
+                <div className="rounded border border-slate-800 bg-slate-950/35 p-2">
+                  <div className="text-slate-500">Requested</div>
+                  <div className="text-slate-100">{transportTotal.toLocaleString()}</div>
+                </div>
+                <div className="rounded border border-emerald-500/25 bg-emerald-500/5 p-2">
+                  <div className="text-emerald-300/80">Complete</div>
+                  <div className="text-emerald-100">{transportConnected.toLocaleString()}</div>
+                </div>
+                <div className="rounded border border-amber-500/25 bg-amber-500/5 p-2">
+                  <div className="text-amber-300/80">Pending</div>
+                  <div className="text-amber-100">{transportPending.toLocaleString()}</div>
+                </div>
+                <div className="rounded border border-rose-500/25 bg-rose-500/5 p-2">
+                  <div className="text-rose-300/80">Failed</div>
+                  <div className="text-rose-100">{transportFailed.toLocaleString()}</div>
+                </div>
+              </div>
               <LayeredBar
-                completed={(uacMetrics.transport_connect_total ?? 0) > 0
-                  ? ((uacMetrics.transport_connect_done ?? 0) / (uacMetrics.transport_connect_total ?? 1)) * 100
+                completed={transportTotal > 0
+                  ? (transportConnected / transportTotal) * 100
                   : 0}
-                partial={(uacMetrics.transport_connect_total ?? 0) > 0
-                  ? ((uacMetrics.transport_connect_failed ?? 0) / (uacMetrics.transport_connect_total ?? 1)) * 100
+                partial={transportTotal > 0
+                  ? (transportFailed / transportTotal) * 100
                   : 0}
               />
               {(uacMetrics.transport_connect_failed_details?.length ?? 0) > 0 && (
@@ -802,6 +842,30 @@ export function PrePhasePanel() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {regSubViewActive && !regDone && !regStarted && !isMock && (
+            <div className="flex flex-col items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+              <ArrowDown className="size-5 text-emerald-300" />
+              <div className="text-center">
+                <p className="text-sm font-semibold text-emerald-100">Connect TCP/TLS to Reg/Sub</p>
+                <p className="text-xs text-muted-foreground">
+                  Connected agents will flow into REGISTER, then successful REGISTERs will flow into SUBSCRIBE.
+                </p>
+              </div>
+              <Button
+                size="sm"
+                disabled={isStartingReg}
+                onClick={handleStartRegSub}
+                className="gap-2 bg-emerald-600 text-white hover:bg-emerald-500"
+              >
+                {isStartingReg ? (
+                  <><Loader2 className="size-3.5 animate-spin" /> Starting…</>
+                ) : (
+                  <><ArrowDown className="size-3.5" /> Start Reg / Sub</>
+                )}
+              </Button>
             </div>
           )}
 
@@ -1034,6 +1098,51 @@ export function PrePhasePanel() {
             </div>
           )}
 
+          {/* Multi-Zone HA Status */}
+          {uacMetrics?.ha_agent_groups && uacMetrics.ha_agent_groups.length > 0 && (
+            <div className="space-y-3 rounded-xl border border-violet-500/30 bg-violet-950/5 p-4">
+              <h3 className="text-sm font-semibold text-violet-300">Multi-Zone HA Status</h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {uacMetrics.ha_agent_groups.map((g) => (
+                  <div key={g.group_id} className={cn(
+                    'rounded-lg border p-3 space-y-2',
+                    g.active_controller === 'primary'
+                      ? 'border-emerald-500/20 bg-emerald-950/10'
+                      : 'border-amber-500/20 bg-amber-950/10',
+                  )}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-slate-200">{g.group_id}</span>
+                      <span className={cn(
+                        'rounded-full px-2 py-0.5 text-[10px] font-bold',
+                        g.active_controller === 'primary'
+                          ? 'bg-emerald-500/20 text-emerald-400'
+                          : 'bg-amber-500/20 text-amber-400',
+                      )}>
+                        {g.active_controller.toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 space-y-0.5">
+                      <div>Zone: {g.zone_id} | Agents: {g.agent_count}</div>
+                      <div>Primary: {g.primary_host}:{g.primary_port} (reg: {g.primary_registered}, sub: {g.active_subscribed})</div>
+                      <div>Secondary: {g.secondary_host}:{g.secondary_port} (reg: {g.secondary_registered})</div>
+                    </div>
+                    {g.last_move_error && (
+                      <div className="text-[10px] text-rose-300 truncate" title={g.last_move_error}>{g.last_move_error}</div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleHAMove(g.active_controller === 'primary' ? 'secondary' : 'primary')}
+                      disabled={g.move_active || !!haBusy}
+                      className="mt-1 rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      Move to {g.active_controller === 'primary' ? 'Secondary' : 'Primary'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* ── Pool count badges ─────────────────────────────────────── */}
           {regSubViewActive && (
             <div className="grid grid-cols-3 gap-3">
@@ -1045,7 +1154,7 @@ export function PrePhasePanel() {
 
           {/* ── Abort button (visible only while reg/sub running) ─────── */}
           {regSubViewActive && !regDone && !isMock && (
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
               <Button
                 size="sm"
                 variant="outline"
@@ -1056,7 +1165,7 @@ export function PrePhasePanel() {
                 {isAborting ? (
                   <><Loader2 className="size-3.5 animate-spin" /> Aborting…</>
                 ) : (
-                  <><ShieldOff className="size-3.5" /> Abort</>
+                  <><ShieldOff className="size-3.5" /> Abort & Cleanup</>
                 )}
               </Button>
             </div>

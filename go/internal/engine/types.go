@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/cci/traffic-engine/internal/rtp"
@@ -56,9 +57,18 @@ type CallResult struct {
 	RTPRxPkts           int           `json:"rtp_rx_pkts"`
 	SIPLocalIP          string        `json:"sip_local_ip"`
 	SIPLocalPort        int           `json:"sip_local_port"`
+	SIPRemoteIP         string        `json:"sip_remote_ip"`
+	SIPRemotePort       int           `json:"sip_remote_port"`
+	SIPCode             int           `json:"sip_code,omitempty"`
+	SIPServerHeader     string        `json:"sip_server_header,omitempty"`
+	SIPUserAgentHeader  string        `json:"sip_user_agent_header,omitempty"`
 	MediaVerified       bool          `json:"media_verified"`
 	RTPLocalPort        int           `json:"rtp_local_port"`
 	MediaSecurity       string        `json:"media_security"`
+	RTPCodec            string        `json:"rtp_codec"`
+	RTPPayloadType      int           `json:"rtp_payload_type"`
+	RTPPayloadMarkers   bool          `json:"rtp_payload_markers"`
+	MOSCodec            string        `json:"mos_codec"`
 	SRTPCryptoSuite     string        `json:"srtp_crypto_suite,omitempty"`
 	SRTPDecryptFailures int           `json:"srtp_decrypt_failures,omitempty"`
 	SRTPAuthFailures    int           `json:"srtp_auth_failures,omitempty"`
@@ -80,6 +90,8 @@ type CallResult struct {
 	RTPExpectedPkts  int    `json:"rtp_expected_pkts"`
 	RTPSSRCCount     int    `json:"rtp_ssrc_count"`
 	Scenario         string `json:"scenario"`
+	ActiveController string `json:"active_controller,omitempty"`
+	AgentGroupID     string `json:"agent_group_id,omitempty"`
 
 	// QoS / Media metrics (Phase 1 — read-only).
 	// Populated by call_engine / uas_auto_answer from rtp.RtpStats and the
@@ -180,7 +192,13 @@ const (
 )
 
 // ComputeMOS returns an estimated Mean Opinion Score using the simplified
-// ITU-T G.107 E-Model. The formula assumes a G.711 narrowband codec.
+// ITU-T G.107 E-Model. It preserves the historical G.711 estimate.
+func ComputeMOS(packetLossFraction, jitterMs float64) float64 {
+	return ComputeMOSForCodec("G711_ULAW", packetLossFraction, jitterMs)
+}
+
+// ComputeMOSForCodec returns an estimated Mean Opinion Score using a simplified
+// ITU-T G.107 E-Model with codec-specific baseline/impairment parameters.
 // Inputs:
 //
 //	packetLossFraction — 0.0 to 1.0 (NOT percentage)
@@ -191,23 +209,33 @@ const (
 // This is an approximation; for production-grade reporting use a dedicated
 // E-Model library. It is intentionally conservative for traffic-test use
 // (slightly under-predicts vs. real subjective scoring).
-func ComputeMOS(packetLossFraction, jitterMs float64) float64 {
+func ComputeMOSForCodec(codec string, packetLossFraction, jitterMs float64) float64 {
 	if packetLossFraction < 0 {
 		packetLossFraction = 0
 	}
 	if jitterMs < 0 {
 		jitterMs = 0
 	}
-	// Base R-factor for G.711 PCMU = 93.2.
 	R := 93.2
+	lossFactor := 17.0
+	switch strings.ToUpper(strings.TrimSpace(codec)) {
+	case "G729":
+		// G.729 narrowband has a lower clean-channel ceiling than G.711 and
+		// degrades faster with loss because this tool does not model PLC.
+		R = 83.0
+		lossFactor = 24.0
+	case "G711_ALAW", "G711_ULAW", "":
+		R = 93.2
+		lossFactor = 17.0
+	}
 	// Effective one-way latency: assume 50ms baseline + jitter buffer
 	// (~2.5x jitter is a typical playout-buffer rule of thumb).
 	effectiveLatency := 50.0 + jitterMs*2.5
 	if effectiveLatency > 177.3 {
 		R -= (effectiveLatency - 177.3) * 0.1
 	}
-	// Packet-loss impairment (logarithmic; G.711 has no built-in PLC).
-	R -= 17.0 * math.Log(1+100*packetLossFraction)
+	// Packet-loss impairment (logarithmic; codec-specific approximation).
+	R -= lossFactor * math.Log(1+100*packetLossFraction)
 
 	if R < 0 {
 		R = 0

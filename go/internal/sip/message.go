@@ -112,6 +112,12 @@ func (m *SipMessage) ReplaceHeader(name, value string) {
 	m.AddHeader(name, value)
 }
 
+func (m *SipMessage) SetDefaultUserAgent() {
+	if len(m.GetHeader(HdrUserAgent)) == 0 {
+		m.AddHeader(HdrUserAgent, UserAgentValue)
+	}
+}
+
 // GetHeader returns all values for the header, or nil if absent.
 func (m *SipMessage) GetHeader(name string) []string {
 	return m.headers[name]

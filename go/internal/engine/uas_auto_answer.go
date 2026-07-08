@@ -205,30 +205,6 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		emitCallEvent(u.metrics, callID, ag.Ext, event, "uas", callerExt, sipCode, ms, extra)
 	}
 
-	// ── Allocate RTP endpoint ──────────────────────────────────────
-	if cfg.MediaEnabled {
-		var err error
-		rtpEP, err = rtp.NewRtpEndpointFull(
-			ag.LocalHost(),
-			cfg.RTPPtime,
-			cfg.IsQoSEnabled(),
-			cfg.IsRTCPSREnabled(),
-			time.Duration(cfg.RTCPSRIntervalSeconds)*time.Second,
-		)
-		if err != nil {
-			slog.Warn("RTP endpoint alloc failed — using port 9",
-				"ext", ag.Ext, "err", err)
-		}
-	}
-	rtpPort := 9
-	if rtpEP != nil {
-		rtpPort = rtpEP.LocalPort()
-	}
-
-	if cfg.RTPPcap && rtpEP != nil {
-		rtpEP.EnablePcap(fmt.Sprintf("logs/rtp_uas_%s_%d.pcap", ag.Ext, rtpEP.LocalPort()))
-	}
-
 	// ── Handle INVITE: sends 100 + 180 ─────────────────────────────
 	dialog, err := ag.HandleIncomingInvite(rawInvite)
 	if err != nil {
@@ -259,6 +235,62 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 	emit("UAS_INVITE_RECEIVED", 0, 0.0, nil)
 	emit("UAS_TRYING_100_SENT", 100, milestones.Trying100SentMs, nil)
 	emit("UAS_RINGING_180_SENT", 180, milestones.Ringing180SentMs, nil)
+
+	negotiatedCodec, fallback, rejectReason := agent.NegotiateSingleCodec(dialog.RemoteSDPInfo, cfg.RTPCodec, cfg.RTPUnsupportedCodecPolicy)
+	if rejectReason != "" {
+		dialog.CodecRejectReason = rejectReason
+		slog.Warn("UAS rejecting INVITE due to unsupported codec offer",
+			"ext", ag.Ext,
+			"call_id", callID,
+			"configured_codec", cfg.RTPCodec,
+			"offered_codecs", dialog.OfferedCodecs,
+			"policy", cfg.RTPUnsupportedCodecPolicy,
+			"reason", rejectReason)
+		if err := ag.SendInviteReject(dialog, "488", "Not Acceptable Here"); err != nil {
+			slog.Error("UAS send 488 failed", "ext", ag.Ext, "call_id", callID, "err", err)
+		}
+		emit("UAS_INVITE_REJECTED", 488, msSince(callStart), map[string]any{
+			"reason":           rejectReason,
+			"configured_codec": cfg.RTPCodec,
+			"offered_codecs":   dialog.OfferedCodecs,
+		})
+		return
+	}
+	dialog.NegotiatedCodec = negotiatedCodec
+	dialog.CodecFallback = fallback
+	if fallback {
+		slog.Info("UAS codec fallback selected",
+			"ext", ag.Ext,
+			"call_id", callID,
+			"configured_codec", cfg.RTPCodec,
+			"negotiated_codec", negotiatedCodec,
+			"offered_codecs", dialog.OfferedCodecs)
+	}
+
+	// ── Allocate RTP endpoint after SDP negotiation ─────────────────
+	if cfg.MediaEnabled {
+		var err error
+		rtpEP, err = rtp.NewRtpEndpointFullCodec(
+			ag.LocalHost(),
+			cfg.RTPPtime,
+			negotiatedCodec,
+			cfg.IsQoSEnabled(),
+			cfg.IsRTCPSREnabled(),
+			time.Duration(cfg.RTCPSRIntervalSeconds)*time.Second,
+		)
+		if err != nil {
+			slog.Warn("RTP endpoint alloc failed — using port 9",
+				"ext", ag.Ext, "err", err)
+		}
+	}
+	rtpPort := 9
+	if rtpEP != nil {
+		rtpPort = rtpEP.LocalPort()
+	}
+
+	if cfg.RTPPcap && rtpEP != nil {
+		rtpEP.EnablePcap(fmt.Sprintf("logs/rtp_uas_%s_%d.pcap", ag.Ext, rtpEP.LocalPort()))
+	}
 
 	if rtpEP != nil && dialog.RTPRemoteIP != "" {
 		rtpEP.SetRemoteRTPAddr(dialog.RTPRemoteIP, dialog.RTPRemotePort)
@@ -436,7 +468,7 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		srtpAuthFailures = st.SRTPAuthFailures
 		srtpReplayFailures = st.SRTPReplayFailures
 		if cfg.IsQoSMOSEnabled() && mediaOK {
-			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+			mosScore = ComputeMOSForCodec(negotiatedCodecForDialog(dialog, cfg.RTPCodec), st.PacketLossPct/100.0, st.JitterMs)
 		}
 
 		mediaEvent := ClassifyMedia(st, float64(cfg.HoldTimeSeconds))
@@ -479,9 +511,15 @@ func (u *UasAutoAnswer) handleCall(ctx context.Context, ag *agent.ExtensionAgent
 		RTPRxPkts:           rtpRx,
 		SIPLocalIP:          ag.LocalHost(),
 		SIPLocalPort:        ag.LocalPort(),
+		SIPRemoteIP:         u.config.SBCHost,
+		SIPRemotePort:       u.config.SBCPort,
 		MediaVerified:       mediaOK,
 		RTPLocalPort:        rtpLocalPort(rtpEP),
 		MediaSecurity:       u.config.MediaSecurity,
+		RTPCodec:            rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).Name,
+		RTPPayloadType:      rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).PayloadType,
+		RTPPayloadMarkers:   rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).PayloadMarkerEnabled,
+		MOSCodec:            rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).Name,
 		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
 		SRTPDecryptFailures: srtpDecryptFailures,
 		SRTPAuthFailures:    srtpAuthFailures,
@@ -584,7 +622,7 @@ func (u *UasAutoAnswer) handleTimeout(
 		srtpAuthFailures = st.SRTPAuthFailures
 		srtpReplayFailures = st.SRTPReplayFailures
 		if u.config.IsQoSMOSEnabled() && mediaOK {
-			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+			mosScore = ComputeMOSForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec), st.PacketLossPct/100.0, st.JitterMs)
 		}
 	}
 	sbcRelayIP, sbcRelayPort := "", 0
@@ -607,6 +645,8 @@ func (u *UasAutoAnswer) handleTimeout(
 		RTPRxPkts:           rtpRx,
 		SIPLocalIP:          ag.LocalHost(),
 		SIPLocalPort:        ag.LocalPort(),
+		SIPRemoteIP:         u.config.SBCHost,
+		SIPRemotePort:       u.config.SBCPort,
 		MediaVerified:       mediaOK,
 		RTPRxFromSBCPkts:    rtpRxFromSBC,
 		RTPRxOtherPkts:      rtpRxOt,
@@ -616,6 +656,10 @@ func (u *UasAutoAnswer) handleTimeout(
 		RTPExpectedPkts:     rtpExpected,
 		RTPSSRCCount:        rtpSSRCCount,
 		MediaSecurity:       u.config.MediaSecurity,
+		RTPCodec:            rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).Name,
+		RTPPayloadType:      rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).PayloadType,
+		RTPPayloadMarkers:   rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).PayloadMarkerEnabled,
+		MOSCodec:            rtp.ProfileForCodec(negotiatedCodecForDialog(dialog, u.config.RTPCodec)).Name,
 		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
 		SRTPDecryptFailures: srtpDecryptFailures,
 		SRTPAuthFailures:    srtpAuthFailures,
@@ -643,6 +687,13 @@ func (u *UasAutoAnswer) handleTimeout(
 		ByeCompletionMs:     byeCompletionMs,
 	}
 	u.complete(result)
+}
+
+func negotiatedCodecForDialog(dialog *agent.DialogState, fallback string) string {
+	if dialog != nil && strings.TrimSpace(dialog.NegotiatedCodec) != "" {
+		return dialog.NegotiatedCodec
+	}
+	return fallback
 }
 
 // complete invokes the on-complete callback if set.

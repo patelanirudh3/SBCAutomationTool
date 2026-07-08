@@ -43,6 +43,7 @@ type TrafficMetrics struct {
 	VMID                               string                            `json:"vm_id"`
 	Phase                              string                            `json:"phase"`
 	CPSActual                          float64                           `json:"cps_actual"`
+	TargetCPS                          int                               `json:"target_cps"`
 	ConcurrentCalls                    int                               `json:"concurrent_calls"`
 	CallsInviteSent                    int                               `json:"calls_invite_sent"`
 	CallsAttempted                     int                               `json:"calls_attempted"`
@@ -143,29 +144,30 @@ type TrafficMetrics struct {
 	MediaSecurity    string           `json:"media_security"`
 	SRTPCryptoSuites []string         `json:"srtp_crypto_suites,omitempty"`
 
-	HostCPUAvgPercent        float64   `json:"host_cpu_avg_percent"`
-	HostCPUMaxPercent        float64   `json:"host_cpu_max_percent"`
-	ProcessCPUCoreAvgPercent float64   `json:"process_cpu_core_avg_percent"`
-	ProcessCPUCoreMaxPercent float64   `json:"process_cpu_core_max_percent"`
-	SoftIRQCPUMaxPercent     float64   `json:"softirq_cpu_max_percent"`
-	IOWaitCPUMaxPercent      float64   `json:"iowait_cpu_max_percent"`
-	HAEnabled                bool      `json:"ha_enabled"`
-	HAActiveController       string    `json:"ha_active_controller,omitempty"`
-	HAPrimaryRegistered      int       `json:"ha_primary_registered"`
-	HASecondaryRegistered    int       `json:"ha_secondary_registered"`
-	HAPrimarySubscribed      int       `json:"ha_primary_subscribed"`
-	HASecondarySubscribed    int       `json:"ha_secondary_subscribed"`
-	HAPrimaryReachable       bool      `json:"ha_primary_reachable"`
-	HAPrimaryRecoveredAt     string    `json:"ha_primary_recovered_at,omitempty"`
-	HAReadyProtected         int       `json:"ha_ready_protected"`
-	HADegradedPrimaryOnly    int       `json:"ha_degraded_primary_only"`
-	HANotUsable              int       `json:"ha_not_usable"`
-	HAMoveActive             bool      `json:"ha_move_active"`
-	HAMoveTarget             string    `json:"ha_move_target,omitempty"`
-	HAMoveLastError          string    `json:"ha_move_last_error,omitempty"`
-	HAFailoverEvents         int       `json:"ha_failover_events"`
-	HAFailoverDeferred       int       `json:"ha_failover_deferred"`
-	HAEvents                 []HAEvent `json:"ha_events,omitempty"`
+	HostCPUAvgPercent        float64            `json:"host_cpu_avg_percent"`
+	HostCPUMaxPercent        float64            `json:"host_cpu_max_percent"`
+	ProcessCPUCoreAvgPercent float64            `json:"process_cpu_core_avg_percent"`
+	ProcessCPUCoreMaxPercent float64            `json:"process_cpu_core_max_percent"`
+	SoftIRQCPUMaxPercent     float64            `json:"softirq_cpu_max_percent"`
+	IOWaitCPUMaxPercent      float64            `json:"iowait_cpu_max_percent"`
+	HAEnabled                bool               `json:"ha_enabled"`
+	HAActiveController       string             `json:"ha_active_controller,omitempty"`
+	HAPrimaryRegistered      int                `json:"ha_primary_registered"`
+	HASecondaryRegistered    int                `json:"ha_secondary_registered"`
+	HAPrimarySubscribed      int                `json:"ha_primary_subscribed"`
+	HASecondarySubscribed    int                `json:"ha_secondary_subscribed"`
+	HAPrimaryReachable       bool               `json:"ha_primary_reachable"`
+	HAPrimaryRecoveredAt     string             `json:"ha_primary_recovered_at,omitempty"`
+	HAReadyProtected         int                `json:"ha_ready_protected"`
+	HADegradedPrimaryOnly    int                `json:"ha_degraded_primary_only"`
+	HANotUsable              int                `json:"ha_not_usable"`
+	HAMoveActive             bool               `json:"ha_move_active"`
+	HAMoveTarget             string             `json:"ha_move_target,omitempty"`
+	HAMoveLastError          string             `json:"ha_move_last_error,omitempty"`
+	HAFailoverEvents         int                `json:"ha_failover_events"`
+	HAFailoverDeferred       int                `json:"ha_failover_deferred"`
+	HAEvents                 []HAEvent          `json:"ha_events,omitempty"`
+	HAAgentGroups            []AgentGroupStatus `json:"ha_agent_groups,omitempty"`
 
 	CallDetailLog      string            `json:"call_detail_log,omitempty"`
 	CallDetailDropped  int               `json:"call_detail_dropped"`
@@ -240,6 +242,29 @@ type HAEvent struct {
 	Details   string `json:"details,omitempty"`
 }
 
+// AgentGroupStatus reports the HA state of a single agent group within a
+// multi-zone topology. Each group has a primary and secondary controller.
+type AgentGroupStatus struct {
+	GroupID             string `json:"group_id"`
+	ZoneID              string `json:"zone_id"`
+	PrimaryHost         string `json:"primary_host"`
+	PrimaryPort         int    `json:"primary_port"`
+	SecondaryHost       string `json:"secondary_host"`
+	SecondaryPort       int    `json:"secondary_port"`
+	ActiveController    string `json:"active_controller"`
+	PrimaryRegistered   int    `json:"primary_registered"`
+	SecondaryRegistered int    `json:"secondary_registered"`
+	ActiveSubscribed    int    `json:"active_subscribed"`
+	AgentCount          int    `json:"agent_count"`
+	PrimaryReachable    bool   `json:"primary_reachable"`
+	MoveActive          bool   `json:"move_active"`
+	LastMoveError       string `json:"last_move_error,omitempty"`
+	PendingMoveOut      int    `json:"pending_move_out"`
+	MoveRetrying        int    `json:"move_retrying"`
+	ActiveOnSecondary   int    `json:"active_on_secondary"`
+	FailbackPending     int    `json:"failback_pending"`
+}
+
 // SubscriptionEventStats exposes per-event-package subscription progress.
 type SubscriptionEventStats struct {
 	Total          int `json:"total"`
@@ -272,9 +297,18 @@ type CallResultData struct {
 	RTPRxPkts           int
 	SIPLocalIP          string
 	SIPLocalPort        int
+	SIPRemoteIP         string
+	SIPRemotePort       int
+	SIPCode             int
+	SIPServerHeader     string
+	SIPUserAgentHeader  string
 	MediaVerified       bool
 	RTPLocalPort        int
 	MediaSecurity       string
+	RTPCodec            string
+	RTPPayloadType      int
+	RTPPayloadMarkers   bool
+	MOSCodec            string
 	SRTPCryptoSuite     string
 	SRTPDecryptFailures int
 	SRTPAuthFailures    int
@@ -294,6 +328,8 @@ type CallResultData struct {
 	RTPExpectedPkts     int
 	RTPSSRCCount        int
 	Scenario            string
+	ActiveController    string
+	AgentGroupID        string
 	SipMilestones       json.RawMessage
 
 	// QoS / Media metrics (Phase 1, mirrors engine.CallResult).
@@ -385,6 +421,7 @@ type MetricsCollector struct {
 	callDetailDropped     int
 	lastMemoryLog         time.Time
 	concurrentProvider    func() int
+	targetCPSProvider     func() int
 	poolCountsProvider    func() (idle, nonIdle, regOnly int)
 	roleCountsProvider    func() (uacIdle, uasIdle, nonIdle, regOnly, uacAssigned, uasAssigned, regSubReady, requiredReady int)
 	hostHealth            *HostHealthCollector
@@ -412,6 +449,7 @@ type MetricsCollector struct {
 	haFailoverEvents      int
 	haFailoverDeferred    int
 	haEvents              []HAEvent
+	haAgentGroups         []AgentGroupStatus
 
 	rtpHealthCounts map[string]int
 
@@ -965,6 +1003,27 @@ func (c *MetricsCollector) RecordHAEvent(eventType, target, details string) {
 	}
 }
 
+// SetHAAgentGroups replaces the per-group HA status snapshot.
+func (c *MetricsCollector) SetHAAgentGroups(groups []AgentGroupStatus) {
+	c.mu.Lock()
+	c.haAgentGroups = append([]AgentGroupStatus(nil), groups...)
+	c.mu.Unlock()
+}
+
+// UpdateHAAgentGroup updates a single group's status by GroupID.
+// If the group doesn't exist in the current list, it is appended.
+func (c *MetricsCollector) UpdateHAAgentGroup(status AgentGroupStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, g := range c.haAgentGroups {
+		if g.GroupID == status.GroupID {
+			c.haAgentGroups[i] = status
+			return
+		}
+	}
+	c.haAgentGroups = append(c.haAgentGroups, status)
+}
+
 func (c *MetricsCollector) PerformanceDiagnosticsMode() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1046,9 +1105,7 @@ func (c *MetricsCollector) SetRegSubBackground(active, complete bool) {
 	c.mu.Unlock()
 }
 
-// IncrementRegistered bumps the live REGISTER progress counter by one. Called
-// from RegisterAll's per-agent goroutine once the agent's REGISTER attempt
-// finishes (regardless of success).
+// IncrementRegistered bumps the successful REGISTER counter by one.
 func (c *MetricsCollector) IncrementRegistered() {
 	c.mu.Lock()
 	c.registeredCount++
@@ -1145,6 +1202,12 @@ func (c *MetricsCollector) PrepStatus() string {
 func (c *MetricsCollector) SetConcurrentProvider(fn func() int) {
 	c.mu.Lock()
 	c.concurrentProvider = fn
+	c.mu.Unlock()
+}
+
+func (c *MetricsCollector) SetTargetCPSProvider(fn func() int) {
+	c.mu.Lock()
+	c.targetCPSProvider = fn
 	c.mu.Unlock()
 }
 
@@ -1313,6 +1376,11 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"rtp_rx_pkts":           r.RTPRxPkts,
 			"sip_local_ip":          r.SIPLocalIP,
 			"sip_local_port":        r.SIPLocalPort,
+			"sip_remote_ip":         r.SIPRemoteIP,
+			"sip_remote_port":       r.SIPRemotePort,
+			"sip_code":              r.SIPCode,
+			"sip_server_header":     r.SIPServerHeader,
+			"sip_user_agent_header": r.SIPUserAgentHeader,
 			"media_verified":        r.MediaVerified,
 			"rtp_local_port":        r.RTPLocalPort,
 			"media_security":        r.MediaSecurity,
@@ -1330,11 +1398,16 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"rtp_rx_other_pkts":     r.RTPRxOtherPkts,
 			"rtcp_rx_pkts":          r.RTCPRxPkts,
 			"rtp_asymmetry_flag":    r.RTPAsymmetryFlag,
+			"rtp_codec":             r.RTPCodec,
+			"rtp_payload_type":      r.RTPPayloadType,
+			"rtp_payload_markers":   r.RTPPayloadMarkers,
 			"markers_sent":          r.MarkersSent,
 			"markers_received":      r.MarkersReceived,
 			"rtp_expected_pkts":     r.RTPExpectedPkts,
 			"rtp_ssrc_count":        r.RTPSSRCCount,
 			"scenario":              r.Scenario,
+			"active_controller":     r.ActiveController,
+			"agent_group_id":        r.AgentGroupID,
 			// Phase-1 QoS fields
 			"jitter_ms":          r.JitterMs,
 			"packet_loss_pct":    r.PacketLossPct,
@@ -1344,6 +1417,7 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 			"remote_jitter_ms":   r.RemoteJitterMs,
 			"remote_loss_pct":    r.RemoteLossPct,
 			"mos_score":          r.MOSScore,
+			"mos_codec":          r.MOSCodec,
 			"media_quality_flag": r.MediaQualityFlag,
 			"call_setup_ms":      r.CallSetupMs,
 			"prack_rtt_ms":       r.PrackRTTMs,
@@ -1374,9 +1448,17 @@ func callResultToDetailMap(r CallResultData) map[string]any {
 		"rtp_rx_pkts":           r.RTPRxPkts,
 		"sip_local_ip":          r.SIPLocalIP,
 		"sip_local_port":        r.SIPLocalPort,
+		"sip_remote_ip":         r.SIPRemoteIP,
+		"sip_remote_port":       r.SIPRemotePort,
+		"sip_code":              r.SIPCode,
+		"sip_server_header":     r.SIPServerHeader,
+		"sip_user_agent_header": r.SIPUserAgentHeader,
 		"media_verified":        r.MediaVerified,
 		"rtp_local_port":        r.RTPLocalPort,
 		"media_security":        r.MediaSecurity,
+		"rtp_codec":             r.RTPCodec,
+		"rtp_payload_type":      r.RTPPayloadType,
+		"rtp_payload_markers":   r.RTPPayloadMarkers,
 		"srtp_crypto_suite":     r.SRTPCryptoSuite,
 		"srtp_decrypt_failures": r.SRTPDecryptFailures,
 		"srtp_auth_failures":    r.SRTPAuthFailures,
@@ -1396,6 +1478,8 @@ func callResultToDetailMap(r CallResultData) map[string]any {
 		"rtp_expected_pkts":     r.RTPExpectedPkts,
 		"rtp_ssrc_count":        r.RTPSSRCCount,
 		"scenario":              r.Scenario,
+		"active_controller":     r.ActiveController,
+		"agent_group_id":        r.AgentGroupID,
 		"jitter_ms":             r.JitterMs,
 		"packet_loss_pct":       r.PacketLossPct,
 		"lost_packets":          r.LostPackets,
@@ -1404,6 +1488,7 @@ func callResultToDetailMap(r CallResultData) map[string]any {
 		"remote_jitter_ms":      r.RemoteJitterMs,
 		"remote_loss_pct":       r.RemoteLossPct,
 		"mos_score":             r.MOSScore,
+		"mos_codec":             r.MOSCodec,
 		"media_quality_flag":    r.MediaQualityFlag,
 		"call_setup_ms":         r.CallSetupMs,
 		"prack_rtt_ms":          r.PrackRTTMs,
@@ -1467,8 +1552,16 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"hold_ms":               cr.HoldMs,
 			"media_status":          media,
 			"media_security":        cr.MediaSecurity,
+			"rtp_codec":             cr.RTPCodec,
+			"rtp_payload_type":      cr.RTPPayloadType,
+			"rtp_payload_markers":   cr.RTPPayloadMarkers,
 			"sip_local_ip":          cr.SIPLocalIP,
 			"sip_local_port":        cr.SIPLocalPort,
+			"sip_remote_ip":         cr.SIPRemoteIP,
+			"sip_remote_port":       cr.SIPRemotePort,
+			"sip_code":              cr.SIPCode,
+			"sip_server_header":     cr.SIPServerHeader,
+			"sip_user_agent_header": cr.SIPUserAgentHeader,
 			"srtp_crypto_suite":     cr.SRTPCryptoSuite,
 			"srtp_decrypt_failures": cr.SRTPDecryptFailures,
 			"srtp_auth_failures":    cr.SRTPAuthFailures,
@@ -1485,6 +1578,8 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"rtp_ssrc_count":        cr.RTPSSRCCount,
 			"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
 			"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
+			"active_controller":     cr.ActiveController,
+			"agent_group_id":        cr.AgentGroupID,
 			"ts_utc":                ts,
 			"timestamp":             ts,
 			// Phase-1 QoS fields
@@ -1496,6 +1591,7 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 			"remote_jitter_ms":   cr.RemoteJitterMs,
 			"remote_loss_pct":    cr.RemoteLossPct,
 			"mos_score":          cr.MOSScore,
+			"mos_codec":          cr.MOSCodec,
 			"media_quality_flag": cr.MediaQualityFlag,
 			"call_setup_ms":      cr.CallSetupMs,
 			"prack_rtt_ms":       cr.PrackRTTMs,
@@ -1652,6 +1748,7 @@ func (c *MetricsCollector) Reset() {
 	c.callDetailPath = ""
 	c.callDetailDropped = 0
 	c.concurrentProvider = nil
+	c.targetCPSProvider = nil
 	c.poolCountsProvider = nil
 	c.roleCountsProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
@@ -1712,6 +1809,7 @@ func (c *MetricsCollector) Reset() {
 	c.haFailoverEvents = 0
 	c.haFailoverDeferred = 0
 	c.haEvents = nil
+	c.haAgentGroups = nil
 	c.vmID = "unconfigured"
 	c.latest = TrafficMetrics{
 		VMID:               "unconfigured",
@@ -1773,6 +1871,10 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 	concurrent := c.concurrentCalls
 	if c.concurrentProvider != nil {
 		concurrent = c.concurrentProvider()
+	}
+	targetCPS := 0
+	if c.targetCPSProvider != nil {
+		targetCPS = c.targetCPSProvider()
 	}
 
 	var runElapsed float64
@@ -1868,6 +1970,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		VMID:                               c.vmID,
 		Phase:                              c.phase,
 		CPSActual:                          math.Round(cpsActual*1000) / 1000,
+		TargetCPS:                          targetCPS,
 		ConcurrentCalls:                    concurrent,
 		CallsInviteSent:                    c.callsInviteSent,
 		CallsAttempted:                     c.callsAttempted,
@@ -1969,6 +2072,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		HAFailoverEvents:         c.haFailoverEvents,
 		HAFailoverDeferred:       c.haFailoverDeferred,
 		HAEvents:                 append([]HAEvent(nil), c.haEvents...),
+		HAAgentGroups:            append([]AgentGroupStatus(nil), c.haAgentGroups...),
 		CallDetailLog:            c.callDetailPath,
 		CallDetailDropped:        c.callDetailDropped,
 		CallResultsKept:          len(c.callResults),
@@ -2168,21 +2272,23 @@ func (c *MetricsCollector) RunPushLoop(stopCh <-chan struct{}) {
 // ProcessContext holds mutable state shared between HTTP endpoints and the
 // traffic lifecycle when running in GUI-driven mode.
 type ProcessContext struct {
-	Collector   *MetricsCollector
-	StopEvent   chan struct{}
-	ProcessExit chan struct{}
-	Port        int
-	Config      any // parsed *config.VMConfig (stored as any to avoid import cycle)
-	RawConfig   map[string]any
-	State       string
-	VMID        string // set by PUT /api/config; used by effectiveVMID
-	Role        string // set by PUT /api/config; used by effectiveRole
-	YAMLPath    string
-	LogLevel    string
-	RunID       string
-	PairID      string
-	StartFunc   func()
-	Mu          sync.Mutex
+	Collector             *MetricsCollector
+	StopEvent             chan struct{}
+	ProcessExit           chan struct{}
+	Port                  int
+	Config                any // parsed *config.VMConfig (stored as any to avoid import cycle)
+	RawConfig             map[string]any
+	State                 string
+	VMID                  string // set by PUT /api/config; used by effectiveVMID
+	Role                  string // set by PUT /api/config; used by effectiveRole
+	YAMLPath              string
+	LogLevel              string
+	RunID                 string
+	PairID                string
+	StartFunc             func()
+	RegSubStartRequested  bool
+	CleanupStartRequested bool
+	Mu                    sync.Mutex
 
 	// Phase-gate channels for the single-pool state machine.
 	// Closed by the corresponding API endpoint to unblock the lifecycle goroutine.
@@ -2204,6 +2310,7 @@ type ProcessContext struct {
 	// OnHAMoveSubscription is invoked by POST /api/ha/move-subscription.
 	// It is wired by main.go when a GUI-driven lifecycle is active.
 	OnHAMoveSubscription func(target string) error
+	OnCPSChange          func(cps int) (int, error)
 
 	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
 	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
@@ -2960,6 +3067,8 @@ func BuildMux(
 		processCtx.StopEvent = make(chan struct{}, 1)
 		processCtx.RunID = ""
 		processCtx.PairID = ""
+		processCtx.RegSubStartRequested = false
+		processCtx.CleanupStartRequested = false
 		if hasConfig {
 			processCtx.State = "CONFIGURED"
 		} else {
@@ -3069,8 +3178,16 @@ func BuildMux(
 				"hold_ms":               cr.HoldMs,
 				"media_status":          media,
 				"media_security":        cr.MediaSecurity,
+				"rtp_codec":             cr.RTPCodec,
+				"rtp_payload_type":      cr.RTPPayloadType,
+				"rtp_payload_markers":   cr.RTPPayloadMarkers,
 				"sip_local_ip":          cr.SIPLocalIP,
 				"sip_local_port":        cr.SIPLocalPort,
+				"sip_remote_ip":         cr.SIPRemoteIP,
+				"sip_remote_port":       cr.SIPRemotePort,
+				"sip_code":              cr.SIPCode,
+				"sip_server_header":     cr.SIPServerHeader,
+				"sip_user_agent_header": cr.SIPUserAgentHeader,
 				"srtp_crypto_suite":     cr.SRTPCryptoSuite,
 				"srtp_decrypt_failures": cr.SRTPDecryptFailures,
 				"srtp_auth_failures":    cr.SRTPAuthFailures,
@@ -3087,6 +3204,8 @@ func BuildMux(
 				"rtp_ssrc_count":        cr.RTPSSRCCount,
 				"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
 				"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
+				"active_controller":     cr.ActiveController,
+				"agent_group_id":        cr.AgentGroupID,
 				"ts_utc":                ts,
 				"timestamp":             ts,
 				// Phase-1 QoS fields
@@ -3098,6 +3217,7 @@ func BuildMux(
 				"remote_jitter_ms":   cr.RemoteJitterMs,
 				"remote_loss_pct":    cr.RemoteLossPct,
 				"mos_score":          cr.MOSScore,
+				"mos_codec":          cr.MOSCodec,
 				"media_quality_flag": cr.MediaQualityFlag,
 				"call_setup_ms":      cr.CallSetupMs,
 				"prack_rtt_ms":       cr.PrackRTTMs,
@@ -3200,30 +3320,36 @@ func BuildMux(
 			})
 			return
 		}
+		processCtx.Mu.Lock()
+		processCtx.RegSubStartRequested = true
+		processCtx.Mu.Unlock()
 		select {
 		case processCtx.RegSubStartCh <- struct{}{}:
 			slog.Info("RegSub start signalled via API")
 			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_starting"})
 		default:
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "reg/sub already started or not ready"})
+			slog.Info("RegSub start requested via API; signal already queued or consumed")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_starting"})
 		}
 	}
 	mux.HandleFunc("POST /api/prephase/start", regSubStartHandler)
 	mux.HandleFunc("POST /api/regsub/start", regSubStartHandler)
 
-	// POST /api/regsub/abort — set stopNew so RegisterAll/SubscribeAll halt
-	// new batches and let in-flight work drain.
+	// POST /api/regsub/abort — abort Reg/Sub and enter the shared cleanup
+	// pipeline. The lifecycle consumes CleanupStartCh during REGSUB_RUNNING,
+	// stops new TCP/TLS, REGISTER, and SUBSCRIBE work, drains in-flight work,
+	// then runs the same unsubscribe/unregister path used after traffic.
 	mux.HandleFunc("POST /api/regsub/abort", func(w http.ResponseWriter, r *http.Request) {
 		if processCtx == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
 			return
 		}
 		select {
-		case processCtx.RegSubAbortCh <- struct{}{}:
-			slog.Info("RegSub abort signalled via API")
-			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_aborting"})
+		case processCtx.CleanupStartCh <- struct{}{}:
+			slog.Info("RegSub abort cleanup signalled via API")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "regsub_abort_cleanup_starting"})
 		default:
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "abort already in flight"})
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "cleanup already started or not ready"})
 		}
 	})
 
@@ -3320,6 +3446,36 @@ func BuildMux(
 		}
 	})
 
+	mux.HandleFunc("POST /api/traffic/cps", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		body, err := readJSONBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		cps := int(getFloat(body, "cps"))
+		if cps <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "cps must be > 0"})
+			return
+		}
+		processCtx.Mu.Lock()
+		fn := processCtx.OnCPSChange
+		processCtx.Mu.Unlock()
+		if fn == nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "CPS changes are only available while traffic is running"})
+			return
+		}
+		applied, err := fn(cps)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "cps_updated", "target_cps": applied})
+	})
+
 	// POST /api/restart-traffic — re-enter the traffic loop after Complete,
 	// reusing the existing populated pool (no re-prep, no re-reg).
 	mux.HandleFunc("POST /api/restart-traffic", func(w http.ResponseWriter, r *http.Request) {
@@ -3342,12 +3498,16 @@ func BuildMux(
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
 			return
 		}
+		processCtx.Mu.Lock()
+		processCtx.CleanupStartRequested = true
+		processCtx.Mu.Unlock()
 		select {
 		case processCtx.CleanupStartCh <- struct{}{}:
 			slog.Info("Cleanup start signalled via API")
 			writeJSON(w, http.StatusAccepted, map[string]any{"status": "cleanup_starting"})
 		default:
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "cleanup already started or not ready"})
+			slog.Info("Cleanup start requested via API; signal already queued or consumed")
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "cleanup_starting"})
 		}
 	})
 

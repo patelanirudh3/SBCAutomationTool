@@ -15,6 +15,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ZoneController identifies a single SBC/controller endpoint within a zone.
+type ZoneController struct {
+	Host string `yaml:"host" json:"host"`
+	Port int    `yaml:"port" json:"port"`
+}
+
+// Zone groups one or more controllers that serve a geographic or logical zone.
+type Zone struct {
+	ZoneID      string           `yaml:"zone_id" json:"zone_id"`
+	Controllers []ZoneController `yaml:"controllers" json:"controllers"`
+}
+
+// ZoneConfig defines a multi-zone HA topology with cross-zone failover.
+// Agents are distributed across zones, and each zone's controllers serve as
+// primary for their zone's agents and secondary for the other zone's agents.
+type ZoneConfig struct {
+	Zones               []Zone `yaml:"zones" json:"zones"`
+	ZoneDistributionPct int    `yaml:"zone_distribution_pct" json:"zone_distribution_pct"`
+}
+
 // VMConfig holds all configuration for a single-pool traffic run.
 // The dual UAC/UAS role model has been replaced with a unified user pool.
 type VMConfig struct {
@@ -23,23 +43,27 @@ type VMConfig struct {
 	ExtEnd   int    `yaml:"ext_end" json:"ext_end"`
 	SBCHost  string `yaml:"sbc_host" json:"sbc_host"`
 	SBCPort  int    `yaml:"sbc_port" json:"sbc_port"`
-	// TODO(failover): SecondaryHost/Port are stored and validated but not yet
-	// wired into the engine. When failover_enabled is true, the forking model
-	// requires: (1) REGISTER on both primary and secondary during pre-phase,
-	// (2) SUBSCRIBE only on primary, (3) on primary failure during traffic run
-	// re-SUBSCRIBE to secondary (no re-REGISTER needed).
-	SecondaryHost           string `yaml:"secondary_host" json:"secondary_host"`
-	SecondaryPort           int    `yaml:"secondary_port" json:"secondary_port"`
-	FailoverEnabled         bool   `yaml:"failover_enabled" json:"failover_enabled"`
-	DualRegistrationEnabled bool   `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
-	FailoverMode            string `yaml:"failover_mode" json:"failover_mode"`
-	AutoFailbackEnabled     bool   `yaml:"auto_failback_enabled" json:"auto_failback_enabled"`
-	FailbackDelaySeconds    int    `yaml:"failback_delay_seconds" json:"failback_delay_seconds"`
-	DNSServers              string `yaml:"dns_servers" json:"dns_servers"`
-	SIPTransport            string `yaml:"sip_transport" json:"sip_transport"`
-	SIPScheme               string `yaml:"sip_scheme" json:"sip_scheme"`
-	Domain                  string `yaml:"domain" json:"domain"`
-	SIPPassword             string `yaml:"sip_password" json:"sip_password"`
+	// Dual-registration HA: REGISTER on both primary and secondary during
+	// pre-phase, SUBSCRIBE only on primary, re-SUBSCRIBE to secondary on
+	// primary failure (no re-REGISTER needed). See HAMode for multi-zone.
+	SecondaryHost           string      `yaml:"secondary_host" json:"secondary_host"`
+	SecondaryPort           int         `yaml:"secondary_port" json:"secondary_port"`
+	FailoverEnabled         bool        `yaml:"failover_enabled" json:"failover_enabled"`
+	DualRegistrationEnabled bool        `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
+	FailoverMode            string      `yaml:"failover_mode" json:"failover_mode"`
+	AutoFailbackEnabled     bool        `yaml:"auto_failback_enabled" json:"auto_failback_enabled"`
+	FailbackDelaySeconds    int         `yaml:"failback_delay_seconds" json:"failback_delay_seconds"`
+	FailoverTrigger         string      `yaml:"failover_trigger" json:"failover_trigger"`
+	FailoverTriggerCount    int         `yaml:"failover_trigger_count" json:"failover_trigger_count"`
+	FailoverTriggerPct      int         `yaml:"failover_trigger_pct" json:"failover_trigger_pct"`
+	FailoverTriggerWindowMs int         `yaml:"failover_trigger_window_ms" json:"failover_trigger_window_ms"`
+	HAMode                  string      `yaml:"ha_mode" json:"ha_mode"`
+	ZoneConfig              *ZoneConfig `yaml:"zone_config,omitempty" json:"zone_config,omitempty"`
+	DNSServers              string      `yaml:"dns_servers" json:"dns_servers"`
+	SIPTransport            string      `yaml:"sip_transport" json:"sip_transport"`
+	SIPScheme               string      `yaml:"sip_scheme" json:"sip_scheme"`
+	Domain                  string      `yaml:"domain" json:"domain"`
+	SIPPassword             string      `yaml:"sip_password" json:"sip_password"`
 
 	// TLS settings — only consulted when SIPTransport == "TLS".
 	// TLSMode controls verification policy and which other fields are required:
@@ -103,6 +127,8 @@ type VMConfig struct {
 	MediaSecurity               string   `yaml:"media_security" json:"media_security"` // "rtp" | "srtp_sdes"
 	SRTPCryptoSuites            []string `yaml:"srtp_crypto_suites" json:"srtp_crypto_suites"`
 	SRTPKeyMode                 string   `yaml:"srtp_key_mode" json:"srtp_key_mode"` // "auto"
+	RTPCodec                    string   `yaml:"rtp_codec" json:"rtp_codec"`
+	RTPUnsupportedCodecPolicy   string   `yaml:"rtp_unsupported_codec_policy" json:"rtp_unsupported_codec_policy"`
 	RTPMode                     string   `yaml:"rtp_mode" json:"rtp_mode"`
 	RTPPtime                    int      `yaml:"rtp_ptime" json:"rtp_ptime"`
 	RTPPcap                     bool     `yaml:"rtp_pcap" json:"rtp_pcap"`
@@ -278,7 +304,7 @@ func (c *VMConfig) BatchDelay() time.Duration {
 	if c.RegisterBatchDelayMs > 0 {
 		return time.Duration(c.RegisterBatchDelayMs) * time.Millisecond
 	}
-	return 500 * time.Millisecond
+	return 1000 * time.Millisecond
 }
 
 // BuildResolver returns a custom *net.Resolver using the configured DNS
@@ -404,7 +430,7 @@ func ApplyDefaults(cfg *VMConfig) {
 		cfg.SubscribeConcurrency = 10
 	}
 	if cfg.RegisterBatchDelayMs == 0 {
-		cfg.RegisterBatchDelayMs = 500
+		cfg.RegisterBatchDelayMs = 1000
 	}
 	if cfg.RegisterExpires == 0 {
 		cfg.RegisterExpires = 3600
@@ -433,7 +459,7 @@ func ApplyDefaults(cfg *VMConfig) {
 		cfg.RegisterTimeout = 5
 	}
 	if cfg.ConnectTimeout == 0 {
-		cfg.ConnectTimeout = 1
+		cfg.ConnectTimeout = 5
 	}
 	if cfg.CleanupBatchSize == 0 {
 		cfg.CleanupBatchSize = 10
@@ -483,6 +509,12 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.SRTPKeyMode == "" {
 		cfg.SRTPKeyMode = "auto"
 	}
+	if cfg.RTPCodec == "" {
+		cfg.RTPCodec = "G711_ULAW"
+	}
+	if cfg.RTPUnsupportedCodecPolicy == "" {
+		cfg.RTPUnsupportedCodecPolicy = "fallback_g711"
+	}
 	if cfg.RTPMediaCoveragePct == 0 {
 		cfg.RTPMediaCoveragePct = 25
 	}
@@ -510,6 +542,30 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.FailoverMode == "" {
 		cfg.FailoverMode = "graceful"
+	}
+	if cfg.FailoverTrigger == "" {
+		cfg.FailoverTrigger = "per_agent"
+	}
+	if cfg.FailoverTriggerCount == 0 {
+		cfg.FailoverTriggerCount = 5
+	}
+	if cfg.FailoverTriggerPct == 0 {
+		cfg.FailoverTriggerPct = 20
+	}
+	if cfg.FailoverTriggerWindowMs == 0 {
+		cfg.FailoverTriggerWindowMs = 1000
+	}
+	if cfg.HAMode == "" {
+		if cfg.DualRegistrationEnabled {
+			cfg.HAMode = "dual"
+		} else if cfg.ZoneConfig != nil && len(cfg.ZoneConfig.Zones) > 0 {
+			cfg.HAMode = "multi_zone"
+		} else {
+			cfg.HAMode = "single"
+		}
+	}
+	if cfg.ZoneConfig != nil && cfg.ZoneConfig.ZoneDistributionPct == 0 {
+		cfg.ZoneConfig.ZoneDistributionPct = 50
 	}
 	if cfg.LocalIPMode == "" {
 		cfg.LocalIPMode = "single"
@@ -781,6 +837,26 @@ func Validate(cfg *VMConfig) error {
 	if cfg.FailoverMode != "graceful" && cfg.FailoverMode != "force" {
 		errs = append(errs, fmt.Sprintf("failover_mode must be 'graceful' or 'force', got %q", cfg.FailoverMode))
 	}
+	cfg.FailoverTrigger = strings.ToLower(strings.TrimSpace(cfg.FailoverTrigger))
+	switch cfg.FailoverTrigger {
+	case "per_agent":
+	case "min_agents":
+		if cfg.FailoverTriggerCount < 2 || cfg.FailoverTriggerCount > 10000 {
+			errs = append(errs, fmt.Sprintf("failover_trigger_count must be 2..10000 when trigger=min_agents, got %d", cfg.FailoverTriggerCount))
+		}
+		if cfg.FailoverTriggerWindowMs < 100 || cfg.FailoverTriggerWindowMs > 60000 {
+			errs = append(errs, fmt.Sprintf("failover_trigger_window_ms must be 100..60000 when trigger=min_agents, got %d", cfg.FailoverTriggerWindowMs))
+		}
+	case "pct_agents":
+		if cfg.FailoverTriggerPct < 1 || cfg.FailoverTriggerPct > 100 {
+			errs = append(errs, fmt.Sprintf("failover_trigger_pct must be 1..100 when trigger=pct_agents, got %d", cfg.FailoverTriggerPct))
+		}
+		if cfg.FailoverTriggerWindowMs < 100 || cfg.FailoverTriggerWindowMs > 60000 {
+			errs = append(errs, fmt.Sprintf("failover_trigger_window_ms must be 100..60000 when trigger=pct_agents, got %d", cfg.FailoverTriggerWindowMs))
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("failover_trigger must be 'per_agent', 'min_agents', or 'pct_agents', got %q", cfg.FailoverTrigger))
+	}
 	if cfg.DualRegistrationEnabled {
 		cfg.FailoverEnabled = true
 		if strings.TrimSpace(cfg.SecondaryHost) == "" {
@@ -788,6 +864,55 @@ func Validate(cfg *VMConfig) error {
 		}
 		if cfg.SecondaryPort <= 0 || cfg.SecondaryPort > 65535 {
 			errs = append(errs, fmt.Sprintf("secondary_port out of range when dual_registration_enabled=true: %d", cfg.SecondaryPort))
+		}
+	}
+
+	cfg.HAMode = strings.ToLower(strings.TrimSpace(cfg.HAMode))
+	switch cfg.HAMode {
+	case "single":
+	case "dual":
+		cfg.DualRegistrationEnabled = true
+		cfg.FailoverEnabled = true
+	case "multi_zone":
+		cfg.FailoverEnabled = true
+		if cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) == 0 {
+			errs = append(errs, "zone_config with at least one zone is required when ha_mode=multi_zone")
+		} else {
+			if len(cfg.ZoneConfig.Zones) != 2 {
+				errs = append(errs, fmt.Sprintf("multi_zone requires exactly 2 zones, got %d", len(cfg.ZoneConfig.Zones)))
+			}
+			for zi, z := range cfg.ZoneConfig.Zones {
+				if strings.TrimSpace(z.ZoneID) == "" {
+					errs = append(errs, fmt.Sprintf("zone[%d].zone_id is required", zi))
+				}
+				if len(z.Controllers) == 0 {
+					errs = append(errs, fmt.Sprintf("zone[%d] (%s) must have at least 1 controller", zi, z.ZoneID))
+				}
+				for ci, c := range z.Controllers {
+					if strings.TrimSpace(c.Host) == "" {
+						errs = append(errs, fmt.Sprintf("zone[%d].controllers[%d].host is required", zi, ci))
+					}
+					if c.Port <= 0 || c.Port > 65535 {
+						errs = append(errs, fmt.Sprintf("zone[%d].controllers[%d].port out of range: %d", zi, ci, c.Port))
+					}
+				}
+			}
+			pct := cfg.ZoneConfig.ZoneDistributionPct
+			if pct < 1 || pct > 99 {
+				errs = append(errs, fmt.Sprintf("zone_distribution_pct must be 1..99, got %d", pct))
+			}
+			totalAgents := cfg.ExtCount()
+			totalControllers := 0
+			for _, z := range cfg.ZoneConfig.Zones {
+				totalControllers += len(z.Controllers)
+			}
+			if totalAgents < totalControllers*2 {
+				errs = append(errs, fmt.Sprintf("need at least %d agents for %d controllers (2 per controller minimum), got %d", totalControllers*2, totalControllers, totalAgents))
+			}
+		}
+	default:
+		if cfg.HAMode != "" {
+			errs = append(errs, fmt.Sprintf("ha_mode must be 'single', 'dual', or 'multi_zone', got %q", cfg.HAMode))
 		}
 	}
 
@@ -862,6 +987,24 @@ func Validate(cfg *VMConfig) error {
 
 	if cfg.RTPMode != "3phase" && cfg.RTPMode != "continuous" && cfg.RTPMode != "3phase_coverage" {
 		errs = append(errs, fmt.Sprintf("rtp_mode must be '3phase', '3phase_coverage', or 'continuous', got %q", cfg.RTPMode))
+	}
+	cfg.RTPCodec = strings.ToUpper(strings.TrimSpace(cfg.RTPCodec))
+	if cfg.RTPCodec == "" {
+		cfg.RTPCodec = "G711_ULAW"
+	}
+	switch cfg.RTPCodec {
+	case "G711_ULAW", "G711_ALAW", "G729":
+	default:
+		errs = append(errs, fmt.Sprintf("rtp_codec must be 'G711_ULAW', 'G711_ALAW', or 'G729', got %q", cfg.RTPCodec))
+	}
+	cfg.RTPUnsupportedCodecPolicy = strings.ToLower(strings.TrimSpace(cfg.RTPUnsupportedCodecPolicy))
+	if cfg.RTPUnsupportedCodecPolicy == "" {
+		cfg.RTPUnsupportedCodecPolicy = "fallback_g711"
+	}
+	switch cfg.RTPUnsupportedCodecPolicy {
+	case "fallback_g711", "reject_488":
+	default:
+		errs = append(errs, fmt.Sprintf("rtp_unsupported_codec_policy must be 'fallback_g711' or 'reject_488', got %q", cfg.RTPUnsupportedCodecPolicy))
 	}
 	if cfg.RTPPtime != 20 && cfg.RTPPtime != 40 {
 		errs = append(errs, fmt.Sprintf("rtp_ptime must be 20 or 40, got %d", cfg.RTPPtime))
@@ -993,6 +1136,19 @@ func Validate(cfg *VMConfig) error {
 		"traffic_mode", cfg.TrafficMode,
 	)
 
+	if cfg.HAMode == "multi_zone" && cfg.ZoneConfig != nil {
+		groups := cfg.ComputeAgentGroups()
+		for _, g := range groups {
+			slog.Info("Agent group assignment",
+				"group_id", g.GroupID,
+				"zone", g.ZoneID,
+				"primary", fmt.Sprintf("%s:%d", g.PrimaryController.Host, g.PrimaryController.Port),
+				"secondary", fmt.Sprintf("%s:%d", g.SecondaryController.Host, g.SecondaryController.Port),
+				"ext_range", fmt.Sprintf("%d-%d (%d agents)", g.ExtStart, g.ExtEnd, g.ExtEnd-g.ExtStart+1),
+			)
+		}
+	}
+
 	return nil
 }
 
@@ -1032,6 +1188,95 @@ func WriteConfigYAML(cfg *VMConfig, path string) (string, error) {
 	}
 	slog.Info("Config YAML written", "path", abs, "vm_id", cfg.VMID)
 	return abs, nil
+}
+
+// AgentGroupAssignment describes the agent range and controller pairing for
+// one group within a multi-zone HA topology.
+type AgentGroupAssignment struct {
+	GroupID             string
+	ZoneID              string
+	PrimaryController   ZoneController
+	SecondaryController ZoneController
+	ExtStart            int
+	ExtEnd              int
+}
+
+// ComputeAgentGroups distributes agents across zones and controllers, pairing
+// each primary controller with a cross-zone secondary using round-robin.
+// Returns nil for single/dual modes (those use the legacy flat config).
+func (cfg *VMConfig) ComputeAgentGroups() []AgentGroupAssignment {
+	if cfg.HAMode != "multi_zone" || cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) != 2 {
+		return nil
+	}
+	zoneA := cfg.ZoneConfig.Zones[0]
+	zoneB := cfg.ZoneConfig.Zones[1]
+	totalAgents := cfg.ExtCount()
+	zoneACount := totalAgents * cfg.ZoneConfig.ZoneDistributionPct / 100
+	zoneBCount := totalAgents - zoneACount
+
+	var groups []AgentGroupAssignment
+	extCursor := cfg.ExtStart
+
+	zoneAPerCtrl := zoneACount / len(zoneA.Controllers)
+	zoneARemainder := zoneACount % len(zoneA.Controllers)
+	for i, ctrl := range zoneA.Controllers {
+		count := zoneAPerCtrl
+		if i < zoneARemainder {
+			count++
+		}
+		if count == 0 {
+			continue
+		}
+		secondary := zoneB.Controllers[i%len(zoneB.Controllers)]
+		groups = append(groups, AgentGroupAssignment{
+			GroupID:             fmt.Sprintf("%s-ctrl-%d", zoneA.ZoneID, i+1),
+			ZoneID:              zoneA.ZoneID,
+			PrimaryController:   ctrl,
+			SecondaryController: secondary,
+			ExtStart:            extCursor,
+			ExtEnd:              extCursor + count - 1,
+		})
+		extCursor += count
+	}
+
+	zoneBPerCtrl := zoneBCount / len(zoneB.Controllers)
+	zoneBRemainder := zoneBCount % len(zoneB.Controllers)
+	for i, ctrl := range zoneB.Controllers {
+		count := zoneBPerCtrl
+		if i < zoneBRemainder {
+			count++
+		}
+		if count == 0 {
+			continue
+		}
+		secondary := zoneA.Controllers[i%len(zoneA.Controllers)]
+		groups = append(groups, AgentGroupAssignment{
+			GroupID:             fmt.Sprintf("%s-ctrl-%d", zoneB.ZoneID, i+1),
+			ZoneID:              zoneB.ZoneID,
+			PrimaryController:   ctrl,
+			SecondaryController: secondary,
+			ExtStart:            extCursor,
+			ExtEnd:              extCursor + count - 1,
+		})
+		extCursor += count
+	}
+
+	return groups
+}
+
+// EffectiveHAMode returns the resolved HA mode. When ha_mode is empty,
+// it infers from other fields for backward compatibility.
+func (cfg *VMConfig) EffectiveHAMode() string {
+	if cfg.HAMode != "" {
+		return cfg.HAMode
+	}
+	if cfg.ZoneConfig != nil && len(cfg.ZoneConfig.Zones) > 0 {
+		return "multi_zone"
+	}
+	if cfg.DualRegistrationEnabled {
+		return "dual"
+	}
+	return "single"
 }
 
 // detectLocalIP discovers the machine's preferred outbound IP address by

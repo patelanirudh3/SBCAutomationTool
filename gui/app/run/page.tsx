@@ -25,7 +25,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor } from '@/lib/api'
+import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor, updateTrafficCPSFor } from '@/lib/api'
 import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
 import {
   MOCK_UAC_METRICS,
@@ -54,9 +54,11 @@ const mapBackendPhase = sharedMapBackendPhase
 function LiveDashboard({
   stopping,
   onGracefulStop,
+  onApplyCPS,
 }: {
   stopping: boolean
   onGracefulStop: () => void
+  onApplyCPS: (cps: number) => Promise<void>
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
@@ -83,6 +85,14 @@ function LiveDashboard({
         return derived > 0 ? derived : 10
       })()
     : 10
+  const [cpsDraft, setCpsDraft] = useState('')
+  const [cpsBusy, setCpsBusy] = useState(false)
+  const [cpsError, setCpsError] = useState<string | null>(null)
+  const targetCPS = uacMetrics?.target_cps ?? pair?.uac.cps ?? 0
+
+  useEffect(() => {
+    if (!cpsDraft && targetCPS > 0) setCpsDraft(String(targetCPS))
+  }, [cpsDraft, targetCPS])
 
   if (!uacMetrics) {
     return (
@@ -105,6 +115,30 @@ function LiveDashboard({
   const extensionsInUse = nonIdleCount || (uacMetrics.concurrent_calls * 2)
   const isTrafficPhase = phase === 'TRAFFIC'
   const isStopping     = phase === 'STOPPING'
+  const stopInProgress = stopping || isStopping
+  const regFailedCount = uacMetrics.register_failed_details?.length ?? 0
+  const subFailedCount = uacMetrics.subscribe_failed_details?.length ?? 0
+  const tcpFailedCount = uacMetrics.transport_connect_failed ?? 0
+  const regSubStillGrowing =
+    uacMetrics.regsub_background_active === true ||
+    uacMetrics.transport_connect_active === true
+
+  const submitCPS = async () => {
+    const next = Number(cpsDraft)
+    if (!Number.isFinite(next) || next <= 0) {
+      setCpsError('CPS must be greater than 0')
+      return
+    }
+    setCpsBusy(true)
+    setCpsError(null)
+    try {
+      await onApplyCPS(Math.round(next))
+    } catch (err) {
+      setCpsError(err instanceof Error ? err.message : 'Failed to update CPS')
+    } finally {
+      setCpsBusy(false)
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4 p-4 max-w-6xl mx-auto w-full">
@@ -131,20 +165,22 @@ function LiveDashboard({
                 <TooltipTrigger asChild>
                   <button
                     onClick={onGracefulStop}
-                    disabled={stopping || isStopping}
+                    disabled={stopInProgress}
                     className={cn(
                       'flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
-                      'border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs font-semibold',
-                      'hover:bg-amber-500/20 hover:text-amber-200 transition-colors',
+                      'text-xs font-semibold transition-colors',
+                      stopInProgress
+                        ? 'border-amber-400/60 bg-amber-500/20 text-amber-100'
+                        : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 hover:text-amber-200',
                       'disabled:cursor-not-allowed disabled:opacity-50',
                     )}
                   >
-                    {stopping && !isStopping ? (
+                    {stopInProgress ? (
                       <Loader2 className="size-3 animate-spin" />
                     ) : (
                       <CheckCircle2 className="size-3" />
                     )}
-                    Stop Traffic
+                    {stopInProgress ? 'Stopping Traffic' : 'Stop Traffic'}
                   </button>
                 </TooltipTrigger>
                 <TooltipContent>
@@ -152,6 +188,24 @@ function LiveDashboard({
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
+            <div className="flex items-center gap-2 rounded-lg border border-slate-700/60 bg-slate-950/30 px-2 py-1">
+              <span className="text-[11px] text-muted-foreground">Target CPS</span>
+              <input
+                value={cpsDraft}
+                onChange={(e) => setCpsDraft(e.target.value)}
+                className="h-7 w-16 rounded border border-slate-700 bg-slate-950 px-2 text-xs font-mono text-slate-100 outline-none focus:border-sky-500"
+                inputMode="numeric"
+                disabled={cpsBusy || isStopping}
+              />
+              <button
+                onClick={submitCPS}
+                disabled={cpsBusy || isStopping}
+                className="h-7 rounded bg-sky-600 px-2 text-[11px] font-semibold text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {cpsBusy ? 'Applying...' : 'Apply'}
+              </button>
+              {cpsError && <span className="max-w-48 truncate text-[11px] text-rose-300" title={cpsError}>{cpsError}</span>}
+            </div>
           </div>
         )}
       </div>
@@ -196,6 +250,59 @@ function LiveDashboard({
         </div>
       )}
 
+      {(isTrafficPhase || isStopping) && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-700/60 bg-card px-3 py-2 text-xs">
+          <span className={cn(
+            'rounded-full border px-2 py-0.5 font-mono font-semibold',
+            regSubStillGrowing
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+              : 'border-slate-700 bg-slate-950/30 text-slate-300',
+          )}>
+            Idle {idleCount.toLocaleString()}{regSubStillGrowing ? ' ↑ growing' : ''}
+          </span>
+          <span className="rounded-full border border-slate-700 bg-slate-950/30 px-2 py-0.5 font-mono text-slate-300">
+            TCP {uacMetrics.transport_connect_done ?? 0}/{uacMetrics.transport_connect_total ?? 0}
+          </span>
+          <span className="rounded-full border border-slate-700 bg-slate-950/30 px-2 py-0.5 font-mono text-slate-300">
+            Reg {uacMetrics.registered_count ?? 0}/{uacMetrics.registered_total ?? 0}
+          </span>
+          <span className="rounded-full border border-slate-700 bg-slate-950/30 px-2 py-0.5 font-mono text-slate-300">
+            Sub {uacMetrics.subscribed_count ?? 0}/{uacMetrics.subscribed_total ?? 0}
+          </span>
+          {(tcpFailedCount > 0 || regFailedCount > 0 || subFailedCount > 0) && (
+            <span className="rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 font-mono text-rose-300">
+              Failed TCP {tcpFailedCount} · Reg {regFailedCount} · Sub {subFailedCount}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* HA Status Strip (multi-zone) */}
+      {(isTrafficPhase || isStopping) && uacMetrics.ha_enabled && uacMetrics.ha_agent_groups && uacMetrics.ha_agent_groups.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-950/5 px-3 py-2 text-xs">
+          <span className="text-[11px] font-semibold text-violet-300 mr-1">HA</span>
+          {uacMetrics.ha_agent_groups.map((g) => (
+            <span
+              key={g.group_id}
+              className={cn(
+                'rounded-full border px-2 py-0.5 font-mono',
+                g.active_controller === 'primary'
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+              )}
+              title={`${g.zone_id} | Primary: ${g.primary_host}:${g.primary_port} | Secondary: ${g.secondary_host}:${g.secondary_port}`}
+            >
+              {g.group_id}: {g.active_controller === 'primary' ? '● pri' : '◉ SEC'}
+            </span>
+          ))}
+          {(uacMetrics.ha_failover_events ?? 0) > 0 && (
+            <span className="rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 text-rose-300">
+              {uacMetrics.ha_failover_events} failover{(uacMetrics.ha_failover_events ?? 0) > 1 ? 's' : ''}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Restart preamble banner — non-blocking warning when some agents
           could not refresh their REGISTER binding before traffic resumed.
           Hidden when failed=0 (happy path: no banner clutter). */}
@@ -223,7 +330,8 @@ function LiveDashboard({
       )}
 
       {/* Runtime signals — non-duplicated engine health values. */}
-      <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-4 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-4 md:grid-cols-5">
+        <RuntimeStat label="Target CPS" value={targetCPS > 0 ? targetCPS.toLocaleString() : '—'} />
         <RuntimeStat label="Actual CPS" value={uacMetrics.cps_actual.toFixed(2)} />
         <RuntimeStat label="Avg PDD" value={`${uacMetrics.avg_pdd_ms.toFixed(0)} ms`} />
         <RuntimeStat label="Avg Hold" value={`${(uacMetrics.avg_hold_ms / 1000).toFixed(1)} s`} />
@@ -263,6 +371,7 @@ function LiveDashboard({
         rtcpSrEnabled={pair?.advancedSettings?.rtcp_sr_enabled === true}
         rtpFlow={{
           mediaSecurity: uacMetrics.media_security ?? pair?.uac.media_security ?? 'rtp',
+          rtpCodec: pair?.uac.rtp_codec ?? null,
           srtpCryptoSuites: uacMetrics.srtp_crypto_suites ?? pair?.uac.srtp_crypto_suites ?? null,
           configuredPacketsPerDirection: computeConfiguredRtpPacketsPerDirection(
             pair?.uac.hold_time_seconds,
@@ -569,6 +678,15 @@ export default function RunPage() {
     setStopping(false)
   }
 
+  const handleApplyCPS = async (cps: number) => {
+    if (IS_MOCK) return
+    const result = await updateTrafficCPSFor(vmIp, vmPort, cps)
+    const latest = useTrafficStore.getState().uacMetrics
+    if (latest) {
+      updateUACMetrics({ ...latest, target_cps: result.target_cps })
+    }
+  }
+
   const handleCleanup = async () => {
     setStopping(true)
     cleanupStartedAtRef.current = Date.now()
@@ -852,6 +970,7 @@ export default function RunPage() {
               <LiveDashboard
                 stopping={stopping}
                 onGracefulStop={handleGracefulStop}
+                onApplyCPS={handleApplyCPS}
               />
             </motion.div>
           )}

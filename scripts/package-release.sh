@@ -27,7 +27,7 @@ echo "Building GUI standalone..."
 (cd gui && bun install && bun run build)
 
 rm -rf "$STAGE_DIR" "$TARBALL" "$SHA_FILE"
-mkdir -p "$STAGE_DIR"/{bin,config/examples,logs,scripts,systemd,gui}
+mkdir -p "$STAGE_DIR"/{bin,config/examples,logs,runtime/bun,scripts,systemd,gui}
 
 cp VERSION "$STAGE_DIR/VERSION"
 cp go/traffic-engine "$STAGE_DIR/bin/traffic-engine"
@@ -40,6 +40,14 @@ cp -R gui/.next/static "$STAGE_DIR/gui/standalone/.next/static"
 if [ -d gui/public ]; then
   cp -R gui/public "$STAGE_DIR/gui/standalone/public"
 fi
+
+BUN_BIN="$(command -v bun || true)"
+if [ -z "$BUN_BIN" ]; then
+  echo "bun runtime is required to build and package the offline GUI runtime" >&2
+  exit 1
+fi
+cp "$BUN_BIN" "$STAGE_DIR/runtime/bun/bun"
+chmod 0755 "$STAGE_DIR/runtime/bun/bun"
 
 if [ -d go/scripts ]; then
   cp -R go/scripts/. "$STAGE_DIR/scripts/"
@@ -75,11 +83,11 @@ cps: 1
 hold_time_seconds: 60
 metrics_port: 8082
 register_batch_size: 10
-register_batch_delay_ms: 500
+register_batch_delay_ms: 1000
 register_expires: 36000
 register_retry: 3
 register_timeout: 5
-connect_timeout: 1
+connect_timeout: 5
 subscribe_concurrency: 10
 subscribe_expires: 36000
 subscribe_events:
@@ -150,7 +158,17 @@ run_gui() {
   echo "GUI: http://0.0.0.0:$GUI_PORT"
   echo "Engine API: $ENGINE_URL"
   cd "$ROOT_DIR/gui/standalone"
-  HOSTNAME=0.0.0.0 PORT="$GUI_PORT" NEXT_PUBLIC_COORDINATOR_URL="$ENGINE_URL" exec node server.js
+  if [ -x "$ROOT_DIR/runtime/bun/bun" ]; then
+    JS_RUNTIME="$ROOT_DIR/runtime/bun/bun"
+  elif command -v node >/dev/null 2>&1; then
+    JS_RUNTIME="$(command -v node)"
+  elif command -v bun >/dev/null 2>&1; then
+    JS_RUNTIME="$(command -v bun)"
+  else
+    echo "No JavaScript runtime found. This package normally includes runtime/bun/bun." >&2
+    exit 1
+  fi
+  HOSTNAME=0.0.0.0 PORT="$GUI_PORT" NEXT_PUBLIC_COORDINATOR_URL="$ENGINE_URL" exec "$JS_RUNTIME" server.js
 }
 
 case "${CMD,,}" in
@@ -346,7 +364,7 @@ This package supports two deployment styles:
 ## Requirements
 
 - Ubuntu 22.04+ x86_64/amd64
-- Node.js available for the packaged Next.js standalone GUI
+- Bundled Bun runtime for the packaged Next.js standalone GUI
 - sudo/root access if using VIP mode
 - Engine API port, default: 8082
 - GUI port, default: 3000

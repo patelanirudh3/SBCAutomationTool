@@ -34,6 +34,9 @@ type RtpStats struct {
 	MarkersReceived int
 	SSRCCount       int
 	ExpectedPackets int
+	Codec           string
+	PayloadType     int
+	PayloadMarkers  bool
 	FirstRxMs       *float64
 	LastRxMs        *float64
 
@@ -162,6 +165,8 @@ type RtpEndpoint struct {
 	firstRecvTs         *float64
 	lastRecvTs          *float64
 
+	codecProfile CodecProfile
+
 	mu   sync.Mutex
 	pcap *PcapWriter
 }
@@ -209,6 +214,10 @@ func NewRtpEndpointWithOpts(localIP string, ptimeMs int, qosEnabled bool) (*RtpE
 // The SR loop goroutine is NOT spawned here; it starts inside Run /
 // RunUntilCancelled when there is a known remote destination to send to.
 func NewRtpEndpointFull(localIP string, ptimeMs int, qosEnabled, rtcpSREnabled bool, rtcpSRInterval time.Duration) (*RtpEndpoint, error) {
+	return NewRtpEndpointFullCodec(localIP, ptimeMs, "G711_ULAW", qosEnabled, rtcpSREnabled, rtcpSRInterval)
+}
+
+func NewRtpEndpointFullCodec(localIP string, ptimeMs int, codec string, qosEnabled, rtcpSREnabled bool, rtcpSRInterval time.Duration) (*RtpEndpoint, error) {
 	addr, err := net.ResolveUDPAddr("udp4", localIP+":0")
 	if err != nil {
 		return nil, err
@@ -219,8 +228,9 @@ func NewRtpEndpointFull(localIP string, ptimeMs int, qosEnabled, rtcpSREnabled b
 	}
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	profile := ProfileForCodec(codec)
 
-	tsInc, _, tone, marker := ComputePtimeParams(ptimeMs)
+	tsInc, _, tone, marker := ComputeCodecPtimeParams(profile.Name, ptimeMs)
 
 	if rtcpSREnabled && rtcpSRInterval <= 0 {
 		rtcpSRInterval = 5 * time.Second
@@ -233,6 +243,7 @@ func NewRtpEndpointFull(localIP string, ptimeMs int, qosEnabled, rtcpSREnabled b
 		tsInc:          tsInc,
 		tonePayload:    tone,
 		markerTemplate: marker,
+		codecProfile:   profile,
 		qosEnabled:     qosEnabled,
 		rtcpSREnabled:  rtcpSREnabled,
 		rtcpSRInterval: rtcpSRInterval,
@@ -345,6 +356,9 @@ func (ep *RtpEndpoint) Stats() RtpStats {
 		MarkersReceived: ep.markersReceived,
 		SSRCCount:       len(ep.ssrcRx),
 		ExpectedPackets: expectedPackets,
+		Codec:           ep.codecProfile.Name,
+		PayloadType:     ep.codecProfile.PayloadType,
+		PayloadMarkers:  ep.codecProfile.PayloadMarkerEnabled,
 		FirstRxMs:       firstMs,
 		LastRxMs:        lastMs,
 
@@ -416,13 +430,15 @@ func protectionProfile(suite string) (srtp.ProtectionProfile, error) {
 	}
 }
 
-// getPayload returns the next TX payload, embedding a marker every
-// MarkerInterval packets. Also accumulates txOctets for the RTCP SR
+// getPayload returns the next TX payload, embedding a payload marker every
+// MarkerInterval packets only for codecs where doing so preserves valid media.
+// G.729 uses RTP-header/sequence/timestamp integrity only because changing
+// encoded bytes would corrupt the codec frame. Also accumulates txOctets for the RTCP SR
 // "sender's octet count" field (RFC 3550 §6.4.1).
 func (ep *RtpEndpoint) getPayload() []byte {
 	ep.txPkts++
 	var p []byte
-	if ep.txPkts%MarkerInterval == 0 {
+	if ep.codecProfile.PayloadMarkerEnabled && ep.txPkts%MarkerInterval == 0 {
 		ep.markersSent++
 		p = buildMarkerPayload(ep.markerTemplate, ep.markersSent)
 	} else {
@@ -536,7 +552,7 @@ func (ep *RtpEndpoint) Run(
 			}
 
 			payload := ep.getPayload()
-			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
+			pkt := packRTPWithPayloadType(seq, ts, ssrc, payload, ep.codecProfile.PayloadType, ep.consumeFirstPacketFlag())
 			wirePkt, err := ep.protectRTP(pkt)
 			if err != nil {
 				slog.Warn("SRTP keepalive protect error", "err", err)
@@ -746,7 +762,7 @@ func (ep *RtpEndpoint) RunUntilCancelled(
 			}
 
 			payload := ep.getPayload()
-			pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
+			pkt := packRTPWithPayloadType(seq, ts, ssrc, payload, ep.codecProfile.PayloadType, ep.consumeFirstPacketFlag())
 			wirePkt, err := ep.protectRTP(pkt)
 			if err != nil {
 				slog.Warn("SRTP keepalive protect error", "err", err)
@@ -835,7 +851,7 @@ func (ep *RtpEndpoint) sendKeepalive(
 		}
 
 		payload := ep.getPayload()
-		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
+		pkt := packRTPWithPayloadType(seq, ts, ssrc, payload, ep.codecProfile.PayloadType, ep.consumeFirstPacketFlag())
 		wirePkt, err := ep.protectRTP(pkt)
 		if err != nil {
 			slog.Warn("SRTP keepalive protect error", "err", err)
@@ -936,7 +952,7 @@ func (ep *RtpEndpoint) sendBurst(
 		}
 
 		payload := ep.getPayload()
-		pkt := packRTP(seq, ts, ssrc, payload, ep.consumeFirstPacketFlag())
+		pkt := packRTPWithPayloadType(seq, ts, ssrc, payload, ep.codecProfile.PayloadType, ep.consumeFirstPacketFlag())
 		wirePkt, err := ep.protectRTP(pkt)
 		if err != nil {
 			slog.Warn("SRTP burst protect error", "err", err)
@@ -1092,6 +1108,7 @@ func (ep *RtpEndpoint) receiveLoop() {
 			payloadOff += 4 + extLen*4
 		}
 		if n >= payloadOff+4 &&
+			ep.codecProfile.PayloadMarkerEnabled &&
 			data[payloadOff] == 0xCC && data[payloadOff+1] == 0x11 &&
 			data[payloadOff+2] == 0xCC && data[payloadOff+3] == 0x11 {
 			ep.markersReceived++
@@ -1405,10 +1422,10 @@ func (ep *RtpEndpoint) rtcpSRLoop(ctx context.Context, dest *net.UDPAddr) {
 // packRTP builds a minimal 12-byte RFC 3550 RTP header + payload.
 // When marker is true the RTP M bit (bit 7 of byte 1) is set, signalling the
 // start of a talkspurt per RFC 3551 §4.1.
-func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte, marker bool) []byte {
+func packRTPWithPayloadType(seq uint16, ts uint32, ssrc uint32, payload []byte, payloadType int, marker bool) []byte {
 	hdr := make([]byte, 12+len(payload))
-	hdr[0] = 0x80       // V=2, P=0, X=0, CC=0
-	pt := byte(PT_PCMU) // PT=0 (PCMU)
+	hdr[0] = 0x80 // V=2, P=0, X=0, CC=0
+	pt := byte(payloadType & 0x7F)
 	if marker {
 		pt |= 0x80 // M=1
 	}
@@ -1418,6 +1435,10 @@ func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte, marker bool) []
 	binary.BigEndian.PutUint32(hdr[8:12], ssrc)
 	copy(hdr[12:], payload)
 	return hdr
+}
+
+func packRTP(seq uint16, ts uint32, ssrc uint32, payload []byte, marker bool) []byte {
+	return packRTPWithPayloadType(seq, ts, ssrc, payload, PT_PCMU, marker)
 }
 
 // buildMarkerPayload embeds the marker sequence number into the template.

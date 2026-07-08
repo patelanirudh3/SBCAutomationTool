@@ -522,8 +522,8 @@ export function startRegSubFor(ip: string, port: number): Promise<{ status: stri
   return postNoBody(ip, port, '/api/regsub/start')
 }
 
-// abortRegSubFor — cancels in-flight Reg/Sub by setting stopNew so RegisterAll
-// / SubscribeAll halt new batches and let in-flight work drain.
+// abortRegSubFor — aborts in-flight Reg/Sub and enters the shared cleanup
+// pipeline so completed subscriptions/registrations are cleaned up.
 export function abortRegSubFor(ip: string, port: number): Promise<{ status: string }> {
   return postNoBody(ip, port, '/api/regsub/abort')
 }
@@ -550,6 +550,20 @@ export function restartTrafficFor(ip: string, port: number): Promise<{ status: s
 
 export function startTrafficFor(ip: string, port: number): Promise<{ status: string }> {
   return postNoBody(ip, port, '/api/traffic/start')
+}
+
+export async function updateTrafficCPSFor(
+  ip: string,
+  port: number,
+  cps: number,
+): Promise<{ status: string; target_cps: number }> {
+  const res = await fetch(`http://${ip}:${port}/api/traffic/cps`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cps }),
+    signal: AbortSignal.timeout(10_000),
+  })
+  return parseJsonResponse<{ status: string; target_cps: number }>(res)
 }
 
 export function startCleanupFor(ip: string, port: number): Promise<{ status: string }> {

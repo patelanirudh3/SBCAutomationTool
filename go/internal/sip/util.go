@@ -7,12 +7,17 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var (
-	rngMu sync.Mutex
-	rng   *rand.Rand
+	rngMu         sync.Mutex
+	rng           *rand.Rand
+	callIDCounter uint64
+	branchCounter uint64
 )
 
 func init() {
@@ -41,9 +46,14 @@ func randomNumber(digits int) int {
 	return lo + lockedRandIntn(hi-lo+1)
 }
 
-// CreateCallID returns a random 7-digit Call-ID string.
+// CreateCallID returns a SIP Call-ID with a UUID v4 local part. It never
+// returns an empty value; if cryptographic random generation fails, it falls
+// back to a timestamp/process/counter value.
 func CreateCallID() string {
-	return fmt.Sprintf("%d", randomNumber(7))
+	if id, err := randomUUIDV4(); err == nil && id != "" {
+		return id + "@nexus-traffic-engine"
+	}
+	return fallbackCallID()
 }
 
 // CreateFromTag returns a From-tag of the form "F" followed by a random
@@ -59,9 +69,47 @@ func CreateToTag() string {
 }
 
 // CreateBranchID returns a Via branch parameter with the RFC 3261 magic cookie
-// followed by a random 6-digit number.
+// followed by a strong random 128-bit hex value. It never returns an empty or
+// cookie-only branch; if cryptographic random generation fails, it falls back
+// to a timestamp/process/counter value.
 func CreateBranchID() string {
-	return fmt.Sprintf("z9hG4bK%d", randomNumber(6))
+	if id, err := randomHex128(); err == nil && id != "" {
+		return "z9hG4bK" + id
+	}
+	return fallbackBranchID()
+}
+
+func randomUUIDV4() (string, error) {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // UUID version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+func randomHex128() (string, error) {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func fallbackCallID() string {
+	return fmt.Sprintf("%x-%x-%x@nexus-traffic-engine",
+		time.Now().UnixNano(),
+		os.Getpid(),
+		atomic.AddUint64(&callIDCounter, 1))
+}
+
+func fallbackBranchID() string {
+	return fmt.Sprintf("z9hG4bK%x%x%x",
+		time.Now().UnixNano(),
+		os.Getpid(),
+		atomic.AddUint64(&branchCounter, 1))
 }
 
 // GenRSeq returns a random RSeq value in [1, 2^32-1].

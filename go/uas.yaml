@@ -23,7 +23,7 @@ metrics_interval: 3
 metrics_port: 8081
 coordinator_url: ""
 register_batch_size: 10
-register_batch_delay_ms: 500
+register_batch_delay_ms: 1000
 register_expires: 3600
 register_retry: 3
 register_timeout: 60

@@ -44,6 +44,29 @@ func TestParseSDPMediaInfoExtractsProtocolPayloadsAndCrypto(t *testing.T) {
 	}
 }
 
+func TestParseSDPMediaInfoExtractsOfferedCodecs(t *testing.T) {
+	info := ParseSDPMediaInfo("v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 50000 RTP/AVP 18 0 8 101\r\na=rtpmap:18 G729/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\n")
+	got := strings.Join(info.OfferedCodecs(), ",")
+	if got != "G729,G711_ULAW,G711_ALAW" {
+		t.Fatalf("offered codecs=%q", got)
+	}
+	if !info.HasCodec("G729") || !info.HasCodec("PCMU") || !info.HasCodec("PCMA") {
+		t.Fatalf("codec lookup failed: %+v", info.PayloadCodecs)
+	}
+}
+
+func TestNegotiateSingleCodecFallbackAndReject(t *testing.T) {
+	offer := ParseSDPMediaInfo("v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 50000 RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n")
+	codec, fallback, reject := NegotiateSingleCodec(offer, "G729", "fallback_g711")
+	if codec != "G711_ULAW" || !fallback || reject != "" {
+		t.Fatalf("fallback negotiation codec=%q fallback=%v reject=%q", codec, fallback, reject)
+	}
+	codec, fallback, reject = NegotiateSingleCodec(offer, "G729", "reject_488")
+	if codec != "" || fallback || reject == "" {
+		t.Fatalf("reject negotiation codec=%q fallback=%v reject=%q", codec, fallback, reject)
+	}
+}
+
 func TestBuildSDPWithSRTPCryptoLines(t *testing.T) {
 	sdp := BuildSDPWithOptions("10.0.0.1", 40000, SDPOptions{
 		MediaSecurity: "srtp_sdes",
@@ -58,6 +81,21 @@ func TestBuildSDPWithSRTPCryptoLines(t *testing.T) {
 	if !strings.Contains(sdp, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:abc") ||
 		!strings.Contains(sdp, "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:def") {
 		t.Fatalf("SRTP SDP missing crypto lines:\n%s", sdp)
+	}
+}
+
+func TestBuildSDPWithG729(t *testing.T) {
+	sdp := BuildSDPWithOptions("10.0.0.1", 40000, SDPOptions{
+		RTPCodec: "G729",
+		RTPPtime: 20,
+	})
+	if !strings.Contains(sdp, "m=audio 40000 RTP/AVP 18 101") {
+		t.Fatalf("G729 SDP missing payload 18:\n%s", sdp)
+	}
+	if !strings.Contains(sdp, "a=rtpmap:18 G729/8000") ||
+		!strings.Contains(sdp, "a=fmtp:18 annexb=no") ||
+		!strings.Contains(sdp, "a=ptime:20") {
+		t.Fatalf("G729 SDP missing codec attributes:\n%s", sdp)
 	}
 }
 

@@ -1,7 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, XCircle, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react'
+import { ChevronDown, ChevronRight, XCircle, ChevronLeft, ChevronRight as ChevronRightIcon, Copy, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { CallEvent } from '@/types'
 
@@ -14,6 +14,18 @@ interface FailedCallsTableProps {
    *  placeholder so the operator can see the discrepancy instead of the
    *  misleading "No failed calls" message. */
   reportedFailedCount?: number
+}
+
+function formatAddrTruncated(ip?: string, port?: number, maxLen = 21): string {
+  if (!ip) return ''
+  const full = port ? `${ip}:${port}` : ip
+  if (full.length <= maxLen) return full
+  return full.slice(0, maxLen - 3) + '...'
+}
+
+function formatAddrFull(ip?: string, port?: number): string {
+  if (!ip) return ''
+  return port ? `${ip}:${port}` : ip
 }
 
 export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTableProps) {
@@ -32,6 +44,7 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
   const [reasonFilter, setReasonFilter] = useState('')
   const [callIdFilter, setCallIdFilter] = useState('')
   const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc')
+  const [copied, setCopied]   = useState(false)
 
   const filtered = useMemo(() => {
     const extQ = extensionFilter.trim().toLowerCase()
@@ -67,16 +80,11 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
   const safePage = Math.min(page, totalPages)
   const pageItems  = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
-  // Discrepancy detector: engine counters say there were failures but the
-  // per-call records list is empty. Most often happens when the engine
-  // exits before flushing call records (e.g. abrupt shutdown).
   const hasReportedButEmpty =
     failed.length === 0 &&
     typeof reportedFailedCount === 'number' &&
     reportedFailedCount > 0
 
-  // The header pill prefers the engine-reported count when records are
-  // missing so the badge stays consistent with the AggregatePanel.
   const headerCount = failed.length > 0 ? failed.length : (reportedFailedCount ?? 0)
   const hasActiveFilters =
     sipCodeFilter !== 'all' ||
@@ -92,6 +100,26 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
     setReasonFilter('')
     setCallIdFilter('')
     setPage(1)
+  }
+
+  const handleCopyAll = async () => {
+    const records = filtered.map((ev) => ({
+      call_id: ev.call_id ?? '',
+      uac_ext: ev.uac_ext ?? ev.ext ?? '',
+      uac_ip: formatAddrFull(ev.sip_local_ip, ev.sip_local_port),
+      uas_ext: ev.uas_ext ?? ev.peer_ext ?? '',
+      uas_ip: formatAddrFull(ev.sip_remote_ip, ev.sip_remote_port),
+      sip_code: ev.sip_code ?? 0,
+      failure_reason: ev.failure_reason ?? '',
+      server_header: ev.sip_server_header ?? '',
+      user_agent_header: ev.sip_user_agent_header ?? '',
+      timestamp: ev.ts_utc ?? ev.timestamp ?? '',
+    }))
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(records, null, 2))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch { /* clipboard unavailable */ }
   }
 
   return (
@@ -174,6 +202,20 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                       Clear filters
                     </button>
                   )}
+                  <button
+                    type="button"
+                    onClick={handleCopyAll}
+                    className={cn(
+                      'flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors',
+                      copied
+                        ? 'border-emerald-600 text-emerald-400'
+                        : 'border-slate-700 text-slate-300 hover:bg-slate-800',
+                    )}
+                    title="Copy all filtered failed call records as JSON"
+                  >
+                    {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+                    {copied ? 'Copied!' : 'Copy All'}
+                  </button>
                   <span className="ml-auto text-[11px] text-slate-400">
                     Showing {filtered.length.toLocaleString()} of {failed.length.toLocaleString()} failed calls
                   </span>
@@ -211,42 +253,61 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="border-b border-slate-700/50 text-[10px] uppercase tracking-widest text-slate-400">
-                      <th className="px-4 py-2 text-left">Extension</th>
-                      <th className="px-4 py-2 text-left">VIP</th>
                       <th className="px-4 py-2 text-left">Call ID</th>
-                      <th className="px-4 py-2 text-left">Time (UTC)</th>
-                      <th className="px-4 py-2 text-left">Failure Reason</th>
+                      <th className="px-4 py-2 text-left">UAC# / IP:Port</th>
+                      <th className="px-4 py-2 text-left">UAS# / IP:Port</th>
+                      <th className="px-4 py-2 text-left">Error Code / Reason</th>
+                      <th className="px-4 py-2 text-left">Server Header</th>
+                      <th className="px-4 py-2 text-left">User-Agent Header</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {pageItems.map((ev, i) => (
-                      <tr
-                        key={ev.call_id ?? i}
-                        className="border-b border-slate-700/30 hover:bg-rose-500/5 transition-colors"
-                      >
-                        <td className="px-4 py-2 font-mono text-amber-300">
-                          {ev.uac_ext ?? ev.ext ?? '—'}
-                        </td>
-                        <td className="px-4 py-2 font-mono text-sky-300">
-                          {ev.sip_local_ip
-                            ? `${ev.sip_local_ip}${ev.sip_local_port ? `:${ev.sip_local_port}` : ''}`
-                            : '—'}
-                        </td>
-                        <td className="px-4 py-2 font-mono text-slate-300 truncate max-w-[160px]" title={ev.call_id}>
-                          {ev.call_id ? ev.call_id.slice(0, 20) + (ev.call_id.length > 20 ? '…' : '') : '—'}
-                        </td>
-                        <td className="px-4 py-2 text-slate-400">
-                          {ev.ts_utc
-                            ? new Date(ev.ts_utc).toLocaleTimeString('en-GB', { hour12: false })
-                            : ev.timestamp
-                              ? new Date(ev.timestamp).toLocaleTimeString('en-GB', { hour12: false })
-                              : '—'}
-                        </td>
-                        <td className="px-4 py-2 text-rose-300 max-w-[240px] truncate" title={ev.failure_reason}>
-                          {ev.failure_reason ?? 'Unknown'}
-                        </td>
-                      </tr>
-                    ))}
+                    {pageItems.map((ev, i) => {
+                      const uacExt = ev.uac_ext ?? ev.ext ?? '—'
+                      const uacAddr = formatAddrFull(ev.sip_local_ip, ev.sip_local_port)
+                      const uacAddrShort = formatAddrTruncated(ev.sip_local_ip, ev.sip_local_port)
+                      const uasExt = ev.uas_ext ?? ev.peer_ext ?? '—'
+                      const uasAddr = formatAddrFull(ev.sip_remote_ip, ev.sip_remote_port)
+                      const uasAddrShort = formatAddrTruncated(ev.sip_remote_ip, ev.sip_remote_port)
+                      const sipCode = ev.sip_code ? String(ev.sip_code) : ''
+                      const reason = ev.failure_reason ?? 'Unknown'
+                      const errorDisplay = sipCode ? `${sipCode} / ${reason}` : reason
+                      return (
+                        <tr
+                          key={ev.call_id ?? i}
+                          className="border-b border-slate-700/30 hover:bg-rose-500/5 transition-colors"
+                        >
+                          <td className="px-4 py-2 font-mono text-slate-300 break-all min-w-[180px]">
+                            {ev.call_id || '—'}
+                          </td>
+                          <td className="px-4 py-2 min-w-[130px]">
+                            <span className="font-mono text-amber-300">{uacExt}</span>
+                            {uacAddr && (
+                              <span className="block text-[10px] text-sky-400/70 font-mono" title={uacAddr}>
+                                {uacAddrShort}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 min-w-[130px]">
+                            <span className="font-mono text-amber-300">{uasExt}</span>
+                            {uasAddr && (
+                              <span className="block text-[10px] text-sky-400/70 font-mono" title={uasAddr}>
+                                {uasAddrShort}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-rose-300 min-w-[180px]">
+                            {errorDisplay}
+                          </td>
+                          <td className="px-4 py-2 font-mono text-[11px] text-slate-300 min-w-[180px] break-all">
+                            {ev.sip_server_header || '—'}
+                          </td>
+                          <td className="px-4 py-2 font-mono text-[11px] text-slate-300 min-w-[180px] break-all">
+                            {ev.sip_user_agent_header || '—'}
+                          </td>
+                        </tr>
+                      )
+                    })}
                   </tbody>
                 </table>
               </div>

@@ -40,6 +40,8 @@ const (
 	HdrServer             = "Server"
 )
 
+const UserAgentValue = "Nexus-Traffic-Engine"
+
 // SipRespCodeMap maps SIP response code strings to their reason phrases.
 var SipRespCodeMap = map[string]string{
 	"100": "Trying",

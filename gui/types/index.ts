@@ -4,7 +4,8 @@ export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type SipScheme = 'SIP' | 'SIPS'
 export type LocalIPMode = 'single' | 'unique_vip' | 'vip_pool'
 export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
-export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'OPUS'
+export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729'
+export type RtpUnsupportedCodecPolicy = 'fallback_g711' | 'reject_488'
 export type MediaSecurity = 'rtp' | 'srtp_sdes'
 export type SRTPCryptoSuite = 'AES_CM_128_HMAC_SHA1_80' | 'AES_CM_128_HMAC_SHA1_32'
 export type RunPhase =
@@ -34,8 +35,8 @@ export type RtpMode = '3phase' | '3phase_coverage' | 'continuous'
 
 export interface AdvancedSettings {
   register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
-  register_batch_delay_ms: number      // default: 500 — delay (ms) between TCP socket / REGISTER batches
-  connect_timeout: number              // default: 1 — per TCP/TLS connection attempt timeout (s)
+  register_batch_delay_ms: number      // default: 1000 — delay (ms) between TCP socket / REGISTER batches
+  connect_timeout: number              // default: 5 — per TCP/TLS connection attempt timeout (s)
   register_timeout: number             // default: 5 — per-REGISTER and per-SUBSCRIBE response wait (s)
   register_retry: number               // default: 3 — retry attempts for REGISTER and SUBSCRIBE
   subscribe_concurrency: number        // default: 10 — max concurrent SUBSCRIBE operations
@@ -77,8 +78,8 @@ export interface AdvancedSettings {
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
   register_batch_size: 10,
-  register_batch_delay_ms: 500,
-  connect_timeout: 1,
+  register_batch_delay_ms: 1000,
+  connect_timeout: 5,
   register_timeout: 5,
   register_retry: 3,
   subscribe_concurrency: 10,
@@ -157,12 +158,24 @@ export interface VMConfig {
   failover_mode?: 'graceful' | 'force'
   auto_failback_enabled?: boolean
   failback_delay_seconds?: number
+  failover_trigger?: 'per_agent' | 'min_agents' | 'pct_agents'
+  failover_trigger_count?: number
+  failover_trigger_pct?: number
+  failover_trigger_window_ms?: number
+  ha_mode?: 'single' | 'dual' | 'multi_zone'
+  zone_config?: {
+    zones: Array<{
+      zone_id: string
+      controllers: Array<{ host: string; port: number }>
+    }>
+    zone_distribution_pct: number
+  }
   dns_servers?: string
 
   // Registration / Subscription
   register_expires?: number        // default: 3600 (seconds)
   subscribe_expires?: number       // default: 3600 (seconds)
-  connect_timeout?: number         // default: 1 (seconds)
+  connect_timeout?: number         // default: 5 (seconds)
   cleanup_unsubscribe_rate_per_sec?: number
   cleanup_unregister_rate_per_sec?: number
   cleanup_audit_timeout_minutes?: number
@@ -203,6 +216,7 @@ export interface VMConfig {
   srtp_crypto_suites?: SRTPCryptoSuite[]
   srtp_key_mode?: 'auto'
   rtp_codec?: RtpCodec             // default: 'G711_ULAW'
+  rtp_unsupported_codec_policy?: RtpUnsupportedCodecPolicy // default: fallback_g711
   rtp_ptime?: number               // default: 20 ms
   rtp_mode?: RtpMode
   rtp_burst_seconds?: number
@@ -280,6 +294,7 @@ export interface TrafficMetrics {
   asr: number
   // csr: Call Success Ratio = calls_completed / calls_attempted * 100.
   csr?: number
+  target_cps?: number
   avg_pdd_ms: number
   min_pdd_ms: number
   max_pdd_ms: number
@@ -391,6 +406,7 @@ export interface TrafficMetrics {
   ha_failover_events?: number
   ha_failover_deferred?: number
   ha_events?: HAEvent[]
+  ha_agent_groups?: AgentGroupStatus[]
 
   // Graceful-drain timer surfaced when the timed-mode deadline fires or
   // when the operator clicks Graceful Stop. While `graceful_drain_active`
@@ -552,6 +568,12 @@ export interface CallEvent {
   sip_code?: number
   sip_local_ip?: string
   sip_local_port?: number
+  sip_remote_ip?: string
+  sip_remote_port?: number
+  sip_server_header?: string
+  sip_user_agent_header?: string
+  active_controller?: string
+  agent_group_id?: string
   pdd_ms: number
   hold_ms: number
   media_status: 'MEDIA_VERIFIED' | 'MEDIA_PARTIAL' | 'MEDIA_FAILED' | 'NO_MEDIA'
@@ -560,6 +582,9 @@ export interface CallEvent {
   rtp_rx_from_sbc_pkts?: number
   rtp_rx_other_pkts?: number
   rtp_asymmetry_flag?: string
+  rtp_codec?: RtpCodec
+  rtp_payload_type?: number
+  rtp_payload_markers?: boolean
   rtp_expected_pkts?: number
   rtp_ssrc_count?: number
   rtcp_rx_pkts?: number
@@ -581,6 +606,7 @@ export interface CallEvent {
   remote_jitter_ms?: number
   remote_loss_pct?: number
   mos_score?: number
+  mos_codec?: RtpCodec
   media_quality_flag?: 'OK' | 'WARNING' | 'CRITICAL' | 'UNKNOWN'
   call_setup_ms?: number
   prack_rtt_ms?: number
@@ -632,6 +658,27 @@ export interface HAEvent {
   type: string
   target?: string
   details?: string
+}
+
+export interface AgentGroupStatus {
+  group_id: string
+  zone_id: string
+  primary_host: string
+  primary_port: number
+  secondary_host: string
+  secondary_port: number
+  active_controller: string
+  primary_registered: number
+  secondary_registered: number
+  active_subscribed: number
+  agent_count: number
+  primary_reachable: boolean
+  move_active: boolean
+  last_move_error?: string
+  pending_move_out?: number
+  move_retrying?: number
+  active_on_secondary?: number
+  failback_pending?: number
 }
 
 export interface AggregateMetrics {

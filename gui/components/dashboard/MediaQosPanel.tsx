@@ -6,6 +6,7 @@ import type { AdvancedSettings } from '@/types'
 
 export interface RtpFlowStats {
   mediaSecurity?: string | null
+  rtpCodec?: string | null
   srtpCryptoSuites?: string[] | null
   configuredPacketsPerDirection?: number | null
   avgTxPackets?: number | null
@@ -155,6 +156,7 @@ export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEn
   const isPending = jitterMs == null && mosEstimate == null && qosScore == null
   const isSRTP = rtpFlow?.mediaSecurity === 'srtp_sdes'
   const mediaLabel = isSRTP ? 'SRTP' : 'RTP'
+  const codecLabel = rtpFlow?.rtpCodec ? String(rtpFlow.rtpCodec).replace('_', ' ') : null
 
   // RTT card is shown only when RTCP SR is enabled — otherwise the SBC has
   // never received an SR from us so the field would always read 0/—.
@@ -233,7 +235,7 @@ export function MediaQosPanel({ jitterMs, mosEstimate, qosScore, rttMs, rtcpSrEn
         </div>
       <div className={cn('grid gap-3', cardCount === 4 ? 'grid-cols-4' : 'grid-cols-3')}>
         <QosCard icon={Activity}  label="Jitter (ms)"   value={jitterMs}     unit="ms"  pending={jitterMs == null} />
-        <QosCard icon={BarChart3} label="MOS Estimate"  value={mosEstimate}  unit=""    pending={mosEstimate == null} />
+        <QosCard icon={BarChart3} label={codecLabel ? `MOS Estimate (${codecLabel})` : 'MOS Estimate'}  value={mosEstimate}  unit=""    pending={mosEstimate == null} />
         <QosCard icon={Gauge}     label="QoS Score"     value={qosScore}     unit="%"   pending={qosScore == null} />
         {showRtt && (
           <QosCard icon={Timer}   label="RTT (ms)"      value={rttMs}        unit="ms"  pending={rttMs == null || rttMs === 0} />

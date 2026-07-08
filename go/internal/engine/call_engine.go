@@ -92,6 +92,7 @@ type CallEngine struct {
 	callsCompleted  atomic.Int32
 	callsFailed     atomic.Int32
 	peakActiveCalls int32
+	targetCPS       atomic.Int64
 
 	metrics MetricsRecorder
 }
@@ -131,6 +132,7 @@ func NewCallEngine(pool *PoolEngine, cfg *config.VMConfig, opts ...CallEngineOpt
 		config:    cfg,
 		StopEvent: make(chan struct{}),
 	}
+	e.targetCPS.Store(int64(cfg.CPS))
 	for _, o := range opts {
 		o(e)
 	}
@@ -151,6 +153,44 @@ func (e *CallEngine) CallsCompleted() int { return int(e.callsCompleted.Load()) 
 
 // CallsFailed returns the number of failed calls.
 func (e *CallEngine) CallsFailed() int { return int(e.callsFailed.Load()) }
+
+// TargetCPS returns the current launch-rate target for new calls.
+func (e *CallEngine) TargetCPS() int {
+	cps := int(e.targetCPS.Load())
+	if cps <= 0 {
+		return 1
+	}
+	return cps
+}
+
+// SetTargetCPS changes the launch-rate target for future calls. It does not
+// affect active calls, hold time, cleanup, or pool membership.
+func (e *CallEngine) SetTargetCPS(cps int) error {
+	if cps <= 0 {
+		return fmt.Errorf("cps must be > 0, got %d", cps)
+	}
+	e.targetCPS.Store(int64(cps))
+	slog.Info("CallEngine target CPS updated", "target_cps", cps)
+	return nil
+}
+
+func (e *CallEngine) effectiveMaxConcurrent() int {
+	if e.config.MaxConcurrentCalls > 0 {
+		return e.config.MaxConcurrentCalls
+	}
+	return e.TargetCPS() * e.config.HoldTimeSeconds
+}
+
+func intervalForCPS(cps int) time.Duration {
+	if cps <= 0 {
+		cps = 1
+	}
+	interval := time.Duration(float64(time.Second) / float64(cps))
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
+}
 
 // Stop signals the run loop to stop firing new calls.
 func (e *CallEngine) Stop() {
@@ -184,16 +224,14 @@ func (e *CallEngine) Run(ctx context.Context) error {
 // for hold/RTP/BYE/200 completion.
 func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) error {
 	cfg := e.config
-	fullInterval := time.Duration(float64(time.Second) / float64(cfg.CPS))
 	rampStart := time.Now()
 	nextLaunchAt := rampStart
-	maxSchedulerLag := fullInterval * 3
 
 	slog.Info("CallEngine starting",
-		"cps", cfg.CPS,
+		"target_cps", e.TargetCPS(),
 		"ramp_up_seconds", cfg.RampUpSeconds,
 		"hold_time_seconds", cfg.HoldTimeSeconds,
-		"max_concurrent", cfg.EffectiveMaxConcurrent(),
+		"max_concurrent", e.effectiveMaxConcurrent(),
 		"max_calls", e.maxCalls,
 	)
 
@@ -251,13 +289,15 @@ func (e *CallEngine) RunWithCallContext(launchCtx, callCtx context.Context) erro
 		}
 
 		// Max concurrent ceiling
-		maxCC := cfg.EffectiveMaxConcurrent()
+		maxCC := e.effectiveMaxConcurrent()
 		if maxCC > 0 && int(e.activeCount.Load()) >= maxCC {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
+		fullInterval := intervalForCPS(e.TargetCPS())
 		interval := pacingInterval(fullInterval, cfg.RampUpSeconds, rampStart, time.Now())
+		maxSchedulerLag := interval * 3
 		if sleepFor := time.Until(nextLaunchAt); sleepFor > 0 {
 			select {
 			case <-launchCtx.Done():
@@ -344,8 +384,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			e.activeCount.Add(-1)
 		}
 		ag.RemoveDialog(callID)
-		// Return the pair to the pool so both users can be reused.
-		e.pool.ReturnPair(ag, calleeAg)
+		// Return the pair to the pool. ReturnPairFiltered drops agents whose
+		// transport died (e.g. during HA failover) instead of re-adding them
+		// to the idle pool where they'd cause immediate call failures.
+		e.pool.ReturnPairFiltered(ag, calleeAg)
 	}()
 
 	emit := func(event string, sipCode int, ms float64, extra map[string]any) {
@@ -382,14 +424,31 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		}
 	}
 
+	extractRemoteFailureHeaders := func(raw string) (server, userAgent string) {
+		if strings.TrimSpace(raw) == "" {
+			return "", ""
+		}
+		msg, _, err := sip.ParseMessage(raw)
+		if err != nil {
+			return "", ""
+		}
+		if vals := msg.GetHeader(sip.HdrServer); len(vals) > 0 {
+			server = vals[0]
+		}
+		if vals := msg.GetHeader(sip.HdrUserAgent); len(vals) > 0 {
+			userAgent = vals[0]
+		}
+		return server, userAgent
+	}
+
 	// tryHandleFinalFailure ACKs a final-failure response (4xx/5xx/6xx)
 	// per RFC 3261 §17.1.1.3 and returns true when the response was a
 	// non-401/407 final failure. The caller is then expected to fail the
 	// call cleanly without sending CANCEL.
-	tryHandleFinalFailure := func(raw string) (string, bool) {
-		code, _ := sip.ClassifyMessage(raw)
+	tryHandleFinalFailure := func(raw string) (code, server, userAgent string, handled bool) {
+		code, _ = sip.ClassifyMessage(raw)
 		if !sip.IsFinalFailureCode(code) {
-			return code, false
+			return code, "", "", false
 		}
 		if err := ag.SendAckForFailure(dialog, raw); err != nil {
 			emit("ACK_FINAL_FAILED", atoi(code), 0, map[string]any{"error": err.Error()})
@@ -397,12 +456,13 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			emit("ACK_FINAL_SENT", atoi(code), 0, nil)
 		}
 		emit("CALL_FAILED", atoi(code), 0, map[string]any{"reason": "final failure"})
-		return code, true
+		server, userAgent = extractRemoteFailureHeaders(raw)
+		return code, server, userAgent, true
 	}
 
-	fail := func(reason string) CallResult {
+	failWithCodeAndHeaders := func(reason string, sipCode int, serverHeader, userAgentHeader string) CallResult {
 		e.callsFailed.Add(1)
-		emit("CALL_FAILED", 0, 0, map[string]any{"reason": reason})
+		emit("CALL_FAILED", sipCode, 0, map[string]any{"reason": reason})
 
 		var rtpTx, rtpRx, rtpRxFromSBC, rtpRxOt, rtcpRx, markersSent, markersRecv, rtpExpected, rtpSSRCCount int
 		var srtpDecryptFailures, srtpAuthFailures, srtpReplayFailures int
@@ -432,7 +492,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			remoteLoss = math.Round(st.RemoteLossPct*100) / 100
 			rttMs = math.Round(st.RTTMs*100) / 100
 			if cfg.IsQoSMOSEnabled() && mediaOK {
-				mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+				mosScore = ComputeMOSForCodec(cfg.RTPCodec, st.PacketLossPct/100.0, st.JitterMs)
 			}
 		}
 		mediaQuality := ClassifyMediaQuality(jitterMs, packetLossPct, mosScore, mediaOK)
@@ -449,12 +509,17 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			Callee:              callee,
 			Success:             false,
 			FailureReason:       reason,
+			SIPCode:             sipCode,
 			TotalMs:             msSince(callStart),
 			RTPLocalPort:        rtpLocalPort(rtpEP),
 			RTPTxPkts:           rtpTx,
 			RTPRxPkts:           rtpRx,
 			SIPLocalIP:          ag.LocalHost(),
 			SIPLocalPort:        ag.LocalPort(),
+			SIPRemoteIP:         cfg.SBCHost,
+			SIPRemotePort:       cfg.SBCPort,
+			SIPServerHeader:     serverHeader,
+			SIPUserAgentHeader:  userAgentHeader,
 			MediaVerified:       mediaOK,
 			RTPRxFromSBCPkts:    rtpRxFromSBC,
 			RTPRxOtherPkts:      rtpRxOt,
@@ -467,6 +532,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			SBCRTPRelayPort:     sbcRelayPort,
 			RTPAsymmetryFlag:    ComputeRTPAsymmetryFlag(rtpTx, rtpRxFromSBC, rtpRx),
 			MediaSecurity:       cfg.MediaSecurity,
+			RTPCodec:            rtp.ProfileForCodec(cfg.RTPCodec).Name,
+			RTPPayloadType:      rtp.ProfileForCodec(cfg.RTPCodec).PayloadType,
+			RTPPayloadMarkers:   rtp.ProfileForCodec(cfg.RTPCodec).PayloadMarkerEnabled,
+			MOSCodec:            rtp.ProfileForCodec(cfg.RTPCodec).Name,
 			SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
 			SRTPDecryptFailures: srtpDecryptFailures,
 			SRTPAuthFailures:    srtpAuthFailures,
@@ -491,13 +560,20 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			ByeCompletionMs:     byeCompletionMs,
 		}
 	}
+	failWithCode := func(reason string, sipCode int) CallResult {
+		return failWithCodeAndHeaders(reason, sipCode, "", "")
+	}
+	fail := func(reason string) CallResult {
+		return failWithCode(reason, 0)
+	}
 
 	// ── Allocate RTP endpoint ──────────────────────────────────────
 	if cfg.MediaEnabled {
 		var err error
-		rtpEP, err = rtp.NewRtpEndpointFull(
+		rtpEP, err = rtp.NewRtpEndpointFullCodec(
 			ag.LocalHost(),
 			cfg.RTPPtime,
+			cfg.RTPCodec,
 			cfg.IsQoSEnabled(),
 			cfg.IsRTCPSREnabled(),
 			time.Duration(cfg.RTCPSRIntervalSeconds)*time.Second,
@@ -576,6 +652,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				RTPLocalPort:    rtpLocalPort(rtpEP),
 				SIPLocalIP:      ag.LocalHost(),
 				SIPLocalPort:    ag.LocalPort(),
+				SIPRemoteIP:     cfg.SBCHost,
+				SIPRemotePort:   cfg.SBCPort,
 				MediaSecurity:   cfg.MediaSecurity,
 				SRTPCryptoSuite: selectedSRTPCryptoSuite(dialog),
 				PeerExt:         callee, TsUTC: inviteTsUTC, Direction: "uac",
@@ -613,7 +691,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			emit("AUTH_401", 401, 0, nil)
 			if err := ag.Handle401Invite(dialog, raw, rtpPort); err != nil {
 				emit("AUTH_INVITE_FAILED", 401, 0, map[string]any{"error": err.Error()})
-				result := fail(fmt.Sprintf("401 handling: %v", err))
+				result := failWithCode(fmt.Sprintf("401 handling: %v", err), 401)
 				e.complete(result)
 				return
 			}
@@ -624,7 +702,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			emit("AUTH_407", 407, 0, nil)
 			if err := ag.Handle407Invite(dialog, raw, rtpPort); err != nil {
 				emit("AUTH_INVITE_FAILED", 407, 0, map[string]any{"error": err.Error()})
-				result := fail(fmt.Sprintf("407 handling: %v", err))
+				result := failWithCode(fmt.Sprintf("407 handling: %v", err), 407)
 				e.complete(result)
 				return
 			}
@@ -637,13 +715,13 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 
 		default:
 			if isFinalFailure(code) {
+				serverHeader, userAgentHeader := extractRemoteFailureHeaders(raw)
 				if err := ag.SendAckForFailure(dialog, raw); err != nil {
 					emit("ACK_FINAL_FAILED", atoi(code), 0, map[string]any{"error": err.Error()})
 				} else {
 					emit("ACK_FINAL_SENT", atoi(code), 0, nil)
 				}
-				emit("CALL_FAILED", atoi(code), 0, map[string]any{"reason": "final failure"})
-				result := fail(fmt.Sprintf("Rejected with %s", code))
+				result := failWithCodeAndHeaders(fmt.Sprintf("Rejected with %s", code), atoi(code), serverHeader, userAgentHeader)
 				e.complete(result)
 				return
 			}
@@ -677,13 +755,14 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				} else {
 					emit("ACK_FINAL_SENT", atoi(prackCode), 0, nil)
 				}
-				emit("CALL_FAILED", atoi(prackCode), 0, map[string]any{"reason": "final failure"})
-				result := fail(fmt.Sprintf("Rejected with %s while awaiting PRACK", prackCode))
+				serverHeader, userAgentHeader := extractRemoteFailureHeaders(rawPrackResp)
+				result := failWithCodeAndHeaders(fmt.Sprintf("Rejected with %s while awaiting PRACK", prackCode), atoi(prackCode), serverHeader, userAgentHeader)
 				e.complete(result)
 				return
 			}
 			sendCleanupOnTimeout()
-			result := fail(fmt.Sprintf("PRACK rejected with %s", prackCode))
+			serverHeader, userAgentHeader := extractRemoteFailureHeaders(rawPrackResp)
+			result := failWithCodeAndHeaders(fmt.Sprintf("PRACK rejected with %s", prackCode), atoi(prackCode), serverHeader, userAgentHeader)
 			e.complete(result)
 			return
 		}
@@ -704,14 +783,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			rawPrackAuth := prackAuthEv.Raw
 			if sip.IsFinalFailureCode(prackAuthEv.Code) {
 				if strings.EqualFold(prackAuthEv.CSeqMethod, "INVITE") {
-					if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
-						result := fail(fmt.Sprintf("Rejected with %s during PRACK auth wait", code))
+					if code, serverHeader, userAgentHeader, handled := tryHandleFinalFailure(rawPrackAuth); handled {
+						result := failWithCodeAndHeaders(fmt.Sprintf("Rejected with %s during PRACK auth wait", code), atoi(code), serverHeader, userAgentHeader)
 						e.complete(result)
 						return
 					}
 				}
 				sendCleanupOnTimeout()
-				result := fail(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code))
+				serverHeader, userAgentHeader := extractRemoteFailureHeaders(rawPrackAuth)
+				result := failWithCodeAndHeaders(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code), atoi(prackAuthEv.Code), serverHeader, userAgentHeader)
 				e.complete(result)
 				return
 			}
@@ -733,14 +813,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			rawPrackAuth := prackAuthEv.Raw
 			if sip.IsFinalFailureCode(prackAuthEv.Code) {
 				if strings.EqualFold(prackAuthEv.CSeqMethod, "INVITE") {
-					if code, handled := tryHandleFinalFailure(rawPrackAuth); handled {
-						result := fail(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code))
+					if code, serverHeader, userAgentHeader, handled := tryHandleFinalFailure(rawPrackAuth); handled {
+						result := failWithCodeAndHeaders(fmt.Sprintf("Rejected with %s during PRACK (after auth)", code), atoi(code), serverHeader, userAgentHeader)
 						e.complete(result)
 						return
 					}
 				}
 				sendCleanupOnTimeout()
-				result := fail(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code))
+				serverHeader, userAgentHeader := extractRemoteFailureHeaders(rawPrackAuth)
+				result := failWithCodeAndHeaders(fmt.Sprintf("PRACK rejected with %s after auth", prackAuthEv.Code), atoi(prackAuthEv.Code), serverHeader, userAgentHeader)
 				e.complete(result)
 				return
 			}
@@ -790,8 +871,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			raw200 = ""
 			continue
 		}
-		if code, handled := tryHandleFinalFailure(raw200); handled {
-			result := fail(fmt.Sprintf("Rejected with %s while awaiting 200 INVITE", code))
+		if code, serverHeader, userAgentHeader, handled := tryHandleFinalFailure(raw200); handled {
+			result := failWithCodeAndHeaders(fmt.Sprintf("Rejected with %s while awaiting 200 INVITE", code), atoi(code), serverHeader, userAgentHeader)
 			e.complete(result)
 			return
 		}
@@ -1004,7 +1085,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		srtpAuthFailures = st.SRTPAuthFailures
 		srtpReplayFailures = st.SRTPReplayFailures
 		if cfg.IsQoSMOSEnabled() && mediaOK {
-			mosScore = ComputeMOS(st.PacketLossPct/100.0, st.JitterMs)
+			mosScore = ComputeMOSForCodec(cfg.RTPCodec, st.PacketLossPct/100.0, st.JitterMs)
 		}
 	}
 	mediaQuality := ClassifyMediaQuality(jitterMs, packetLossPct, mosScore, mediaOK)
@@ -1022,9 +1103,15 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		RTPRxPkts:           rtpRx,
 		SIPLocalIP:          ag.LocalHost(),
 		SIPLocalPort:        ag.LocalPort(),
+		SIPRemoteIP:         cfg.SBCHost,
+		SIPRemotePort:       cfg.SBCPort,
 		MediaVerified:       mediaOK,
 		RTPLocalPort:        rtpLocalPort(rtpEP),
 		MediaSecurity:       cfg.MediaSecurity,
+		RTPCodec:            rtp.ProfileForCodec(cfg.RTPCodec).Name,
+		RTPPayloadType:      rtp.ProfileForCodec(cfg.RTPCodec).PayloadType,
+		RTPPayloadMarkers:   rtp.ProfileForCodec(cfg.RTPCodec).PayloadMarkerEnabled,
+		MOSCodec:            rtp.ProfileForCodec(cfg.RTPCodec).Name,
 		SRTPCryptoSuite:     selectedSRTPCryptoSuite(dialog),
 		SRTPDecryptFailures: srtpDecryptFailures,
 		SRTPAuthFailures:    srtpAuthFailures,

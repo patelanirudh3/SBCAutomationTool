@@ -20,6 +20,8 @@ type SDPOptions struct {
 	RTCPMux         bool
 	MediaSecurity   string
 	SRTPCryptoLines []string
+	RTPCodec        string
+	RTPPtime        int
 }
 
 // BuildSDP builds a G.711 audio SDP for the given local host and RTP port.
@@ -37,6 +39,10 @@ func BuildSDP(localHost string, rtpPort int, rtcpMux bool) string {
 
 func BuildSDPWithOptions(localHost string, rtpPort int, opts SDPOptions) string {
 	sessID := uint64(time.Now().UnixNano()) ^ atomic.AddUint64(&sdpSessionCounter, 1)
+	ptime := opts.RTPPtime
+	if ptime == 0 {
+		ptime = 20
+	}
 	rtcpMuxLine := ""
 	if opts.RTCPMux {
 		rtcpMuxLine = "a=rtcp-mux\r\n"
@@ -51,22 +57,38 @@ func BuildSDPWithOptions(localHost string, rtpPort int, opts SDPOptions) string 
 			}
 		}
 	}
+	codec := strings.ToUpper(strings.TrimSpace(opts.RTPCodec))
+	if codec == "" {
+		codec = "G711_ULAW"
+	}
+	mediaPayloads := "0 8 101"
+	codecLines := "a=rtpmap:0 PCMU/8000\r\n" +
+		"a=rtpmap:8 PCMA/8000\r\n"
+	switch codec {
+	case "G711_ALAW":
+		mediaPayloads = "8 0 101"
+	case "G729":
+		mediaPayloads = "18 101"
+		codecLines = "a=rtpmap:18 G729/8000\r\n" +
+			"a=fmtp:18 annexb=no\r\n"
+	default:
+		codec = "G711_ULAW"
+	}
 	return fmt.Sprintf(
 		"v=0\r\n"+
 			"o=- %d 1 IN IP4 %s\r\n"+
 			"s=-\r\n"+
 			"c=IN IP4 %s\r\n"+
 			"t=0 0\r\n"+
-			"m=audio %d %s 0 8 101\r\n"+
-			"a=rtpmap:0 PCMU/8000\r\n"+
-			"a=rtpmap:8 PCMA/8000\r\n"+
+			"m=audio %d %s %s\r\n"+
+			"%s"+
 			"a=rtpmap:101 telephone-event/8000\r\n"+
 			"a=fmtp:101 0-15\r\n"+
-			"a=ptime:20\r\n"+
+			"a=ptime:%d\r\n"+
 			"a=sendrecv\r\n"+
 			"%s"+
 			"%s",
-		sessID, localHost, localHost, rtpPort, proto, cryptoLines, rtcpMuxLine,
+		sessID, localHost, localHost, rtpPort, proto, mediaPayloads, codecLines, ptime, cryptoLines, rtcpMuxLine,
 	)
 }
 
@@ -107,6 +129,7 @@ type SDPMediaInfo struct {
 	MediaType       string
 	Proto           string
 	PayloadTypes    []int
+	PayloadCodecs   map[int]string
 	CryptoSuite     string
 	CryptoKeyParams string
 	CryptoLines     []SRTPCryptoOffer
@@ -126,7 +149,7 @@ func ParseSDPMedia(sdpBody string) (ip string, port int) {
 // SRTP crypto details from SDP. It scans line by line and does not recover
 // missing fields; callers can inspect HasAudio/IP/Port/Proto for diagnostics.
 func ParseSDPMediaInfo(sdpBody string) SDPMediaInfo {
-	var info SDPMediaInfo
+	info := SDPMediaInfo{PayloadCodecs: make(map[int]string)}
 	sessionIP := ""
 	mediaIP := ""
 	inAudio := false
@@ -169,9 +192,14 @@ func ParseSDPMediaInfo(sdpBody string) SDPMediaInfo {
 				for _, ptRaw := range parts[3:] {
 					if pt, err := strconv.Atoi(ptRaw); err == nil {
 						info.PayloadTypes = append(info.PayloadTypes, pt)
+						if codec := staticPayloadCodec(pt); codec != "" {
+							info.PayloadCodecs[pt] = codec
+						}
 					}
 				}
 			}
+		case inAudio && strings.HasPrefix(strings.ToLower(line), "a=rtpmap:"):
+			parseRTPMapLine(line, &info)
 		case inAudio && strings.HasPrefix(line, "a=crypto:"):
 			parseCryptoLine(line, &info)
 		case inAudio && strings.EqualFold(line, "a=rtcp-mux"):
@@ -196,6 +224,33 @@ func ParseSDPMediaInfo(sdpBody string) SDPMediaInfo {
 		)
 	}
 	return info
+}
+
+func (info SDPMediaInfo) OfferedCodecs() []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(info.PayloadTypes))
+	for _, pt := range info.PayloadTypes {
+		codec := info.PayloadCodecs[pt]
+		if codec == "" || codec == "TELEPHONE_EVENT" || seen[codec] {
+			continue
+		}
+		seen[codec] = true
+		out = append(out, codec)
+	}
+	return out
+}
+
+func (info SDPMediaInfo) HasCodec(codec string) bool {
+	want := normalizeSDPCodec(codec)
+	if want == "" {
+		return false
+	}
+	for _, offered := range info.OfferedCodecs() {
+		if offered == want {
+			return true
+		}
+	}
+	return false
 }
 
 func nextSDPLine(s string, offset int) (line string, next int) {
@@ -229,6 +284,50 @@ func parseCryptoLine(line string, info *SDPMediaInfo) {
 		KeyParams: fields[2],
 		SDPLine:   line,
 	})
+}
+
+func parseRTPMapLine(line string, info *SDPMediaInfo) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return
+	}
+	left := strings.TrimPrefix(strings.ToLower(fields[0]), "a=rtpmap:")
+	pt, err := strconv.Atoi(left)
+	if err != nil {
+		return
+	}
+	codecName := strings.SplitN(fields[1], "/", 2)[0]
+	if codec := normalizeSDPCodec(codecName); codec != "" {
+		info.PayloadCodecs[pt] = codec
+	}
+}
+
+func staticPayloadCodec(pt int) string {
+	switch pt {
+	case 0:
+		return "G711_ULAW"
+	case 8:
+		return "G711_ALAW"
+	case 18:
+		return "G729"
+	default:
+		return ""
+	}
+}
+
+func normalizeSDPCodec(codec string) string {
+	switch strings.ToUpper(strings.TrimSpace(codec)) {
+	case "G711_ULAW", "PCMU":
+		return "G711_ULAW"
+	case "G711_ALAW", "PCMA":
+		return "G711_ALAW"
+	case "G729", "G.729":
+		return "G729"
+	case "TELEPHONE-EVENT", "TELEPHONE_EVENT":
+		return "TELEPHONE_EVENT"
+	default:
+		return ""
+	}
 }
 
 func truncateSDP(s string, max int) string {

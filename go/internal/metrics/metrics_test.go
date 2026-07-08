@@ -1,6 +1,10 @@
 package metrics
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestMilestoneCountersAreEventDrivenAndDeduped(t *testing.T) {
 	c := NewMetricsCollector("traffic-local", 1)
@@ -76,6 +80,43 @@ func TestRecordCallDoesNotMutateLiveFunnelCounters(t *testing.T) {
 		snap.CallsAcknowledged != 0 || snap.CallsCompleted != 0 ||
 		snap.CallsFailed != 0 {
 		t.Fatalf("RecordCall mutated live funnel counters: %+v", snap)
+	}
+}
+
+func TestCallResultExposesRemoteFailureHeaders(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	c.RecordCall(CallResultData{
+		CallID:             "failed-call",
+		Caller:             "6001",
+		Callee:             "6002",
+		Success:            false,
+		FailureReason:      "Rejected with 500",
+		SIPCode:            500,
+		SIPServerHeader:    "Remote-SBC/1.2",
+		SIPUserAgentHeader: "Remote-UA/3.4",
+		Direction:          "uac",
+	})
+
+	dicts := c.GetCallResultsAsDicts()
+	if len(dicts) != 1 {
+		t.Fatalf("call results len=%d, want 1", len(dicts))
+	}
+	if got := dicts[0]["sip_server_header"]; got != "Remote-SBC/1.2" {
+		t.Fatalf("sip_server_header=%v, want Remote-SBC/1.2", got)
+	}
+	if got := dicts[0]["sip_user_agent_header"]; got != "Remote-UA/3.4" {
+		t.Fatalf("sip_user_agent_header=%v, want Remote-UA/3.4", got)
+	}
+
+	events := c.GetCallEvents()
+	if len(events) != 1 {
+		t.Fatalf("call events len=%d, want 1", len(events))
+	}
+	if got := events[0]["sip_server_header"]; got != "Remote-SBC/1.2" {
+		t.Fatalf("event sip_server_header=%v, want Remote-SBC/1.2", got)
+	}
+	if got := events[0]["sip_user_agent_header"]; got != "Remote-UA/3.4" {
+		t.Fatalf("event sip_user_agent_header=%v, want Remote-UA/3.4", got)
 	}
 }
 
@@ -194,5 +235,61 @@ func TestPerformanceDiagnosticsModeDefaultsInvalidToWarningOnly(t *testing.T) {
 	}
 	if got := c.SetPerformanceDiagnosticsMode(TopProcessModeSlow); got != TopProcessModeSlow {
 		t.Fatalf("mode=%q, want %q", got, TopProcessModeSlow)
+	}
+}
+
+func TestCleanupStartPersistsRequestEvenWhenSignalAlreadyQueued(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	pctx := NewProcessContext(c, 8082)
+	mux := BuildMux(c, "traffic-local", "", pctx)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/cleanup/start", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("cleanup/start attempt %d status=%d body=%s, want 202", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	pctx.Mu.Lock()
+	requested := pctx.CleanupStartRequested
+	pctx.Mu.Unlock()
+	if !requested {
+		t.Fatal("CleanupStartRequested=false, want true after cleanup/start")
+	}
+
+	select {
+	case <-pctx.CleanupStartCh:
+	default:
+		t.Fatal("cleanup/start did not signal CleanupStartCh")
+	}
+}
+
+func TestRegSubStartPersistsRequestEvenWhenSignalAlreadyQueued(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	pctx := NewProcessContext(c, 8082)
+	mux := BuildMux(c, "traffic-local", "", pctx)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/regsub/start", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("regsub/start attempt %d status=%d body=%s, want 202", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	pctx.Mu.Lock()
+	requested := pctx.RegSubStartRequested
+	pctx.Mu.Unlock()
+	if !requested {
+		t.Fatal("RegSubStartRequested=false, want true after regsub/start")
+	}
+
+	select {
+	case <-pctx.RegSubStartCh:
+	default:
+		t.Fatal("regsub/start did not signal RegSubStartCh")
 	}
 }

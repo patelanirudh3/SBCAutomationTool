@@ -18,7 +18,7 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
-import type { TrafficMode, SipTransport, SipScheme, LocalIPMode, RtpCodec, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
+import type { TrafficMode, SipTransport, SipScheme, LocalIPMode, RtpCodec, RtpUnsupportedCodecPolicy, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { SUBSCRIBE_EVENT_OPTIONS, SUBSCRIBE_EVENT_VALUES } from '@/lib/subscription-events'
 import { applyVIPsFor, uploadCertificateFor, verifyTLSFor, verifyVIPsFor, type TLSVerifyResult, type VIPResult } from '@/lib/api'
 
@@ -61,6 +61,10 @@ export type RawVMFormValues = {
   failover_mode: 'graceful' | 'force'
   auto_failback_enabled: boolean
   failback_delay_seconds: string
+  failover_trigger: 'per_agent' | 'min_agents' | 'pct_agents'
+  failover_trigger_count: string
+  failover_trigger_pct: string
+  failover_trigger_window_ms: string
   dns_servers: string
   sip_transport: SipTransport
   sip_scheme: SipScheme
@@ -84,9 +88,13 @@ export type RawVMFormValues = {
   srtp_crypto_suites: SRTPCryptoSuite[]
   srtp_key_mode: 'auto'
   rtp_codec: RtpCodec
+  rtp_unsupported_codec_policy: RtpUnsupportedCodecPolicy
   rtp_ptime: string
   // Engine
   metrics_port: string
+  // HA
+  ha_mode: 'single' | 'dual' | 'multi_zone'
+  zone_config_json: string
   // Run control
   traffic_mode: TrafficMode
   call_count: string
@@ -132,7 +140,8 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'vm_id', 'vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path',
     'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip',
     'sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds', 'dns_servers',
+    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds',
+    'failover_trigger', 'failover_trigger_count', 'failover_trigger_pct', 'failover_trigger_window_ms', 'dns_servers',
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
   ],
   signaling: [
@@ -144,7 +153,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'cps', 'hold_time_seconds', 'ramp_up_seconds',
     'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
   ],
-  media: ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_ptime'],
+  media: ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_unsupported_codec_policy', 'rtp_ptime'],
 }
 
 // Default values for the Registration section — used to detect "dirty" state
@@ -166,12 +175,13 @@ const SECTION_FIELDS = {
   identity:       ['vm_id'] as (keyof RawVMFormValues)[],
   agent_host:     ['vm_ip', 'metrics_port', 'ssh_user', 'ssh_key_path', 'local_ip_mode', 'local_host', 'vip_interface', 'vip_cidr', 'vip_first_ip', 'vip_count', 'vip_gateway_ip', 'vip_sanity_target_ip'] as (keyof RawVMFormValues)[],
   sip_server:     ['sbc_host', 'sbc_port', 'sip_transport', 'sip_scheme', 'domain', 'sip_password',
-                   'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds', 'dns_servers',
+                   'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds',
+                   'failover_trigger', 'failover_trigger_count', 'failover_trigger_pct', 'failover_trigger_window_ms', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
-  media:          ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_ptime'] as (keyof RawVMFormValues)[],
+  media:          ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_unsupported_codec_policy', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
 
 // ---------------------------------------------------------------------------
@@ -517,6 +527,554 @@ function CpsBhccField({
 }
 
 // ---------------------------------------------------------------------------
+// HASection — HA Mode selector + zone configuration
+// ---------------------------------------------------------------------------
+
+function HASection({
+  raw,
+  onChange,
+  onBlur,
+  errors,
+  touched,
+}: {
+  raw: RawVMFormValues
+  onChange: VMConfigPanelProps['onChange']
+  onBlur: VMConfigPanelProps['onBlur']
+  errors: Record<string, string>
+  touched: Set<string>
+}) {
+  const e = (field: string) => (touched.has(field) ? errors[field] : undefined)
+  const t = (field: string) => touched.has(field)
+
+  const effectiveHAMode: 'single' | 'dual' | 'multi_zone' =
+    raw.ha_mode || (raw.dual_registration_enabled ? 'dual' : 'single')
+
+  // Zone controller state management
+  const parseZoneConfig = () => {
+    try {
+      if (raw.zone_config_json) return JSON.parse(raw.zone_config_json)
+    } catch { /* ignore */ }
+    return { zones: [{ zone_id: 'zone-a', controllers: [{ host: '', port: 5060 }] }, { zone_id: 'zone-b', controllers: [{ host: '', port: 5060 }] }], zone_distribution_pct: 50 }
+  }
+
+  const zoneConfig = parseZoneConfig()
+  const zoneDistPct: number = zoneConfig.zone_distribution_pct ?? 50
+  const zoneAControllers: Array<{ host: string; port: number }> = zoneConfig.zones?.[0]?.controllers ?? [{ host: '', port: 5060 }]
+  const zoneBControllers: Array<{ host: string; port: number }> = zoneConfig.zones?.[1]?.controllers ?? [{ host: '', port: 5060 }]
+
+  const serializeZoneConfig = (
+    aControllers: Array<{ host: string; port: number }>,
+    bControllers: Array<{ host: string; port: number }>,
+    distPct: number,
+  ) => {
+    const config = {
+      zones: [
+        { zone_id: 'zone-a', controllers: aControllers },
+        { zone_id: 'zone-b', controllers: bControllers },
+      ],
+      zone_distribution_pct: distPct,
+    }
+    onChange('zone_config_json', JSON.stringify(config))
+  }
+
+  const handleZoneDistChange = (val: number) => {
+    serializeZoneConfig(zoneAControllers, zoneBControllers, val)
+  }
+
+  const updateZoneAController = (i: number, field: 'host' | 'port', value: string) => {
+    const updated = [...zoneAControllers]
+    updated[i] = { ...updated[i], [field]: field === 'port' ? (parseInt(value) || 0) : value }
+    serializeZoneConfig(updated, zoneBControllers, zoneDistPct)
+  }
+  const updateZoneBController = (i: number, field: 'host' | 'port', value: string) => {
+    const updated = [...zoneBControllers]
+    updated[i] = { ...updated[i], [field]: field === 'port' ? (parseInt(value) || 0) : value }
+    serializeZoneConfig(zoneAControllers, updated, zoneDistPct)
+  }
+  const addZoneAController = () => serializeZoneConfig([...zoneAControllers, { host: '', port: 5060 }], zoneBControllers, zoneDistPct)
+  const addZoneBController = () => serializeZoneConfig(zoneAControllers, [...zoneBControllers, { host: '', port: 5060 }], zoneDistPct)
+  const removeZoneAController = (i: number) => serializeZoneConfig(zoneAControllers.filter((_, idx) => idx !== i), zoneBControllers, zoneDistPct)
+  const removeZoneBController = (i: number) => serializeZoneConfig(zoneAControllers, zoneBControllers.filter((_, idx) => idx !== i), zoneDistPct)
+
+  return (
+    <div className="space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
+      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-sky-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+        Remote Server HA
+      </div>
+
+      {/* HA Mode selector */}
+      <div className="flex items-center gap-2 mb-4">
+        <span className="text-xs font-medium text-muted-foreground">HA Mode:</span>
+        <div className="flex rounded-lg border border-slate-700 overflow-hidden">
+          {(['single', 'dual', 'multi_zone'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => {
+                onChange('ha_mode', mode)
+                if (mode === 'dual') {
+                  onChange('dual_registration_enabled', true)
+                } else {
+                  onChange('dual_registration_enabled', false)
+                }
+              }}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium transition-colors',
+                effectiveHAMode === mode
+                  ? 'bg-sky-600 text-white'
+                  : 'bg-slate-950 text-slate-300 hover:bg-slate-800',
+              )}
+            >
+              {mode === 'single' ? 'Single Controller' : mode === 'dual' ? 'Dual Controller' : 'Multi-Zone HA'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Single mode — primary controller fields only */}
+      {effectiveHAMode === 'single' && (
+        <div className="space-y-2 rounded-md border border-slate-700/50 bg-slate-950/20 p-2.5">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Primary Controller</div>
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-slate-400">Host</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Input
+                value={raw.sbc_host}
+                onChange={(ev) => onChange('sbc_host', ev.target.value)}
+                onBlur={() => onBlur('sbc_host')}
+                placeholder="x.x.x.x"
+                className="w-40 font-mono"
+                aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+              />
+              <span className="text-slate-500">:</span>
+              <Input
+                type="number"
+                value={raw.sbc_port}
+                onChange={(ev) => onChange('sbc_port', ev.target.value)}
+                onBlur={() => onBlur('sbc_port')}
+                placeholder="5060"
+                className="w-16 font-mono"
+                aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+              />
+              <Select
+                value={raw.sip_transport}
+                onValueChange={(v) => {
+                  const transport = v as SipTransport
+                  onChange('sip_transport', transport)
+                  if (transport === 'TLS') onChange('sbc_port', '5061')
+                  if (transport === 'TCP') {
+                    onChange('sbc_port', '5060')
+                    onChange('sip_scheme', 'SIP')
+                    onBlur('sip_scheme')
+                  }
+                  onBlur('sip_transport')
+                  onBlur('sbc_port')
+                }}
+              >
+                <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="TCP">TCP</SelectItem>
+                  <SelectItem value="TLS">TLS</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
+              <>
+                {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
+                {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
+                {e('sip_transport') && <FieldError error={e('sip_transport')} />}
+              </>
+            )}
+          </div>
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-slate-400">Identity</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Select
+                value={raw.sip_scheme}
+                onValueChange={(v) => {
+                  const scheme = v as SipScheme
+                  onChange('sip_scheme', scheme)
+                  if (scheme === 'SIPS') {
+                    onChange('sip_transport', 'TLS')
+                    onChange('sbc_port', '5061')
+                    onBlur('sip_transport')
+                    onBlur('sbc_port')
+                  }
+                  onBlur('sip_scheme')
+                }}
+              >
+                <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="SIP">SIP</SelectItem>
+                  <SelectItem value="SIPS">SIPS</SelectItem>
+                </SelectContent>
+              </Select>
+              <Input
+                value={raw.domain}
+                onChange={(ev) => onChange('domain', ev.target.value)}
+                onBlur={() => onBlur('domain')}
+                placeholder="avaya.com"
+                className="w-32 font-mono"
+                aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+              />
+            </div>
+            {(e('sip_scheme') || e('domain')) && (
+              <>
+                {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
+                {e('domain')     && <FieldError error={e('domain')} />}
+              </>
+            )}
+            {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
+              <FieldError error="SIPS requires TLS transport." />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Dual mode — primary + secondary columns */}
+      {effectiveHAMode === 'dual' && (
+        <div className="grid gap-3 xl:grid-cols-2">
+          <div className="space-y-2 rounded-md border border-slate-700/50 bg-slate-950/20 p-2.5">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Primary Controller</div>
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-400">Prim. Host</div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Input
+                  value={raw.sbc_host}
+                  onChange={(ev) => onChange('sbc_host', ev.target.value)}
+                  onBlur={() => onBlur('sbc_host')}
+                  placeholder="x.x.x.x"
+                  className="w-40 font-mono"
+                  aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
+                />
+                <span className="text-slate-500">:</span>
+                <Input
+                  type="number"
+                  value={raw.sbc_port}
+                  onChange={(ev) => onChange('sbc_port', ev.target.value)}
+                  onBlur={() => onBlur('sbc_port')}
+                  placeholder="5060"
+                  className="w-16 font-mono"
+                  aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
+                />
+                <Select
+                  value={raw.sip_transport}
+                  onValueChange={(v) => {
+                    const transport = v as SipTransport
+                    onChange('sip_transport', transport)
+                    if (transport === 'TLS') onChange('sbc_port', '5061')
+                    if (transport === 'TCP') {
+                      onChange('sbc_port', '5060')
+                      onChange('sip_scheme', 'SIP')
+                      onBlur('sip_scheme')
+                    }
+                    onBlur('sip_transport')
+                    onBlur('sbc_port')
+                  }}
+                >
+                  <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="TCP">TCP</SelectItem>
+                    <SelectItem value="TLS">TLS</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
+                <>
+                  {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
+                  {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
+                  {e('sip_transport') && <FieldError error={e('sip_transport')} />}
+                </>
+              )}
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-400">Identity</div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Select
+                  value={raw.sip_scheme}
+                  onValueChange={(v) => {
+                    const scheme = v as SipScheme
+                    onChange('sip_scheme', scheme)
+                    if (scheme === 'SIPS') {
+                      onChange('sip_transport', 'TLS')
+                      onChange('sbc_port', '5061')
+                      onBlur('sip_transport')
+                      onBlur('sbc_port')
+                    }
+                    onBlur('sip_scheme')
+                  }}
+                >
+                  <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="SIP">SIP</SelectItem>
+                    <SelectItem value="SIPS">SIPS</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Input
+                  value={raw.domain}
+                  onChange={(ev) => onChange('domain', ev.target.value)}
+                  onBlur={() => onBlur('domain')}
+                  placeholder="avaya.com"
+                  className="w-32 font-mono"
+                  aria-invalid={t('domain') && !!errors.domain ? true : undefined}
+                />
+              </div>
+              {(e('sip_scheme') || e('domain')) && (
+                <>
+                  {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
+                  {e('domain')     && <FieldError error={e('domain')} />}
+                </>
+              )}
+              {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
+                <FieldError error="SIPS requires TLS transport." />
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-2 rounded-md border border-slate-700/50 bg-slate-950/20 p-2.5">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Secondary Controller</div>
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-400">Sec. Host</div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Input
+                  value={raw.secondary_host}
+                  onChange={(ev) => onChange('secondary_host', ev.target.value)}
+                  onBlur={() => onBlur('secondary_host')}
+                  placeholder="x.x.x.x"
+                  className="w-40 font-mono"
+                />
+                <span className="text-slate-500">:</span>
+                <Input
+                  type="number"
+                  value={raw.secondary_port}
+                  onChange={(ev) => onChange('secondary_port', ev.target.value)}
+                  onBlur={() => onBlur('secondary_port')}
+                  placeholder={raw.sip_transport === 'TLS' ? '5061' : '5060'}
+                  className="w-16 font-mono"
+                />
+                <span className="rounded border border-slate-700 bg-slate-900/50 px-2.5 py-1 text-xs font-semibold text-slate-300">
+                  {raw.sip_transport}
+                </span>
+              </div>
+              {(e('secondary_host') || e('secondary_port')) && (
+                <>
+                  {e('secondary_host') && <FieldError error={e('secondary_host')} />}
+                  {e('secondary_port') && <FieldError error={e('secondary_port')} />}
+                </>
+              )}
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-400">Failover Mode</div>
+              <Select
+                value={raw.failover_mode}
+                onValueChange={(v) => onChange('failover_mode', v as 'graceful' | 'force')}
+              >
+                <SelectTrigger className="w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="graceful">Graceful Failover</SelectItem>
+                  <SelectItem value="force">Force Failover</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1 rounded-md border border-slate-800/70 bg-slate-950/30 p-2">
+              <label className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+                <Switch
+                  checked={raw.auto_failback_enabled}
+                  onCheckedChange={(checked) => onChange('auto_failback_enabled', checked)}
+                />
+                Auto failback to primary
+              </label>
+              <div className="flex items-center gap-2 pl-10">
+                <Input
+                  type="number"
+                  min={1}
+                  max={3600}
+                  value={raw.failback_delay_seconds}
+                  onChange={(ev) => onChange('failback_delay_seconds', ev.target.value)}
+                  onBlur={() => onBlur('failback_delay_seconds')}
+                  className="w-20 font-mono"
+                  disabled={!raw.auto_failback_enabled}
+                />
+                <span className="text-xs text-slate-400">seconds after primary recovery</span>
+              </div>
+              {e('failback_delay_seconds') && <FieldError error={e('failback_delay_seconds')} />}
+              {raw.auto_failback_enabled && (
+                <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                  Lab caution: auto failback moves subscriptions back to primary after recovery delay. Validate manual failback first.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Multi-Zone Configuration */}
+      {effectiveHAMode === 'multi_zone' && (
+        <div className="space-y-4 rounded-lg border border-violet-500/30 bg-violet-950/5 p-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-sm font-semibold text-violet-300">Multi-Zone Configuration</h4>
+          </div>
+
+          {/* Zone distribution slider */}
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-slate-400 w-20">Zone-A: {zoneDistPct}%</span>
+            <input
+              type="range" min="10" max="90" step="5"
+              value={zoneDistPct}
+              onChange={(ev) => handleZoneDistChange(Number(ev.target.value))}
+              className="flex-1 accent-violet-500"
+            />
+            <span className="text-xs text-slate-400 w-20 text-right">Zone-B: {100 - zoneDistPct}%</span>
+          </div>
+
+          {/* Two zone columns */}
+          <div className="grid grid-cols-2 gap-4">
+            {/* Zone-A */}
+            <div className="space-y-3">
+              <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Zone-A</h5>
+              {zoneAControllers.map((ctrl: { host: string; port: number }, i: number) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <Input
+                    value={ctrl.host}
+                    onChange={(ev) => updateZoneAController(i, 'host', ev.target.value)}
+                    placeholder="Host"
+                    className="flex-1 font-mono text-xs"
+                  />
+                  <Input
+                    value={String(ctrl.port)}
+                    onChange={(ev) => updateZoneAController(i, 'port', ev.target.value)}
+                    placeholder="Port"
+                    className="w-20 font-mono text-xs"
+                    type="number"
+                  />
+                  {zoneAControllers.length > 1 && (
+                    <button type="button" onClick={() => removeZoneAController(i)} className="text-rose-400 hover:text-rose-300 text-lg leading-none">×</button>
+                  )}
+                </div>
+              ))}
+              <button type="button" onClick={addZoneAController} className="text-xs text-violet-400 hover:text-violet-300">
+                + Add Controller
+              </button>
+            </div>
+
+            {/* Zone-B */}
+            <div className="space-y-3">
+              <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Zone-B</h5>
+              {zoneBControllers.map((ctrl: { host: string; port: number }, i: number) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <Input
+                    value={ctrl.host}
+                    onChange={(ev) => updateZoneBController(i, 'host', ev.target.value)}
+                    placeholder="Host"
+                    className="flex-1 font-mono text-xs"
+                  />
+                  <Input
+                    value={String(ctrl.port)}
+                    onChange={(ev) => updateZoneBController(i, 'port', ev.target.value)}
+                    placeholder="Port"
+                    className="w-20 font-mono text-xs"
+                    type="number"
+                  />
+                  {zoneBControllers.length > 1 && (
+                    <button type="button" onClick={() => removeZoneBController(i)} className="text-rose-400 hover:text-rose-300 text-lg leading-none">×</button>
+                  )}
+                </div>
+              ))}
+              <button type="button" onClick={addZoneBController} className="text-xs text-violet-400 hover:text-violet-300">
+                + Add Controller
+              </button>
+            </div>
+          </div>
+
+          {/* Shared settings */}
+          <div className="grid grid-cols-2 gap-3 pt-3 border-t border-slate-700/30">
+            <div>
+              <label className="text-[11px] text-muted-foreground">Failover Mode</label>
+              <Select
+                value={raw.failover_mode || 'graceful'}
+                onValueChange={(v) => onChange('failover_mode', v as 'graceful' | 'force')}
+              >
+                <SelectTrigger className="w-full mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="graceful">Graceful</SelectItem>
+                  <SelectItem value="force">Force</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center gap-2 pt-4">
+              <Switch
+                checked={raw.auto_failback_enabled}
+                onCheckedChange={(checked) => onChange('auto_failback_enabled', checked)}
+              />
+              <span className="text-xs">Auto Failback ({raw.failback_delay_seconds || '30'}s)</span>
+            </div>
+          </div>
+
+          {/* Failover Trigger */}
+          <div className="grid grid-cols-2 gap-3 pt-3 border-t border-slate-700/30">
+            <div>
+              <label className="text-[11px] text-muted-foreground">Failover Trigger</label>
+              <Select
+                value={raw.failover_trigger || 'per_agent'}
+                onValueChange={(v) => onChange('failover_trigger', v as 'per_agent' | 'min_agents' | 'pct_agents')}
+              >
+                <SelectTrigger className="w-full mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="per_agent">Per Agent (individual)</SelectItem>
+                  <SelectItem value="min_agents">Minimum Agents</SelectItem>
+                  <SelectItem value="pct_agents">% of Agents</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {raw.failover_trigger === 'min_agents' && (
+              <div>
+                <label className="text-[11px] text-muted-foreground">Min Agent Count</label>
+                <input
+                  type="number" min="2" max="10000"
+                  value={raw.failover_trigger_count}
+                  onChange={(ev) => onChange('failover_trigger_count', ev.target.value)}
+                  className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200"
+                />
+              </div>
+            )}
+            {raw.failover_trigger === 'pct_agents' && (
+              <div>
+                <label className="text-[11px] text-muted-foreground">Agent % (whole number)</label>
+                <input
+                  type="number" min="1" max="100" step="1"
+                  value={raw.failover_trigger_pct}
+                  onChange={(ev) => onChange('failover_trigger_pct', ev.target.value)}
+                  className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200"
+                />
+              </div>
+            )}
+            {(raw.failover_trigger === 'min_agents' || raw.failover_trigger === 'pct_agents') && (
+              <div className="col-span-2">
+                <label className="text-[11px] text-muted-foreground">Time Window (ms)</label>
+                <input
+                  type="number" min="100" max="60000" step="100"
+                  value={raw.failover_trigger_window_ms}
+                  onChange={(ev) => onChange('failover_trigger_window_ms', ev.target.value)}
+                  className="mt-1 w-40 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200"
+                />
+                <span className="ml-2 text-[10px] text-slate-500">Resets within this window count toward threshold</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main panel — unified "User Agent (UA)" — no UAC/UAS branching
 // ---------------------------------------------------------------------------
 
@@ -751,210 +1309,7 @@ export function VMConfigPanel({
       <div className="space-y-2">
         <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.sip_server)}>Remote SIP Server</SectionHeader>
 
-        <div className="space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
-          <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-sky-300">
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
-            Remote Server HA
-          </div>
-          <div className="flex items-center gap-3 rounded-md border border-slate-700/50 bg-slate-950/20 px-3 py-2">
-            <Switch
-              checked={raw.dual_registration_enabled}
-              onCheckedChange={(checked) => {
-                onChange('dual_registration_enabled', checked)
-                onChange('failover_enabled', checked)
-              }}
-            />
-            <span className="text-xs font-semibold text-slate-300">
-              {raw.dual_registration_enabled ? 'Dual Registration mode' : 'Single Controller mode'}
-            </span>
-          </div>
-
-          <div className="grid gap-3 xl:grid-cols-2">
-            <div className="space-y-2 rounded-md border border-slate-700/50 bg-slate-950/20 p-2.5">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Primary Controller</div>
-              <div className="space-y-1">
-                <div className="text-xs font-semibold text-slate-400">Prim. Host</div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <Input
-                    value={raw.sbc_host}
-                    onChange={(ev) => onChange('sbc_host', ev.target.value)}
-                    onBlur={() => onBlur('sbc_host')}
-                    placeholder="x.x.x.x"
-                    className="w-40 font-mono"
-                    aria-invalid={t('sbc_host') && !!errors.sbc_host ? true : undefined}
-                  />
-                  <span className="text-slate-500">:</span>
-                  <Input
-                    type="number"
-                    value={raw.sbc_port}
-                    onChange={(ev) => onChange('sbc_port', ev.target.value)}
-                    onBlur={() => onBlur('sbc_port')}
-                    placeholder="5060"
-                    className="w-16 font-mono"
-                    aria-invalid={t('sbc_port') && !!errors.sbc_port ? true : undefined}
-                  />
-                  <Select
-                    value={raw.sip_transport}
-                    onValueChange={(v) => {
-                      const transport = v as SipTransport
-                      onChange('sip_transport', transport)
-                      if (transport === 'TLS') onChange('sbc_port', '5061')
-                      if (transport === 'TCP') {
-                        onChange('sbc_port', '5060')
-                        onChange('sip_scheme', 'SIP')
-                        onBlur('sip_scheme')
-                      }
-                      onBlur('sip_transport')
-                      onBlur('sbc_port')
-                    }}
-                  >
-                    <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="TCP">TCP</SelectItem>
-                      <SelectItem value="TLS">TLS</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                {(e('sbc_host') || e('sbc_port') || e('sip_transport')) && (
-                  <>
-                    {e('sbc_host')      && <FieldError error={e('sbc_host')} />}
-                    {e('sbc_port')      && <FieldError error={e('sbc_port')} />}
-                    {e('sip_transport') && <FieldError error={e('sip_transport')} />}
-                  </>
-                )}
-              </div>
-
-              <div className="space-y-1">
-                <div className="text-xs font-semibold text-slate-400">Identity</div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <Select
-                    value={raw.sip_scheme}
-                    onValueChange={(v) => {
-                      const scheme = v as SipScheme
-                      onChange('sip_scheme', scheme)
-                      if (scheme === 'SIPS') {
-                        onChange('sip_transport', 'TLS')
-                        onChange('sbc_port', '5061')
-                        onBlur('sip_transport')
-                        onBlur('sbc_port')
-                      }
-                      onBlur('sip_scheme')
-                    }}
-                  >
-                    <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="SIP">SIP</SelectItem>
-                      <SelectItem value="SIPS">SIPS</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Input
-                    value={raw.domain}
-                    onChange={(ev) => onChange('domain', ev.target.value)}
-                    onBlur={() => onBlur('domain')}
-                    placeholder="avaya.com"
-                    className="w-32 font-mono"
-                    aria-invalid={t('domain') && !!errors.domain ? true : undefined}
-                  />
-                </div>
-                {(e('sip_scheme') || e('domain')) && (
-                  <>
-                    {e('sip_scheme') && <FieldError error={e('sip_scheme')} />}
-                    {e('domain')     && <FieldError error={e('domain')} />}
-                  </>
-                )}
-                {raw.sip_scheme === 'SIPS' && raw.sip_transport !== 'TLS' && (
-                  <FieldError error="SIPS requires TLS transport." />
-                )}
-              </div>
-            </div>
-
-              <div className={cn(
-                'space-y-2 rounded-md border p-2.5',
-                raw.dual_registration_enabled
-                  ? 'border-slate-700/50 bg-slate-950/20'
-                  : 'border-slate-800/50 bg-slate-950/10 opacity-60',
-              )}>
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Secondary Controller</div>
-              <div className="space-y-1">
-                <div className="text-xs font-semibold text-slate-400">Sec. Host</div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <Input
-                    value={raw.secondary_host}
-                    onChange={(ev) => onChange('secondary_host', ev.target.value)}
-                    onBlur={() => onBlur('secondary_host')}
-                    placeholder="x.x.x.x"
-                    className="w-40 font-mono"
-                    disabled={!raw.dual_registration_enabled}
-                  />
-                  <span className="text-slate-500">:</span>
-                  <Input
-                    type="number"
-                    value={raw.secondary_port}
-                    onChange={(ev) => onChange('secondary_port', ev.target.value)}
-                    onBlur={() => onBlur('secondary_port')}
-                    placeholder={raw.sip_transport === 'TLS' ? '5061' : '5060'}
-                    className="w-16 font-mono"
-                    disabled={!raw.dual_registration_enabled}
-                  />
-                  <span className="rounded border border-slate-700 bg-slate-900/50 px-2.5 py-1 text-xs font-semibold text-slate-300">
-                    {raw.sip_transport}
-                  </span>
-                </div>
-                {(e('secondary_host') || e('secondary_port')) && (
-                  <>
-                    {e('secondary_host') && <FieldError error={e('secondary_host')} />}
-                    {e('secondary_port') && <FieldError error={e('secondary_port')} />}
-                  </>
-                )}
-              </div>
-              <div className="space-y-1">
-                <div className="text-xs font-semibold text-slate-400">Failover Mode</div>
-                <Select
-                  value={raw.failover_mode}
-                  onValueChange={(v) => onChange('failover_mode', v as 'graceful' | 'force')}
-                  disabled={!raw.dual_registration_enabled}
-                >
-                  <SelectTrigger className="w-40">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="graceful">Graceful Failover</SelectItem>
-                    <SelectItem value="force">Force Failover</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1 rounded-md border border-slate-800/70 bg-slate-950/30 p-2">
-                <label className="flex items-center gap-2 text-xs font-semibold text-slate-300">
-                  <Switch
-                    checked={raw.auto_failback_enabled}
-                    onCheckedChange={(checked) => onChange('auto_failback_enabled', checked)}
-                    disabled={!raw.dual_registration_enabled}
-                  />
-                  Auto failback to primary
-                </label>
-                <div className="flex items-center gap-2 pl-10">
-                  <Input
-                    type="number"
-                    min={1}
-                    max={3600}
-                    value={raw.failback_delay_seconds}
-                    onChange={(ev) => onChange('failback_delay_seconds', ev.target.value)}
-                    onBlur={() => onBlur('failback_delay_seconds')}
-                    className="w-20 font-mono"
-                    disabled={!raw.dual_registration_enabled || !raw.auto_failback_enabled}
-                  />
-                  <span className="text-xs text-slate-400">seconds after primary recovery</span>
-                </div>
-                {e('failback_delay_seconds') && <FieldError error={e('failback_delay_seconds')} />}
-                {raw.auto_failback_enabled && (
-                  <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
-                    Lab caution: auto failback moves subscriptions back to primary after recovery delay. Validate manual failback first.
-                  </div>
-                )}
-              </div>
-              </div>
-          </div>
-        </div>
+        <HASection raw={raw} onChange={onChange} onBlur={onBlur} errors={errors} touched={touched} />
 
         {raw.sip_transport === 'TLS' && (
           <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
@@ -1781,14 +2136,39 @@ export function VMConfigPanel({
             <FormRow label="Codec">
               <Select
                 value={raw.rtp_codec}
-                onValueChange={(v) => { onChange('rtp_codec', v as RtpCodec); onBlur('rtp_codec') }}
+                onValueChange={(v) => {
+                  const codec = v as RtpCodec
+                  onChange('rtp_codec', codec)
+                  if (codec === 'G729') {
+                    onChange('rtp_ptime', '20')
+                    onBlur('rtp_ptime')
+                  }
+                  onBlur('rtp_codec')
+                }}
               >
                 <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="G711_ULAW">G.711 μ-law (PCMU)</SelectItem>
                   <SelectItem value="G711_ALAW">G.711 A-law (PCMA)</SelectItem>
                   <SelectItem value="G729">G.729</SelectItem>
-                  <SelectItem value="OPUS">OPUS</SelectItem>
+                </SelectContent>
+              </Select>
+            </FormRow>
+            <FormRow
+              label="Unsupported codec offer"
+              hint="Single-codec mode: controls what UAS does when the INVITE offer does not include the selected codec."
+            >
+              <Select
+                value={raw.rtp_unsupported_codec_policy}
+                onValueChange={(v) => {
+                  onChange('rtp_unsupported_codec_policy', v as RtpUnsupportedCodecPolicy)
+                  onBlur('rtp_unsupported_codec_policy')
+                }}
+              >
+                <SelectTrigger className="w-72"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="fallback_g711">Fallback to offered G.711</SelectItem>
+                  <SelectItem value="reject_488">Reject with 488 Not Acceptable Here</SelectItem>
                 </SelectContent>
               </Select>
             </FormRow>

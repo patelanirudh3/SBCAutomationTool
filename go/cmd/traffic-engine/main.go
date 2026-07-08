@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,8 @@ import (
 	"github.com/cci/traffic-engine/internal/spine"
 	"github.com/cci/traffic-engine/internal/version"
 )
+
+var errTransportConnectStopped = errors.New("transport connection stopped")
 
 func main() {
 	var (
@@ -192,8 +195,15 @@ func runLifecycle(
 
 	collector.SetPhase("CONNECTING_TRANSPORTS")
 
+	multiZoneMode := cfg.EffectiveHAMode() == "multi_zone"
+
 	// Create and connect agents
-	agents := createAgents(cfg)
+	var agents map[string]*agent.ExtensionAgent
+	if multiZoneMode {
+		agents = make(map[string]*agent.ExtensionAgent, cfg.ExtCount())
+	} else {
+		agents = createAgents(cfg)
+	}
 	agentSlice := agentsToSlice(agents)
 	configuredAgentTotal := len(agents)
 	var secondaryCfg *config.VMConfig
@@ -205,7 +215,10 @@ func runLifecycle(
 	var haMoveMu sync.Mutex
 	primaryDownCh := make(chan string, 1)
 	var primaryRecoveredAt string
-	streamConnectRegSub := pctx != nil && !cfg.DualRegistrationEnabled
+	streamConnectRegSub := pctx != nil && !cfg.DualRegistrationEnabled && !multiZoneMode
+
+	var agentGroups []*engine.AgentGroup
+
 	slog.Info("Connecting transports", "count", len(agents), "streaming_regsub", streamConnectRegSub)
 	if cfg.DualRegistrationEnabled {
 		for _, ag := range agents {
@@ -221,8 +234,231 @@ func runLifecycle(
 		}
 	}
 
-	if !streamConnectRegSub {
-		connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector)
+	// ── Multi-zone HA: create agent groups and connect all transports ────────
+	var updateGroupMetrics func()
+	var poolCtrl engine.PoolController
+	var multiZoneOnReady engine.AgentReadyFunc
+	if multiZoneMode && cfg.ZoneConfig != nil {
+		assignments := cfg.ComputeAgentGroups()
+		slog.Info("Multi-zone HA mode: creating agent groups", "groups", len(assignments), "total_agents", cfg.ExtCount())
+
+		for _, assignment := range assignments {
+			group := engine.NewAgentGroup(assignment)
+
+			primaryCfg := group.PrimaryConfig(cfg)
+			for ext := assignment.ExtStart; ext <= assignment.ExtEnd; ext++ {
+				extStr := strconv.Itoa(ext)
+				ag := agent.NewExtensionAgent(extStr, primaryCfg)
+				ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
+				group.PrimaryAgents[extStr] = ag
+				agents[extStr] = ag
+			}
+
+			secondaryCfg := group.SecondaryConfig(cfg)
+			for ext := assignment.ExtStart; ext <= assignment.ExtEnd; ext++ {
+				extStr := strconv.Itoa(ext)
+				ag := agent.NewExtensionAgent(extStr, secondaryCfg)
+				ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
+				group.SecondaryAgents[extStr] = ag
+			}
+
+			agentGroups = append(agentGroups, group)
+		}
+
+		collector.SetHAStatus(true, "primary", 0, 0, 0, 0)
+
+		// Per-agent recovery trackers (one per group)
+		recoveryTrackers := make(map[string]*engine.AgentRecoveryTracker)
+		recoveryCfg := engine.RecoveryFromConfig(cfg)
+		for _, group := range agentGroups {
+			exts := make([]string, 0, len(group.PrimaryAgents))
+			for ext := range group.PrimaryAgents {
+				exts = append(exts, ext)
+			}
+			recoveryTrackers[group.GroupID] = engine.NewAgentRecoveryTracker(exts, nil)
+		}
+
+		updateGroupMetrics = func() {
+			var statuses []metrics.AgentGroupStatus
+			for _, g := range agentGroups {
+				status := metrics.AgentGroupStatus{
+					GroupID:             g.GroupID,
+					ZoneID:              g.ZoneID,
+					PrimaryHost:         g.PrimaryController.Host,
+					PrimaryPort:         g.PrimaryController.Port,
+					SecondaryHost:       g.SecondaryCtrl.Host,
+					SecondaryPort:       g.SecondaryCtrl.Port,
+					ActiveController:    g.ActiveController(),
+					PrimaryRegistered:   len(g.PrimaryRegistered),
+					SecondaryRegistered: len(g.SecondaryRegistered),
+					ActiveSubscribed:    len(g.ActiveSubscribed),
+					AgentCount:          g.AgentCount(),
+					PrimaryReachable:    g.PrimaryReachable(),
+					MoveActive:          g.MoveActive(),
+					LastMoveError:       g.LastMoveError(),
+				}
+				if tracker, ok := recoveryTrackers[g.GroupID]; ok {
+					rs := tracker.Status()
+					status.PendingMoveOut = rs.PendingMoveOut
+					status.MoveRetrying = rs.MoveRetrying
+					status.ActiveOnSecondary = rs.ActiveOnSecondary
+					status.FailbackPending = rs.FailbackPending
+
+					// Derive group active controller from per-agent recovery state
+					normalCount := g.AgentCount() - rs.PendingMoveOut - rs.ActiveOnSecondary - rs.FailbackPending - rs.MoveRetrying
+					if normalCount < 0 {
+						normalCount = 0
+					}
+					if rs.PendingMoveOut == 0 && rs.MoveRetrying == 0 && rs.ActiveOnSecondary == 0 && rs.FailbackPending == 0 {
+						g.SetActiveController("primary")
+					} else if normalCount == 0 && rs.PendingMoveOut == 0 && rs.MoveRetrying == 0 && rs.FailbackPending == 0 {
+						g.SetActiveController("secondary")
+					} else if rs.ActiveOnSecondary > 0 && normalCount > 0 {
+						g.SetActiveController("mixed")
+					} else if rs.PendingMoveOut > 0 || rs.MoveRetrying > 0 {
+						g.SetActiveController("failover_in_progress")
+					}
+					status.ActiveController = g.ActiveController()
+				}
+				statuses = append(statuses, status)
+			}
+			collector.SetHAAgentGroups(statuses)
+		}
+
+		slog.Info("Multi-zone: connecting primary transports")
+		collector.ResetTransportConnect(cfg.ExtCount() * 2)
+		var primaryConnected, secondaryConnected int
+		var connectMu sync.Mutex
+		connectTimeout := time.Duration(cfg.ConnectTimeout) * time.Second
+		if connectTimeout <= 0 {
+			connectTimeout = 5 * time.Second
+		}
+		connectConcurrency := cfg.RegisterBatchSize
+		if connectConcurrency <= 0 {
+			connectConcurrency = 10
+		}
+
+		// Connect primary transports with bounded concurrency
+		for _, group := range agentGroups {
+			primaryCfg := group.PrimaryConfig(cfg)
+			primarySlice := agentsToSlice(group.PrimaryAgents)
+			sem := make(chan struct{}, connectConcurrency)
+			var wg sync.WaitGroup
+			for _, ag := range primarySlice {
+				ag := ag
+				wg.Add(1)
+				sem <- struct{}{}
+				go func() {
+					defer wg.Done()
+					defer func() { <-sem }()
+					connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+					defer connectCancel()
+					if err := ag.Start(connectCtx); err != nil {
+						slog.Warn("Multi-zone primary connect failed", "group", group.GroupID, "ext", ag.Ext, "err", err)
+						collector.RecordTransportConnectFailure(ag.Ext, cfg.LocalHostForExtension(ag.Ext),
+							fmt.Sprintf("%s:%d", primaryCfg.SBCHost, primaryCfg.SBCPort), err)
+					} else {
+						connectMu.Lock()
+						primaryConnected++
+						connectMu.Unlock()
+						collector.RecordTransportConnectSuccess()
+					}
+				}()
+			}
+			wg.Wait()
+		}
+
+		// Connect secondary transports with bounded concurrency
+		slog.Info("Multi-zone: connecting secondary transports")
+		for _, group := range agentGroups {
+			secondaryCfg := group.SecondaryConfig(cfg)
+			secondarySlice := agentsToSlice(group.SecondaryAgents)
+			sem := make(chan struct{}, connectConcurrency)
+			var wg sync.WaitGroup
+			for _, ag := range secondarySlice {
+				ag := ag
+				wg.Add(1)
+				sem <- struct{}{}
+				go func() {
+					defer wg.Done()
+					defer func() { <-sem }()
+					connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+					defer connectCancel()
+					if err := ag.Start(connectCtx); err != nil {
+						slog.Warn("Multi-zone secondary connect failed", "group", group.GroupID, "ext", ag.Ext, "err", err)
+						collector.RecordTransportConnectFailure(ag.Ext, cfg.LocalHostForExtension(ag.Ext),
+							fmt.Sprintf("%s:%d", secondaryCfg.SBCHost, secondaryCfg.SBCPort), err)
+					} else {
+						connectMu.Lock()
+						secondaryConnected++
+						connectMu.Unlock()
+						collector.RecordTransportConnectSuccess()
+					}
+				}()
+			}
+			wg.Wait()
+		}
+		collector.FinishTransportConnect()
+		collector.SetSocketCount(primaryConnected + secondaryConnected)
+
+		// Wire updateGroupMetrics as onStateChange callback for each tracker
+		for gid, tracker := range recoveryTrackers {
+			_ = gid
+			tracker.SetOnStateChange(updateGroupMetrics)
+		}
+
+		triggerCfg := engine.TriggerFromConfig(cfg)
+		failoverAccumulators := make(map[string]*engine.FailoverTriggerAccumulator)
+		for _, group := range agentGroups {
+			failoverAccumulators[group.GroupID] = engine.NewFailoverTriggerAccumulator(triggerCfg, group.AgentCount())
+		}
+
+		for _, group := range agentGroups {
+			group := group
+			tracker := recoveryTrackers[group.GroupID]
+			accumulator := failoverAccumulators[group.GroupID]
+
+			group.SetupTransportDownHandlers(
+				accumulator,
+				// Tier 1: Individual agent recovery (always fires for each reset)
+				func(g *engine.AgentGroup, ext string, err error) {
+					slog.Warn("Multi-zone primary transport down", "group", g.GroupID, "ext", ext, "err", err)
+					collector.RecordHAEvent("primary_down", g.GroupID, fmt.Sprintf("ext=%s err=%v", ext, err))
+
+					if g.ActiveController() == "primary" || g.ActiveController() == "mixed" || g.ActiveController() == "failover_in_progress" {
+						g.SetActiveController("failover_in_progress")
+					}
+
+					if poolCtrl != nil && multiZoneOnReady != nil {
+						engine.TriggerSingleAgentRecovery(ctx, g, tracker, ext, cfg, poolCtrl, multiZoneOnReady, recoveryCfg)
+					}
+					updateGroupMetrics()
+				},
+				// Tier 2: Group-wide recovery (fires only when threshold modes reach their limit)
+				func(g *engine.AgentGroup) {
+					slog.Info("Multi-zone group failover threshold reached",
+						"group", g.GroupID,
+						"trigger_mode", triggerCfg.Mode,
+						"triggered_count", accumulator.TriggeredExtCount())
+					collector.RecordHAEvent("group_failover_threshold", g.GroupID,
+						fmt.Sprintf("mode=%s triggered=%d", triggerCfg.Mode, accumulator.TriggeredExtCount()))
+
+					if poolCtrl != nil && multiZoneOnReady != nil {
+						engine.TriggerGroupRecoveryExcluding(ctx, g, tracker, accumulator, cfg, poolCtrl, multiZoneOnReady, recoveryCfg)
+					}
+					updateGroupMetrics()
+				},
+			)
+		}
+
+		agentSlice = agentsToSlice(agents)
+
+		slog.Info("Multi-zone transport connection complete", "groups", len(agentGroups))
+		updateGroupMetrics()
+	}
+
+	if !streamConnectRegSub && !multiZoneMode {
+		connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector, nil)
 		if err != nil {
 			slog.Error("Transport connection failed", "err", err)
 			collector.SetPhase("FAILED")
@@ -255,7 +491,7 @@ func runLifecycle(
 		secondaryAgents = createAgents(secondaryCfg)
 		secondaryAgentSlice = agentsToSlice(secondaryAgents)
 		slog.Info("Connecting secondary controller transports", "count", len(secondaryAgents), "host", cfg.SecondaryHost, "port", cfg.SecondaryPort)
-		connectedSecondaryAgents, err := connectTransportsBatched(ctx, secondaryAgents, secondaryCfg, nil)
+		connectedSecondaryAgents, err := connectTransportsBatched(ctx, secondaryAgents, secondaryCfg, nil, nil)
 		if err != nil {
 			slog.Error("Secondary transport connection failed", "err", err)
 			collector.SetPhase("FAILED")
@@ -276,13 +512,16 @@ func runLifecycle(
 		secondaryAgents = connectedSecondaryAgents
 		secondaryAgentSlice = agentsToSlice(secondaryAgents)
 	}
-	collector.SetHAStatus(cfg.DualRegistrationEnabled, activeController, 0, 0, 0, 0)
+	collector.SetHAStatus(cfg.DualRegistrationEnabled || multiZoneMode, activeController, 0, 0, 0, 0)
 	if cfg.DualRegistrationEnabled {
 		collector.SetHAPrimaryRecovery(true, "")
 	}
 
 	// Create pool engine and wire pool counts provider into the metrics collector
 	pool := engine.NewPoolEngine()
+	if multiZoneMode {
+		poolCtrl = pool
+	}
 	requiredReady := requiredTrafficReadyCount(configuredAgentTotal)
 	collector.SetPoolCountsProvider(func() (idle, nonIdle, regOnly int) {
 		return pool.Counts()
@@ -333,6 +572,10 @@ func runLifecycle(
 		slog.Debug("Agent added to reg-only pool (sub failed)", "ext", ag.Ext)
 	}
 
+	if multiZoneMode {
+		multiZoneOnReady = onIdle
+	}
+
 	if stopNew == nil {
 		var sn atomic.Bool
 		stopNew = &sn
@@ -373,6 +616,11 @@ func runLifecycle(
 	)
 
 	cleanupAll := func(cleanupCtx context.Context, activeEngine *engine.CallEngine) {
+		if pctx != nil {
+			pctx.Mu.Lock()
+			pctx.CleanupStartRequested = false
+			pctx.Mu.Unlock()
+		}
 		stopRegRefresh()
 		stopRegRefresh = func() {}
 		stopSubRefresh()
@@ -383,6 +631,21 @@ func runLifecycle(
 			stopSecondaryRegRefresh = func() {}
 			unregisterSecondaryRegistrations(cleanupCtx, secondaryAgents, secondaryCfg)
 		}
+		if len(agentGroups) > 0 {
+			for _, group := range agentGroups {
+				secondaryCfg := group.SecondaryConfig(cfg)
+				for _, ag := range group.SecondaryAgents {
+					if ag.GrantedRegisterExpiry() > 0 && ag.IsTransportConnected() {
+						unregCtx, cancel := context.WithTimeout(cleanupCtx, time.Duration(cfg.RegisterTimeout)*time.Second)
+						if err := ag.Unregister(unregCtx); err != nil {
+							slog.Debug("Multi-zone secondary unregister failed", "group", group.GroupID, "ext", ag.Ext, "host", secondaryCfg.SBCHost, "err", err)
+						}
+						cancel()
+					}
+					ag.Close()
+				}
+			}
+		}
 	}
 
 	if pctx != nil {
@@ -390,47 +653,184 @@ func runLifecycle(
 		collector.SetPhase("REGSUB_READY")
 		slog.Info("REGSUB_READY — waiting for Start Reg/Sub signal", "ext_count", len(agents))
 
-		select {
-		case <-pctx.RegSubStartCh:
-			slog.Info("Start Reg/Sub signal received via API")
-		case <-pctx.PrePhaseStartCh:
-			// Legacy alias — older clients still hit /api/prephase/start
-			slog.Info("Start Reg/Sub signal received via legacy /api/prephase/start")
-		case <-pctx.GracefulStopCh:
-			slog.Info("Graceful stop received before Reg/Sub started")
-			cleanupAll(ctx, nil)
-			collector.SetPhase("DONE")
-			return 0
-		case <-pctx.InterruptStopCh:
-			slog.Info("Interrupted stop received before Reg/Sub started")
-			stopNew.Store(true)
-			cleanupAll(ctx, nil)
-			collector.SetPhase("DONE")
-			return 0
-		case <-ctx.Done():
-			return 0
+		if multiZoneMode {
+			// Multi-zone: transports already connected in the setup block above.
+			// Wait for Start Reg/Sub signal to begin per-group registration.
+			select {
+			case <-pctx.RegSubStartCh:
+				slog.Info("Start Reg/Sub signal received via API (multi-zone)")
+			case <-pctx.PrePhaseStartCh:
+				slog.Info("Start Reg/Sub signal received via legacy API (multi-zone)")
+			case <-pctx.GracefulStopCh:
+				slog.Info("Graceful stop received before Reg/Sub started")
+				cleanupAll(ctx, nil)
+				collector.SetPhase("DONE")
+				return 0
+			case <-pctx.InterruptStopCh:
+				slog.Info("Interrupted stop received before Reg/Sub started")
+				stopNew.Store(true)
+				cleanupAll(ctx, nil)
+				collector.SetPhase("DONE")
+				return 0
+			case <-ctx.Done():
+				return 0
+			}
+		} else if cfg.DualRegistrationEnabled {
+			// Dual controller: transports already connected. Wait for Start Reg/Sub.
+			select {
+			case <-pctx.RegSubStartCh:
+				slog.Info("Start Reg/Sub signal received via API")
+			case <-pctx.PrePhaseStartCh:
+				slog.Info("Start Reg/Sub signal received via legacy /api/prephase/start")
+			case <-pctx.GracefulStopCh:
+				slog.Info("Graceful stop received before Reg/Sub started")
+				cleanupAll(ctx, nil)
+				collector.SetPhase("DONE")
+				return 0
+			case <-pctx.InterruptStopCh:
+				slog.Info("Interrupted stop received before Reg/Sub started")
+				stopNew.Store(true)
+				cleanupAll(ctx, nil)
+				collector.SetPhase("DONE")
+				return 0
+			case <-ctx.Done():
+				return 0
+			}
+		} else {
+			// Single controller: streaming pipeline handles connect + reg + sub together.
+			slog.Info("Starting TCP/TLS connection phase; Reg/Sub connector remains closed until Start Reg/Sub")
 		}
 
 		collector.SetPhase("REGSUB_RUNNING")
 		// Wire RegSubAbortCh into stopNew so an Abort click cleanly halts new batches.
+		var cleanupRequested atomic.Bool
+		regSubWatchCtx, cancelRegSubWatcher := context.WithCancel(ctx)
+		defer cancelRegSubWatcher()
 		go func() {
 			select {
 			case <-pctx.RegSubAbortCh:
 				slog.Info("RegSub abort received — halting new batches")
 				stopNew.Store(true)
-			case <-ctx.Done():
+			case <-pctx.CleanupStartCh:
+				slog.Info("Cleanup signal received during REGSUB_RUNNING - halting new work")
+				stopNew.Store(true)
+				cleanupRequested.Store(true)
+			case <-regSubWatchCtx.Done():
 			}
 		}()
 
-		if !cfg.DualRegistrationEnabled {
+		if multiZoneMode && len(agentGroups) > 0 {
+			// ── Multi-zone HA: per-group register + subscribe ─────────────────
+			collector.SetRegisterTotal(cfg.ExtCount())
+			collector.SetSubscribeTotal(cfg.ExtCount() * len(cfg.SubscribeEvents))
+
+			for _, group := range agentGroups {
+				group := group
+				primaryCfg := group.PrimaryConfig(cfg)
+				secondaryCfg := group.SecondaryConfig(cfg)
+				primarySlice := agentsToSlice(group.PrimaryAgents)
+				secondarySlice := agentsToSlice(group.SecondaryAgents)
+
+				registered, groupFailedReg, _ := prephase.RunRegister(ctx, primarySlice, primaryCfg,
+					func() { collector.IncrementRegistered() }, stopNew)
+				group.PrimaryRegistered = registered
+				for _, ext := range groupFailedReg {
+					collector.RecordRegisterFailure(ext,
+						fmt.Errorf("REGISTER failed [group=%s zone=%s controller=%s:%d]",
+							group.GroupID, group.ZoneID, primaryCfg.SBCHost, primaryCfg.SBCPort))
+				}
+				registeredAg = append(registeredAg, registered...)
+
+				secRegistered, _, _ := prephase.RunRegister(ctx, secondarySlice, secondaryCfg, nil, stopNew)
+				group.SecondaryRegistered = secRegistered
+
+				failedSub, _ := prephase.RunSubscribe(ctx, registered, primaryCfg, skipSubscribe,
+					onIdle, onRegOnly,
+					func(event string, ok bool, notifyReceived bool) {
+						collector.RecordSubscriptionEvent(event, ok, notifyReceived)
+					}, stopNew)
+				subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
+				for _, ext := range failedSub {
+					collector.RecordSubscribeFailure(ext, subscribeEvents,
+						fmt.Errorf("SUBSCRIBE failed [group=%s zone=%s controller=%s:%d]",
+							group.GroupID, group.ZoneID, primaryCfg.SBCHost, primaryCfg.SBCPort))
+				}
+
+				subscribed := agentsExceptExts(registered, failedSub)
+				group.ActiveSubscribed = subscribed
+
+				slog.Info("Multi-zone group reg/sub complete",
+					"group", group.GroupID,
+					"primary_registered", len(registered),
+					"secondary_registered", len(secRegistered),
+					"subscribed", len(subscribed),
+					"failed_reg", len(groupFailedReg),
+					"failed_sub", len(failedSub))
+			}
+			updateGroupMetrics()
+
+		} else if cfg.DualRegistrationEnabled {
+			// ── Dual-controller HA: register both, subscribe primary ──────────
+			collector.SetRegisterTotal(len(agentSlice))
+			regStart := time.Now()
+			registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
+				ctx, agentSlice, cfg,
+				func() { collector.IncrementRegistered() },
+				stopNew,
+			)
+			slog.Info("REGISTER phase complete",
+				"registered", len(registeredAg),
+				"failed", len(failedRegister),
+				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
+			collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
+
+			if len(secondaryAgentSlice) > 0 {
+				secondaryRegStart := time.Now()
+				var secondaryFailed []string
+				secondaryRegisteredAg, secondaryFailed, stopSecondaryRegRefresh = prephase.RunRegister(
+					ctx, secondaryAgentSlice, secondaryCfg,
+					nil,
+					stopNew,
+				)
+				slog.Info("SECONDARY REGISTER phase complete",
+					"registered", len(secondaryRegisteredAg),
+					"failed", len(secondaryFailed),
+					"elapsed_s", fmt.Sprintf("%.1f", time.Since(secondaryRegStart).Seconds()))
+				collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), 0, 0)
+			}
+
+			if len(registeredAg) > 0 {
+				collector.SetSubscribeTotal(len(registeredAg) * len(cfg.SubscribeEvents))
+				collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(registeredAg))
+				subStart := time.Now()
+				failedSubscribe, stopSubRefresh = prephase.RunSubscribe(
+					ctx, registeredAg, cfg, skipSubscribe,
+					onIdle, onRegOnly,
+					func(event string, ok bool, notifyReceived bool) {
+						collector.RecordSubscriptionEvent(event, ok, notifyReceived)
+					},
+					stopNew,
+				)
+				slog.Info("SUBSCRIBE phase complete",
+					"subscribed", len(registeredAg)-len(failedSubscribe),
+					"failed", len(failedSubscribe),
+					"elapsed_s", fmt.Sprintf("%.1f", time.Since(subStart).Seconds()))
+				collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), len(registeredAg)-len(failedSubscribe), 0)
+			} else {
+				slog.Error("REG/SUB: no extensions registered — skipping SUBSCRIBE")
+			}
+
+		} else {
+			// ── Single-controller: streaming connect + reg + sub pipeline ─────
 			pipelineMode = true
+			collector.SetPhase("CONNECTING_TRANSPORTS")
+			collector.ResetTransportConnect(len(agentSlice))
 			collector.SetRegisterTotal(len(agentSlice))
 			collector.SetSubscribeTotal(len(agentSlice) * len(cfg.SubscribeEvents))
 			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(agentSlice))
 			collector.SetRegSubBackground(true, false)
 			regSubStart := time.Now()
 			var connectedSoFar atomic.Int32
-			collector.ResetTransportConnect(len(agentSlice))
 			pipeline := prephase.RunConnectRegSubPipeline(
 				ctx, agentSlice, cfg, skipSubscribe,
 				func(progress prephase.ConnectProgress) {
@@ -458,15 +858,22 @@ func runLifecycle(
 				func(event string, ok bool, notifyReceived bool) {
 					collector.RecordSubscriptionEvent(event, ok, notifyReceived)
 				},
-				onIdle, onRegOnly, stopNew,
+				onIdle, onRegOnly, pctx.RegSubStartCh,
+				func() bool {
+					pctx.Mu.Lock()
+					defer pctx.Mu.Unlock()
+					return pctx.RegSubStartRequested
+				},
+				stopNew,
 			)
 			stopRegRefresh = pipeline.Stop
 			doneCh := pipeline.Done
 			ready := false
-			for !ready && doneCh != nil {
+			for (!ready || cleanupRequested.Load()) && doneCh != nil {
 				select {
 				case res := <-doneCh:
 					doneCh = nil
+					cancelRegSubWatcher()
 					if res != nil {
 						failedRegister = res.FailedRegister
 						failedSubscribe = res.FailedSubscribe
@@ -477,9 +884,20 @@ func runLifecycle(
 					ready = trafficReady(pool.RoleCounts(), requiredReady)
 				case <-time.After(500 * time.Millisecond):
 					ready = trafficReady(pool.RoleCounts(), requiredReady)
+				case <-pctx.CleanupStartCh:
+					slog.Info("Cleanup signal received during REGSUB_RUNNING - stopping new Reg/Sub work")
+					stopNew.Store(true)
+					cleanupRequested.Store(true)
 				case <-ctx.Done():
 					return 0
 				}
+			}
+			if cleanupRequested.Load() {
+				cancelRegSubWatcher()
+				slog.Info("Reg/Sub pipeline drained after cleanup request - starting cleanup")
+				cleanupAll(ctx, nil)
+				collector.SetPhase("DONE")
+				return 0
 			}
 			if ready && doneCh != nil {
 				go func() {
@@ -493,65 +911,14 @@ func runLifecycle(
 							collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
 						}
 					}
+					cancelRegSubWatcher()
 					collector.SetRegSubBackground(false, true)
 					slog.Info("Background Reg/Sub pipeline complete", "elapsed_s", fmt.Sprintf("%.1f", time.Since(regSubStart).Seconds()))
 				}()
 			}
-			slog.Info("REG/SUB pipeline ready gate reached",
+			slog.Info("REG/SUB producer-consumer pipeline ready gate reached",
+				"eligible_agents", len(agentSlice),
 				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regSubStart).Seconds()))
-		} else {
-			// Live REG progress
-			collector.SetRegisterTotal(len(agentSlice))
-			regStart := time.Now()
-			registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
-				ctx, agentSlice, cfg,
-				func() { collector.IncrementRegistered() },
-				stopNew,
-			)
-			slog.Info("REGISTER phase complete",
-				"registered", len(registeredAg),
-				"failed", len(failedRegister),
-				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regStart).Seconds()))
-			collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
-		}
-
-		if cfg.DualRegistrationEnabled && len(secondaryAgentSlice) > 0 {
-			secondaryRegStart := time.Now()
-			var secondaryFailed []string
-			secondaryRegisteredAg, secondaryFailed, stopSecondaryRegRefresh = prephase.RunRegister(
-				ctx, secondaryAgentSlice, secondaryCfg,
-				nil,
-				stopNew,
-			)
-			slog.Info("SECONDARY REGISTER phase complete",
-				"registered", len(secondaryRegisteredAg),
-				"failed", len(secondaryFailed),
-				"elapsed_s", fmt.Sprintf("%.1f", time.Since(secondaryRegStart).Seconds()))
-			collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), 0, 0)
-		}
-
-		// Live SUB progress (only if any agent registered)
-		if cfg.DualRegistrationEnabled && len(registeredAg) > 0 {
-			collector.SetSubscribeTotal(len(registeredAg) * len(cfg.SubscribeEvents))
-			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(registeredAg))
-			subStart := time.Now()
-			failedSubscribe, stopSubRefresh = prephase.RunSubscribe(
-				ctx, registeredAg, cfg, skipSubscribe,
-				onIdle, onRegOnly,
-				func(event string, ok bool, notifyReceived bool) {
-					collector.RecordSubscriptionEvent(event, ok, notifyReceived)
-				},
-				stopNew,
-			)
-			slog.Info("SUBSCRIBE phase complete",
-				"subscribed", len(registeredAg)-len(failedSubscribe),
-				"failed", len(failedSubscribe),
-				"elapsed_s", fmt.Sprintf("%.1f", time.Since(subStart).Seconds()))
-			if cfg.DualRegistrationEnabled {
-				collector.SetHAStatus(true, activeController, len(registeredAg), len(secondaryRegisteredAg), len(registeredAg)-len(failedSubscribe), 0)
-			}
-		} else if cfg.DualRegistrationEnabled {
-			slog.Error("REG/SUB: no extensions registered — skipping SUBSCRIBE")
 		}
 	} else {
 		// ── CLI mode: legacy monolithic pipeline (Phase 0 + 1 + 2) ───────────
@@ -596,7 +963,7 @@ func runLifecycle(
 	} else {
 		collector.UpdateCounts(0, len(agents), registered, subscribed)
 	}
-	if cfg.DualRegistrationEnabled {
+	if cfg.DualRegistrationEnabled || multiZoneMode {
 		collector.SetHAStatus(true, activeController, registered, len(secondaryRegisteredAg), len(activeSubscribedAg), 0)
 		protected, degraded, notUsable := haReadinessCounts(activeSubscribedAg, secondaryRegisteredAg, len(agents))
 		collector.SetHAReadiness(protected, degraded, notUsable)
@@ -803,6 +1170,56 @@ func runLifecycle(
 		}()
 	}
 
+	// ── Multi-zone HA move subscription handler + auto-failback ──────────────
+	if multiZoneMode && len(agentGroups) > 0 && pctx != nil {
+		pctx.Mu.Lock()
+		pctx.OnHAMoveSubscription = func(target string) error {
+			for _, group := range agentGroups {
+				if group.ActiveController() == target {
+					continue
+				}
+				drainFn := func(agents []*agent.ExtensionAgent) error {
+					slog.Info("Multi-zone manual move: waiting for group calls to drain",
+						"group", group.GroupID, "agents", len(agents))
+					// Wait up to 15s for agents to become idle
+					deadline := time.After(15 * time.Second)
+					for {
+						idle := true
+						for _, ag := range agents {
+							if !ag.AutoAnswerEnabled() {
+								idle = false
+								break
+							}
+						}
+						if idle {
+							return nil
+						}
+						select {
+						case <-deadline:
+							if cfg.FailoverMode == "force" {
+								slog.Warn("Multi-zone force move: drain timeout, proceeding", "group", group.GroupID)
+								return nil
+							}
+							return fmt.Errorf("group %s: agents still in active calls after 15s drain (use force mode)", group.GroupID)
+						case <-time.After(500 * time.Millisecond):
+						}
+					}
+				}
+				_, err := group.MoveSubscriptions(ctx, target, false, cfg, drainFn)
+				if err != nil {
+					return fmt.Errorf("group %s: %w", group.GroupID, err)
+				}
+			}
+			updateGroupMetrics()
+			return nil
+		}
+		pctx.Mu.Unlock()
+	}
+
+	// Multi-zone auto-failback is handled per-agent within StartAgentRecovery.
+	// Each recovery goroutine monitors primary reconnection and moves the agent
+	// home when primary is stable (after failback_delay_seconds).
+
 	// ── Wait for "Start Traffic" gate (GUI mode) ─────────────────────────────
 	collector.SetPhase("REGSUB_DONE")
 	roleCounts = pool.RoleCounts()
@@ -865,6 +1282,36 @@ trafficLoop:
 		callEngine := engine.NewCallEngine(
 			pool, cfg,
 			engine.WithOnComplete(func(r engine.CallResult) {
+				if multiZoneMode && len(agentGroups) > 0 {
+					ext := r.Caller
+					for _, g := range agentGroups {
+						if _, ok := g.PrimaryAgents[ext]; ok {
+							r.AgentGroupID = g.GroupID
+							r.ActiveController = g.ActiveController()
+							break
+						}
+						if _, ok := g.SecondaryAgents[ext]; ok {
+							r.AgentGroupID = g.GroupID
+							r.ActiveController = g.ActiveController()
+							break
+						}
+					}
+					if r.AgentGroupID == "" {
+						ext = r.Callee
+						for _, g := range agentGroups {
+							if _, ok := g.PrimaryAgents[ext]; ok {
+								r.AgentGroupID = g.GroupID
+								r.ActiveController = g.ActiveController()
+								break
+							}
+							if _, ok := g.SecondaryAgents[ext]; ok {
+								r.AgentGroupID = g.GroupID
+								r.ActiveController = g.ActiveController()
+								break
+							}
+						}
+					}
+				}
 				collector.RecordCall(callResultToMetrics(r))
 			}),
 			engine.WithOnAttempt(func() {
@@ -874,6 +1321,17 @@ trafficLoop:
 			engine.WithMetrics(collector),
 		)
 		collector.SetConcurrentProvider(func() int { return callEngine.ActiveCallCount() })
+		collector.SetTargetCPSProvider(func() int { return callEngine.TargetCPS() })
+		if pctx != nil {
+			pctx.Mu.Lock()
+			pctx.OnCPSChange = func(cps int) (int, error) {
+				if err := callEngine.SetTargetCPS(cps); err != nil {
+					return callEngine.TargetCPS(), err
+				}
+				return callEngine.TargetCPS(), nil
+			}
+			pctx.Mu.Unlock()
+		}
 
 		slog.Info("Traffic starting",
 			"cps", cfg.CPS, "hold_s", cfg.HoldTimeSeconds,
@@ -931,6 +1389,12 @@ trafficLoop:
 		}
 
 	trafficDone:
+		if pctx != nil {
+			pctx.Mu.Lock()
+			pctx.OnCPSChange = nil
+			pctx.Mu.Unlock()
+		}
+		collector.SetTargetCPSProvider(nil)
 		trafficCancel()
 		callCancel()
 		collector.SetPhase("STOPPING")
@@ -944,15 +1408,23 @@ trafficLoop:
 		slog.Info("CLEANUP_READY — waiting for Cleanup or Restart Traffic signal")
 
 		if pctx != nil {
-			select {
-			case <-pctx.RestartTrafficCh:
-				slog.Info("Restart Traffic received — re-running traffic with current pool")
-				continue trafficLoop
-			case <-pctx.CleanupStartCh:
-				slog.Info("Cleanup signal received via API")
-				break trafficLoop
-			case <-ctx.Done():
-				break trafficLoop
+		cleanupReadyWait:
+			for {
+				if cleanupStartRequested(pctx) {
+					slog.Info("Cleanup request observed from process state")
+					break cleanupReadyWait
+				}
+				select {
+				case <-pctx.RestartTrafficCh:
+					slog.Info("Restart Traffic received — re-running traffic with current pool")
+					continue trafficLoop
+				case <-pctx.CleanupStartCh:
+					slog.Info("Cleanup signal received via API")
+					break cleanupReadyWait
+				case <-ctx.Done():
+					break cleanupReadyWait
+				case <-time.After(250 * time.Millisecond):
+				}
 			}
 		}
 		// CLI mode: proceed immediately to cleanup
@@ -1069,21 +1541,24 @@ func shutdownCleanup(
 		var cleanupAgents []*agent.ExtensionAgent
 		if pool != nil {
 			cleanupAgents = pool.AllForCleanup()
+			cleanupAgents = mergeCleanupAgents(cleanupAgents, agentsToSlice(agents))
 		} else {
 			cleanupAgents = agentsToSlice(agents)
 		}
+		cleanupCandidates := cleanupAgentsNeedingSIPCleanup(cleanupAgents)
 		// Seed the cleanup-status counters now that we know the agent set.
 		// Phase was already flipped to CLEANING_UP at the top of this fn.
-		collector.ResetCleanup(len(cleanupAgents))
-		collector.SetCleanupUnsubscribeTotal(cleanupUnsubscribeTotal(cleanupAgents, cfg))
+		collector.ResetCleanup(len(cleanupCandidates))
+		collector.SetCleanupUnsubscribeTotal(cleanupUnsubscribeTotal(cleanupCandidates, cfg))
 
 		slog.Info("Cleaning up extensions",
-			"count", len(cleanupAgents),
+			"count", len(cleanupCandidates),
+			"skipped_never_registered", len(cleanupAgents)-len(cleanupCandidates),
 			"unsubscribe_rate_per_sec", cleanupUnsubscribeRate(cfg),
 			"unregister_rate_per_sec", cleanupUnregisterRate(cfg),
 			"audit_timeout_min", cleanupAuditTimeoutMinutes(cfg),
 		)
-		runCleanupPipeline(ctx, cleanupAgents, cfg, collector)
+		runCleanupPipeline(ctx, cleanupCandidates, cfg, collector)
 	} else {
 		slog.Info("--no-unregister: skipping unregistration")
 	}
@@ -1099,6 +1574,39 @@ func shutdownCleanup(
 
 	writeTrafficSummary(collector, cfg, logDir, runID, pairID, eng, agents)
 	slog.Info("SIP cleanup complete — metrics server still serving")
+}
+
+func mergeCleanupAgents(primary, fallback []*agent.ExtensionAgent) []*agent.ExtensionAgent {
+	seen := make(map[string]bool, len(primary)+len(fallback))
+	out := make([]*agent.ExtensionAgent, 0, len(primary)+len(fallback))
+	for _, ag := range primary {
+		if ag == nil || seen[ag.Ext] {
+			continue
+		}
+		seen[ag.Ext] = true
+		out = append(out, ag)
+	}
+	for _, ag := range fallback {
+		if ag == nil || seen[ag.Ext] {
+			continue
+		}
+		seen[ag.Ext] = true
+		out = append(out, ag)
+	}
+	return out
+}
+
+func cleanupAgentsNeedingSIPCleanup(agents []*agent.ExtensionAgent) []*agent.ExtensionAgent {
+	out := make([]*agent.ExtensionAgent, 0, len(agents))
+	for _, ag := range agents {
+		if ag == nil {
+			continue
+		}
+		if ag.GrantedRegisterExpiry() > 0 || ag.NeedsUnsubscribe() || len(ag.TerminatedSubscriptionEvents()) > 0 {
+			out = append(out, ag)
+		}
+	}
+	return out
 }
 
 func cleanupRetryCount(cfg *config.VMConfig) int {
@@ -1200,7 +1708,7 @@ func runCleanupPipeline(ctx context.Context, agents []*agent.ExtensionAgent, cfg
 		stateMu.Unlock()
 
 		if forced {
-			slog.Warn("Cleanup audit forcing unregister", "ext", ag.Ext, "reason", reason)
+			slog.Warn("Cleanup forcing unregister", "ext", ag.Ext, "reason", reason)
 		} else {
 			slog.Debug("Cleanup unsubscribe complete; queued unregister", "ext", ag.Ext)
 		}
@@ -1265,11 +1773,7 @@ func runCleanupPipeline(ctx context.Context, agents []*agent.ExtensionAgent, cfg
 					}
 				}
 				collector.IncrementCleanupUnsubscribe(ag.Ext, unsubSkipped, unsubOK)
-				if unsubOK {
-					queueUnregister(ag, false, "")
-				} else {
-					slog.Warn("Cleanup unsubscribe incomplete; withholding unregister until audit timeout", "ext", ag.Ext)
-				}
+				queueUnregister(ag, !unsubOK, "unsubscribe_incomplete")
 			}
 		}()
 	}
@@ -1461,6 +1965,13 @@ func cleanupUnsubscribeTotal(agents []*agent.ExtensionAgent, cfg *config.VMConfi
 }
 
 func cleanupUnregisterWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig) error {
+	if ag.GrantedRegisterExpiry() <= 0 {
+		slog.Debug("Unregister skipped; agent never completed REGISTER", "ext", ag.Ext)
+		return nil
+	}
+	if !ag.IsTransportConnected() {
+		return fmt.Errorf("ext=%s: transport not connected for unregister", ag.Ext)
+	}
 	maxRetries := cleanupRetryCount(cfg)
 	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
 	if timeout <= 0 {
@@ -1541,6 +2052,15 @@ func requiredTrafficReadyCount(configuredTotal int) int {
 		return 2
 	}
 	return required
+}
+
+func cleanupStartRequested(pctx *metrics.ProcessContext) bool {
+	if pctx == nil {
+		return false
+	}
+	pctx.Mu.Lock()
+	defer pctx.Mu.Unlock()
+	return pctx.CleanupStartRequested
 }
 
 func trafficReady(counts engine.PoolRoleCounts, requiredReady int) bool {
@@ -1658,6 +2178,8 @@ func writeRunJSON(collector *metrics.MetricsCollector, cfg *config.VMConfig, run
 		"subscribe_unsubscribe_events": cfg.SubscribeUnsubscribeEvents,
 		"media_enabled":                cfg.MediaEnabled,
 		"media_security":               cfg.MediaSecurity,
+		"rtp_codec":                    cfg.RTPCodec,
+		"rtp_ptime":                    cfg.RTPPtime,
 		"srtp_crypto_suites":           cfg.SRTPCryptoSuites,
 		"metrics_port":                 cfg.MetricsPort,
 		"traffic_mode":                 cfg.TrafficMode,
@@ -1873,7 +2395,22 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	return out
 }
 
-func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector) (map[string]*agent.ExtensionAgent, error) {
+func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector, stopCh <-chan struct{}) (map[string]*agent.ExtensionAgent, error) {
+	connectCtx := ctx
+	var cancelConnect context.CancelFunc
+	var stopped atomic.Bool
+	if stopCh != nil {
+		connectCtx, cancelConnect = context.WithCancel(ctx)
+		defer cancelConnect()
+		go func() {
+			select {
+			case <-stopCh:
+				stopped.Store(true)
+				cancelConnect()
+			case <-connectCtx.Done():
+			}
+		}()
+	}
 	allAgents := agentsToSlice(agents)
 	total := len(allAgents)
 	connected := make(map[string]*agent.ExtensionAgent, total)
@@ -1896,6 +2433,9 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 	)
 
 	for batchStart := 0; batchStart < total; batchStart += batchSize {
+		if stopped.Load() {
+			return connected, errTransportConnectStopped
+		}
 		batchEnd := batchStart + batchSize
 		if batchEnd > total {
 			batchEnd = total
@@ -1915,7 +2455,7 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 			wg.Add(1)
 			go func(a *agent.ExtensionAgent) {
 				defer wg.Done()
-				connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+				connectCtx, cancel := context.WithTimeout(connectCtx, connectTimeout)
 				defer cancel()
 				if err := a.Start(connectCtx); err != nil {
 					mu.Lock()
@@ -1950,11 +2490,17 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 
 		if batchEnd < total {
 			select {
-			case <-ctx.Done():
-				return connected, ctx.Err()
+			case <-connectCtx.Done():
+				if stopped.Load() {
+					return connected, errTransportConnectStopped
+				}
+				return connected, connectCtx.Err()
 			case <-time.After(batchDelay):
 			}
 		}
+	}
+	if stopped.Load() {
+		return connected, errTransportConnectStopped
 	}
 	if len(connected) == 0 {
 		return connected, fmt.Errorf("no transports connected out of %d configured agents", total)
@@ -1972,7 +2518,7 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 func transportConnectTimeout(cfg *config.VMConfig) time.Duration {
 	timeoutSeconds := cfg.ConnectTimeout
 	if timeoutSeconds <= 0 {
-		timeoutSeconds = 1
+		timeoutSeconds = 5
 	}
 	return time.Duration(timeoutSeconds) * time.Second
 }
@@ -2295,9 +2841,18 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		RTPRxPkts:           r.RTPRxPkts,
 		SIPLocalIP:          r.SIPLocalIP,
 		SIPLocalPort:        r.SIPLocalPort,
+		SIPRemoteIP:         r.SIPRemoteIP,
+		SIPRemotePort:       r.SIPRemotePort,
+		SIPCode:             r.SIPCode,
+		SIPServerHeader:     r.SIPServerHeader,
+		SIPUserAgentHeader:  r.SIPUserAgentHeader,
 		MediaVerified:       r.MediaVerified,
 		RTPLocalPort:        r.RTPLocalPort,
 		MediaSecurity:       r.MediaSecurity,
+		RTPCodec:            r.RTPCodec,
+		RTPPayloadType:      r.RTPPayloadType,
+		RTPPayloadMarkers:   r.RTPPayloadMarkers,
+		MOSCodec:            r.MOSCodec,
 		SRTPCryptoSuite:     r.SRTPCryptoSuite,
 		SRTPDecryptFailures: r.SRTPDecryptFailures,
 		SRTPAuthFailures:    r.SRTPAuthFailures,
@@ -2317,6 +2872,8 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		RTPExpectedPkts:     r.RTPExpectedPkts,
 		RTPSSRCCount:        r.RTPSSRCCount,
 		Scenario:            r.Scenario,
+		ActiveController:    r.ActiveController,
+		AgentGroupID:        r.AgentGroupID,
 
 		// Phase-1 QoS metrics
 		JitterMs:            r.JitterMs,

@@ -1,0 +1,36 @@
+{
+  "records": [
+    {
+      "traffic_run_date": "2026-06-06",
+      "engine_version": "1.8.4.8",
+      "cps": 8,
+      "hold_time": "15 minutes",
+      "rtp_mode": "3 phase",
+      "total_register_count": 847,
+      "total_subscribe_count": 5082,
+      "subscribe_events_per_extension": 6,
+      "reg_sub_failure": false,
+      "duration": "15 minutes",
+      "call_failure_count": null,
+      "call_failure_reason": "BYE timeout",
+      "unregister_unsubscribe_result": "success",
+      "conclusion": "Stable Traffic"
+    },
+    {
+      "traffic_run_date": "2026-06-08",
+      "engine_version": "1.8.6.0",
+      "cps": 8,
+      "hold_time": "1 minute",
+      "rtp_mode": "3 phase",
+      "total_register_count": 841,
+      "total_subscribe_count": 5046,
+      "subscribe_events_per_extension": 6,
+      "reg_sub_failure": false,
+      "duration": "25 minutes",
+      "call_failure_count": 1,
+      "call_failure_reason": "BYE_200 OK timeout",
+      "unregister_unsubscribe_result": "success",
+      "conclusion": "Stable Traffic"
+    }
+  ]
+}

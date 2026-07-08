@@ -47,13 +47,18 @@ type DialogState struct {
 	// InviteSDP is the SDP body sent with the original INVITE; needed so
 	// Timer A retransmissions (RFC 3261 §17.1.1.2, UDP only) can re-send
 	// the exact same payload without rebuilding it.
-	InviteSDP        string
-	ProvMsg          *sip.SipMessage
-	RTPRemoteIP      string
-	RTPRemotePort    int
-	MediaSecurity    string
-	SRTPCryptoOffers []SRTPCryptoOffer
-	SRTPRemoteCrypto SDPMediaInfo
+	InviteSDP         string
+	ProvMsg           *sip.SipMessage
+	RTPRemoteIP       string
+	RTPRemotePort     int
+	MediaSecurity     string
+	OfferedCodecs     []string
+	NegotiatedCodec   string
+	CodecFallback     bool
+	CodecRejectReason string
+	RemoteSDPInfo     SDPMediaInfo
+	SRTPCryptoOffers  []SRTPCryptoOffer
+	SRTPRemoteCrypto  SDPMediaInfo
 
 	// [FIX-2] Proactive Auth: after the first INVITE 407 challenge is handled,
 	// these fields store the digest credentials so that every subsequent
@@ -464,6 +469,7 @@ func (a *ExtensionAgent) NeedsUnsubscribe() bool {
 
 // Send serializes a SIP message and sends it.
 func (a *ExtensionAgent) Send(msg *sip.SipMessage, body string) error {
+	msg.SetDefaultUserAgent()
 	raw := sip.BuildMessage(msg, body)
 	return a.transport.Send(raw)
 }
@@ -1361,6 +1367,8 @@ func (a *ExtensionAgent) SendInvite(calleeExt string, rtpPort int) (*DialogState
 		RTCPMux:         a.Config.IsRTCPMuxEnabled(),
 		MediaSecurity:   a.Config.MediaSecurity,
 		SRTPCryptoLines: cryptoOfferLines(cryptoOffers),
+		RTPCodec:        a.Config.RTPCodec,
+		RTPPtime:        a.Config.RTPPtime,
 	})
 
 	msg := sip.NewSipMessage()
@@ -1788,6 +1796,8 @@ func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 		RTCPMux:         a.Config.IsRTCPMuxEnabled(),
 		MediaSecurity:   a.Config.MediaSecurity,
 		SRTPCryptoLines: cryptoOfferLines(cryptoOffers),
+		RTPCodec:        negotiatedCodecForDialog(dialog, a.Config.RTPCodec),
+		RTPPtime:        a.Config.RTPPtime,
 	})
 	dialog.SRTPCryptoOffers = cryptoOffers
 	dialog.MediaSecurity = a.Config.MediaSecurity
@@ -1818,6 +1828,33 @@ func (a *ExtensionAgent) Send200Invite(dialog *DialogState, rtpPort int) error {
 	dialog.State = "SUCCESSFULRESP_SENT"
 
 	return a.Send(resp, sdpBody)
+}
+
+func (a *ExtensionAgent) SendInviteReject(dialog *DialogState, code, reason string) error {
+	if dialog == nil || dialog.InviteMsg == nil {
+		return fmt.Errorf("no INVITE available to reject")
+	}
+	invite := dialog.InviteMsg
+	resp := sip.NewSipMessage()
+	resp.SetResponseLine(fmt.Sprintf("SIP/2.0 %s %s", code, reason))
+	if v := invite.GetHeader(sip.HdrVia); len(v) > 0 {
+		for _, h := range v {
+			resp.AddHeader(sip.HdrVia, h)
+		}
+	}
+	if fh := invite.GetHeader(sip.HdrFrom); len(fh) > 0 {
+		resp.AddHeader(sip.HdrFrom, fh[0])
+	}
+	if th := invite.GetHeader(sip.HdrTo); len(th) > 0 {
+		resp.AddHeader(sip.HdrTo, th[0]+";tag="+dialog.LocalTag)
+	}
+	resp.AddHeader(sip.HdrCallID, dialog.CallID)
+	if ch := invite.GetHeader(sip.HdrCSeq); len(ch) > 0 {
+		resp.AddHeader(sip.HdrCSeq, ch[0])
+	}
+	resp.AddHeader(sip.HdrContentLength, "0")
+	dialog.State = "REJECTED"
+	return a.Send(resp, "")
 }
 
 // ParseProvResponse parses a 180/183 provisional response.
@@ -1862,8 +1899,10 @@ func (a *ExtensionAgent) Parse200Invite(rawMsg string, dialog *DialogState) {
 func (a *ExtensionAgent) applySDPMedia(dialog *DialogState, body, source string) {
 	info := ParseSDPMediaInfo(body)
 	if info.IP != "" && info.Port > 0 {
+		dialog.RemoteSDPInfo = info
 		dialog.RTPRemoteIP = info.IP
 		dialog.RTPRemotePort = info.Port
+		dialog.OfferedCodecs = info.OfferedCodecs()
 		if dialog.MediaSecurity == "srtp_sdes" {
 			dialog.SRTPRemoteCrypto = info
 			if info.Proto != "RTP/SAVP" || len(info.CryptoLines) == 0 {
@@ -1912,6 +1951,34 @@ func (a *ExtensionAgent) WaitForEvent(ctx context.Context, eventCodes ...string)
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+func negotiatedCodecForDialog(dialog *DialogState, fallback string) string {
+	if dialog != nil && strings.TrimSpace(dialog.NegotiatedCodec) != "" {
+		return dialog.NegotiatedCodec
+	}
+	return fallback
+}
+
+func NegotiateSingleCodec(offer SDPMediaInfo, configuredCodec, unsupportedPolicy string) (codec string, fallback bool, rejectReason string) {
+	configured := normalizeSDPCodec(configuredCodec)
+	if configured == "" {
+		configured = "G711_ULAW"
+	}
+	if offer.HasCodec(configured) {
+		return configured, false, ""
+	}
+
+	if strings.EqualFold(strings.TrimSpace(unsupportedPolicy), "reject_488") {
+		return "", false, fmt.Sprintf("configured codec %s not offered", configured)
+	}
+
+	for _, offered := range offer.OfferedCodecs() {
+		if offered == "G711_ULAW" || offered == "G711_ALAW" {
+			return offered, true, ""
+		}
+	}
+	return "", false, fmt.Sprintf("configured codec %s not offered and no G.711 fallback codec present", configured)
 }
 
 // RegisterWildcardListener returns a channel receiving all events.
@@ -2080,6 +2147,8 @@ func (a *ExtensionAgent) Handle401Invite(dialog *DialogState, raw401 string, rtp
 				RTCPMux:         a.Config.IsRTCPMuxEnabled(),
 				MediaSecurity:   dialog.MediaSecurity,
 				SRTPCryptoLines: cryptoOfferLines(dialog.SRTPCryptoOffers),
+				RTPCodec:        a.Config.RTPCodec,
+				RTPPtime:        a.Config.RTPPtime,
 			})
 			dialog.InviteSDP = sdpBody
 		}
@@ -2139,6 +2208,8 @@ func (a *ExtensionAgent) Handle407Invite(dialog *DialogState, raw407 string, rtp
 				RTCPMux:         a.Config.IsRTCPMuxEnabled(),
 				MediaSecurity:   dialog.MediaSecurity,
 				SRTPCryptoLines: cryptoOfferLines(dialog.SRTPCryptoOffers),
+				RTPCodec:        a.Config.RTPCodec,
+				RTPPtime:        a.Config.RTPPtime,
 			})
 			dialog.InviteSDP = sdpBody
 		}
