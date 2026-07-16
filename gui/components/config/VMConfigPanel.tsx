@@ -18,7 +18,7 @@ import { TrafficModeSelector } from './TrafficModeSelector'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { Loader2, CheckCircle, XCircle, Signal, RotateCcw, Info, ChevronDown } from 'lucide-react'
-import type { TrafficMode, SipTransport, SipScheme, LocalIPMode, RtpCodec, RtpUnsupportedCodecPolicy, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
+import type { TrafficMode, PairingPolicy, SipTransport, SipScheme, LocalIPMode, RtpCodec, RtpUnsupportedCodecPolicy, ReachabilityStatus, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
 import { SUBSCRIBE_EVENT_OPTIONS, SUBSCRIBE_EVENT_VALUES } from '@/lib/subscription-events'
 import { applyVIPsFor, uploadCertificateFor, verifyTLSFor, verifyVIPsFor, type TLSVerifyResult, type VIPResult } from '@/lib/api'
 
@@ -46,8 +46,8 @@ export type RawVMFormValues = {
   subscribe_events: string[]
   subscribe_refresh_events: string[]
   subscribe_unsubscribe_events: string[]
-  register_rate_cps: string
-  cleanup_batch_size: string
+  agent_connection_cps: string
+  agent_regsub_cps: string
   // RFC 3261 INVITE client-transaction timers (UAC). Empty -> backend uses RFC defaults.
   t1_ms: string
   timer_b_seconds: string
@@ -82,6 +82,7 @@ export type RawVMFormValues = {
   cps: string
   hold_time_seconds: string
   ramp_up_seconds: string
+  pairing_policy: PairingPolicy
   // Media
   media_enabled: boolean
   media_security: MediaSecurity | 'capneg'
@@ -145,13 +146,14 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version',
   ],
   signaling: [
-    'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size',
+    'register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events',
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
     'ext_start', 'ext_count',
+    'agent_connection_cps', 'agent_regsub_cps',
     'cps', 'hold_time_seconds', 'ramp_up_seconds',
-    'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
+    'pairing_policy', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
   ],
   media: ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_unsupported_codec_policy', 'rtp_ptime'],
 }
@@ -164,8 +166,6 @@ const DEFAULTS_REGISTRATION = {
   subscribe_events:  ['dialog'],
   subscribe_refresh_events: ['dialog'],
   subscribe_unsubscribe_events: ['dialog'],
-  register_rate_cps: '10',
-  cleanup_batch_size: '10',
   t1_ms:             '500',
   timer_b_seconds:   '32',
 }
@@ -179,8 +179,9 @@ const SECTION_FIELDS = {
                    'failover_trigger', 'failover_trigger_count', 'failover_trigger_pct', 'failover_trigger_window_ms', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
   extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
-  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 'register_rate_cps', 'cleanup_batch_size', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
-  call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
+  registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
+  register_traffic: ['agent_connection_cps', 'agent_regsub_cps'] as (keyof RawVMFormValues)[],
+  call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'pairing_policy', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
   media:          ['media_enabled', 'media_security', 'srtp_crypto_suites', 'srtp_key_mode', 'rtp_codec', 'rtp_unsupported_codec_policy', 'rtp_ptime'] as (keyof RawVMFormValues)[],
 } as const
 
@@ -559,19 +560,26 @@ function HASection({
 
   const zoneConfig = parseZoneConfig()
   const zoneDistPct: number = zoneConfig.zone_distribution_pct ?? 50
-  const zoneAControllers: Array<{ host: string; port: number }> = zoneConfig.zones?.[0]?.controllers ?? [{ host: '', port: 5060 }]
-  const zoneBControllers: Array<{ host: string; port: number }> = zoneConfig.zones?.[1]?.controllers ?? [{ host: '', port: 5060 }]
+  const zoneAControllers: Array<{ host: string; port: number }> =
+    zoneConfig.zones?.find((z: { zone_id?: string }) => z.zone_id === 'zone-a')?.controllers ?? [{ host: '', port: 5060 }]
+  const zoneBControllers: Array<{ host: string; port: number }> =
+    zoneConfig.zones?.find((z: { zone_id?: string }) => z.zone_id === 'zone-b')?.controllers ?? [{ host: '', port: 5060 }]
 
   const serializeZoneConfig = (
     aControllers: Array<{ host: string; port: number }>,
     bControllers: Array<{ host: string; port: number }>,
     distPct: number,
   ) => {
+    const cleanControllers = (controllers: Array<{ host: string; port: number }>) =>
+      controllers
+        .map((c) => ({ host: c.host.trim(), port: c.port || 5060 }))
+        .filter((c) => c.host !== '')
+    const zones = [
+      { zone_id: 'zone-a', controllers: cleanControllers(aControllers) },
+      { zone_id: 'zone-b', controllers: cleanControllers(bControllers) },
+    ].filter((z) => z.controllers.length > 0)
     const config = {
-      zones: [
-        { zone_id: 'zone-a', controllers: aControllers },
-        { zone_id: 'zone-b', controllers: bControllers },
-      ],
+      zones,
       zone_distribution_pct: distPct,
     }
     onChange('zone_config_json', JSON.stringify(config))
@@ -1681,8 +1689,6 @@ export function VMConfigPanel({
           raw.subscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_events.join(',') ||
           raw.subscribe_refresh_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_refresh_events.join(',') ||
           raw.subscribe_unsubscribe_events.join(',') !== DEFAULTS_REGISTRATION.subscribe_unsubscribe_events.join(',') ||
-          raw.register_rate_cps !== DEFAULTS_REGISTRATION.register_rate_cps ||
-          raw.cleanup_batch_size !== DEFAULTS_REGISTRATION.cleanup_batch_size ||
           raw.t1_ms !== DEFAULTS_REGISTRATION.t1_ms ||
           raw.timer_b_seconds !== DEFAULTS_REGISTRATION.timer_b_seconds
         return (
@@ -1692,12 +1698,12 @@ export function VMConfigPanel({
             dirty={regDirty}
             onReset={() => onResetSection(SECTION_FIELDS.registration)}
           >
-            {/* Expiry & rate — three logical fields packed onto one row.
-                Each input keeps an inline mini-label (REG / SUB / Rate)
+            {/* Expiry — compact REG/SUB row.
+                Each input keeps an inline mini-label (REG / SUB)
                 so the values stay self-describing. */}
             <FormRow
-              label="Expiry & Rate"
-              hint="REGISTER and SUBSCRIBE Expires headers (seconds) plus the rate at which REGISTER messages are pumped (reg/s). Defaults: 3600 / 3600 / 10."
+              label="Expiry"
+              hint="REGISTER and SUBSCRIBE Expires headers in seconds. Defaults: 3600 / 3600."
             >
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
                 {/* REG Expires */}
@@ -1735,53 +1741,13 @@ export function VMConfigPanel({
                   />
                   <span className="text-xs text-slate-400">s</span>
                 </div>
-                <span className="text-slate-600">·</span>
-                {/* Reg. Rate */}
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs font-medium text-slate-400">Reg. Rate</span>
-                  <Input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={raw.register_rate_cps}
-                    onChange={(ev) => onChange('register_rate_cps', ev.target.value)}
-                    onBlur={() => onBlur('register_rate_cps')}
-                    placeholder="10"
-                    className="w-16 font-mono"
-                    aria-invalid={t('register_rate_cps') && !!errors.register_rate_cps ? true : undefined}
-                  />
-                  <span className="text-xs text-slate-400">reg/s</span>
-                </div>
               </div>
-              {(e('register_expires') || e('subscribe_expires') || e('register_rate_cps')) && (
+              {(e('register_expires') || e('subscribe_expires')) && (
                 <>
                   {e('register_expires')   && <FieldError error={e('register_expires')} />}
                   {e('subscribe_expires')  && <FieldError error={e('subscribe_expires')} />}
-                  {e('register_rate_cps')  && <FieldError error={e('register_rate_cps')} />}
                 </>
               )}
-            </FormRow>
-
-            <FormRow
-              label="Cleanup Batch"
-              hint="Cleanup-only batch size for post-run unsubscribe and unregister. Default 10; use up to 100 when the SBC can handle a wider teardown batch."
-            >
-              <div className="flex items-center gap-1.5">
-                <Input
-                  type="number"
-                  min={1}
-                  max={100}
-                  step={1}
-                  value={raw.cleanup_batch_size}
-                  onChange={(ev) => onChange('cleanup_batch_size', ev.target.value)}
-                  onBlur={() => onBlur('cleanup_batch_size')}
-                  placeholder="10"
-                  className="w-20 font-mono"
-                  aria-invalid={t('cleanup_batch_size') && !!errors.cleanup_batch_size ? true : undefined}
-                />
-                <span className="text-xs text-slate-400">extensions / cleanup batch</span>
-              </div>
-              {e('cleanup_batch_size') && <FieldError error={e('cleanup_batch_size')} />}
             </FormRow>
 
             <FormRow
@@ -1949,6 +1915,56 @@ export function VMConfigPanel({
         )
       })()}
 
+      {/* ── Registration/Subscription Traffic (Traffic tab) ───────────────── */}
+      {showTraffic && (
+      <div className="space-y-2">
+        <SectionHeader onReset={() => onResetSection(SECTION_FIELDS.register_traffic)}>Registration/Subscription Traffic</SectionHeader>
+        <FormRow
+          label="Agent Setup Rates"
+          hint="Agent Conn Rate limits TCP/TLS connection starts per second. Agent Reg/Sub Rate limits logical agent setup flows per second; in HA modes a flow can include primary REGISTER, secondary REGISTER, and primary SUBSCRIBE."
+        >
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium text-slate-400">Agent Conn Rate</span>
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                value={raw.agent_connection_cps}
+                onChange={(ev) => onChange('agent_connection_cps', ev.target.value)}
+                onBlur={() => onBlur('agent_connection_cps')}
+                placeholder="30"
+                className="w-16 font-mono"
+                aria-invalid={t('agent_connection_cps') && !!errors.agent_connection_cps ? true : undefined}
+              />
+              <span className="text-xs text-slate-400">/s</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium text-slate-400">Agent Reg/Sub Rate</span>
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                value={raw.agent_regsub_cps}
+                onChange={(ev) => onChange('agent_regsub_cps', ev.target.value)}
+                onBlur={() => onBlur('agent_regsub_cps')}
+                placeholder="30"
+                className="w-16 font-mono"
+                aria-invalid={t('agent_regsub_cps') && !!errors.agent_regsub_cps ? true : undefined}
+              />
+              <span className="text-xs text-slate-400">/s</span>
+            </div>
+          </div>
+          {(e('agent_connection_cps') || e('agent_regsub_cps')) && (
+            <>
+              {e('agent_connection_cps') && <FieldError error={e('agent_connection_cps')} />}
+              {e('agent_regsub_cps') && <FieldError error={e('agent_regsub_cps')} />}
+            </>
+          )}
+        </FormRow>
+      </div>
+      )}
+
       {/* ── Call Traffic (Traffic tab) ─────────────────────────── */}
       {showTraffic && (
       <div className="space-y-2">
@@ -1991,6 +2007,28 @@ export function VMConfigPanel({
             <span className="text-xs text-slate-400">s</span>
           </div>
           {e('ramp_up_seconds') && <FieldError error={e('ramp_up_seconds')} />}
+        </FormRow>
+
+        <FormRow
+          label="Call Pairing"
+          hint="Initial call pairing policy. You can still change this dynamically from the run page while traffic is active."
+        >
+          <Select
+            value={raw.pairing_policy || 'random'}
+            onValueChange={(v) => {
+              onChange('pairing_policy', v as PairingPolicy)
+              onBlur('pairing_policy')
+            }}
+          >
+            <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="random">Random</SelectItem>
+              <SelectItem value="cross_zone">Cross Zone Only</SelectItem>
+              <SelectItem value="same_zone">Same Zone</SelectItem>
+              <SelectItem value="same_controller">Same Controller</SelectItem>
+            </SelectContent>
+          </Select>
+          {e('pairing_policy') && <FieldError error={e('pairing_policy')} />}
         </FormRow>
 
         {/* Traffic mode: smoke / timed / unlimited */}
@@ -2139,7 +2177,7 @@ export function VMConfigPanel({
                 onValueChange={(v) => {
                   const codec = v as RtpCodec
                   onChange('rtp_codec', codec)
-                  if (codec === 'G729') {
+                  if (codec === 'G729' || codec === 'G729_AUDIO') {
                     onChange('rtp_ptime', '20')
                     onBlur('rtp_ptime')
                   }
@@ -2150,7 +2188,8 @@ export function VMConfigPanel({
                 <SelectContent>
                   <SelectItem value="G711_ULAW">G.711 μ-law (PCMU)</SelectItem>
                   <SelectItem value="G711_ALAW">G.711 A-law (PCMA)</SelectItem>
-                  <SelectItem value="G729">G.729</SelectItem>
+                  <SelectItem value="G729">G.729 - pre-encoded frame</SelectItem>
+                  <SelectItem value="G729_AUDIO">G.729 pre-encoded audio</SelectItem>
                 </SelectContent>
               </Select>
             </FormRow>

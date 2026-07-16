@@ -67,7 +67,7 @@ func BuildSDPWithOptions(localHost string, rtpPort int, opts SDPOptions) string 
 	switch codec {
 	case "G711_ALAW":
 		mediaPayloads = "8 0 101"
-	case "G729":
+	case "G729", "G729_AUDIO":
 		mediaPayloads = "18 101"
 		codecLines = "a=rtpmap:18 G729/8000\r\n" +
 			"a=fmtp:18 annexb=no\r\n"
@@ -321,7 +321,7 @@ func normalizeSDPCodec(codec string) string {
 		return "G711_ULAW"
 	case "G711_ALAW", "PCMA":
 		return "G711_ALAW"
-	case "G729", "G.729":
+	case "G729", "G.729", "G729_AUDIO":
 		return "G729"
 	case "TELEPHONE-EVENT", "TELEPHONE_EVENT":
 		return "TELEPHONE_EVENT"

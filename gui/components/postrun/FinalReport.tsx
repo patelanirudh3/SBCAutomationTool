@@ -6,6 +6,7 @@ import { CheckCircle2, XCircle, Phone, PhoneOff, PhoneMissed, PhoneIncoming, Pho
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
+import { ControllerCallSummary } from '@/components/dashboard/ControllerCallSummary'
 import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
 import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { DownloadReport } from './DownloadReport'
@@ -331,6 +332,7 @@ export function FinalReport({
 
       {/* Failed calls table */}
       <div className="space-y-2">
+        <ControllerCallSummary stats={uacMetrics?.calls_by_controller} />
         <SectionLabel>Failed Call Records</SectionLabel>
         <FailedCallsTable
           events={callEvents}

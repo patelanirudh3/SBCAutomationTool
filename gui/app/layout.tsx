@@ -1,7 +1,9 @@
 import type { Metadata } from 'next'
+import { Suspense } from 'react'
 import { DM_Sans, Space_Mono } from 'next/font/google'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { StoreHydrator } from '@/components/shared/StoreHydrator'
+import { EngineDiscovery } from '@/components/run/EngineDiscovery'
 import './globals.css'
 
 const dmSans = DM_Sans({
@@ -33,7 +35,12 @@ export default function RootLayout({
         className={`${dmSans.variable} ${spaceMono.variable} font-sans antialiased bg-background text-foreground`}
       >
         <StoreHydrator>
-          <TooltipProvider delayDuration={300}>{children}</TooltipProvider>
+          <TooltipProvider delayDuration={300}>
+            <Suspense fallback={null}>
+              <EngineDiscovery />
+            </Suspense>
+            {children}
+          </TooltipProvider>
         </StoreHydrator>
       </body>
     </html>

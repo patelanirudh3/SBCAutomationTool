@@ -99,6 +99,22 @@ func TestBuildSDPWithG729(t *testing.T) {
 	}
 }
 
+func TestBuildSDPWithG729AudioAdvertisesStandardG729(t *testing.T) {
+	sdp := BuildSDPWithOptions("10.0.0.1", 40000, SDPOptions{
+		RTPCodec: "G729_AUDIO",
+		RTPPtime: 20,
+	})
+	if !strings.Contains(sdp, "m=audio 40000 RTP/AVP 18 101") ||
+		!strings.Contains(sdp, "a=rtpmap:18 G729/8000") ||
+		!strings.Contains(sdp, "a=fmtp:18 annexb=no") {
+		t.Fatalf("G729_AUDIO SDP should advertise standard G729:\n%s", sdp)
+	}
+	codec, fallback, reject := NegotiateSingleCodec(ParseSDPMediaInfo(sdp), "G729_AUDIO", "reject_488")
+	if codec != "G729" || fallback || reject != "" {
+		t.Fatalf("codec=%q fallback=%v reject=%q, want canonical G729", codec, fallback, reject)
+	}
+}
+
 func TestGenerateSRTPCryptoOffers(t *testing.T) {
 	offers, err := GenerateSRTPCryptoOffers([]string{"AES_CM_128_HMAC_SHA1_80", "AES_CM_128_HMAC_SHA1_32"})
 	if err != nil {

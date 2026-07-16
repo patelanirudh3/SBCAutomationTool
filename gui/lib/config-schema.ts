@@ -30,11 +30,12 @@ function isValidIpOrHostname(val: string): boolean {
 
 export const VMRoleSchema = z.enum(['UAC', 'UAS'])
 export const TrafficModeSchema = z.enum(['smoke', 'timed', 'unlimited'])
+export const PairingPolicySchema = z.enum(['random', 'cross_zone', 'same_zone', 'same_controller'])
 export const SipTransportSchema = z.enum(['TCP', 'TLS', 'UDP'])
 export const SipSchemeSchema = z.enum(['SIP', 'SIPS'])
 export const LocalIPModeSchema = z.enum(['single', 'unique_vip', 'vip_pool'])
 export const TLSModeSchema = z.enum(['insecure', 'server_ca', 'client_cert', 'mutual'])
-export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729'])
+export const RtpCodecSchema = z.enum(['G711_ULAW', 'G711_ALAW', 'G729', 'G729_AUDIO'])
 export const RtpUnsupportedCodecPolicySchema = z.enum(['fallback_g711', 'reject_488'])
 export const MediaSecuritySchema = z.enum(['rtp', 'srtp_sdes'])
 export const SRTPCryptoSuiteSchema = z.enum(['AES_CM_128_HMAC_SHA1_80', 'AES_CM_128_HMAC_SHA1_32'])
@@ -90,7 +91,7 @@ export const VMConfigSchema = z
           host: z.string().min(1).refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
           port: z.number().int().min(1).max(65535),
         })).min(1, 'Each zone needs at least 1 controller'),
-      })).length(2, 'Exactly 2 zones required'),
+      })).min(1, 'At least 1 zone required').max(2, 'At most 2 zones supported'),
       zone_distribution_pct: z.number().int().min(1).max(99),
     }).optional(),
     failover_enabled: z.boolean().optional(),
@@ -119,13 +120,14 @@ export const VMConfigSchema = z
     subscribe_events: z.array(SubscribeEventSchema).min(1, 'Select at least one SUBSCRIBE event').optional(),
     subscribe_refresh_events: z.array(SubscribeEventSchema).optional(),
     subscribe_unsubscribe_events: z.array(SubscribeEventSchema).optional(),
-    register_rate_cps: z.number().positive('Rate must be positive').max(500, 'Cannot exceed 500 reg/s').optional(),
-    cleanup_batch_size: z.number().int().min(1, 'Minimum 1 extension').max(100, 'Maximum 100 extensions').optional(),
+    agent_connection_cps: z.number().positive('Connection rate must be positive').max(500, 'Cannot exceed 500 agents/s').optional(),
+    agent_regsub_cps: z.number().positive('Reg/Sub rate must be positive').max(500, 'Cannot exceed 500 agents/s').optional(),
     t1_ms: z.number().int().min(100, 'Minimum 100 ms').max(5000, 'Maximum 5000 ms').optional(),
     timer_b_seconds: z.number().int().min(1, 'Minimum 1 s').max(300, 'Maximum 300 s').optional(),
 
     cps: z.number().positive('CPS must be positive').max(200, 'CPS cannot exceed 200'),
     hold_time_seconds: z.number().nonnegative('Hold time must be ≥ 0').max(3600, 'Cannot exceed 3600s'),
+    pairing_policy: PairingPolicySchema.optional(),
     // Wall-clock seconds for the engine to ramp from 0 cps → configured cps.
     // 0 disables ramp (full speed from t=0). Mirrors backend
     // VMConfig.RampUpSeconds semantics in go/internal/engine/call_engine.go.
@@ -228,11 +230,11 @@ export const VMConfigSchema = z
     }
 
     if (data.ha_mode === 'multi_zone') {
-      if (!data.zone_config || !data.zone_config.zones || data.zone_config.zones.length !== 2) {
+      if (!data.zone_config || !data.zone_config.zones || data.zone_config.zones.length < 1 || data.zone_config.zones.length > 2) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['zone_config'],
-          message: 'Multi-Zone HA requires exactly 2 zones configured',
+          message: 'Multi-Zone HA requires 1 or 2 zones configured',
         })
       } else {
         for (let zi = 0; zi < data.zone_config.zones.length; zi++) {
@@ -246,7 +248,7 @@ export const VMConfigSchema = z
           }
         }
         const pct = data.zone_config.zone_distribution_pct
-        if (pct < 1 || pct > 99) {
+        if (data.zone_config.zones.length === 2 && (pct < 1 || pct > 99)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ['zone_config', 'zone_distribution_pct'],
@@ -390,8 +392,8 @@ export function getFieldWarnings(raw: {
   call_count: string
   duration_hours: string
   traffic_mode: string
-  register_rate_cps?: string
-  cleanup_batch_size?: string
+  agent_connection_cps?: string
+  agent_regsub_cps?: string
 }): FieldWarnings {
   const w: FieldWarnings = {}
 

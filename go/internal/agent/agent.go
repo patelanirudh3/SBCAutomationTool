@@ -13,6 +13,7 @@ import (
 
 	"github.com/cci/traffic-engine/internal/config"
 	"github.com/cci/traffic-engine/internal/sip"
+	"github.com/cci/traffic-engine/internal/siptx"
 )
 
 // DialogState tracks a single SIP dialog for one call leg.
@@ -125,10 +126,17 @@ type ExtensionAgent struct {
 	Config *config.VMConfig
 
 	transport         sip.Transport
+	txManager         *siptx.Manager
 	localPort         int
 	localHost         string
 	assignedLocalHost string
 	transportDown     func(ext string, err error)
+	registerRegID     int
+
+	AgentGroupID   string
+	ZoneID         string
+	ControllerHost string
+	ControllerPort int
 
 	Registered     chan struct{}
 	Subscribed     chan struct{}
@@ -255,7 +263,25 @@ func NewExtensionAgent(ext string, cfg *config.VMConfig) *ExtensionAgent {
 		Subscribed:    make(chan struct{}),
 	}
 	a.autoAnswerEnabled.Store(true)
+	a.registerRegID = 1
 	return a
+}
+
+// SetRegisterRegID sets the RFC 5626 reg-id used in REGISTER Contact. Primary
+// flows use 1; secondary HA flows should use 2 so the SBC treats them as a
+// second flow for the same +sip.instance rather than replacing the primary.
+func (a *ExtensionAgent) SetRegisterRegID(regID int) {
+	if regID <= 0 {
+		regID = 1
+	}
+	a.registerRegID = regID
+}
+
+func (a *ExtensionAgent) SetPlacement(groupID, zoneID, controllerHost string, controllerPort int) {
+	a.AgentGroupID = groupID
+	a.ZoneID = zoneID
+	a.ControllerHost = controllerHost
+	a.ControllerPort = controllerPort
 }
 
 // SetAutoAnswer enables or disables automatic INVITE answering for this agent.
@@ -322,6 +348,9 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		return fmt.Errorf("ext=%s connect: %w", a.Ext, err)
 	}
 	t.SetDownHandler(func(err error) {
+		if a.txManager != nil {
+			a.txManager.Shutdown("transport_down")
+		}
 		a.MarkRegistrationUncertain(err)
 		if a.transportDown != nil {
 			a.transportDown(a.Ext, err)
@@ -329,6 +358,11 @@ func (a *ExtensionAgent) Start(ctx context.Context) error {
 		go a.reregisterAfterTransportRecovery(context.Background())
 	})
 	a.transport = t
+	a.txManager = siptx.NewManager(t, siptx.Timers{
+		T1:     time.Duration(a.Config.T1Ms) * time.Millisecond,
+		TimerB: time.Duration(a.Config.TimerBSeconds) * time.Second,
+	})
+	a.txManager.SetDuplicateInvite2xxHandler(a.handleDuplicateInvite2xx)
 	a.localPort = t.LocalPort()
 
 	go a.dispatchLoop()
@@ -381,6 +415,9 @@ func (a *ExtensionAgent) reregisterAfterTransportRecovery(ctx context.Context) {
 // Close stops the dispatch loop and closes the transport.
 func (a *ExtensionAgent) Close() error {
 	a.closed.Store(true)
+	if a.txManager != nil {
+		a.txManager.Shutdown("agent_closed")
+	}
 	if a.transport != nil {
 		return a.transport.Close()
 	}
@@ -471,7 +508,36 @@ func (a *ExtensionAgent) NeedsUnsubscribe() bool {
 func (a *ExtensionAgent) Send(msg *sip.SipMessage, body string) error {
 	msg.SetDefaultUserAgent()
 	raw := sip.BuildMessage(msg, body)
+	if a.txManager != nil {
+		return a.txManager.Send(raw)
+	}
 	return a.transport.Send(raw)
+}
+
+func (a *ExtensionAgent) handleDuplicateInvite2xx(raw string) {
+	msg, _, err := sip.ParseMessage(raw)
+	if err != nil {
+		return
+	}
+	callID := msg.GetCallID()
+	if callID == "" || !strings.EqualFold(msg.GetMethod(), "INVITE") || !strings.HasPrefix(msg.GetResponseCode(), "2") {
+		return
+	}
+	a.mu.RLock()
+	dialog := a.ActiveDialogs[callID]
+	a.mu.RUnlock()
+	if dialog == nil {
+		return
+	}
+	if dialog.RemoteTag == "" {
+		dialog.RemoteTag = msg.GetToTag()
+	}
+	if target := firstURIFromHeader(msg.GetHeader(sip.HdrContact)); target != "" && dialog.RemoteTarget == "" {
+		dialog.RemoteTarget = target
+	}
+	if err := a.SendAck(dialog); err != nil {
+		slog.Debug("duplicate INVITE 2xx ACK replay failed", "ext", a.Ext, "call_id", callID, "err", err)
+	}
 }
 
 func (a *ExtensionAgent) syncLocalPort() {
@@ -520,7 +586,7 @@ func (a *ExtensionAgent) Register(ctx context.Context) error {
 	callID := sip.CreateCallID()
 	fromTag := sip.CreateFromTag()
 
-	msg := sip.BuildInitialRegisterWithScheme(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg := sip.BuildInitialRegisterWithSchemeAndRegID(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires, a.registerRegID)
 	msg.ReplaceHeader(sip.HdrCallID, callID)
 	fromHdr := fmt.Sprintf("%s;tag=%s", a.nameAddr(a.Ext, a.Config.Domain), fromTag)
 	msg.ReplaceHeader(sip.HdrFrom, fromHdr)
@@ -616,7 +682,7 @@ func (a *ExtensionAgent) Reregister(ctx context.Context) error {
 	a.regCSeq++
 	expiresVal := fmt.Sprintf("%d", a.Config.RegisterExpires)
 
-	msg := sip.BuildInitialRegisterWithScheme(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg := sip.BuildInitialRegisterWithSchemeAndRegID(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires, a.registerRegID)
 	msg.ReplaceHeader(sip.HdrCallID, a.regCallID)
 	msg.ReplaceHeader(sip.HdrFrom, a.regFromHeader)
 	msg.ReplaceHeader(sip.HdrCSeq, fmt.Sprintf("%d REGISTER", a.regCSeq))
@@ -2361,6 +2427,9 @@ func (a *ExtensionAgent) dispatchLoop() {
 		case raw, ok := <-recvCh:
 			if !ok {
 				return
+			}
+			if a.txManager != nil && a.txManager.HandleInbound(raw) {
+				continue
 			}
 			eventCode, _ := sip.ClassifyMessage(raw)
 			sipEvent := buildSipEvent(eventCode, raw)

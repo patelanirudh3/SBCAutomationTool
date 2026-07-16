@@ -1,19 +1,29 @@
 package engine
 
 import (
+	"fmt"
 	"log/slog"
 
 	"github.com/cci/traffic-engine/internal/agent"
 )
 
 // AgentRole is assigned only after an extension has completed REGISTER and
-// SUBSCRIBE. Roles are based on Reg/Sub-ready order so the usable pool remains
-// balanced even when connection, register, or subscribe failures are uneven.
+// SUBSCRIBE. Roles are based on the active pairing policy so restricted traffic
+// models still get usable UAC/UAS pairs within the relevant zone/controller.
 type AgentRole string
 
 const (
 	RoleUAS AgentRole = "uas"
 	RoleUAC AgentRole = "uac"
+)
+
+type PairingPolicy string
+
+const (
+	PairingRandom         PairingPolicy = "random"
+	PairingCrossZone      PairingPolicy = "cross_zone"
+	PairingSameZone       PairingPolicy = "same_zone"
+	PairingSameController PairingPolicy = "same_controller"
 )
 
 // PoolRoleCounts is a read-only snapshot of role-specific pool counts.
@@ -35,6 +45,7 @@ type poolCommand struct {
 	callee  *agent.ExtensionAgent
 	agents  []*agent.ExtensionAgent
 	ext     string
+	policy  PairingPolicy
 	resp    chan poolResponse
 	respAll chan []*agent.ExtensionAgent
 }
@@ -76,13 +87,14 @@ func NewPoolEngine() *PoolEngine {
 
 func (p *PoolEngine) run() {
 	var (
-		uacIdle     []*agent.ExtensionAgent
-		uasIdle     []*agent.ExtensionAgent
-		nonIdle     []*agent.ExtensionAgent
-		regOnly     []*agent.ExtensionAgent
-		regSubReady []*agent.ExtensionAgent
-		roles       = make(map[*agent.ExtensionAgent]AgentRole)
-		readySeq    int
+		uacIdle      []*agent.ExtensionAgent
+		uasIdle      []*agent.ExtensionAgent
+		nonIdle      []*agent.ExtensionAgent
+		regOnly      []*agent.ExtensionAgent
+		regSubReady  []*agent.ExtensionAgent
+		roles        = make(map[*agent.ExtensionAgent]AgentRole)
+		roleSeqByKey = make(map[string]int)
+		policy       = PairingRandom
 	)
 
 	reorderUsable := func(list []*agent.ExtensionAgent) []*agent.ExtensionAgent {
@@ -101,6 +113,34 @@ func (p *PoolEngine) run() {
 		return append(usable, blocked...)
 	}
 
+	assignRole := func(a *agent.ExtensionAgent) AgentRole {
+		key := roleAssignmentKey(a, policy)
+		seq := roleSeqByKey[key]
+		roleSeqByKey[key] = seq + 1
+		if seq%2 == 1 {
+			return RoleUAC
+		}
+		return RoleUAS
+	}
+
+	rebuildIdleRoles := func(agents []*agent.ExtensionAgent) {
+		uacIdle = nil
+		uasIdle = nil
+		roles = make(map[*agent.ExtensionAgent]AgentRole, len(agents))
+		roleSeqByKey = make(map[string]int)
+		for _, ag := range agents {
+			role := assignRole(ag)
+			roles[ag] = role
+			if role == RoleUAC {
+				ag.SetAutoAnswer(false)
+				uacIdle = append(uacIdle, ag)
+			} else {
+				ag.SetAutoAnswer(true)
+				uasIdle = append(uasIdle, ag)
+			}
+		}
+	}
+
 	snapshot := func() PoolRoleCounts {
 		return PoolRoleCounts{
 			UACIdle:     len(uacIdle),
@@ -116,11 +156,7 @@ func (p *PoolEngine) run() {
 	for cmd := range p.cmdCh {
 		switch cmd.op {
 		case "assign_ready":
-			role := RoleUAS
-			if readySeq%2 == 1 {
-				role = RoleUAC
-			}
-			readySeq++
+			role := assignRole(cmd.agent)
 			roles[cmd.agent] = role
 			regSubReady = append(regSubReady, cmd.agent)
 			cmd.resp <- poolResponse{role: role, counts: snapshot()}
@@ -136,6 +172,19 @@ func (p *PoolEngine) run() {
 		case "add_reg_only":
 			regOnly = append(regOnly, cmd.agent)
 
+		case "set_policy":
+			switch cmd.policy {
+			case PairingRandom, PairingCrossZone, PairingSameZone, PairingSameController:
+				policy = cmd.policy
+			default:
+				policy = PairingRandom
+			}
+			idleAgents := make([]*agent.ExtensionAgent, 0, len(uacIdle)+len(uasIdle))
+			idleAgents = append(idleAgents, uacIdle...)
+			idleAgents = append(idleAgents, uasIdle...)
+			rebuildIdleRoles(idleAgents)
+			cmd.resp <- poolResponse{ok: true}
+
 		case "next_pair":
 			uacIdle = reorderUsable(uacIdle)
 			uasIdle = reorderUsable(uasIdle)
@@ -148,10 +197,15 @@ func (p *PoolEngine) run() {
 				cmd.resp <- poolResponse{}
 				continue
 			}
-			caller := uacIdle[0]
-			callee := uasIdle[0]
-			uacIdle = uacIdle[1:]
-			uasIdle = uasIdle[1:]
+			callerIdx, calleeIdx := selectPair(uacIdle, uasIdle, policy)
+			if callerIdx < 0 || calleeIdx < 0 {
+				cmd.resp <- poolResponse{}
+				continue
+			}
+			caller := uacIdle[callerIdx]
+			callee := uasIdle[calleeIdx]
+			uacIdle = append(uacIdle[:callerIdx], uacIdle[callerIdx+1:]...)
+			uasIdle = append(uasIdle[:calleeIdx], uasIdle[calleeIdx+1:]...)
 			caller.SetAutoAnswer(false)
 			callee.SetAutoAnswer(true)
 			nonIdle = append(nonIdle, caller, callee)
@@ -185,21 +239,7 @@ func (p *PoolEngine) run() {
 			nonIdle = nil
 			regOnly = nil
 			regSubReady = append([]*agent.ExtensionAgent(nil), cmd.agents...)
-			roles = make(map[*agent.ExtensionAgent]AgentRole, len(cmd.agents))
-			readySeq = 0
-			for _, ag := range cmd.agents {
-				role := RoleUAS
-				if readySeq%2 == 1 {
-					role = RoleUAC
-					ag.SetAutoAnswer(false)
-					uacIdle = append(uacIdle, ag)
-				} else {
-					ag.SetAutoAnswer(true)
-					uasIdle = append(uasIdle, ag)
-				}
-				roles[ag] = role
-				readySeq++
-			}
+			rebuildIdleRoles(cmd.agents)
 
 		case "remove_from_idle":
 			found := false
@@ -225,11 +265,7 @@ func (p *PoolEngine) run() {
 			cmd.resp <- poolResponse{ok: found}
 
 		case "add_to_idle":
-			role := RoleUAS
-			if readySeq%2 == 1 {
-				role = RoleUAC
-			}
-			readySeq++
+			role := assignRole(cmd.agent)
 			roles[cmd.agent] = role
 			if role == RoleUAC {
 				cmd.agent.SetAutoAnswer(false)
@@ -267,8 +303,52 @@ func (p *PoolEngine) run() {
 
 		case "counts":
 			cmd.resp <- poolResponse{counts: snapshot()}
+
 		}
 	}
+}
+
+func selectPair(uacs, uases []*agent.ExtensionAgent, policy PairingPolicy) (int, int) {
+	for i, uac := range uacs {
+		for j, uas := range uases {
+			if pairAllowed(uac, uas, policy) {
+				return i, j
+			}
+		}
+	}
+	return -1, -1
+}
+
+func pairAllowed(uac, uas *agent.ExtensionAgent, policy PairingPolicy) bool {
+	switch policy {
+	case PairingCrossZone:
+		return uac.ZoneID != "" && uas.ZoneID != "" && uac.ZoneID != uas.ZoneID
+	case PairingSameZone:
+		return uac.ZoneID != "" && uas.ZoneID != "" && uac.ZoneID == uas.ZoneID
+	case PairingSameController:
+		return uac.ControllerHost != "" &&
+			uac.ControllerHost == uas.ControllerHost &&
+			uac.ControllerPort == uas.ControllerPort
+	default:
+		return true
+	}
+}
+
+func roleAssignmentKey(a *agent.ExtensionAgent, policy PairingPolicy) string {
+	if a == nil {
+		return "global"
+	}
+	switch policy {
+	case PairingSameController:
+		if a.ControllerHost != "" {
+			return fmt.Sprintf("controller:%s:%d", a.ControllerHost, a.ControllerPort)
+		}
+	case PairingSameZone:
+		if a.ZoneID != "" {
+			return "zone:" + a.ZoneID
+		}
+	}
+	return "global"
 }
 
 func countRole(roles map[*agent.ExtensionAgent]AgentRole, role AgentRole) int {
@@ -314,6 +394,12 @@ func (p *PoolEngine) NextPair() (caller, callee *agent.ExtensionAgent, ok bool, 
 	p.cmdCh <- poolCommand{op: "next_pair", resp: resp}
 	r := <-resp
 	return r.caller, r.callee, r.ok, r.stalled
+}
+
+func (p *PoolEngine) SetPairingPolicy(policy PairingPolicy) {
+	resp := make(chan poolResponse, 1)
+	p.cmdCh <- poolCommand{op: "set_policy", policy: policy, resp: resp}
+	<-resp
 }
 
 // ReturnPair moves a completed UAC/UAS pair back to their role queues.

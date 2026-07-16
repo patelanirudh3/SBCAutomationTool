@@ -21,8 +21,9 @@ import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { VMConfigSchema, getFieldWarnings } from '@/lib/config-schema'
 import { useTrafficStore } from '@/store/traffic'
 import { checkHealth, getMetricsFor, putConfigFor, startNewRunFor } from '@/lib/api'
+import { selectedEngineEndpoint } from '@/lib/engine-endpoint'
 import { cn } from '@/lib/utils'
-import type { HostHealth, VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, RtpUnsupportedCodecPolicy, TLSMode, MediaSecurity, SRTPCryptoSuite } from '@/types'
+import type { HostHealth, VMConfig, VMPair, ReachabilityStatus, SipScheme, RtpCodec, RtpUnsupportedCodecPolicy, TLSMode, MediaSecurity, SRTPCryptoSuite, PairingPolicy } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
@@ -52,8 +53,8 @@ const DEFAULTS: RawVMFormValues = {
   subscribe_events: ['dialog'],
   subscribe_refresh_events: ['dialog'],
   subscribe_unsubscribe_events: ['dialog'],
-  register_rate_cps: '10',
-  cleanup_batch_size: '10',
+  agent_connection_cps: '30',
+  agent_regsub_cps: '30',
   t1_ms: '500',
   timer_b_seconds: '32',
   sbc_host: '10.133.63.117',
@@ -86,6 +87,7 @@ const DEFAULTS: RawVMFormValues = {
   cps: '1',
   hold_time_seconds: '5',
   ramp_up_seconds: '30',
+  pairing_policy: 'random',
   media_enabled: true,
   media_security: 'rtp',
   srtp_crypto_suites: ['AES_CM_128_HMAC_SHA1_80'],
@@ -106,7 +108,7 @@ const UA_FIELDS = [
   'local_ip_mode',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
   'cps', 'hold_time_seconds', 'metrics_port', 'traffic_mode', 'call_count',
-  'duration_hours',
+  'duration_hours', 'pairing_policy',
 ]
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ const UA_FIELDS = [
 
 function pairToRaw(p: VMPair): RawVMFormValues {
   const u = p.uac
+  const legacy = u as VMConfig & { register_rate_cps?: number }
   const extStart = u.ext_start ?? parseInt(DEFAULTS.ext_start)
   const extEnd   = u.ext_end   ?? parseInt(DEFAULTS.ext_end)
   return {
@@ -138,8 +141,8 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     subscribe_events:   u.subscribe_events?.length ? u.subscribe_events : (u.subscribe_event ? [u.subscribe_event] : ['dialog']),
     subscribe_refresh_events: u.subscribe_refresh_events ?? (u.subscribe_events?.length ? u.subscribe_events : (u.subscribe_event ? [u.subscribe_event] : ['dialog'])),
     subscribe_unsubscribe_events: u.subscribe_unsubscribe_events ?? (u.subscribe_events?.length ? u.subscribe_events : (u.subscribe_event ? [u.subscribe_event] : ['dialog'])),
-    register_rate_cps:  String(u.register_rate_cps  ?? parseFloat(DEFAULTS.register_rate_cps)),
-    cleanup_batch_size: String(u.cleanup_batch_size ?? parseInt(DEFAULTS.cleanup_batch_size)),
+    agent_connection_cps: String(u.agent_connection_cps ?? parseFloat(DEFAULTS.agent_connection_cps)),
+    agent_regsub_cps:     String(u.agent_regsub_cps     ?? legacy.register_rate_cps ?? parseFloat(DEFAULTS.agent_regsub_cps)),
     t1_ms:              String(u.t1_ms              ?? parseInt(DEFAULTS.t1_ms)),
     timer_b_seconds:    String(u.timer_b_seconds    ?? parseInt(DEFAULTS.timer_b_seconds)),
     sbc_host:           u.sbc_host         ?? DEFAULTS.sbc_host,
@@ -172,6 +175,7 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     cps:                String(u.cps               ?? parseFloat(DEFAULTS.cps)),
     hold_time_seconds:  String(u.hold_time_seconds ?? parseFloat(DEFAULTS.hold_time_seconds)),
     ramp_up_seconds:    String(u.ramp_up_seconds   ?? parseInt(DEFAULTS.ramp_up_seconds)),
+    pairing_policy:     (u.pairing_policy ?? DEFAULTS.pairing_policy) as PairingPolicy,
     media_enabled:      u.media_enabled    ?? true,
     media_security:     (u.media_security   ?? 'rtp') as MediaSecurity,
     srtp_crypto_suites: (u.srtp_crypto_suites?.length ? u.srtp_crypto_suites : ['AES_CM_128_HMAC_SHA1_80']) as SRTPCryptoSuite[],
@@ -246,13 +250,14 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     subscribe_events: raw.subscribe_events,
     subscribe_refresh_events: raw.subscribe_refresh_events,
     subscribe_unsubscribe_events: raw.subscribe_unsubscribe_events,
-    register_rate_cps: raw.register_rate_cps ? parseFloat(raw.register_rate_cps) : undefined,
-    cleanup_batch_size: raw.cleanup_batch_size ? parseInt(raw.cleanup_batch_size) : undefined,
+    agent_connection_cps: raw.agent_connection_cps ? parseFloat(raw.agent_connection_cps) : undefined,
+    agent_regsub_cps: raw.agent_regsub_cps ? parseFloat(raw.agent_regsub_cps) : undefined,
     t1_ms: raw.t1_ms ? parseInt(raw.t1_ms) : undefined,
     timer_b_seconds: raw.timer_b_seconds ? parseInt(raw.timer_b_seconds) : undefined,
     cps: parseFloat(raw.cps) || 0,
     hold_time_seconds: parseFloat(raw.hold_time_seconds) || 0,
     ramp_up_seconds: raw.ramp_up_seconds ? parseInt(raw.ramp_up_seconds) : undefined,
+    pairing_policy: raw.pairing_policy,
     media_enabled: raw.media_enabled,
     media_security: raw.media_security === 'capneg' ? 'rtp' : raw.media_security,
     srtp_crypto_suites: raw.srtp_crypto_suites,
@@ -508,8 +513,9 @@ export function VMPairBook() {
 
   const handleStartNewRun = useCallback(async () => {
     if (isStartingNewRun) return
-    const vmIp = raw.vm_ip || '127.0.0.1'
-    const metricsPort = parseInt(raw.metrics_port) || 8082
+    const endpoint = selectedEngineEndpoint({ vm_ip: raw.vm_ip || '127.0.0.1', metrics_port: parseInt(raw.metrics_port) || 8082 })
+    const vmIp = endpoint.ip
+    const metricsPort = endpoint.port
     setIsStartingNewRun(true)
     setConfigPushError(null)
     try {
@@ -570,10 +576,11 @@ export function VMPairBook() {
         setReachability({ vm_id: vmId, reachable: true, checking: false })
         return
       }
-      const result = await checkHealth(vmIp, metricsPort)
+      const endpoint = selectedEngineEndpoint({ vm_ip: vmIp, metrics_port: metricsPort })
+      const result = await checkHealth(endpoint.ip, endpoint.port)
       setReachability({ vm_id: vmId, reachable: result.reachable, checking: false, error: result.reachable ? undefined : (result.error ?? 'Connection refused') })
       if (result.reachable) {
-        const metrics = await getMetricsFor(vmIp, metricsPort).catch(() => null)
+        const metrics = await getMetricsFor(endpoint.ip, endpoint.port).catch(() => null)
         setConfigHostHealth(metrics?.host_health ?? null)
       } else {
         setConfigHostHealth(null)
@@ -596,7 +603,8 @@ export function VMPairBook() {
     const metricsPort = parseInt(raw.metrics_port) || 0
     if (!vmIp || !metricsPort) return
     const id = setInterval(async () => {
-      const metrics = await getMetricsFor(vmIp, metricsPort).catch(() => null)
+      const endpoint = selectedEngineEndpoint({ vm_ip: vmIp, metrics_port: metricsPort })
+      const metrics = await getMetricsFor(endpoint.ip, endpoint.port).catch(() => null)
       if (metrics?.host_health) setConfigHostHealth(metrics.host_health)
     }, 10000)
     return () => clearInterval(id)
@@ -708,7 +716,8 @@ export function VMPairBook() {
       await new Promise((r) => setTimeout(r, 600))
     } else {
       try {
-        await putConfigFor(uac.vm_ip, uac.metrics_port, payload)
+        const endpoint = selectedEngineEndpoint(uac)
+        await putConfigFor(endpoint.ip, endpoint.port, payload)
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Failed to push config'
         setConfigPushError(msg)

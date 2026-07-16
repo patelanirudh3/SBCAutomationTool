@@ -503,11 +503,16 @@ cat > "$STAGE_DIR/RELEASE-NOTES.txt" <<EOF
 Nexus Traffic Engine ${VERSION}
 
 Highlights:
-- Long-run memory retention bounded.
-- Full call details streamed to disk as NDJSON.
-- Current-run UDP error delta reporting.
-- REGISTER refresh failure recovery and traffic-pool protection.
-- GUI Start New Run flow and post-cleanup reporting improvements.
+- Multi-Zone HA: two-zone multi-controller topology with configurable agent distribution.
+- Per-agent autonomous failover recovery with race-to-recovery (Path A/B) model.
+- Configurable failover trigger: per-agent, min-agents, or percentage with sliding time window.
+- G.729 codec support with correct SDP offer, RTP packetization, and codec-aware MOS estimation.
+- SIP transaction layer (retransmission, duplicate suppression, RFC 3261 timers).
+- Failed call records: full Call-ID display, Server/User-Agent headers from error responses, copy-to-clipboard.
+- Live CPS adjustment during traffic via GUI and API.
+- GUI version badge in navbar.
+- UDP buffer tuning guidance for high-CPS media runs.
+- Numerous HA, cleanup, and pool-safety bug fixes.
 EOF
 
 touch "$STAGE_DIR/logs/.gitkeep"

@@ -31,6 +31,34 @@ export interface SummaryGroups {
   bhcc: number | null
 }
 
+function formatRtpCodec(codec?: string): string {
+  switch (codec) {
+    case 'G711_ULAW':
+      return 'G711-ULAW'
+    case 'G711_ALAW':
+      return 'G711-ALAW'
+    case 'G729_AUDIO':
+      return 'G.729 audio'
+    case 'G729':
+      return 'G.729 frame'
+    default:
+      return codec || '—'
+  }
+}
+
+function formatPairingPolicy(policy?: string): string {
+  switch (policy) {
+    case 'cross_zone':
+      return 'Cross Zone Only'
+    case 'same_zone':
+      return 'Same Zone'
+    case 'same_controller':
+      return 'Same Controller'
+    default:
+      return 'Random'
+  }
+}
+
 function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups {
   const extStart = parseInt(raw.ext_start) || 0
   const extEnd = parseInt(raw.ext_end) || 0
@@ -84,6 +112,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
         ? `${raw.ramp_up_seconds}s`
         : 'off',
     },
+    { label: 'Pairing', value: formatPairingPolicy(raw.pairing_policy) },
     { label: 'Mode', value: raw.traffic_mode || '—' },
     ...(raw.traffic_mode === 'smoke' ? [{ label: 'Calls', value: raw.call_count }] : []),
     ...(raw.traffic_mode === 'timed' ? [{ label: 'Duration', value: formatDurationHours(raw.duration_hours) }] : []),
@@ -103,8 +132,8 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
   const registration: SummaryItem[] = [
     { label: 'REG Expires', value: `${raw.register_expires || '3600'}s` },
     { label: 'SUB Expires', value: `${raw.subscribe_expires || '3600'}s` },
-    { label: 'Reg Rate', value: `${raw.register_rate_cps || '10'} reg/s` },
-    { label: 'Cleanup Batch', value: `${raw.cleanup_batch_size || '10'} ext/batch` },
+    { label: 'Agent Conn Rate', value: `${raw.agent_connection_cps || '30'} /s` },
+    { label: 'Agent Reg/Sub Rate', value: `${raw.agent_regsub_cps || '30'} /s` },
     { label: 'T1 / Timer-B', value: `${raw.t1_ms || '500'}ms / ${raw.timer_b_seconds || '32'}s` },
   ]
 
@@ -117,7 +146,7 @@ function summarize(raw: RawVMFormValues, adv?: AdvancedSettings): SummaryGroups 
               { label: 'SRTP Keys', value: 'Auto per call' },
             ]
           : []),
-        { label: 'Codec', value: raw.rtp_codec },
+        { label: 'Codec', value: formatRtpCodec(raw.rtp_codec) },
         { label: 'ptime', value: `${raw.rtp_ptime || '20'}ms` },
       ]
     : [{ label: 'Media', value: 'Disabled', muted: true }]
@@ -225,7 +254,7 @@ export function ConfigSummaryStrip({ raw, onOpenDrawer }: ConfigSummaryStripProp
       <SummaryPill label="Hold"  value={`${raw.hold_time_seconds || '—'}s`} />
       <SummaryPill
         label="Media"
-        value={raw.media_enabled ? raw.rtp_codec.replace('G711_', 'G711-') : 'off'}
+        value={raw.media_enabled ? formatRtpCodec(raw.rtp_codec) : 'off'}
       />
       <SummaryPill label="Mode" value={raw.traffic_mode || '—'} />
       <span className="ml-auto flex shrink-0 items-center gap-1 text-xs text-slate-400 group-hover:text-emerald-400 transition-colors">

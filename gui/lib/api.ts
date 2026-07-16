@@ -1,4 +1,4 @@
-import type { VMConfig, TrafficMetrics, RunPhase, PerformanceDiagnosticsMode } from '@/types'
+import type { VMConfig, TrafficMetrics, RunPhase, PerformanceDiagnosticsMode, PairingPolicy } from '@/types'
 
 const BASE_URL =
   process.env.NEXT_PUBLIC_COORDINATOR_URL ?? 'http://localhost:8082'
@@ -101,6 +101,26 @@ export async function putConfig(config: VMConfig): Promise<void> {
     method: 'PUT',
     body: JSON.stringify(config),
   })
+}
+
+export interface CurrentConfigResponse {
+  config: Partial<VMConfig> & Record<string, unknown>
+  state: string
+  vm_id: string
+  yaml_path?: string
+}
+
+export async function getCurrentConfigFor(
+  ip: string,
+  port: number
+): Promise<CurrentConfigResponse | null> {
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/config`, { signal: AbortSignal.timeout(5000) })
+    if (res.status === 404) return null
+    return parseJsonResponse<CurrentConfigResponse>(res)
+  } catch {
+    return null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +586,20 @@ export async function updateTrafficCPSFor(
   return parseJsonResponse<{ status: string; target_cps: number }>(res)
 }
 
+export async function updatePairingPolicyFor(
+  ip: string,
+  port: number,
+  policy: PairingPolicy,
+): Promise<{ status: string; pairing_policy: PairingPolicy }> {
+  const res = await fetch(`http://${ip}:${port}/api/traffic/pairing-policy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ policy }),
+    signal: AbortSignal.timeout(10_000),
+  })
+  return parseJsonResponse<{ status: string; pairing_policy: PairingPolicy }>(res)
+}
+
 export function startCleanupFor(ip: string, port: number): Promise<{ status: string }> {
   return postNoBody(ip, port, '/api/cleanup/start')
 }
@@ -587,6 +621,17 @@ export async function resetTestFor(
   port: number
 ): Promise<{ status: string; state?: string }> {
   const res = await fetch(`http://${ip}:${port}/api/test/reset`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10_000),
+  })
+  return parseJsonResponse<{ status: string; state?: string }>(res)
+}
+
+export async function forceResetTestFor(
+  ip: string,
+  port: number
+): Promise<{ status: string; state?: string }> {
+  const res = await fetch(`http://${ip}:${port}/api/test/force-reset`, {
     method: 'POST',
     signal: AbortSignal.timeout(10_000),
   })

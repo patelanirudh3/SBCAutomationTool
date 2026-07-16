@@ -87,8 +87,11 @@ type VMConfig struct {
 	MetricsInterval int `yaml:"metrics_interval" json:"metrics_interval"`
 	MetricsPort     int `yaml:"metrics_port" json:"metrics_port"`
 
+	// Deprecated: use AgentConnectionCPS and AgentRegSubCPS. Kept for
+	// backward-compatible config parsing only.
 	RegisterBatchSize          int      `yaml:"register_batch_size" json:"register_batch_size"`
-	RegisterBatchDelayMs       int      `yaml:"register_batch_delay_ms" json:"register_batch_delay_ms"`
+	AgentConnectionCPS         int      `yaml:"agent_connection_cps" json:"agent_connection_cps"`
+	AgentRegSubCPS             int      `yaml:"agent_regsub_cps" json:"agent_regsub_cps"`
 	RegisterExpires            int      `yaml:"register_expires" json:"register_expires"`
 	RegisterRetry              int      `yaml:"register_retry" json:"register_retry"`
 	RegisterTimeout            int      `yaml:"register_timeout" json:"register_timeout"`
@@ -99,10 +102,12 @@ type VMConfig struct {
 	SubscribeEvents            []string `yaml:"subscribe_events" json:"subscribe_events"`
 	SubscribeRefreshEvents     []string `yaml:"subscribe_refresh_events" json:"subscribe_refresh_events"`
 	SubscribeUnsubscribeEvents []string `yaml:"subscribe_unsubscribe_events" json:"subscribe_unsubscribe_events"`
-	CleanupBatchSize           int      `yaml:"cleanup_batch_size" json:"cleanup_batch_size"`
-	CleanupUnsubscribeRate     int      `yaml:"cleanup_unsubscribe_rate_per_sec" json:"cleanup_unsubscribe_rate_per_sec"`
-	CleanupUnregisterRate      int      `yaml:"cleanup_unregister_rate_per_sec" json:"cleanup_unregister_rate_per_sec"`
-	CleanupAuditTimeoutMinutes int      `yaml:"cleanup_audit_timeout_minutes" json:"cleanup_audit_timeout_minutes"`
+	// Deprecated: cleanup pacing is controlled by CleanupUnsubscribeRate and
+	// CleanupUnregisterRate. Kept for backward-compatible config parsing only.
+	CleanupBatchSize           int `yaml:"cleanup_batch_size" json:"cleanup_batch_size"`
+	CleanupUnsubscribeRate     int `yaml:"cleanup_unsubscribe_rate_per_sec" json:"cleanup_unsubscribe_rate_per_sec"`
+	CleanupUnregisterRate      int `yaml:"cleanup_unregister_rate_per_sec" json:"cleanup_unregister_rate_per_sec"`
+	CleanupAuditTimeoutMinutes int `yaml:"cleanup_audit_timeout_minutes" json:"cleanup_audit_timeout_minutes"`
 
 	// SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
 	// Zero means use the RFC default. T1Ms drives Timer A (UDP-only INVITE
@@ -142,6 +147,7 @@ type VMConfig struct {
 	TrafficMode   string  `yaml:"traffic_mode" json:"traffic_mode"`
 	CallCount     int     `yaml:"call_count" json:"call_count"`
 	DurationHours float64 `yaml:"duration_hours" json:"duration_hours"`
+	PairingPolicy string  `yaml:"pairing_policy" json:"pairing_policy"`
 
 	Scenario                    string  `yaml:"scenario" json:"scenario"`
 	ScenarioHoldDurationSeconds float64 `yaml:"scenario_hold_duration_seconds" json:"scenario_hold_duration_seconds"`
@@ -298,13 +304,18 @@ func uint32ToIPv4(v uint32) net.IP {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// BatchDelay returns the inter-batch delay for TCP socket creation and
-// REGISTER batches as a time.Duration.
-func (c *VMConfig) BatchDelay() time.Duration {
-	if c.RegisterBatchDelayMs > 0 {
-		return time.Duration(c.RegisterBatchDelayMs) * time.Millisecond
+func (c *VMConfig) EffectiveAgentConnectionCPS() int {
+	if c.AgentConnectionCPS > 0 {
+		return c.AgentConnectionCPS
 	}
-	return 1000 * time.Millisecond
+	return 30
+}
+
+func (c *VMConfig) EffectiveAgentRegSubCPS() int {
+	if c.AgentRegSubCPS > 0 {
+		return c.AgentRegSubCPS
+	}
+	return 30
 }
 
 // BuildResolver returns a custom *net.Resolver using the configured DNS
@@ -423,14 +434,20 @@ func ApplyDefaults(cfg *VMConfig) {
 	if cfg.MetricsInterval == 0 {
 		cfg.MetricsInterval = 3
 	}
+	if cfg.PairingPolicy == "" {
+		cfg.PairingPolicy = "random"
+	}
 	if cfg.RegisterBatchSize == 0 {
 		cfg.RegisterBatchSize = 10
 	}
+	if cfg.AgentConnectionCPS == 0 {
+		cfg.AgentConnectionCPS = 30
+	}
+	if cfg.AgentRegSubCPS == 0 {
+		cfg.AgentRegSubCPS = 30
+	}
 	if cfg.SubscribeConcurrency == 0 {
 		cfg.SubscribeConcurrency = 10
-	}
-	if cfg.RegisterBatchDelayMs == 0 {
-		cfg.RegisterBatchDelayMs = 1000
 	}
 	if cfg.RegisterExpires == 0 {
 		cfg.RegisterExpires = 3600
@@ -460,9 +477,6 @@ func ApplyDefaults(cfg *VMConfig) {
 	}
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 5
-	}
-	if cfg.CleanupBatchSize == 0 {
-		cfg.CleanupBatchSize = 10
 	}
 	if cfg.CleanupUnsubscribeRate == 0 {
 		cfg.CleanupUnsubscribeRate = 20
@@ -878,8 +892,8 @@ func Validate(cfg *VMConfig) error {
 		if cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) == 0 {
 			errs = append(errs, "zone_config with at least one zone is required when ha_mode=multi_zone")
 		} else {
-			if len(cfg.ZoneConfig.Zones) != 2 {
-				errs = append(errs, fmt.Sprintf("multi_zone requires exactly 2 zones, got %d", len(cfg.ZoneConfig.Zones)))
+			if len(cfg.ZoneConfig.Zones) > 2 {
+				errs = append(errs, fmt.Sprintf("multi_zone supports 1 or 2 zones, got %d", len(cfg.ZoneConfig.Zones)))
 			}
 			for zi, z := range cfg.ZoneConfig.Zones {
 				if strings.TrimSpace(z.ZoneID) == "" {
@@ -898,7 +912,7 @@ func Validate(cfg *VMConfig) error {
 				}
 			}
 			pct := cfg.ZoneConfig.ZoneDistributionPct
-			if pct < 1 || pct > 99 {
+			if len(cfg.ZoneConfig.Zones) == 2 && (pct < 1 || pct > 99) {
 				errs = append(errs, fmt.Sprintf("zone_distribution_pct must be 1..99, got %d", pct))
 			}
 			totalAgents := cfg.ExtCount()
@@ -914,6 +928,13 @@ func Validate(cfg *VMConfig) error {
 		if cfg.HAMode != "" {
 			errs = append(errs, fmt.Sprintf("ha_mode must be 'single', 'dual', or 'multi_zone', got %q", cfg.HAMode))
 		}
+	}
+	if cfg.HAMode == "multi_zone" {
+		slog.Warn("multi_zone uses zone_config controllers for agent assignment; flat sbc_host/secondary_host are ignored for primary/secondary pairing",
+			"sbc_host", cfg.SBCHost,
+			"sbc_port", cfg.SBCPort,
+			"secondary_host", cfg.SecondaryHost,
+			"secondary_port", cfg.SecondaryPort)
 	}
 
 	if cfg.ExtStart > cfg.ExtEnd {
@@ -961,6 +982,24 @@ func Validate(cfg *VMConfig) error {
 	if cfg.SBCPort <= 0 || cfg.SBCPort > 65535 {
 		errs = append(errs, fmt.Sprintf("sbc_port out of range: %d", cfg.SBCPort))
 	}
+	if cfg.AgentConnectionCPS < 1 || cfg.AgentConnectionCPS > 500 {
+		errs = append(errs, fmt.Sprintf("agent_connection_cps must be 1..500, got %d", cfg.AgentConnectionCPS))
+	}
+	if cfg.AgentRegSubCPS < 1 || cfg.AgentRegSubCPS > 500 {
+		errs = append(errs, fmt.Sprintf("agent_regsub_cps must be 1..500, got %d", cfg.AgentRegSubCPS))
+	}
+	if cfg.CleanupUnsubscribeRate < 1 || cfg.CleanupUnsubscribeRate > 500 {
+		errs = append(errs, fmt.Sprintf("cleanup_unsubscribe_rate_per_sec must be 1..500, got %d", cfg.CleanupUnsubscribeRate))
+	}
+	if cfg.CleanupUnregisterRate < 1 || cfg.CleanupUnregisterRate > 500 {
+		errs = append(errs, fmt.Sprintf("cleanup_unregister_rate_per_sec must be 1..500, got %d", cfg.CleanupUnregisterRate))
+	}
+	if cfg.RegisterBatchSize != 10 {
+		slog.Warn("register_batch_size is deprecated and ignored for setup pacing; use agent_connection_cps and agent_regsub_cps",
+			"register_batch_size", cfg.RegisterBatchSize,
+			"agent_connection_cps", cfg.AgentConnectionCPS,
+			"agent_regsub_cps", cfg.AgentRegSubCPS)
+	}
 
 	if cfg.T1Ms < 100 || cfg.T1Ms > 5000 {
 		errs = append(errs, fmt.Sprintf("t1_ms must be 100..5000 ms, got %d", cfg.T1Ms))
@@ -971,10 +1010,6 @@ func Validate(cfg *VMConfig) error {
 	if cfg.FailbackDelaySeconds < 1 || cfg.FailbackDelaySeconds > 3600 {
 		errs = append(errs, fmt.Sprintf("failback_delay_seconds must be 1..3600 s, got %d", cfg.FailbackDelaySeconds))
 	}
-	if cfg.CleanupBatchSize < 1 || cfg.CleanupBatchSize > 100 {
-		errs = append(errs, fmt.Sprintf("cleanup_batch_size must be 1..100, got %d", cfg.CleanupBatchSize))
-	}
-
 	if cfg.RTPBurstSeconds < 0 {
 		errs = append(errs, fmt.Sprintf("rtp_burst_seconds must be >= 0, got %d", cfg.RTPBurstSeconds))
 	}
@@ -993,9 +1028,9 @@ func Validate(cfg *VMConfig) error {
 		cfg.RTPCodec = "G711_ULAW"
 	}
 	switch cfg.RTPCodec {
-	case "G711_ULAW", "G711_ALAW", "G729":
+	case "G711_ULAW", "G711_ALAW", "G729", "G729_AUDIO":
 	default:
-		errs = append(errs, fmt.Sprintf("rtp_codec must be 'G711_ULAW', 'G711_ALAW', or 'G729', got %q", cfg.RTPCodec))
+		errs = append(errs, fmt.Sprintf("rtp_codec must be 'G711_ULAW', 'G711_ALAW', 'G729', or 'G729_AUDIO', got %q", cfg.RTPCodec))
 	}
 	cfg.RTPUnsupportedCodecPolicy = strings.ToLower(strings.TrimSpace(cfg.RTPUnsupportedCodecPolicy))
 	if cfg.RTPUnsupportedCodecPolicy == "" {
@@ -1059,6 +1094,15 @@ func Validate(cfg *VMConfig) error {
 	if cfg.TrafficMode != "" && cfg.TrafficMode != "smoke" && cfg.TrafficMode != "timed" && cfg.TrafficMode != "unlimited" {
 		errs = append(errs, fmt.Sprintf("traffic_mode must be 'smoke', 'timed', or 'unlimited', got %q", cfg.TrafficMode))
 	}
+	cfg.PairingPolicy = strings.ToLower(strings.TrimSpace(cfg.PairingPolicy))
+	if cfg.PairingPolicy == "" {
+		cfg.PairingPolicy = "random"
+	}
+	switch cfg.PairingPolicy {
+	case "random", "cross_zone", "same_zone", "same_controller":
+	default:
+		errs = append(errs, fmt.Sprintf("pairing_policy must be 'random', 'cross_zone', 'same_zone', or 'same_controller', got %q", cfg.PairingPolicy))
+	}
 
 	// RTCP SR safety checks (Phase 2). ApplyDefaults coerces mux to true
 	// whenever SR is enabled, but Validate also rejects the combination
@@ -1121,10 +1165,8 @@ func Validate(cfg *VMConfig) error {
 		"subscribe_events", cfg.SubscribeEvents,
 		"subscribe_refresh_events", cfg.SubscribeRefreshEvents,
 		"subscribe_unsubscribe_events", cfg.SubscribeUnsubscribeEvents,
-		"register_batch_size", cfg.RegisterBatchSize,
+		"register_batch_size_deprecated", cfg.RegisterBatchSize,
 		"subscribe_concurrency", cfg.SubscribeConcurrency,
-		"cleanup_batch_size", cfg.CleanupBatchSize,
-		"register_batch_delay_ms", cfg.RegisterBatchDelayMs,
 		"register_timeout", cfg.RegisterTimeout,
 		"connect_timeout", cfg.ConnectTimeout,
 		"cleanup_unsubscribe_rate_per_sec", cfg.CleanupUnsubscribeRate,
@@ -1134,6 +1176,7 @@ func Validate(cfg *VMConfig) error {
 		"srtp_crypto_suites", cfg.SRTPCryptoSuites,
 		"rtp_mode", cfg.RTPMode,
 		"traffic_mode", cfg.TrafficMode,
+		"pairing_policy", cfg.PairingPolicy,
 	)
 
 	if cfg.HAMode == "multi_zone" && cfg.ZoneConfig != nil {
@@ -1201,36 +1244,59 @@ type AgentGroupAssignment struct {
 	ExtEnd              int
 }
 
-// ComputeAgentGroups distributes agents across zones and controllers, pairing
-// each primary controller with a cross-zone secondary using round-robin.
+// ComputeAgentGroups distributes agents across zones and controllers. With two
+// zones, each primary controller is paired with a cross-zone secondary using
+// round-robin. With one zone, groups have no secondary and secondary-only work
+// is skipped by the multi-zone lifecycle.
 // Returns nil for single/dual modes (those use the legacy flat config).
 func (cfg *VMConfig) ComputeAgentGroups() []AgentGroupAssignment {
-	if cfg.HAMode != "multi_zone" || cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) != 2 {
+	if cfg.HAMode != "multi_zone" || cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) == 0 {
 		return nil
 	}
 	zoneA := cfg.ZoneConfig.Zones[0]
-	zoneB := cfg.ZoneConfig.Zones[1]
 	totalAgents := cfg.ExtCount()
+	if len(cfg.ZoneConfig.Zones) == 1 {
+		return computeZoneAssignments(zoneA, nil, totalAgents, cfg.ExtStart)
+	}
+	zoneB := cfg.ZoneConfig.Zones[1]
 	zoneACount := totalAgents * cfg.ZoneConfig.ZoneDistributionPct / 100
 	zoneBCount := totalAgents - zoneACount
 
 	var groups []AgentGroupAssignment
 	extCursor := cfg.ExtStart
 
-	zoneAPerCtrl := zoneACount / len(zoneA.Controllers)
-	zoneARemainder := zoneACount % len(zoneA.Controllers)
-	for i, ctrl := range zoneA.Controllers {
-		count := zoneAPerCtrl
-		if i < zoneARemainder {
+	zoneAGroups := computeZoneAssignments(zoneA, zoneB.Controllers, zoneACount, extCursor)
+	groups = append(groups, zoneAGroups...)
+	if len(zoneAGroups) > 0 {
+		extCursor = zoneAGroups[len(zoneAGroups)-1].ExtEnd + 1
+	}
+	groups = append(groups, computeZoneAssignments(zoneB, zoneA.Controllers, zoneBCount, extCursor)...)
+
+	return groups
+}
+
+func computeZoneAssignments(zone Zone, secondaryControllers []ZoneController, count, extCursor int) []AgentGroupAssignment {
+	if count <= 0 || len(zone.Controllers) == 0 {
+		return nil
+	}
+	perCtrl := count / len(zone.Controllers)
+	remainder := count % len(zone.Controllers)
+	groups := make([]AgentGroupAssignment, 0, len(zone.Controllers))
+	for i, ctrl := range zone.Controllers {
+		count := perCtrl
+		if i < remainder {
 			count++
 		}
 		if count == 0 {
 			continue
 		}
-		secondary := zoneB.Controllers[i%len(zoneB.Controllers)]
+		var secondary ZoneController
+		if len(secondaryControllers) > 0 {
+			secondary = secondaryControllers[i%len(secondaryControllers)]
+		}
 		groups = append(groups, AgentGroupAssignment{
-			GroupID:             fmt.Sprintf("%s-ctrl-%d", zoneA.ZoneID, i+1),
-			ZoneID:              zoneA.ZoneID,
+			GroupID:             fmt.Sprintf("%s-ctrl-%d", zone.ZoneID, i+1),
+			ZoneID:              zone.ZoneID,
 			PrimaryController:   ctrl,
 			SecondaryController: secondary,
 			ExtStart:            extCursor,
@@ -1238,29 +1304,6 @@ func (cfg *VMConfig) ComputeAgentGroups() []AgentGroupAssignment {
 		})
 		extCursor += count
 	}
-
-	zoneBPerCtrl := zoneBCount / len(zoneB.Controllers)
-	zoneBRemainder := zoneBCount % len(zoneB.Controllers)
-	for i, ctrl := range zoneB.Controllers {
-		count := zoneBPerCtrl
-		if i < zoneBRemainder {
-			count++
-		}
-		if count == 0 {
-			continue
-		}
-		secondary := zoneA.Controllers[i%len(zoneA.Controllers)]
-		groups = append(groups, AgentGroupAssignment{
-			GroupID:             fmt.Sprintf("%s-ctrl-%d", zoneB.ZoneID, i+1),
-			ZoneID:              zoneB.ZoneID,
-			PrimaryController:   ctrl,
-			SecondaryController: secondary,
-			ExtStart:            extCursor,
-			ExtEnd:              extCursor + count - 1,
-		})
-		extCursor += count
-	}
-
 	return groups
 }
 

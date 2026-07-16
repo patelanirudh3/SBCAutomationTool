@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { MessageCircle } from 'lucide-react'
@@ -8,6 +9,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { SessionMenu } from './SessionMenu'
 import type { RunPhase } from '@/types'
 import { cn } from '@/lib/utils'
+import { engineBaseUrl, selectedEngineEndpoint } from '@/lib/engine-endpoint'
+
+const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || '1.15.1'
 
 const PHASE_LABEL: Record<RunPhase, string> = {
   IDLE: 'Idle',
@@ -51,16 +55,81 @@ function deriveWsStatus(ws: { uac: WsDisplayStatus }): WsDisplayStatus {
   return ws.uac
 }
 
+function formatGMT(ms: number): string {
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZone: 'UTC',
+    timeZoneName: 'short',
+  }).format(new Date(ms))
+}
+
 export function Navbar() {
   const phase = useTrafficStore((s) => s.phase)
   const wsStatusRaw = useTrafficStore((s) => s.wsStatus)
   const wsStatus = deriveWsStatus(wsStatusRaw)
   const chatOpen = useTrafficStore((s) => s.chatPanelOpen)
   const setChatOpen = useTrafficStore((s) => s.setChatPanelOpen)
+  const selectedEngine = useTrafficStore((s) => s.selectedEngine)
   const pathname = usePathname()
+  const [engineOffsetMs, setEngineOffsetMs] = useState(0)
+  const [clockNowMs, setClockNowMs] = useState(() => Date.now())
+  const [clockReachable, setClockReachable] = useState(true)
 
   const isScenarioMode = pathname.startsWith('/scenarios')
   const showWsStatus = (phase === 'TRAFFIC' || phase === 'STOPPING') && wsStatus !== 'connected'
+  const clockEndpoint = useMemo(
+    () => selectedEngine ?? selectedEngineEndpoint(),
+    [selectedEngine],
+  )
+  const engineTimeMs = clockNowMs + engineOffsetMs
+  const engineTimeLabel = formatGMT(engineTimeMs)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const syncEngineTime = async () => {
+      try {
+        const res = await fetch(`${engineBaseUrl(clockEndpoint)}/api/ping`, {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(3000),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json() as { server_unix_ms?: number; server_time_utc?: string }
+        const serverMs =
+          typeof data.server_unix_ms === 'number'
+            ? data.server_unix_ms
+            : data.server_time_utc
+              ? Date.parse(data.server_time_utc)
+              : NaN
+        if (!Number.isFinite(serverMs)) throw new Error('missing engine time')
+        if (!cancelled) {
+          setEngineOffsetMs(serverMs - Date.now())
+          setClockReachable(true)
+        }
+      } catch {
+        if (!cancelled) setClockReachable(false)
+      }
+    }
+
+    syncEngineTime()
+    const syncTimer = window.setInterval(syncEngineTime, 30_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(syncTimer)
+    }
+  }, [clockEndpoint])
+
+  useEffect(() => {
+    const tick = window.setInterval(() => setClockNowMs(Date.now()), 1000)
+    return () => window.clearInterval(tick)
+  }, [])
 
   return (
     <header className="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-border bg-card px-5">
@@ -71,6 +140,9 @@ export function Navbar() {
         </span>
         <span className="font-bold tracking-tight text-base text-foreground">
           Nexus Studio
+        </span>
+        <span className="rounded border border-amber-500/40 bg-amber-950/20 px-1.5 py-0.5 text-[10px] font-mono text-amber-300">
+          v{APP_VERSION}
         </span>
       </div>
 
@@ -116,6 +188,15 @@ export function Navbar() {
 
       {/* Spacer */}
       <div className="flex-1" />
+
+      {/* Session management dropdown */}
+      {selectedEngine && (
+        <div className="hidden items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900/60 px-2.5 py-1 text-[11px] font-mono text-slate-300 lg:flex">
+          <span className="size-2 rounded-full bg-emerald-400" />
+          <span>Engine {selectedEngine.ip}:{selectedEngine.port}</span>
+          <span className="text-slate-500">({selectedEngine.source})</span>
+        </div>
+      )}
 
       {/* Session management dropdown */}
       <SessionMenu />
@@ -168,6 +249,18 @@ export function Navbar() {
         </Tooltip>
       </>
       )}
+      <div
+        className={cn(
+          'ml-1 rounded-md border px-2.5 py-1 text-right font-mono text-[11px]',
+          clockReachable
+            ? 'border-slate-700 bg-slate-900/70 text-slate-200'
+            : 'border-amber-500/40 bg-amber-950/20 text-amber-300',
+        )}
+        title={`Engine VM time from ${clockEndpoint.ip}:${clockEndpoint.port}`}
+      >
+        <div className="text-[9px] uppercase tracking-widest text-slate-500">Engine GMT</div>
+        <div>{engineTimeLabel}</div>
+      </div>
     </header>
   )
 }

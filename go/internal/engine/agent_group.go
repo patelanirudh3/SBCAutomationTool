@@ -64,6 +64,13 @@ func (g *AgentGroup) ActiveController() string {
 	return "primary"
 }
 
+// HasSecondary reports whether this group has a configured standby controller.
+// Single-zone multi-zone topologies intentionally leave SecondaryCtrl empty and
+// still use the multi-zone code path with secondary-only work skipped.
+func (g *AgentGroup) HasSecondary() bool {
+	return g.SecondaryCtrl.Host != "" && g.SecondaryCtrl.Port > 0
+}
+
 // SetActiveController sets the active controller label.
 func (g *AgentGroup) SetActiveController(controller string) {
 	g.activeController.Store(controller)

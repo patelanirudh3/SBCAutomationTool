@@ -1,6 +1,7 @@
 package rtp
 
 import (
+	_ "embed"
 	"fmt"
 	"math"
 	"strings"
@@ -20,8 +21,23 @@ type CodecProfile struct {
 	PayloadMarkerEnabled bool
 }
 
-func ProfileForCodec(codec string) CodecProfile {
+func CanonicalCodec(codec string) string {
 	switch strings.ToUpper(strings.TrimSpace(codec)) {
+	case "G711_ALAW":
+		return "G711_ALAW"
+	case "G729", "G729_AUDIO":
+		return "G729"
+	default:
+		return "G711_ULAW"
+	}
+}
+
+func IsG729PreEncodedAudio(codec string) bool {
+	return strings.ToUpper(strings.TrimSpace(codec)) == "G729_AUDIO"
+}
+
+func ProfileForCodec(codec string) CodecProfile {
+	switch CanonicalCodec(codec) {
 	case "G711_ALAW":
 		return CodecProfile{Name: "G711_ALAW", PayloadType: 8, ClockRate: 8000, FrameDurationMs: 1, BytesPerFrame: 1, PayloadMarkerEnabled: true}
 	case "G729":
@@ -90,6 +106,15 @@ var g729ToneFrames = [][]byte{
 	{0x6e, 0x91, 0x24, 0xc7, 0x9c, 0x55, 0x23, 0x33, 0x14, 0x0e},
 	{0x71, 0x01, 0x21, 0x49, 0x89, 0x58, 0x21, 0x30, 0x18, 0x11},
 }
+
+const G729PreEncodedAudioDurationSeconds = 180
+
+// g729PreEncodedAudioStream is a raw 3-minute G.729 audio asset represented as
+// contiguous 10-byte/10-ms frames. The RTP endpoint reads it sequentially and
+// loops only when the call hold time exceeds the embedded audio duration.
+//
+//go:embed assets/g729_preencoded_audio_3m.g729
+var g729PreEncodedAudioStream []byte
 
 // ComputePtimeParams returns the RTP timestamp increment, payload size,
 // PCMU-encoded 1 kHz tone payload, and marker template for a given ptime.

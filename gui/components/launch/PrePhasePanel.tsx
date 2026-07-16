@@ -16,6 +16,7 @@ import {
   APIError,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { selectedEngineEndpoint } from '@/lib/engine-endpoint'
 import type { HAEvent, PrepStatus, RegisterExpirySummary, RegisterFailure, SubscribeFailure, SubscriptionEventStats } from '@/types'
 
 const POLL_INTERVAL_MS = 1_000
@@ -244,8 +245,9 @@ export function PrePhasePanel() {
   } = useTrafficStore()
 
   const pair = pairs[activePairIndex]
-  const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
-  const vmPort = pair?.uac.metrics_port ?? 8082
+  const endpoint = selectedEngineEndpoint(pair?.uac)
+  const vmIp = endpoint.ip
+  const vmPort = endpoint.port
   const extCount = pair ? (pair.uac.ext_end ?? 0) - (pair.uac.ext_start ?? 0) + 1 : 0
   const subscribeEventCount = Math.max(pair?.uac.subscribe_events?.length ?? 1, 1)
   const subscribeTxnFallback = extCount * subscribeEventCount
@@ -324,7 +326,8 @@ export function PrePhasePanel() {
 
         if (m.prep_status) setPrepStatus(m.prep_status)
 
-        const newReg = m.registered_count ?? 0
+        const haRegistered = (m.ha_primary_registered ?? 0) + (m.ha_secondary_registered ?? 0)
+        const newReg = haRegistered > 0 ? haRegistered : (m.registered_count ?? 0)
         const delta = newReg - prevRegCountRef.current
         const rate  = delta / (POLL_INTERVAL_MS / 1000)
         prevRegCountRef.current = newReg
@@ -353,7 +356,7 @@ export function PrePhasePanel() {
           setPrePhaseStatus({
             vm_id: pair?.uac.vm_id ?? 'traffic-local',
             register_complete: true,
-            register_count: m.registered_count ?? 0,
+            register_count: newReg,
             register_total: m.registered_total ?? extCount,
             subscribe_complete: true,
             subscribe_count: m.subscribed_count ?? 0,
@@ -632,9 +635,11 @@ export function PrePhasePanel() {
   const transportPending = Math.max(0, transportTotal - transportConnected - transportFailed)
   const backendPhase = (uacMetrics?.phase ?? '').toUpperCase()
   const configuredExtensions = transportTotal > 0 ? transportTotal : total
+  const haRegisteredTotal = (uacMetrics?.ha_primary_registered ?? 0) + (uacMetrics?.ha_secondary_registered ?? 0)
+  const displayRegCount = haRegisteredTotal > 0 ? haRegisteredTotal : regCount
   const registerAttempted = regTotal > 0 ? regTotal : (transportConnected > 0 ? transportConnected : total)
-  const displayPending = Math.max(0, registerAttempted - regCount)
-  const registerFailed = regDone ? Math.max(0, registerAttempted - regCount) : 0
+  const displayPending = Math.max(0, registerAttempted - displayRegCount)
+  const registerFailed = regDone ? Math.max(0, registerAttempted - displayRegCount) : 0
   const subscribeFailedAgents = regDone ? displayRegOnly : 0
   const excludedFromTraffic = Math.max(0, configuredExtensions - displayIdle)
   const registerExpiry = uacMetrics?.register_expiry
@@ -646,8 +651,8 @@ export function PrePhasePanel() {
   const primaryFailbackBlocked = haActiveController === 'secondary' && !haPrimaryReachable
   const regBarPct = useMemo(() => {
     const denom = regTotal > 0 ? regTotal : extCount
-    return denom > 0 ? Math.round((regCount / denom) * 100) : 0
-  }, [regCount, regTotal, extCount])
+    return denom > 0 ? Math.round((displayRegCount / denom) * 100) : 0
+  }, [displayRegCount, regTotal, extCount])
   const subBarPct = useMemo(() => {
     const denom = subTotal > 0 ? subTotal : subscribeTxnFallback
     return denom > 0 ? Math.round((subCount / denom) * 100) : 0
@@ -667,6 +672,7 @@ export function PrePhasePanel() {
     regStarted ||
     regDone ||
     backendPhase === 'CONNECTING_TRANSPORTS' ||
+    backendPhase === 'REGSUB_READY' ||
     backendPhase === 'REGSUB_RUNNING' ||
     regCount > 0 ||
     regTotal > 0 ||
@@ -893,8 +899,8 @@ export function PrePhasePanel() {
                 <div className="flex justify-between text-xs text-muted-foreground">
                   <span>REGISTER</span>
                   <span className="font-mono">
-                    <span className="font-semibold text-foreground">{regCount}</span> / {regTotal > 0 ? regTotal : extCount}
-                    {regCount >= (regTotal > 0 ? regTotal : extCount) && (
+                    <span className="font-semibold text-foreground">{displayRegCount}</span> / {regTotal > 0 ? regTotal : extCount}
+                    {displayRegCount >= (regTotal > 0 ? regTotal : extCount) && (
                       <CheckCircle2 className="ml-1 inline size-3 text-emerald-400" />
                     )}
                   </span>
@@ -1201,7 +1207,7 @@ export function PrePhasePanel() {
                   </div>
                   <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-2">
                     <div className="text-slate-500">Registered</div>
-                    <div className="mt-1 font-mono text-base font-semibold text-slate-100">{regCount.toLocaleString()}</div>
+                    <div className="mt-1 font-mono text-base font-semibold text-slate-100">{displayRegCount.toLocaleString()}</div>
                     {registerFailed > 0 && <div className="mt-0.5 font-mono text-[11px] text-rose-300">-{registerFailed.toLocaleString()}</div>}
                   </div>
                   <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2">

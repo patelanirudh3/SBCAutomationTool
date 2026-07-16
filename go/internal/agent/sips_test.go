@@ -29,13 +29,37 @@ func TestRegisterUsesSIPSScheme(t *testing.T) {
 	if !strings.Contains(sent, "User-Agent: Nexus-Traffic-Engine") {
 		t.Fatalf("REGISTER missing Nexus User-Agent:\n%s", sent)
 	}
+	if !strings.Contains(sent, "reg-id=1") {
+		t.Fatalf("REGISTER default reg-id is not 1:\n%s", sent)
+	}
 }
 
 func (a *ExtensionAgent) buildInitialRegisterForTest() string {
-	msg := sip.BuildInitialRegisterWithScheme(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires)
+	msg := sip.BuildInitialRegisterWithSchemeAndRegID(a.Ext, a.Config.Domain, a.uriScheme(), a.Config.SIPTransport, a.localHost, a.localPort, a.Config.RegisterExpires, a.registerRegID)
 	raw := sip.BuildMessage(msg, "")
 	_ = a.transport.Send(raw)
 	return raw
+}
+
+func TestSecondaryRegisterUsesRegID2(t *testing.T) {
+	tr := newMockTransport()
+	a := newTestAgent(t, tr)
+	a.Config = &config.VMConfig{
+		Domain: "avaya.com", SIPTransport: "TLS", SIPScheme: "SIPS",
+		SIPPassword: "123456", RegisterExpires: 3600,
+	}
+	a.localHost = "127.0.0.1"
+	a.localPort = 5061
+	a.SetRegisterRegID(2)
+
+	_ = a.buildInitialRegisterForTest()
+	sent := waitSent(t, tr)
+	if !strings.Contains(sent, `+sip.instance="<urn:uuid:`) {
+		t.Fatalf("REGISTER missing sip.instance:\n%s", sent)
+	}
+	if !strings.Contains(sent, "reg-id=2") {
+		t.Fatalf("secondary REGISTER did not use reg-id=2:\n%s", sent)
+	}
 }
 
 func TestInviteUsesSIPSScheme(t *testing.T) {

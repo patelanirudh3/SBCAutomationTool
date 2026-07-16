@@ -74,7 +74,56 @@ type SRTPSessionConfig struct {
 	InboundKeySalt  []byte
 }
 
-// RtpEndpoint is a bidirectional G.711 PCMU RTP endpoint used by both UAC and UAS.
+type payloadSource interface {
+	NextPayload() []byte
+}
+
+type staticPayloadSource struct {
+	payload []byte
+}
+
+func (s *staticPayloadSource) NextPayload() []byte {
+	return s.payload
+}
+
+type g729PreEncodedAudioSource struct {
+	stream         []byte
+	bytesPerPacket int
+	offset         int
+}
+
+func newG729PreEncodedAudioSource(ptimeMs int) *g729PreEncodedAudioSource {
+	profile := ProfileForCodec("G729")
+	if ptimeMs%profile.FrameDurationMs != 0 {
+		ptimeMs = ((ptimeMs + profile.FrameDurationMs - 1) / profile.FrameDurationMs) * profile.FrameDurationMs
+	}
+	framesPerPacket := ptimeMs / profile.FrameDurationMs
+	if framesPerPacket <= 0 {
+		framesPerPacket = 1
+	}
+	return &g729PreEncodedAudioSource{
+		stream:         g729PreEncodedAudioStream,
+		bytesPerPacket: framesPerPacket * profile.BytesPerFrame,
+	}
+}
+
+func (s *g729PreEncodedAudioSource) NextPayload() []byte {
+	if len(s.stream) == 0 || s.bytesPerPacket <= 0 {
+		return nil
+	}
+	start := s.offset
+	end := start + s.bytesPerPacket
+	s.offset = end % len(s.stream)
+	if end <= len(s.stream) {
+		return s.stream[start:end]
+	}
+	payload := make([]byte, s.bytesPerPacket)
+	n := copy(payload, s.stream[start:])
+	copy(payload[n:], s.stream[:s.offset])
+	return payload
+}
+
+// RtpEndpoint is a bidirectional RTP endpoint used by both UAC and UAS.
 type RtpEndpoint struct {
 	conn      *net.UDPConn
 	localPort int
@@ -153,6 +202,7 @@ type RtpEndpoint struct {
 	tsInc          int
 	tonePayload    []byte
 	markerTemplate []byte
+	payloadSource  payloadSource
 
 	expectedSrc    *net.UDPAddr
 	preSdpSourceIP string
@@ -231,6 +281,10 @@ func NewRtpEndpointFullCodec(localIP string, ptimeMs int, codec string, qosEnabl
 	profile := ProfileForCodec(codec)
 
 	tsInc, _, tone, marker := ComputeCodecPtimeParams(profile.Name, ptimeMs)
+	source := payloadSource(&staticPayloadSource{payload: tone})
+	if IsG729PreEncodedAudio(codec) {
+		source = newG729PreEncodedAudioSource(ptimeMs)
+	}
 
 	if rtcpSREnabled && rtcpSRInterval <= 0 {
 		rtcpSRInterval = 5 * time.Second
@@ -243,6 +297,7 @@ func NewRtpEndpointFullCodec(localIP string, ptimeMs int, codec string, qosEnabl
 		tsInc:          tsInc,
 		tonePayload:    tone,
 		markerTemplate: marker,
+		payloadSource:  source,
 		codecProfile:   profile,
 		qosEnabled:     qosEnabled,
 		rtcpSREnabled:  rtcpSREnabled,
@@ -442,7 +497,7 @@ func (ep *RtpEndpoint) getPayload() []byte {
 		ep.markersSent++
 		p = buildMarkerPayload(ep.markerTemplate, ep.markersSent)
 	} else {
-		p = ep.tonePayload
+		p = ep.payloadSource.NextPayload()
 	}
 	ep.txOctets += uint64(len(p))
 	return p

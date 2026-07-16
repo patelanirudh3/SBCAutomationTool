@@ -51,34 +51,35 @@ func TestNonInviteTransactionTimeoutDerivesFromT1(t *testing.T) {
 	}
 }
 
-func TestCleanupBatchSizeDefaultsAndValidation(t *testing.T) {
+func TestCleanupRateDefaultsAndValidation(t *testing.T) {
 	cfg := &VMConfig{}
 	ApplyDefaults(cfg)
-	if cfg.CleanupBatchSize != 10 {
-		t.Fatalf("default cleanup_batch_size=%d, want 10", cfg.CleanupBatchSize)
+	if cfg.CleanupUnsubscribeRate != 20 || cfg.CleanupUnregisterRate != 20 {
+		t.Fatalf("cleanup rate defaults unsubscribe=%d unregister=%d, want 20/20", cfg.CleanupUnsubscribeRate, cfg.CleanupUnregisterRate)
 	}
 
 	bad := &VMConfig{
-		VMID:             "traffic-local",
-		ExtStart:         1000,
-		ExtEnd:           1001,
-		SBCHost:          "10.0.0.1",
-		SBCPort:          5060,
-		SIPTransport:     "TCP",
-		Domain:           "avaya.com",
-		CPS:              1,
-		HoldTimeSeconds:  1,
-		RTPBurstPPS:      50,
-		RTPPtime:         20,
-		RTPMode:          "3phase",
-		TrafficMode:      "unlimited",
-		MediaEnabled:     true,
-		MediaSecurity:    "rtp",
-		CleanupBatchSize: 101,
+		VMID:                  "traffic-local",
+		ExtStart:              1000,
+		ExtEnd:                1001,
+		SBCHost:               "10.0.0.1",
+		SBCPort:               5060,
+		SIPTransport:          "TCP",
+		Domain:                "avaya.com",
+		CPS:                   1,
+		HoldTimeSeconds:       1,
+		RTPBurstPPS:           50,
+		RTPPtime:              20,
+		RTPMode:               "3phase",
+		TrafficMode:           "unlimited",
+		MediaEnabled:          true,
+		MediaSecurity:         "rtp",
+		CleanupUnregisterRate: 0,
 	}
 	ApplyDefaults(bad)
+	bad.CleanupUnregisterRate = -1
 	if err := Validate(bad); err == nil {
-		t.Fatal("Validate succeeded with cleanup_batch_size > 100")
+		t.Fatal("Validate succeeded with negative cleanup_unregister_rate_per_sec")
 	}
 }
 
@@ -87,6 +88,28 @@ func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
 	ApplyDefaults(cfg)
 	if cfg.MediaSecurity != "rtp" || cfg.SRTPKeyMode != "auto" || len(cfg.SRTPCryptoSuites) != 1 || cfg.RTPUnsupportedCodecPolicy != "fallback_g711" {
 		t.Fatalf("media security defaults got security=%q key_mode=%q suites=%v codec_policy=%q", cfg.MediaSecurity, cfg.SRTPKeyMode, cfg.SRTPCryptoSuites, cfg.RTPUnsupportedCodecPolicy)
+	}
+
+	g729Audio := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        1000,
+		ExtEnd:          1001,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		MediaEnabled:    true,
+		RTPCodec:        "G729_AUDIO",
+	}
+	ApplyDefaults(g729Audio)
+	if err := Validate(g729Audio); err != nil {
+		t.Fatalf("Validate failed for G729_AUDIO: %v", err)
 	}
 
 	bad := &VMConfig{
@@ -121,6 +144,40 @@ func TestMediaSecurityDefaultsAndValidation(t *testing.T) {
 	bad.RTPUnsupportedCodecPolicy = "bad_policy"
 	if err := Validate(bad); err == nil {
 		t.Fatal("Validate succeeded with unsupported RTP codec policy")
+	}
+}
+
+func TestPairingPolicyDefaultsAndValidation(t *testing.T) {
+	cfg := &VMConfig{}
+	ApplyDefaults(cfg)
+	if cfg.PairingPolicy != "random" {
+		t.Fatalf("pairing policy default=%q, want random", cfg.PairingPolicy)
+	}
+
+	valid := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        1000,
+		ExtEnd:          1001,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		PairingPolicy:   "same_controller",
+	}
+	ApplyDefaults(valid)
+	if err := Validate(valid); err != nil {
+		t.Fatalf("Validate failed for same_controller pairing policy: %v", err)
+	}
+
+	valid.PairingPolicy = "invalid"
+	if err := Validate(valid); err == nil {
+		t.Fatal("Validate succeeded with unsupported pairing_policy")
 	}
 }
 
@@ -249,6 +306,88 @@ func TestDualRegistrationValidation(t *testing.T) {
 	}
 	if !cfg.FailoverEnabled {
 		t.Fatal("dual registration should enable failover compatibility flag")
+	}
+}
+
+func TestComputeAgentGroupsTwoZoneHalfSplit(t *testing.T) {
+	cfg := &VMConfig{
+		HAMode:     "multi_zone",
+		ExtStart:   6000000,
+		ExtEnd:     6000003,
+		ZoneConfig: twoZoneConfig(50, []ZoneController{{Host: "controller-a", Port: 5061}}, []ZoneController{{Host: "controller-b", Port: 5061}}),
+	}
+
+	groups := cfg.ComputeAgentGroups()
+	if len(groups) != 2 {
+		t.Fatalf("groups=%d, want 2: %#v", len(groups), groups)
+	}
+	assertGroup(t, groups[0], "zone-a-ctrl-1", "zone-a", "controller-a", "controller-b", 6000000, 6000001)
+	assertGroup(t, groups[1], "zone-b-ctrl-1", "zone-b", "controller-b", "controller-a", 6000002, 6000003)
+}
+
+func TestComputeAgentGroupsUnevenDistributionAndControllerRemainder(t *testing.T) {
+	cfg := &VMConfig{
+		HAMode:   "multi_zone",
+		ExtStart: 1000,
+		ExtEnd:   1009,
+		ZoneConfig: twoZoneConfig(60,
+			[]ZoneController{{Host: "a1", Port: 5060}, {Host: "a2", Port: 5060}},
+			[]ZoneController{{Host: "b1", Port: 5060}},
+		),
+	}
+
+	groups := cfg.ComputeAgentGroups()
+	if len(groups) != 3 {
+		t.Fatalf("groups=%d, want 3: %#v", len(groups), groups)
+	}
+	assertGroup(t, groups[0], "zone-a-ctrl-1", "zone-a", "a1", "b1", 1000, 1002)
+	assertGroup(t, groups[1], "zone-a-ctrl-2", "zone-a", "a2", "b1", 1003, 1005)
+	assertGroup(t, groups[2], "zone-b-ctrl-1", "zone-b", "b1", "a1", 1006, 1009)
+}
+
+func TestComputeAgentGroupsSingleZoneNoSecondary(t *testing.T) {
+	cfg := &VMConfig{
+		HAMode:   "multi_zone",
+		ExtStart: 7000,
+		ExtEnd:   7003,
+		ZoneConfig: &ZoneConfig{
+			ZoneDistributionPct: 50,
+			Zones: []Zone{
+				{ZoneID: "zone-a", Controllers: []ZoneController{{Host: "a1", Port: 5060}}},
+			},
+		},
+	}
+
+	groups := cfg.ComputeAgentGroups()
+	if len(groups) != 1 {
+		t.Fatalf("groups=%d, want 1: %#v", len(groups), groups)
+	}
+	assertGroup(t, groups[0], "zone-a-ctrl-1", "zone-a", "a1", "", 7000, 7003)
+	if groups[0].SecondaryController.Port != 0 {
+		t.Fatalf("secondary port=%d, want 0", groups[0].SecondaryController.Port)
+	}
+}
+
+func twoZoneConfig(distribution int, zoneA, zoneB []ZoneController) *ZoneConfig {
+	return &ZoneConfig{
+		ZoneDistributionPct: distribution,
+		Zones: []Zone{
+			{ZoneID: "zone-a", Controllers: zoneA},
+			{ZoneID: "zone-b", Controllers: zoneB},
+		},
+	}
+}
+
+func assertGroup(t *testing.T, got AgentGroupAssignment, groupID, zoneID, primaryHost, secondaryHost string, extStart, extEnd int) {
+	t.Helper()
+	if got.GroupID != groupID ||
+		got.ZoneID != zoneID ||
+		got.PrimaryController.Host != primaryHost ||
+		got.SecondaryController.Host != secondaryHost ||
+		got.ExtStart != extStart ||
+		got.ExtEnd != extEnd {
+		t.Fatalf("group mismatch:\n got=%+v\nwant group=%s zone=%s primary=%s secondary=%s range=%d-%d",
+			got, groupID, zoneID, primaryHost, secondaryHost, extStart, extEnd)
 	}
 }
 

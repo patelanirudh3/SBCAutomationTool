@@ -13,8 +13,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useTrafficStore } from '@/store/traffic'
-import { startCleanupFor, resetTestFor, getMetricsFor } from '@/lib/api'
+import { startCleanupFor, resetTestFor, forceResetTestFor, getMetricsFor } from '@/lib/api'
 import { mapBackendPhase } from '@/lib/phase'
+import { selectedEngineEndpoint } from '@/lib/engine-endpoint'
 import type { GuardConfig } from '@/lib/nav-guard'
 
 // NavGuardDialog — shared confirmation/warning dialog used by both
@@ -61,8 +62,9 @@ export function NavGuardDialog({
   const [resetStage, setResetStage] = useState<string>('')
 
   const pair = pairs[activePairIndex]
-  const vmIp = pair?.uac.vm_ip ?? '127.0.0.1'
-  const vmPort = pair?.uac.metrics_port ?? 8082
+  const endpoint = selectedEngineEndpoint(pair?.uac)
+  const vmIp = endpoint.ip
+  const vmPort = endpoint.port
 
   // emergencyReset — best-effort recovery sequence. Each step swallows
   // errors that just mean "already done" (e.g. cleanup returns 409 if
@@ -87,7 +89,7 @@ export function NavGuardDialog({
       // Step 2: poll until backend confirms cleanup finished. Cap at 60s
       // so we don't hang indefinitely if the backend itself is wedged.
       setResetStage('Waiting for cleanup to complete...')
-      const deadline = Date.now() + 60_000
+      const deadline = Date.now() + 15_000
       let phaseConfirmed = false
       while (Date.now() < deadline) {
         try {
@@ -111,12 +113,18 @@ export function NavGuardDialog({
       }
 
       // Step 3: reset engine state to IDLE so /config can push a fresh
-      // config later. Tolerates backends already at IDLE (returns 400).
+      // config later. If normal reset refuses the current state, use the
+      // pre-traffic force-reset escape hatch.
       setResetStage('Resetting engine state...')
       try {
         await resetTestFor(vmIp, vmPort)
       } catch {
-        // already idle, or backend gone — proceed to local cleanup.
+        try {
+          await forceResetTestFor(vmIp, vmPort)
+          phaseConfirmed = true
+        } catch {
+          // already idle, active traffic, or backend gone — proceed locally.
+        }
       }
 
       // Step 4: wipe the local store so cached phase/aggregate/events

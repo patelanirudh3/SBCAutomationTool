@@ -249,17 +249,22 @@ func runLifecycle(
 			for ext := assignment.ExtStart; ext <= assignment.ExtEnd; ext++ {
 				extStr := strconv.Itoa(ext)
 				ag := agent.NewExtensionAgent(extStr, primaryCfg)
+				ag.SetPlacement(group.GroupID, group.ZoneID, group.PrimaryController.Host, group.PrimaryController.Port)
 				ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
 				group.PrimaryAgents[extStr] = ag
 				agents[extStr] = ag
 			}
 
-			secondaryCfg := group.SecondaryConfig(cfg)
-			for ext := assignment.ExtStart; ext <= assignment.ExtEnd; ext++ {
-				extStr := strconv.Itoa(ext)
-				ag := agent.NewExtensionAgent(extStr, secondaryCfg)
-				ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
-				group.SecondaryAgents[extStr] = ag
+			if group.HasSecondary() {
+				secondaryCfg := group.SecondaryConfig(cfg)
+				for ext := assignment.ExtStart; ext <= assignment.ExtEnd; ext++ {
+					extStr := strconv.Itoa(ext)
+					ag := agent.NewExtensionAgent(extStr, secondaryCfg)
+					ag.SetRegisterRegID(2)
+					ag.SetPlacement(group.GroupID, group.ZoneID, group.SecondaryCtrl.Host, group.SecondaryCtrl.Port)
+					ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
+					group.SecondaryAgents[extStr] = ag
+				}
 			}
 
 			agentGroups = append(agentGroups, group)
@@ -326,46 +331,21 @@ func runLifecycle(
 		}
 
 		slog.Info("Multi-zone: connecting primary transports")
-		collector.ResetTransportConnect(cfg.ExtCount() * 2)
+		expectedTransportConnects := 0
+		for _, group := range agentGroups {
+			expectedTransportConnects += len(group.PrimaryAgents) + len(group.SecondaryAgents)
+		}
+		collector.ResetTransportConnect(expectedTransportConnects)
 		var primaryConnected, secondaryConnected int
 		var connectMu sync.Mutex
-		connectTimeout := time.Duration(cfg.ConnectTimeout) * time.Second
-		if connectTimeout <= 0 {
-			connectTimeout = 5 * time.Second
-		}
-		connectConcurrency := cfg.RegisterBatchSize
-		if connectConcurrency <= 0 {
-			connectConcurrency = 10
-		}
-
 		// Connect primary transports with bounded concurrency
 		for _, group := range agentGroups {
 			primaryCfg := group.PrimaryConfig(cfg)
 			primarySlice := agentsToSlice(group.PrimaryAgents)
-			sem := make(chan struct{}, connectConcurrency)
-			var wg sync.WaitGroup
-			for _, ag := range primarySlice {
-				ag := ag
-				wg.Add(1)
-				sem <- struct{}{}
-				go func() {
-					defer wg.Done()
-					defer func() { <-sem }()
-					connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
-					defer connectCancel()
-					if err := ag.Start(connectCtx); err != nil {
-						slog.Warn("Multi-zone primary connect failed", "group", group.GroupID, "ext", ag.Ext, "err", err)
-						collector.RecordTransportConnectFailure(ag.Ext, cfg.LocalHostForExtension(ag.Ext),
-							fmt.Sprintf("%s:%d", primaryCfg.SBCHost, primaryCfg.SBCPort), err)
-					} else {
-						connectMu.Lock()
-						primaryConnected++
-						connectMu.Unlock()
-						collector.RecordTransportConnectSuccess()
-					}
-				}()
-			}
-			wg.Wait()
+			connected, _ := connectAgentSliceRateLimited(ctx, primarySlice, primaryCfg, collector, nil)
+			connectMu.Lock()
+			primaryConnected += len(connected)
+			connectMu.Unlock()
 		}
 
 		// Connect secondary transports with bounded concurrency
@@ -373,30 +353,10 @@ func runLifecycle(
 		for _, group := range agentGroups {
 			secondaryCfg := group.SecondaryConfig(cfg)
 			secondarySlice := agentsToSlice(group.SecondaryAgents)
-			sem := make(chan struct{}, connectConcurrency)
-			var wg sync.WaitGroup
-			for _, ag := range secondarySlice {
-				ag := ag
-				wg.Add(1)
-				sem <- struct{}{}
-				go func() {
-					defer wg.Done()
-					defer func() { <-sem }()
-					connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
-					defer connectCancel()
-					if err := ag.Start(connectCtx); err != nil {
-						slog.Warn("Multi-zone secondary connect failed", "group", group.GroupID, "ext", ag.Ext, "err", err)
-						collector.RecordTransportConnectFailure(ag.Ext, cfg.LocalHostForExtension(ag.Ext),
-							fmt.Sprintf("%s:%d", secondaryCfg.SBCHost, secondaryCfg.SBCPort), err)
-					} else {
-						connectMu.Lock()
-						secondaryConnected++
-						connectMu.Unlock()
-						collector.RecordTransportConnectSuccess()
-					}
-				}()
-			}
-			wg.Wait()
+			connected, _ := connectAgentSliceRateLimited(ctx, secondarySlice, secondaryCfg, collector, nil)
+			connectMu.Lock()
+			secondaryConnected += len(connected)
+			connectMu.Unlock()
 		}
 		collector.FinishTransportConnect()
 		collector.SetSocketCount(primaryConnected + secondaryConnected)
@@ -429,7 +389,7 @@ func runLifecycle(
 						g.SetActiveController("failover_in_progress")
 					}
 
-					if poolCtrl != nil && multiZoneOnReady != nil {
+					if g.HasSecondary() && poolCtrl != nil && multiZoneOnReady != nil {
 						engine.TriggerSingleAgentRecovery(ctx, g, tracker, ext, cfg, poolCtrl, multiZoneOnReady, recoveryCfg)
 					}
 					updateGroupMetrics()
@@ -443,7 +403,7 @@ func runLifecycle(
 					collector.RecordHAEvent("group_failover_threshold", g.GroupID,
 						fmt.Sprintf("mode=%s triggered=%d", triggerCfg.Mode, accumulator.TriggeredExtCount()))
 
-					if poolCtrl != nil && multiZoneOnReady != nil {
+					if g.HasSecondary() && poolCtrl != nil && multiZoneOnReady != nil {
 						engine.TriggerGroupRecoveryExcluding(ctx, g, tracker, accumulator, cfg, poolCtrl, multiZoneOnReady, recoveryCfg)
 					}
 					updateGroupMetrics()
@@ -458,7 +418,7 @@ func runLifecycle(
 	}
 
 	if !streamConnectRegSub && !multiZoneMode {
-		connectedAgents, err := connectTransportsBatched(ctx, agents, cfg, collector, nil)
+		connectedAgents, err := connectTransportsRateLimited(ctx, agents, cfg, collector, nil)
 		if err != nil {
 			slog.Error("Transport connection failed", "err", err)
 			collector.SetPhase("FAILED")
@@ -489,9 +449,13 @@ func runLifecycle(
 		secondaryCopy.SBCPort = cfg.SecondaryPort
 		secondaryCfg = &secondaryCopy
 		secondaryAgents = createAgents(secondaryCfg)
+		for _, ag := range secondaryAgents {
+			ag.SetRegisterRegID(2)
+			ag.SetPlacement("default", "default", secondaryCfg.SBCHost, secondaryCfg.SBCPort)
+		}
 		secondaryAgentSlice = agentsToSlice(secondaryAgents)
 		slog.Info("Connecting secondary controller transports", "count", len(secondaryAgents), "host", cfg.SecondaryHost, "port", cfg.SecondaryPort)
-		connectedSecondaryAgents, err := connectTransportsBatched(ctx, secondaryAgents, secondaryCfg, nil, nil)
+		connectedSecondaryAgents, err := connectTransportsRateLimited(ctx, secondaryAgents, secondaryCfg, nil, nil)
 		if err != nil {
 			slog.Error("Secondary transport connection failed", "err", err)
 			collector.SetPhase("FAILED")
@@ -519,6 +483,26 @@ func runLifecycle(
 
 	// Create pool engine and wire pool counts provider into the metrics collector
 	pool := engine.NewPoolEngine()
+	initialPairingPolicy := engine.PairingPolicy(cfg.PairingPolicy)
+	if initialPairingPolicy == "" {
+		initialPairingPolicy = engine.PairingRandom
+	}
+	pool.SetPairingPolicy(initialPairingPolicy)
+	collector.SetPairingPolicy(string(initialPairingPolicy))
+	if pctx != nil {
+		pctx.Mu.Lock()
+		pctx.OnPairingPolicyChange = func(policy string) (string, error) {
+			switch engine.PairingPolicy(policy) {
+			case engine.PairingRandom, engine.PairingCrossZone, engine.PairingSameZone, engine.PairingSameController:
+				pool.SetPairingPolicy(engine.PairingPolicy(policy))
+				collector.SetPairingPolicy(policy)
+				return policy, nil
+			default:
+				return "", fmt.Errorf("pairing policy must be one of: random, cross_zone, same_zone, same_controller")
+			}
+		}
+		pctx.Mu.Unlock()
+	}
 	if multiZoneMode {
 		poolCtrl = pool
 	}
@@ -585,7 +569,7 @@ func runLifecycle(
 	// /api/prep/start handler invokes this in a goroutine and updates
 	// collector.PrepStatus() before/after. Reads/writes of OnPrepStart are
 	// guarded by pctx.Mu so the handler can poll for it during the brief
-	// window between /api/test/start and connectTransportsBatched finishing.
+	// window between /api/test/start and connectTransportsRateLimited finishing.
 	if pctx != nil {
 		pctx.Mu.Lock()
 		pctx.OnPrepStart = func() error {
@@ -609,6 +593,7 @@ func runLifecycle(
 		registeredAg            []*agent.ExtensionAgent
 		failedRegister          []string
 		failedSubscribe         []string
+		multiZoneRefreshStops   []func()
 		stopRegRefresh          = func() {}
 		stopSubRefresh          = func() {}
 		stopSecondaryRegRefresh = func() {}
@@ -706,66 +691,56 @@ func runLifecycle(
 		var cleanupRequested atomic.Bool
 		regSubWatchCtx, cancelRegSubWatcher := context.WithCancel(ctx)
 		defer cancelRegSubWatcher()
+		regSubWorkCtx, cancelRegSubWork := context.WithCancel(ctx)
+		defer cancelRegSubWork()
 		go func() {
 			select {
 			case <-pctx.RegSubAbortCh:
 				slog.Info("RegSub abort received — halting new batches")
 				stopNew.Store(true)
+				cleanupRequested.Store(true)
+				cancelRegSubWork()
 			case <-pctx.CleanupStartCh:
 				slog.Info("Cleanup signal received during REGSUB_RUNNING - halting new work")
 				stopNew.Store(true)
 				cleanupRequested.Store(true)
+				cancelRegSubWork()
 			case <-regSubWatchCtx.Done():
 			}
 		}()
 
 		if multiZoneMode && len(agentGroups) > 0 {
-			// ── Multi-zone HA: per-group register + subscribe ─────────────────
-			collector.SetRegisterTotal(cfg.ExtCount())
-			collector.SetSubscribeTotal(cfg.ExtCount() * len(cfg.SubscribeEvents))
-
+			// ── Multi-zone HA: interleaved per-agent register + subscribe ─────
+			expectedRegistrations := 0
 			for _, group := range agentGroups {
-				group := group
-				primaryCfg := group.PrimaryConfig(cfg)
-				secondaryCfg := group.SecondaryConfig(cfg)
-				primarySlice := agentsToSlice(group.PrimaryAgents)
-				secondarySlice := agentsToSlice(group.SecondaryAgents)
-
-				registered, groupFailedReg, _ := prephase.RunRegister(ctx, primarySlice, primaryCfg,
-					func() { collector.IncrementRegistered() }, stopNew)
-				group.PrimaryRegistered = registered
-				for _, ext := range groupFailedReg {
-					collector.RecordRegisterFailure(ext,
-						fmt.Errorf("REGISTER failed [group=%s zone=%s controller=%s:%d]",
-							group.GroupID, group.ZoneID, primaryCfg.SBCHost, primaryCfg.SBCPort))
+				expectedRegistrations += len(group.PrimaryAgents) + len(group.SecondaryAgents)
+			}
+			collector.SetRegisterTotal(expectedRegistrations)
+			collector.SetSubscribeTotal(cfg.ExtCount() * len(cfg.SubscribeEvents))
+			collector.SetSubscribeEventTotals(cfg.SubscribeEvents, cfg.ExtCount())
+			mzResult := runMultiZoneRegSubPipeline(
+				regSubWorkCtx,
+				cfg,
+				agentGroups,
+				collector,
+				skipSubscribe,
+				onIdle,
+				onRegOnly,
+				updateGroupMetrics,
+				stopNew,
+			)
+			registeredAg = append(registeredAg, mzResult.registered...)
+			secondaryRegisteredAg = append(secondaryRegisteredAg, mzResult.secondaryRegistered...)
+			activeSubscribedAg = append(activeSubscribedAg, mzResult.activeSubscribed...)
+			failedRegister = append(failedRegister, mzResult.failedRegister...)
+			failedSubscribe = append(failedSubscribe, mzResult.failedSubscribe...)
+			multiZoneRefreshStops = append(multiZoneRefreshStops, mzResult.stopRefresh)
+			stopRegRefresh = func() {
+				for _, stop := range multiZoneRefreshStops {
+					if stop != nil {
+						stop()
+					}
 				}
-				registeredAg = append(registeredAg, registered...)
-
-				secRegistered, _, _ := prephase.RunRegister(ctx, secondarySlice, secondaryCfg, nil, stopNew)
-				group.SecondaryRegistered = secRegistered
-
-				failedSub, _ := prephase.RunSubscribe(ctx, registered, primaryCfg, skipSubscribe,
-					onIdle, onRegOnly,
-					func(event string, ok bool, notifyReceived bool) {
-						collector.RecordSubscriptionEvent(event, ok, notifyReceived)
-					}, stopNew)
-				subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
-				for _, ext := range failedSub {
-					collector.RecordSubscribeFailure(ext, subscribeEvents,
-						fmt.Errorf("SUBSCRIBE failed [group=%s zone=%s controller=%s:%d]",
-							group.GroupID, group.ZoneID, primaryCfg.SBCHost, primaryCfg.SBCPort))
-				}
-
-				subscribed := agentsExceptExts(registered, failedSub)
-				group.ActiveSubscribed = subscribed
-
-				slog.Info("Multi-zone group reg/sub complete",
-					"group", group.GroupID,
-					"primary_registered", len(registered),
-					"secondary_registered", len(secRegistered),
-					"subscribed", len(subscribed),
-					"failed_reg", len(groupFailedReg),
-					"failed_sub", len(failedSub))
 			}
 			updateGroupMetrics()
 
@@ -774,7 +749,7 @@ func runLifecycle(
 			collector.SetRegisterTotal(len(agentSlice))
 			regStart := time.Now()
 			registeredAg, failedRegister, stopRegRefresh = prephase.RunRegister(
-				ctx, agentSlice, cfg,
+				regSubWorkCtx, agentSlice, cfg,
 				func() { collector.IncrementRegistered() },
 				stopNew,
 			)
@@ -788,7 +763,7 @@ func runLifecycle(
 				secondaryRegStart := time.Now()
 				var secondaryFailed []string
 				secondaryRegisteredAg, secondaryFailed, stopSecondaryRegRefresh = prephase.RunRegister(
-					ctx, secondaryAgentSlice, secondaryCfg,
+					regSubWorkCtx, secondaryAgentSlice, secondaryCfg,
 					nil,
 					stopNew,
 				)
@@ -804,7 +779,7 @@ func runLifecycle(
 				collector.SetSubscribeEventTotals(cfg.SubscribeEvents, len(registeredAg))
 				subStart := time.Now()
 				failedSubscribe, stopSubRefresh = prephase.RunSubscribe(
-					ctx, registeredAg, cfg, skipSubscribe,
+					regSubWorkCtx, registeredAg, cfg, skipSubscribe,
 					onIdle, onRegOnly,
 					func(event string, ok bool, notifyReceived bool) {
 						collector.RecordSubscriptionEvent(event, ok, notifyReceived)
@@ -832,7 +807,7 @@ func runLifecycle(
 			regSubStart := time.Now()
 			var connectedSoFar atomic.Int32
 			pipeline := prephase.RunConnectRegSubPipeline(
-				ctx, agentSlice, cfg, skipSubscribe,
+				regSubWorkCtx, agentSlice, cfg, skipSubscribe,
 				func(progress prephase.ConnectProgress) {
 					if progress.OK {
 						current := int(connectedSoFar.Add(1))
@@ -920,6 +895,17 @@ func runLifecycle(
 				"eligible_agents", len(agentSlice),
 				"elapsed_s", fmt.Sprintf("%.1f", time.Since(regSubStart).Seconds()))
 		}
+		if cleanupRequested.Load() {
+			cancelRegSubWatcher()
+			slog.Info("Reg/Sub stopped after cleanup request - starting cleanup")
+			cleanupAll(ctx, nil)
+			collector.SetPhase("DONE")
+			return 0
+		}
+		// Reg/Sub is fully past its operator-gated section. Stop the watcher so
+		// it cannot consume CleanupStartCh while the lifecycle is waiting at
+		// REGSUB_DONE for either Start Traffic or Cleanup.
+		cancelRegSubWatcher()
 	} else {
 		// ── CLI mode: legacy monolithic pipeline (Phase 0 + 1 + 2) ───────────
 		collector.SetPhase("PRE_REGISTER")
@@ -936,15 +922,19 @@ func runLifecycle(
 		failedSubscribe = preResult.FailedSubscribe
 	}
 
-	for _, ext := range failedRegister {
-		collector.RecordRegisterFailure(ext, fmt.Errorf("REGISTER failed after retry attempts"))
+	if !multiZoneMode {
+		for _, ext := range failedRegister {
+			collector.RecordRegisterFailure(ext, fmt.Errorf("REGISTER failed after retry attempts"))
+		}
 	}
 	if !pipelineMode {
 		collector.SetRegisterExpirySummary(buildRegisterExpirySummary(registeredAg, cfg))
 	}
 	subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
-	for _, ext := range failedSubscribe {
-		collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
+	if !multiZoneMode {
+		for _, ext := range failedSubscribe {
+			collector.RecordSubscribeFailure(ext, subscribeEvents, fmt.Errorf("SUBSCRIBE failed after retry attempts"))
+		}
 	}
 
 	defer stopRegRefresh()
@@ -1621,13 +1611,6 @@ func cleanupBackoff(attempt int) time.Duration {
 	return time.Duration(float64(time.Second) * 0.5 * float64(attempt))
 }
 
-func cleanupBatchSize(cfg *config.VMConfig) int {
-	if cfg.CleanupBatchSize > 0 {
-		return cfg.CleanupBatchSize
-	}
-	return 10
-}
-
 func cleanupBatchCount(total, batchSize int) int {
 	if total <= 0 {
 		return 0
@@ -1642,18 +1625,12 @@ func cleanupUnsubscribeRate(cfg *config.VMConfig) int {
 	if cfg.CleanupUnsubscribeRate > 0 {
 		return cfg.CleanupUnsubscribeRate
 	}
-	if cfg.CleanupBatchSize > 0 {
-		return cfg.CleanupBatchSize
-	}
 	return 20
 }
 
 func cleanupUnregisterRate(cfg *config.VMConfig) int {
 	if cfg.CleanupUnregisterRate > 0 {
 		return cfg.CleanupUnregisterRate
-	}
-	if cfg.CleanupBatchSize > 0 {
-		return cfg.CleanupBatchSize
 	}
 	return 20
 }
@@ -2012,8 +1989,8 @@ func unregisterSecondaryRegistrations(ctx context.Context, agents map[string]*ag
 	if len(agentSlice) == 0 {
 		return
 	}
-	batchSize := cleanupBatchSize(cfg)
-	slog.Info("Cleaning up secondary controller registrations", "count", len(agentSlice), "batch_size", batchSize)
+	batchSize := cleanupUnregisterRate(cfg)
+	slog.Info("Cleaning up secondary controller registrations", "count", len(agentSlice), "unregister_rate_per_sec", batchSize)
 	runCleanupBatches(ctx, agentSlice, batchSize, "secondary_unregister", func(a *agent.ExtensionAgent) {
 		if err := cleanupUnregisterWithRetry(ctx, a, cfg); err != nil {
 			slog.Debug("Secondary unregister error", "ext", a.Ext, "err", err)
@@ -2052,6 +2029,323 @@ func requiredTrafficReadyCount(configuredTotal int) int {
 		return 2
 	}
 	return required
+}
+
+type multiZoneRegSubResult struct {
+	registered          []*agent.ExtensionAgent
+	secondaryRegistered []*agent.ExtensionAgent
+	activeSubscribed    []*agent.ExtensionAgent
+	failedRegister      []string
+	failedSubscribe     []string
+	stopRefresh         func()
+}
+
+type multiZoneRegSubItem struct {
+	group        *engine.AgentGroup
+	primary      *agent.ExtensionAgent
+	secondary    *agent.ExtensionAgent
+	primaryCfg   *config.VMConfig
+	secondaryCfg *config.VMConfig
+}
+
+func runMultiZoneRegSubPipeline(
+	ctx context.Context,
+	cfg *config.VMConfig,
+	groups []*engine.AgentGroup,
+	collector *metrics.MetricsCollector,
+	skipSubscribe bool,
+	onIdle func(*agent.ExtensionAgent),
+	onRegOnly func(*agent.ExtensionAgent),
+	updateGroupMetrics func(),
+	stopNew *atomic.Bool,
+) multiZoneRegSubResult {
+	items := buildMultiZoneRegSubItems(cfg, groups)
+	rate := cfg.EffectiveAgentRegSubCPS()
+	workerCount := derivedWorkerCount(rate, cfg.RegisterTimeout*len(cfg.SubscribeEvents)+cfg.RegisterTimeout*2, len(items))
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	workCh := make(chan multiZoneRegSubItem)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var stops []func()
+	result := multiZoneRegSubResult{stopRefresh: func() {}}
+	slog.Info("Multi-zone Reg/Sub pipeline starting", "items", len(items), "agent_regsub_cps", rate, "workers", workerCount)
+
+	appendStop := func(stop func()) {
+		if stop == nil {
+			return
+		}
+		mu.Lock()
+		stops = append(stops, stop)
+		mu.Unlock()
+	}
+	recordGroup := func(group *engine.AgentGroup, primary, secondary, subscribed *agent.ExtensionAgent) {
+		mu.Lock()
+		if primary != nil {
+			group.PrimaryRegistered = append(group.PrimaryRegistered, primary)
+			result.registered = append(result.registered, primary)
+		}
+		if secondary != nil {
+			group.SecondaryRegistered = append(group.SecondaryRegistered, secondary)
+			result.secondaryRegistered = append(result.secondaryRegistered, secondary)
+		}
+		if subscribed != nil {
+			group.ActiveSubscribed = append(group.ActiveSubscribed, subscribed)
+			result.activeSubscribed = append(result.activeSubscribed, subscribed)
+		}
+		mu.Unlock()
+		if updateGroupMetrics != nil {
+			updateGroupMetrics()
+		}
+	}
+	recordFailedRegister := func(ext string, err error) {
+		mu.Lock()
+		result.failedRegister = append(result.failedRegister, ext)
+		mu.Unlock()
+		collector.RecordRegisterFailure(ext, err)
+	}
+	recordFailedSubscribe := func(ext, events string, err error) {
+		mu.Lock()
+		result.failedSubscribe = append(result.failedSubscribe, ext)
+		mu.Unlock()
+		collector.RecordSubscribeFailure(ext, events, err)
+	}
+
+	subscribeEvents := strings.Join(cfg.SubscribeEvents, ",")
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range workCh {
+				if stopNew != nil && stopNew.Load() {
+					return
+				}
+
+				var primaryOK, secondaryOK, subOK bool
+				if item.primary != nil {
+					primaryOK = registerAgentWithRetry(ctx, item.primary, item.primaryCfg)
+					if primaryOK {
+						collector.IncrementRegistered()
+						appendStop(prephase.StartRegisterRefreshLoop(ctx, []*agent.ExtensionAgent{item.primary}, item.primaryCfg))
+					} else {
+						recordFailedRegister(item.primary.Ext,
+							fmt.Errorf("REGISTER failed [group=%s zone=%s controller=%s:%d]",
+								item.group.GroupID, item.group.ZoneID, item.primaryCfg.SBCHost, item.primaryCfg.SBCPort))
+					}
+				}
+
+				if item.secondary != nil {
+					secondaryOK = registerAgentWithRetry(ctx, item.secondary, item.secondaryCfg)
+					if secondaryOK {
+						collector.IncrementRegistered()
+						appendStop(prephase.StartRegisterRefreshLoop(ctx, []*agent.ExtensionAgent{item.secondary}, item.secondaryCfg))
+					} else {
+						recordFailedRegister(item.secondary.Ext,
+							fmt.Errorf("SECONDARY REGISTER failed [group=%s zone=%s controller=%s:%d]",
+								item.group.GroupID, item.group.ZoneID, item.secondaryCfg.SBCHost, item.secondaryCfg.SBCPort))
+					}
+				}
+
+				if primaryOK && item.primary != nil {
+					if skipSubscribe {
+						if onRegOnly != nil {
+							onRegOnly(item.primary)
+						}
+					} else {
+						subOK = subscribeAgentWithRetry(ctx, item.primary, cfg, func(event string, ok bool, notifyReceived bool) {
+							collector.RecordSubscriptionEvent(event, ok, notifyReceived)
+						})
+						if subOK {
+							if onIdle != nil {
+								onIdle(item.primary)
+							}
+							appendStop(prephase.StartSubscribeRefreshLoop(ctx, []*agent.ExtensionAgent{item.primary}, item.primaryCfg))
+						} else {
+							if onRegOnly != nil {
+								onRegOnly(item.primary)
+							}
+							recordFailedSubscribe(item.primary.Ext, subscribeEvents,
+								fmt.Errorf("SUBSCRIBE failed [group=%s zone=%s controller=%s:%d]",
+									item.group.GroupID, item.group.ZoneID, item.primaryCfg.SBCHost, item.primaryCfg.SBCPort))
+						}
+					}
+				}
+
+				var primaryReg, secondaryReg, subscribed *agent.ExtensionAgent
+				if primaryOK {
+					primaryReg = item.primary
+				}
+				if secondaryOK {
+					secondaryReg = item.secondary
+				}
+				if subOK {
+					subscribed = item.primary
+				}
+				recordGroup(item.group, primaryReg, secondaryReg, subscribed)
+			}
+		}()
+	}
+
+	go func() {
+		defer close(workCh)
+		interval := time.Second / time.Duration(rate)
+		if interval <= 0 {
+			interval = time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for _, item := range items {
+			if stopNew != nil && stopNew.Load() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case workCh <- item:
+			}
+		}
+	}()
+
+	wg.Wait()
+	result.stopRefresh = func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}
+	return result
+}
+
+func buildMultiZoneRegSubItems(cfg *config.VMConfig, groups []*engine.AgentGroup) []multiZoneRegSubItem {
+	type groupItems struct {
+		group *engine.AgentGroup
+		items []multiZoneRegSubItem
+	}
+	sortedGroups := append([]*engine.AgentGroup(nil), groups...)
+	sort.Slice(sortedGroups, func(i, j int) bool {
+		gi, gj := sortedGroups[i], sortedGroups[j]
+		if gi.ZoneID != gj.ZoneID {
+			return gi.ZoneID < gj.ZoneID
+		}
+		if gi.GroupID != gj.GroupID {
+			return gi.GroupID < gj.GroupID
+		}
+		if gi.PrimaryController.Host != gj.PrimaryController.Host {
+			return gi.PrimaryController.Host < gj.PrimaryController.Host
+		}
+		return gi.PrimaryController.Port < gj.PrimaryController.Port
+	})
+	perGroup := make([]groupItems, 0, len(groups))
+	maxLen := 0
+	for _, group := range sortedGroups {
+		primaryCfg := group.PrimaryConfig(cfg)
+		secondaryCfg := group.SecondaryConfig(cfg)
+		primary := agentsToSlice(group.PrimaryAgents)
+		items := make([]multiZoneRegSubItem, 0, len(primary))
+		for _, primaryAg := range primary {
+			items = append(items, multiZoneRegSubItem{
+				group:        group,
+				primary:      primaryAg,
+				secondary:    group.SecondaryAgents[primaryAg.Ext],
+				primaryCfg:   primaryCfg,
+				secondaryCfg: secondaryCfg,
+			})
+		}
+		if len(items) > maxLen {
+			maxLen = len(items)
+		}
+		perGroup = append(perGroup, groupItems{group: group, items: items})
+	}
+	out := make([]multiZoneRegSubItem, 0)
+	for i := 0; i < maxLen; i++ {
+		for _, gi := range perGroup {
+			if i < len(gi.items) {
+				out = append(out, gi.items[i])
+			}
+		}
+	}
+	return out
+}
+
+func registerAgentWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig) bool {
+	maxRetries := cfg.RegisterRetry
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	timeout := time.Duration(cfg.RegisterTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		regCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := ag.Register(regCtx)
+		cancel()
+		if err == nil {
+			return true
+		}
+		slog.Warn("REGISTER attempt failed", "ext", ag.Ext, "attempt", attempt, "max", maxRetries, "err", err)
+		if attempt < maxRetries {
+			backoff := time.Duration(float64(time.Second) * 0.5 * float64(attempt))
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(backoff):
+			}
+		}
+	}
+	slog.Error("failed to register after all attempts", "ext", ag.Ext, "attempts", maxRetries)
+	return false
+}
+
+func subscribeAgentWithRetry(ctx context.Context, ag *agent.ExtensionAgent, cfg *config.VMConfig, onProgress func(event string, ok bool, notifyReceived bool)) bool {
+	maxRetries := cfg.RegisterRetry
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var attemptProgress []struct {
+			event          string
+			ok             bool
+			notifyReceived bool
+		}
+		err := ag.SubscribeWithProgress(ctx, func(event string, ok bool, notifyReceived bool) {
+			attemptProgress = append(attemptProgress, struct {
+				event          string
+				ok             bool
+				notifyReceived bool
+			}{event: event, ok: ok, notifyReceived: notifyReceived})
+		})
+		if err == nil {
+			if onProgress != nil {
+				for _, p := range attemptProgress {
+					onProgress(p.event, p.ok, p.notifyReceived)
+				}
+			}
+			return true
+		}
+		slog.Warn("SUBSCRIBE attempt failed", "ext", ag.Ext, "attempt", attempt, "max", maxRetries, "err", err)
+		if attempt < maxRetries {
+			backoff := time.Duration(float64(time.Second) * 0.5 * float64(attempt))
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(backoff):
+			}
+		} else if onProgress != nil {
+			for _, p := range attemptProgress {
+				onProgress(p.event, p.ok, p.notifyReceived)
+			}
+		}
+	}
+	slog.Error("failed to subscribe after all attempts", "ext", ag.Ext, "attempts", maxRetries)
+	return false
 }
 
 func cleanupStartRequested(pctx *metrics.ProcessContext) bool {
@@ -2376,6 +2670,7 @@ func createAgents(cfg *config.VMConfig) map[string]*agent.ExtensionAgent {
 	for ext := cfg.ExtStart; ext <= cfg.ExtEnd; ext++ {
 		extStr := strconv.Itoa(ext)
 		ag := agent.NewExtensionAgent(extStr, cfg)
+		ag.SetPlacement("default", "default", cfg.SBCHost, cfg.SBCPort)
 		ag.SetAssignedLocalHost(cfg.LocalHostForExtension(extStr))
 		agents[extStr] = ag
 	}
@@ -2395,7 +2690,27 @@ func agentsToSlice(agents map[string]*agent.ExtensionAgent) []*agent.ExtensionAg
 	return out
 }
 
-func connectTransportsBatched(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector, stopCh <-chan struct{}) (map[string]*agent.ExtensionAgent, error) {
+func derivedWorkerCount(rate, timeoutSeconds, total int) int {
+	if rate <= 0 {
+		rate = 30
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 5
+	}
+	workers := rate * timeoutSeconds
+	if workers < rate {
+		workers = rate
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if total > 0 && workers > total {
+		workers = total
+	}
+	return workers
+}
+
+func connectAgentSliceRateLimited(ctx context.Context, agentSlice []*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector, stopCh <-chan struct{}) ([]*agent.ExtensionAgent, error) {
 	connectCtx := ctx
 	var cancelConnect context.CancelFunc
 	var stopped atomic.Bool
@@ -2411,94 +2726,76 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 			}
 		}()
 	}
-	allAgents := agentsToSlice(agents)
-	total := len(allAgents)
-	connected := make(map[string]*agent.ExtensionAgent, total)
-	if collector != nil {
-		collector.ResetTransportConnect(total)
-		defer collector.FinishTransportConnect()
+
+	total := len(agentSlice)
+	connected := make([]*agent.ExtensionAgent, 0, total)
+	if total == 0 {
+		return connected, nil
 	}
-	batchSize := cfg.RegisterBatchSize
-	if batchSize <= 0 {
-		batchSize = 10
-	}
-	batchDelay := cfg.BatchDelay()
+	rate := cfg.EffectiveAgentConnectionCPS()
 	connectTimeout := transportConnectTimeout(cfg)
+	workerCount := derivedWorkerCount(rate, int(connectTimeout.Seconds()), total)
+	jobs := make(chan *agent.ExtensionAgent)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-	slog.Info("Connecting transports in batches",
+	slog.Info("Connecting transports with CPS pacing",
 		"total", total,
-		"batch_size", batchSize,
-		"batch_delay_ms", batchDelay.Milliseconds(),
-		"connect_timeout_ms", connectTimeout.Milliseconds(),
-	)
+		"agent_connection_cps", rate,
+		"workers", workerCount,
+		"connect_timeout_ms", connectTimeout.Milliseconds())
 
-	for batchStart := 0; batchStart < total; batchStart += batchSize {
-		if stopped.Load() {
-			return connected, errTransportConnectStopped
-		}
-		batchEnd := batchStart + batchSize
-		if batchEnd > total {
-			batchEnd = total
-		}
-		batch := allAgents[batchStart:batchEnd]
-		batchNum := batchStart/batchSize + 1
-
-		slog.Info("Transport batch connecting",
-			"batch", batchNum, "count", len(batch),
-			"from", batch[0].Ext, "to", batch[len(batch)-1].Ext,
-		)
-
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		batchFailures := 0
-		for _, ag := range batch {
-			wg.Add(1)
-			go func(a *agent.ExtensionAgent) {
-				defer wg.Done()
-				connectCtx, cancel := context.WithTimeout(connectCtx, connectTimeout)
-				defer cancel()
-				if err := a.Start(connectCtx); err != nil {
-					mu.Lock()
-					batchFailures++
-					mu.Unlock()
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for a := range jobs {
+				cctx, cancel := context.WithTimeout(connectCtx, connectTimeout)
+				err := a.Start(cctx)
+				cancel()
+				if err != nil {
 					slog.Error("Agent start failed", "ext", a.Ext, "err", err)
 					if collector != nil {
 						collector.RecordTransportConnectFailure(a.Ext, cfg.LocalHostForExtension(a.Ext), fmt.Sprintf("%s:%d", cfg.SBCHost, cfg.SBCPort), err)
 					}
-					return
+					continue
 				}
 				mu.Lock()
-				connected[a.Ext] = a
+				connected = append(connected, a)
 				mu.Unlock()
 				if collector != nil {
 					collector.RecordTransportConnectSuccess()
 				}
-			}(ag)
-		}
-		wg.Wait()
+			}
+		}()
+	}
 
-		if batchFailures > 0 {
-			slog.Warn("Transport batch partially connected",
-				"batch", batchNum,
-				"connected", len(batch)-batchFailures,
-				"failed", batchFailures,
-				"count", len(batch),
-			)
-		} else {
-			slog.Info("Transport batch connected", "batch", batchNum, "count", len(batch))
+	go func() {
+		defer close(jobs)
+		interval := time.Second / time.Duration(rate)
+		if interval <= 0 {
+			interval = time.Millisecond
 		}
-
-		if batchEnd < total {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for _, ag := range agentSlice {
+			if stopped.Load() {
+				return
+			}
 			select {
 			case <-connectCtx.Done():
-				if stopped.Load() {
-					return connected, errTransportConnectStopped
-				}
-				return connected, connectCtx.Err()
-			case <-time.After(batchDelay):
+				return
+			case <-ticker.C:
+			}
+			select {
+			case <-connectCtx.Done():
+				return
+			case jobs <- ag:
 			}
 		}
-	}
+	}()
+
+	wg.Wait()
 	if stopped.Load() {
 		return connected, errTransportConnectStopped
 	}
@@ -2509,10 +2806,24 @@ func connectTransportsBatched(ctx context.Context, agents map[string]*agent.Exte
 		slog.Warn("Transport connection completed with partial success",
 			"configured", total,
 			"connected", len(connected),
-			"failed", total-len(connected),
-		)
+			"failed", total-len(connected))
 	}
 	return connected, nil
+}
+
+func connectTransportsRateLimited(ctx context.Context, agents map[string]*agent.ExtensionAgent, cfg *config.VMConfig, collector *metrics.MetricsCollector, stopCh <-chan struct{}) (map[string]*agent.ExtensionAgent, error) {
+	allAgents := agentsToSlice(agents)
+	total := len(allAgents)
+	if collector != nil {
+		collector.ResetTransportConnect(total)
+		defer collector.FinishTransportConnect()
+	}
+	connectedSlice, err := connectAgentSliceRateLimited(ctx, allAgents, cfg, collector, stopCh)
+	connected := make(map[string]*agent.ExtensionAgent, len(connectedSlice))
+	for _, ag := range connectedSlice {
+		connected[ag.Ext] = ag
+	}
+	return connected, err
 }
 
 func transportConnectTimeout(cfg *config.VMConfig) time.Duration {
@@ -2832,48 +3143,59 @@ func callResultToMetrics(r engine.CallResult) metrics.CallResultData {
 		// UAC leg: ACK was sent after receiving 200 OK (AckSentMs > 0).
 		// UAS leg: ACK was received from the caller (AckReceivedMs > 0).
 		// Either side indicates the call was answered by the called party.
-		Answered:            r.SipMilestones.AckSentMs > 0 || r.SipMilestones.AckReceivedMs > 0,
-		FailureReason:       r.FailureReason,
-		PDDMs:               r.PDDMs,
-		HoldMs:              r.HoldMs,
-		TotalMs:             r.TotalMs,
-		RTPTxPkts:           r.RTPTxPkts,
-		RTPRxPkts:           r.RTPRxPkts,
-		SIPLocalIP:          r.SIPLocalIP,
-		SIPLocalPort:        r.SIPLocalPort,
-		SIPRemoteIP:         r.SIPRemoteIP,
-		SIPRemotePort:       r.SIPRemotePort,
-		SIPCode:             r.SIPCode,
-		SIPServerHeader:     r.SIPServerHeader,
-		SIPUserAgentHeader:  r.SIPUserAgentHeader,
-		MediaVerified:       r.MediaVerified,
-		RTPLocalPort:        r.RTPLocalPort,
-		MediaSecurity:       r.MediaSecurity,
-		RTPCodec:            r.RTPCodec,
-		RTPPayloadType:      r.RTPPayloadType,
-		RTPPayloadMarkers:   r.RTPPayloadMarkers,
-		MOSCodec:            r.MOSCodec,
-		SRTPCryptoSuite:     r.SRTPCryptoSuite,
-		SRTPDecryptFailures: r.SRTPDecryptFailures,
-		SRTPAuthFailures:    r.SRTPAuthFailures,
-		SRTPReplayFailures:  r.SRTPReplayFailures,
-		PoolWrapIndex:       r.PoolWrapIndex,
-		PeerExt:             r.PeerExt,
-		TsUTC:               r.TsUTC,
-		Direction:           r.Direction,
-		SBCRTPRelayIP:       r.SBCRTPRelayIP,
-		SBCRTPRelayPort:     r.SBCRTPRelayPort,
-		RTPRxFromSBCPkts:    r.RTPRxFromSBCPkts,
-		RTPRxOtherPkts:      r.RTPRxOtherPkts,
-		RTCPRxPkts:          r.RTCPRxPkts,
-		RTPAsymmetryFlag:    r.RTPAsymmetryFlag,
-		MarkersSent:         r.MarkersSent,
-		MarkersReceived:     r.MarkersReceived,
-		RTPExpectedPkts:     r.RTPExpectedPkts,
-		RTPSSRCCount:        r.RTPSSRCCount,
-		Scenario:            r.Scenario,
-		ActiveController:    r.ActiveController,
-		AgentGroupID:        r.AgentGroupID,
+		Answered:              r.SipMilestones.AckSentMs > 0 || r.SipMilestones.AckReceivedMs > 0,
+		FailureReason:         r.FailureReason,
+		PDDMs:                 r.PDDMs,
+		HoldMs:                r.HoldMs,
+		TotalMs:               r.TotalMs,
+		RTPTxPkts:             r.RTPTxPkts,
+		RTPRxPkts:             r.RTPRxPkts,
+		SIPLocalIP:            r.SIPLocalIP,
+		SIPLocalPort:          r.SIPLocalPort,
+		SIPRemoteIP:           r.SIPRemoteIP,
+		SIPRemotePort:         r.SIPRemotePort,
+		SIPCode:               r.SIPCode,
+		SIPServerHeader:       r.SIPServerHeader,
+		SIPUserAgentHeader:    r.SIPUserAgentHeader,
+		MediaVerified:         r.MediaVerified,
+		RTPLocalPort:          r.RTPLocalPort,
+		MediaSecurity:         r.MediaSecurity,
+		RTPCodec:              r.RTPCodec,
+		RTPPayloadType:        r.RTPPayloadType,
+		RTPPayloadMarkers:     r.RTPPayloadMarkers,
+		MOSCodec:              r.MOSCodec,
+		SRTPCryptoSuite:       r.SRTPCryptoSuite,
+		SRTPDecryptFailures:   r.SRTPDecryptFailures,
+		SRTPAuthFailures:      r.SRTPAuthFailures,
+		SRTPReplayFailures:    r.SRTPReplayFailures,
+		PoolWrapIndex:         r.PoolWrapIndex,
+		PeerExt:               r.PeerExt,
+		TsUTC:                 r.TsUTC,
+		Direction:             r.Direction,
+		SBCRTPRelayIP:         r.SBCRTPRelayIP,
+		SBCRTPRelayPort:       r.SBCRTPRelayPort,
+		RTPRxFromSBCPkts:      r.RTPRxFromSBCPkts,
+		RTPRxOtherPkts:        r.RTPRxOtherPkts,
+		RTCPRxPkts:            r.RTCPRxPkts,
+		RTPAsymmetryFlag:      r.RTPAsymmetryFlag,
+		MarkersSent:           r.MarkersSent,
+		MarkersReceived:       r.MarkersReceived,
+		RTPExpectedPkts:       r.RTPExpectedPkts,
+		RTPSSRCCount:          r.RTPSSRCCount,
+		Scenario:              r.Scenario,
+		ActiveController:      r.ActiveController,
+		AgentGroupID:          r.AgentGroupID,
+		UACControllerHost:     r.UACControllerHost,
+		UACControllerPort:     r.UACControllerPort,
+		UACAgentGroupID:       r.UACAgentGroupID,
+		UACZoneID:             r.UACZoneID,
+		UASControllerHost:     r.UASControllerHost,
+		UASControllerPort:     r.UASControllerPort,
+		UASAgentGroupID:       r.UASAgentGroupID,
+		UASZoneID:             r.UASZoneID,
+		FailureControllerRole: r.FailureControllerRole,
+		FailureControllerHost: r.FailureControllerHost,
+		FailureControllerPort: r.FailureControllerPort,
 
 		// Phase-1 QoS metrics
 		JitterMs:            r.JitterMs,

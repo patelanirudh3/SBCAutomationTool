@@ -1,10 +1,11 @@
 export type VMRole = 'UAC' | 'UAS'
 export type TrafficMode = 'smoke' | 'timed' | 'unlimited'
+export type PairingPolicy = 'random' | 'cross_zone' | 'same_zone' | 'same_controller'
 export type SipTransport = 'TCP' | 'TLS' | 'UDP'
 export type SipScheme = 'SIP' | 'SIPS'
 export type LocalIPMode = 'single' | 'unique_vip' | 'vip_pool'
 export type TLSMode = 'insecure' | 'server_ca' | 'client_cert' | 'mutual'
-export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729'
+export type RtpCodec = 'G711_ULAW' | 'G711_ALAW' | 'G729' | 'G729_AUDIO'
 export type RtpUnsupportedCodecPolicy = 'fallback_g711' | 'reject_488'
 export type MediaSecurity = 'rtp' | 'srtp_sdes'
 export type SRTPCryptoSuite = 'AES_CM_128_HMAC_SHA1_80' | 'AES_CM_128_HMAC_SHA1_32'
@@ -34,8 +35,6 @@ export type RunMode = 'local' | 'multi-vm'
 export type RtpMode = '3phase' | '3phase_coverage' | 'continuous'
 
 export interface AdvancedSettings {
-  register_batch_size: number          // default: 10 — concurrent batch size for TCP connect + REGISTER
-  register_batch_delay_ms: number      // default: 1000 — delay (ms) between TCP socket / REGISTER batches
   connect_timeout: number              // default: 5 — per TCP/TLS connection attempt timeout (s)
   register_timeout: number             // default: 5 — per-REGISTER and per-SUBSCRIBE response wait (s)
   register_retry: number               // default: 3 — retry attempts for REGISTER and SUBSCRIBE
@@ -77,8 +76,6 @@ export interface AdvancedSettings {
 }
 
 export const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = {
-  register_batch_size: 10,
-  register_batch_delay_ms: 1000,
   connect_timeout: 5,
   register_timeout: 5,
   register_retry: 3,
@@ -183,9 +180,8 @@ export interface VMConfig {
   subscribe_events?: string[]      // default: ['dialog']
   subscribe_refresh_events?: string[]
   subscribe_unsubscribe_events?: string[]
-  register_rate_cps?: number       // default: 10 — REGISTERs per second
-  cleanup_batch_size?: number      // default: 10 — cleanup-only unsubscribe/unregister batch size
-
+  agent_connection_cps?: number    // default: 30 — agent TCP/TLS connection starts per second
+  agent_regsub_cps?: number        // default: 30 — logical agent Reg/Sub setup starts per second
   // SIP timers (RFC 3261 §17.1.1, INVITE client transaction).
   // Both optional — backend uses RFC defaults when unset.
   t1_ms?: number                   // RFC default 500 — Timer A retransmit interval (UDP only)
@@ -230,6 +226,7 @@ export interface VMConfig {
 
   // Run Control
   traffic_mode?: TrafficMode
+  pairing_policy?: PairingPolicy
   call_count?: number
   duration_hours?: number
   start_time_iso?: string          // optional scheduled start (ISO 8601 UTC)
@@ -290,11 +287,13 @@ export interface TrafficMetrics {
   calls_acknowledged?: number
   calls_completed: number
   calls_failed: number
+  calls_by_controller?: Record<string, ControllerCallStats>
   // asr: Answer Seizure Ratio = calls_answered / calls_attempted * 100.
   asr: number
   // csr: Call Success Ratio = calls_completed / calls_attempted * 100.
   csr?: number
   target_cps?: number
+  pairing_policy?: PairingPolicy
   avg_pdd_ms: number
   min_pdd_ms: number
   max_pdd_ms: number
@@ -441,6 +440,16 @@ export interface TrafficMetrics {
   }
 }
 
+export interface ControllerCallStats {
+  controller: string
+  uac_calls: number
+  uas_calls: number
+  completed: number
+  failed: number
+  failed_as_uac_controller: number
+  failed_as_uas_controller: number
+}
+
 export interface SubscriptionEventStats {
   total: number
   successful: number
@@ -574,6 +583,17 @@ export interface CallEvent {
   sip_user_agent_header?: string
   active_controller?: string
   agent_group_id?: string
+  uac_controller_host?: string
+  uac_controller_port?: number
+  uac_agent_group_id?: string
+  uac_zone_id?: string
+  uas_controller_host?: string
+  uas_controller_port?: number
+  uas_agent_group_id?: string
+  uas_zone_id?: string
+  failure_controller_role?: string
+  failure_controller_host?: string
+  failure_controller_port?: number
   pdd_ms: number
   hold_ms: number
   media_status: 'MEDIA_VERIFIED' | 'MEDIA_PARTIAL' | 'MEDIA_FAILED' | 'NO_MEDIA'

@@ -5,6 +5,7 @@ import { CheckCircle2, XCircle, Play, XOctagon, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTrafficStore } from '@/store/traffic'
 import { startTrafficFor } from '@/lib/api'
+import { selectedEngineEndpoint } from '@/lib/engine-endpoint'
 
 // ---------------------------------------------------------------------------
 // Stat row
@@ -53,8 +54,9 @@ export function PrePhaseSummaryModal({ elapsedSeconds, onAbort }: PrePhaseSummar
   const [error, setError]       = useState<string | null>(null)
 
   const pair       = pairs[activePairIndex]
-  const vmIp       = pair?.uac.vm_ip       ?? '127.0.0.1'
-  const vmPort     = pair?.uac.metrics_port ?? 8082
+  const endpoint   = selectedEngineEndpoint(pair?.uac)
+  const vmIp       = endpoint.ip
+  const vmPort     = endpoint.port
   const extCount   = pair ? (pair.uac.ext_end - pair.uac.ext_start + 1) : 0
 
   const regDone  = prePhaseStatus?.register_count  ?? 0

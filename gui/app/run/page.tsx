@@ -17,6 +17,7 @@ import { AggregatePanel } from '@/components/dashboard/AggregatePanel'
 import { PrePhaseReport } from '@/components/dashboard/PrePhaseReport'
 import { PrePhaseSummaryModal } from '@/components/dashboard/PrePhaseSummaryModal'
 import { FailedCallsTable } from '@/components/dashboard/FailedCallsTable'
+import { ControllerCallSummary } from '@/components/dashboard/ControllerCallSummary'
 import { MediaQosPanel, computeConfiguredRtpPacketsPerDirection } from '@/components/dashboard/MediaQosPanel'
 import { VMHealthPanel } from '@/components/dashboard/VMHealthPanel'
 import { FinalReport } from '@/components/postrun/FinalReport'
@@ -25,15 +26,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useTrafficStore } from '@/store/traffic'
 import type { CallEvent } from '@/types'
 import { useMetricsStream } from '@/lib/ws'
-import { vmWsUrl, getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor, updateTrafficCPSFor } from '@/lib/api'
+import { getMetricsFor, getCallsFor, getCallSpinesFor, buildAggregate, gracefulStopFor, startCleanupFor, resetTestFor, updateTrafficCPSFor, updatePairingPolicyFor, getCurrentConfigFor, type CurrentConfigResponse } from '@/lib/api'
 import { mapBackendPhase as sharedMapBackendPhase } from '@/lib/phase'
+import { selectedEngineEndpoint, engineWsUrl } from '@/lib/engine-endpoint'
 import {
   MOCK_UAC_METRICS,
   MOCK_CALL_EVENTS,
   MOCK_AGGREGATE,
   simulateMetricsTick,
 } from '@/lib/mock-data'
-import type { TrafficMetrics, RunPhase } from '@/types'
+import type { TrafficMetrics, RunPhase, PairingPolicy } from '@/types'
 
 const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === 'true'
 
@@ -55,10 +57,12 @@ function LiveDashboard({
   stopping,
   onGracefulStop,
   onApplyCPS,
+  onApplyPairingPolicy,
 }: {
   stopping: boolean
   onGracefulStop: () => void
   onApplyCPS: (cps: number) => Promise<void>
+  onApplyPairingPolicy: (policy: PairingPolicy) => Promise<void>
 }) {
   const phase = useTrafficStore((s) => s.phase)
   const uacMetrics = useTrafficStore((s) => s.uacMetrics)
@@ -88,7 +92,10 @@ function LiveDashboard({
   const [cpsDraft, setCpsDraft] = useState('')
   const [cpsBusy, setCpsBusy] = useState(false)
   const [cpsError, setCpsError] = useState<string | null>(null)
+  const [pairingBusy, setPairingBusy] = useState(false)
+  const [pairingError, setPairingError] = useState<string | null>(null)
   const targetCPS = uacMetrics?.target_cps ?? pair?.uac.cps ?? 0
+  const pairingPolicy = uacMetrics?.pairing_policy ?? 'random'
 
   useEffect(() => {
     if (!cpsDraft && targetCPS > 0) setCpsDraft(String(targetCPS))
@@ -137,6 +144,18 @@ function LiveDashboard({
       setCpsError(err instanceof Error ? err.message : 'Failed to update CPS')
     } finally {
       setCpsBusy(false)
+    }
+  }
+
+  const submitPairingPolicy = async (policy: PairingPolicy) => {
+    setPairingBusy(true)
+    setPairingError(null)
+    try {
+      await onApplyPairingPolicy(policy)
+    } catch (err) {
+      setPairingError(err instanceof Error ? err.message : 'Failed to update pairing policy')
+    } finally {
+      setPairingBusy(false)
     }
   }
 
@@ -205,6 +224,21 @@ function LiveDashboard({
                 {cpsBusy ? 'Applying...' : 'Apply'}
               </button>
               {cpsError && <span className="max-w-48 truncate text-[11px] text-rose-300" title={cpsError}>{cpsError}</span>}
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-slate-700/60 bg-slate-950/30 px-2 py-1">
+              <span className="text-[11px] text-muted-foreground">Pairing</span>
+              <select
+                value={pairingPolicy}
+                disabled={pairingBusy || isStopping}
+                onChange={(e) => submitPairingPolicy(e.target.value as PairingPolicy)}
+                className="h-7 rounded border border-slate-700 bg-slate-950 px-2 text-[11px] font-mono text-slate-100 outline-none focus:border-sky-500"
+              >
+                <option value="random">Random</option>
+                <option value="cross_zone">Cross Zone Only</option>
+                <option value="same_zone">Same Zone</option>
+                <option value="same_controller">Same Controller</option>
+              </select>
+              {pairingError && <span className="max-w-48 truncate text-[11px] text-rose-300" title={pairingError}>{pairingError}</span>}
             </div>
           </div>
         )}
@@ -352,6 +386,7 @@ function LiveDashboard({
       </div>
 
       {/* Failed calls table */}
+      <ControllerCallSummary stats={uacMetrics.calls_by_controller} />
       <FailedCallsTable
         events={callEvents}
         reportedFailedCount={uacMetrics.calls_failed}
@@ -440,6 +475,57 @@ function ReconnectBanner({ visible }: { visible: boolean }) {
         </motion.div>
       )}
     </AnimatePresence>
+  )
+}
+
+function RunConfigModal({
+  open,
+  snapshot,
+  loading,
+  error,
+  onClose,
+}: {
+  open: boolean
+  snapshot: CurrentConfigResponse | null
+  loading: boolean
+  error: string | null
+  onClose: () => void
+}) {
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+      <div className="max-h-[82vh] w-full max-w-4xl overflow-hidden rounded-xl border border-slate-700 bg-slate-950 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-100">Run Configuration</h2>
+            <p className="text-xs text-slate-400">Read-only snapshot accepted by the traffic engine for this run.</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-md border border-slate-700 px-3 py-1 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+          >
+            Back to Running Traffic
+          </button>
+        </div>
+        <div className="max-h-[68vh] overflow-auto p-4">
+          {loading && <p className="text-sm text-slate-400">Loading configuration...</p>}
+          {error && <p className="text-sm text-rose-300">{error}</p>}
+          {!loading && !error && snapshot && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <RuntimeStat label="VM ID" value={snapshot.vm_id || 'unknown'} />
+                <RuntimeStat label="State" value={snapshot.state || 'unknown'} />
+                <RuntimeStat label="YAML" value={snapshot.yaml_path || 'not written'} />
+              </div>
+              <pre className="whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs leading-relaxed text-slate-200">
+                {JSON.stringify(snapshot.config, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -557,6 +643,10 @@ export default function RunPage() {
     useTrafficStore()
 
   const [stopping, setStopping] = useState(false)
+  const [configOpen, setConfigOpen] = useState(false)
+  const [configSnapshot, setConfigSnapshot] = useState<CurrentConfigResponse | null>(null)
+  const [configLoading, setConfigLoading] = useState(false)
+  const [configError, setConfigError] = useState<string | null>(null)
   // Elapsed seconds frozen at the moment traffic stops (set once, never overwritten)
   const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null)
   // Wall-clock start of the unregister phase (used to freeze
@@ -655,8 +745,27 @@ export default function RunPage() {
     }
   }, [phase, uacMetrics, frozenElapsed, setCleanupStatus])
 
-  const vmIp   = pair?.uac.vm_ip   ?? '127.0.0.1'
-  const vmPort = pair?.uac.metrics_port ?? 8082
+  const selectedEndpoint = selectedEngineEndpoint(pair?.uac)
+  const vmPort = selectedEndpoint.port
+  const engineIp = selectedEndpoint.ip
+
+  const openRunConfig = async () => {
+    setConfigOpen(true)
+    setConfigLoading(true)
+    setConfigError(null)
+    try {
+      const snapshot = await getCurrentConfigFor(engineIp, vmPort)
+      if (!snapshot) {
+        setConfigError('No accepted run configuration is available from the engine.')
+      } else {
+        setConfigSnapshot(snapshot)
+      }
+    } catch (err) {
+      setConfigError(err instanceof Error ? err.message : 'Failed to load run configuration')
+    } finally {
+      setConfigLoading(false)
+    }
+  }
 
   // Bind for ESLint. The full reset path is no longer used inside restart
   // but is still imported for potential future "Hard Reset" affordance.
@@ -672,7 +781,7 @@ export default function RunPage() {
       return
     }
     try {
-      await gracefulStopFor(vmIp, vmPort)
+      await gracefulStopFor(engineIp, vmPort)
       setPhase('STOPPING')
     } catch { /* backend will still stop, polling detects phase change */ }
     setStopping(false)
@@ -680,10 +789,19 @@ export default function RunPage() {
 
   const handleApplyCPS = async (cps: number) => {
     if (IS_MOCK) return
-    const result = await updateTrafficCPSFor(vmIp, vmPort, cps)
+    const result = await updateTrafficCPSFor(engineIp, vmPort, cps)
     const latest = useTrafficStore.getState().uacMetrics
     if (latest) {
       updateUACMetrics({ ...latest, target_cps: result.target_cps })
+    }
+  }
+
+  const handleApplyPairingPolicy = async (policy: PairingPolicy) => {
+    if (IS_MOCK) return
+    const result = await updatePairingPolicyFor(engineIp, vmPort, policy)
+    const latest = useTrafficStore.getState().uacMetrics
+    if (latest) {
+      updateUACMetrics({ ...latest, pairing_policy: result.pairing_policy })
     }
   }
 
@@ -725,7 +843,7 @@ export default function RunPage() {
       return
     }
     try {
-      await startCleanupFor(vmIp, vmPort)
+      await startCleanupFor(engineIp, vmPort)
       // Flip to CLEANING_UP optimistically so the progress card renders
       // before the next metrics tick. The store will overwrite this with
       // the real backend phase on the next WS push (still CLEANING_UP).
@@ -750,7 +868,7 @@ export default function RunPage() {
       })
       return
     }
-    try { await startCleanupFor(vmIp, vmPort) } catch { /* ignore */ }
+    try { await startCleanupFor(engineIp, vmPort) } catch { /* ignore */ }
   }
 
   // ------------------------------------------------------------------
@@ -774,7 +892,15 @@ export default function RunPage() {
     if (IS_MOCK) return
 
     const { pairs, activePairIndex } = useTrafficStore.getState()
-    const livePair = pairs[activePairIndex]
+    const storePair = pairs[activePairIndex]
+    const endpoint = selectedEngineEndpoint(storePair?.uac)
+    const livePair = {
+      uac: {
+        ...(storePair?.uac ?? { vm_id: 'traffic-local' }),
+        vm_ip: endpoint.ip,
+        metrics_port: endpoint.port,
+      },
+    }
 
     let intervalId: ReturnType<typeof setInterval> | null = null
     let consecutiveFailures = 0
@@ -868,7 +994,7 @@ export default function RunPage() {
   // ------------------------------------------------------------------
 
   useMetricsStream(
-    vmWsUrl(pair?.uac.vm_ip ?? '127.0.0.1', pair?.uac.metrics_port ?? 8082),
+    engineWsUrl(selectedEndpoint),
     {
       onMetrics: (metrics) => {
         const m = metrics.find((m) => m.vm_id === pair?.uac.vm_id) ?? metrics[0]
@@ -917,7 +1043,22 @@ export default function RunPage() {
           <HomeGuardButton href="/config" />
         </div>
         <StepIndicator />
+        <div className="absolute right-6">
+          <button
+            onClick={openRunConfig}
+            className="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-xs font-semibold text-slate-300 transition hover:border-sky-500/50 hover:text-sky-300"
+          >
+            View Run Config
+          </button>
+        </div>
       </div>
+      <RunConfigModal
+        open={configOpen}
+        snapshot={configSnapshot}
+        loading={configLoading}
+        error={configError}
+        onClose={() => setConfigOpen(false)}
+      />
       <main className="flex-1 overflow-y-auto py-2">
         <AnimatePresence mode="wait">
 
@@ -971,6 +1112,7 @@ export default function RunPage() {
                 stopping={stopping}
                 onGracefulStop={handleGracefulStop}
                 onApplyCPS={handleApplyCPS}
+                    onApplyPairingPolicy={handleApplyPairingPolicy}
               />
             </motion.div>
           )}

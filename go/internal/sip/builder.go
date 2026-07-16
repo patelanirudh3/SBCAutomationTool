@@ -37,6 +37,13 @@ func BuildInitialRegister(fromUser, domain, transport, localIP string, localPort
 }
 
 func BuildInitialRegisterWithScheme(fromUser, domain, scheme, transport, localIP string, localPort int, expires int) *SipMessage {
+	return BuildInitialRegisterWithSchemeAndRegID(fromUser, domain, scheme, transport, localIP, localPort, expires, 1)
+}
+
+func BuildInitialRegisterWithSchemeAndRegID(fromUser, domain, scheme, transport, localIP string, localPort int, expires, regID int) *SipMessage {
+	if regID <= 0 {
+		regID = 1
+	}
 	m := NewSipMessage()
 	m.SetRequestLine(fmt.Sprintf("REGISTER %s:%s SIP/2.0", scheme, domain))
 
@@ -59,7 +66,7 @@ func BuildInitialRegisterWithScheme(fromUser, domain, scheme, transport, localIP
 	contact += `+avaya.firmware="FW_S_J179_R4_0_4_0_3b4033.bin";`
 	contact += `+av.ip.mode=4;+av.sdp.anat;+av.sip.sig=4;+av.sip.media=4;`
 	contact += `+av.sip.max-sim-reg=5;`
-	contact += fmt.Sprintf(`+sip.instance="<urn:uuid:%s>";reg-id=1`, InstanceUUID(fromUser))
+	contact += fmt.Sprintf(`+sip.instance="<urn:uuid:%s>";reg-id=%d`, InstanceUUID(fromUser), regID)
 	m.AddHeader(HdrContact, contact)
 
 	m.AddHeader(HdrExpires, strconv.Itoa(expires))

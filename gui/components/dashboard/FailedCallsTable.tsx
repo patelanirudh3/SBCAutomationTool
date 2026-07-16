@@ -28,6 +28,10 @@ function formatAddrFull(ip?: string, port?: number): string {
   return port ? `${ip}:${port}` : ip
 }
 
+function formatController(host?: string, port?: number): string {
+  return formatAddrFull(host, port) || '—'
+}
+
 export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTableProps) {
   // Filter to UAC-only so each call session shows up once (the events list
   // contains both UAC and UAS legs from /api/calls — kept for spine
@@ -107,8 +111,16 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
       call_id: ev.call_id ?? '',
       uac_ext: ev.uac_ext ?? ev.ext ?? '',
       uac_ip: formatAddrFull(ev.sip_local_ip, ev.sip_local_port),
+      uac_controller: formatController(ev.uac_controller_host, ev.uac_controller_port),
+      uac_agent_group_id: ev.uac_agent_group_id ?? ev.agent_group_id ?? '',
+      uac_zone_id: ev.uac_zone_id ?? '',
       uas_ext: ev.uas_ext ?? ev.peer_ext ?? '',
       uas_ip: formatAddrFull(ev.sip_remote_ip, ev.sip_remote_port),
+      uas_controller: formatController(ev.uas_controller_host, ev.uas_controller_port),
+      uas_agent_group_id: ev.uas_agent_group_id ?? '',
+      uas_zone_id: ev.uas_zone_id ?? '',
+      failure_controller_role: ev.failure_controller_role ?? '',
+      failure_controller: formatController(ev.failure_controller_host, ev.failure_controller_port),
       sip_code: ev.sip_code ?? 0,
       failure_reason: ev.failure_reason ?? '',
       server_header: ev.sip_server_header ?? '',
@@ -255,7 +267,10 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                     <tr className="border-b border-slate-700/50 text-[10px] uppercase tracking-widest text-slate-400">
                       <th className="px-4 py-2 text-left">Call ID</th>
                       <th className="px-4 py-2 text-left">UAC# / IP:Port</th>
+                      <th className="px-4 py-2 text-left">UAC Controller</th>
                       <th className="px-4 py-2 text-left">UAS# / IP:Port</th>
+                      <th className="px-4 py-2 text-left">UAS Controller</th>
+                      <th className="px-4 py-2 text-left">Failure Controller</th>
                       <th className="px-4 py-2 text-left">Error Code / Reason</th>
                       <th className="px-4 py-2 text-left">Server Header</th>
                       <th className="px-4 py-2 text-left">User-Agent Header</th>
@@ -266,9 +281,12 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                       const uacExt = ev.uac_ext ?? ev.ext ?? '—'
                       const uacAddr = formatAddrFull(ev.sip_local_ip, ev.sip_local_port)
                       const uacAddrShort = formatAddrTruncated(ev.sip_local_ip, ev.sip_local_port)
+                      const uacController = formatController(ev.uac_controller_host, ev.uac_controller_port)
                       const uasExt = ev.uas_ext ?? ev.peer_ext ?? '—'
                       const uasAddr = formatAddrFull(ev.sip_remote_ip, ev.sip_remote_port)
                       const uasAddrShort = formatAddrTruncated(ev.sip_remote_ip, ev.sip_remote_port)
+                      const uasController = formatController(ev.uas_controller_host, ev.uas_controller_port)
+                      const failureController = formatController(ev.failure_controller_host, ev.failure_controller_port)
                       const sipCode = ev.sip_code ? String(ev.sip_code) : ''
                       const reason = ev.failure_reason ?? 'Unknown'
                       const errorDisplay = sipCode ? `${sipCode} / ${reason}` : reason
@@ -288,11 +306,35 @@ export function FailedCallsTable({ events, reportedFailedCount }: FailedCallsTab
                               </span>
                             )}
                           </td>
+                          <td className="px-4 py-2 min-w-[145px]">
+                            <span className="font-mono text-sky-300" title={uacController}>{uacController}</span>
+                            {(ev.uac_agent_group_id || ev.uac_zone_id) && (
+                              <span className="block text-[10px] text-slate-500">
+                                {[ev.uac_zone_id, ev.uac_agent_group_id].filter(Boolean).join(' / ')}
+                              </span>
+                            )}
+                          </td>
                           <td className="px-4 py-2 min-w-[130px]">
                             <span className="font-mono text-amber-300">{uasExt}</span>
                             {uasAddr && (
                               <span className="block text-[10px] text-sky-400/70 font-mono" title={uasAddr}>
                                 {uasAddrShort}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 min-w-[145px]">
+                            <span className="font-mono text-sky-300" title={uasController}>{uasController}</span>
+                            {(ev.uas_agent_group_id || ev.uas_zone_id) && (
+                              <span className="block text-[10px] text-slate-500">
+                                {[ev.uas_zone_id, ev.uas_agent_group_id].filter(Boolean).join(' / ')}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 min-w-[145px]">
+                            <span className="font-mono text-rose-300" title={failureController}>{failureController}</span>
+                            {ev.failure_controller_role && (
+                              <span className="block text-[10px] uppercase tracking-wide text-rose-400/70">
+                                {ev.failure_controller_role}
                               </span>
                             )}
                           </td>

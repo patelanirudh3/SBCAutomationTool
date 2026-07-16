@@ -394,6 +394,29 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		emitCallEvent(e.metrics, callID, ag.Ext, event, "uac", callee, sipCode, ms, extra)
 	}
 
+	applyControllerContext := func(r *CallResult) {
+		r.UACControllerHost = ag.ControllerHost
+		r.UACControllerPort = ag.ControllerPort
+		r.UACAgentGroupID = ag.AgentGroupID
+		r.UACZoneID = ag.ZoneID
+		r.UASControllerHost = calleeAg.ControllerHost
+		r.UASControllerPort = calleeAg.ControllerPort
+		r.UASAgentGroupID = calleeAg.AgentGroupID
+		r.UASZoneID = calleeAg.ZoneID
+		if r.AgentGroupID == "" {
+			r.AgentGroupID = ag.AgentGroupID
+		}
+		if !r.Success {
+			r.FailureControllerRole = "uac"
+			r.FailureControllerHost = r.SIPRemoteIP
+			r.FailureControllerPort = r.SIPRemotePort
+			if r.FailureControllerHost == "" {
+				r.FailureControllerHost = ag.ControllerHost
+				r.FailureControllerPort = ag.ControllerPort
+			}
+		}
+	}
+
 	var dialog *agent.DialogState
 
 	// sendCleanupOnTimeout sends the correct cleanup signal when an INVITE
@@ -503,7 +526,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			sbcRelayPort = dialog.RTPRemotePort
 		}
 
-		return CallResult{
+		result := CallResult{
 			CallID:              callID,
 			Caller:              ag.Ext,
 			Callee:              callee,
@@ -559,6 +582,8 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 			SipTransactionRTTMs: sipTxnRTTMs,
 			ByeCompletionMs:     byeCompletionMs,
 		}
+		applyControllerContext(&result)
+		return result
 	}
 	failWithCode := func(reason string, sipCode int) CallResult {
 		return failWithCodeAndHeaders(reason, sipCode, "", "")
@@ -613,12 +638,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 	}
 	emit("INVITE_SENT", 0, 0.0, map[string]any{"callee": callee, "auth": "none"})
 
-	// ── RFC 3261 §17.1.1 INVITE client transaction timers ──────────
-	// Timer B: overall transaction timeout (default 64*T1 = 32s) covering
-	// every wait until the transaction terminates (ACK sent for 2xx, or
-	// ACK sent for 3xx/4xx/5xx/6xx). PRACK / BYE waits remain on the
-	// existing flat sipTimeout (out of scope per minimal RFC enablement).
-	t1 := time.Duration(cfg.T1Ms) * time.Millisecond
+	// ── RFC 3261 §17.1.1 INVITE client transaction timeout ──────────
+	// Timer A retransmission is owned by the shared SIP transaction manager
+	// under ExtensionAgent.Send. The call flow keeps Timer B as the overall
+	// business wait deadline for existing metrics and cleanup behavior.
 	timerB := time.Duration(cfg.TimerBSeconds) * time.Second
 	timerBDeadline := time.Now().Add(timerB)
 	remainingTimerB := func() time.Duration {
@@ -627,14 +650,6 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		}
 		return 0
 	}
-	// Timer A: UDP-only INVITE retransmit. No-op on TCP/TLS.
-	stopTimerA := startTimerA(ctx, cfg.SIPTransport, t1, timerBDeadline, func() error {
-		if e.metrics != nil {
-			e.metrics.IncrementSIPCounter("invite_retransmits")
-		}
-		return ag.RetransmitInvite(dialog)
-	})
-	defer stopTimerA()
 
 	// ── Wait for provisional / 407 / final fail ────────────────────
 	var raw200 string
@@ -659,12 +674,10 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 				PeerExt:         callee, TsUTC: inviteTsUTC, Direction: "uac",
 				SipMilestones: milestones,
 			}
+			applyControllerContext(&result)
 			e.complete(result)
 			return
 		}
-
-		// RFC 3261 §17.1.1.2: stop Timer A on first response (1xx or final).
-		stopTimerA()
 
 		raw := ev.Raw
 		code := ev.Code
@@ -1146,6 +1159,7 @@ func (e *CallEngine) executeCall(ctx context.Context, ag *agent.ExtensionAgent, 
 		SipTransactionRTTMs: sipTxnRTTMs,
 		ByeCompletionMs:     byeCompletionMs,
 	}
+	applyControllerContext(&result)
 	e.complete(result)
 }
 

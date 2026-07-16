@@ -81,17 +81,28 @@ type CallResult struct {
 	SBCRTPRelayPort     int           `json:"sbc_rtp_relay_port"`
 	SipMilestones       SipMilestones `json:"sip_milestones"`
 
-	RTPRxFromSBCPkts int    `json:"rtp_rx_from_sbc_pkts"`
-	RTPRxOtherPkts   int    `json:"rtp_rx_other_pkts"`
-	RTCPRxPkts       int    `json:"rtcp_rx_pkts"`
-	RTPAsymmetryFlag string `json:"rtp_asymmetry_flag"`
-	MarkersSent      int    `json:"markers_sent"`
-	MarkersReceived  int    `json:"markers_received"`
-	RTPExpectedPkts  int    `json:"rtp_expected_pkts"`
-	RTPSSRCCount     int    `json:"rtp_ssrc_count"`
-	Scenario         string `json:"scenario"`
-	ActiveController string `json:"active_controller,omitempty"`
-	AgentGroupID     string `json:"agent_group_id,omitempty"`
+	RTPRxFromSBCPkts      int    `json:"rtp_rx_from_sbc_pkts"`
+	RTPRxOtherPkts        int    `json:"rtp_rx_other_pkts"`
+	RTCPRxPkts            int    `json:"rtcp_rx_pkts"`
+	RTPAsymmetryFlag      string `json:"rtp_asymmetry_flag"`
+	MarkersSent           int    `json:"markers_sent"`
+	MarkersReceived       int    `json:"markers_received"`
+	RTPExpectedPkts       int    `json:"rtp_expected_pkts"`
+	RTPSSRCCount          int    `json:"rtp_ssrc_count"`
+	Scenario              string `json:"scenario"`
+	ActiveController      string `json:"active_controller,omitempty"`
+	AgentGroupID          string `json:"agent_group_id,omitempty"`
+	UACControllerHost     string `json:"uac_controller_host,omitempty"`
+	UACControllerPort     int    `json:"uac_controller_port,omitempty"`
+	UACAgentGroupID       string `json:"uac_agent_group_id,omitempty"`
+	UACZoneID             string `json:"uac_zone_id,omitempty"`
+	UASControllerHost     string `json:"uas_controller_host,omitempty"`
+	UASControllerPort     int    `json:"uas_controller_port,omitempty"`
+	UASAgentGroupID       string `json:"uas_agent_group_id,omitempty"`
+	UASZoneID             string `json:"uas_zone_id,omitempty"`
+	FailureControllerRole string `json:"failure_controller_role,omitempty"`
+	FailureControllerHost string `json:"failure_controller_host,omitempty"`
+	FailureControllerPort int    `json:"failure_controller_port,omitempty"`
 
 	// QoS / Media metrics (Phase 1 — read-only).
 	// Populated by call_engine / uas_auto_answer from rtp.RtpStats and the

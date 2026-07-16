@@ -13,6 +13,8 @@ import type {
 } from '@/types'
 import { DEFAULT_ADVANCED_SETTINGS } from '@/types'
 import { mapBackendPhase } from '@/lib/phase'
+import type { EngineEndpoint } from '@/lib/engine-endpoint'
+import { loadSelectedEngineEndpoint, saveSelectedEngineEndpoint } from '@/lib/engine-endpoint'
 
 // ---------------------------------------------------------------------------
 // Persist full VM pair config across page reloads (localStorage)
@@ -63,8 +65,8 @@ function makeDefaultConfig(vmId: string, metricsPort: number) {
     subscribe_events: ['dialog'],
     subscribe_refresh_events: ['dialog'],
     subscribe_unsubscribe_events: ['dialog'],
-    register_rate_cps: 10,
-    cleanup_batch_size: 10,
+    agent_connection_cps: 30,
+    agent_regsub_cps: 30,
     t1_ms: 500,
     timer_b_seconds: 32,
     sbc_host: '10.133.63.117',
@@ -136,6 +138,10 @@ interface TrafficStore {
   phase: RunPhase
   setPhase: (p: RunPhase) => void
 
+  // Selected engine endpoint for cross-machine resume
+  selectedEngine: EngineEndpoint | null
+  setSelectedEngine: (e: EngineEndpoint | null) => void
+
   // Pre-phase (unified pool)
   prePhaseStatus: PrePhaseStatus | null
   setPrePhaseStatus: (s: PrePhaseStatus) => void
@@ -194,6 +200,7 @@ const initialState = {
   activePairIndex: 0,
   reachability: {} as Record<string, ReachabilityStatus>,
   phase: 'IDLE' as RunPhase,
+  selectedEngine: null as EngineEndpoint | null,
   prePhaseStatus: null,
   cleanupStatus: null as CleanupStatus | null,
   idleCount: 0,
@@ -246,6 +253,11 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
     })),
 
   setPhase: (p) => set({ phase: p }),
+
+  setSelectedEngine: (e) => {
+    if (e) saveSelectedEngineEndpoint(e)
+    set({ selectedEngine: e })
+  },
 
   setPrePhaseStatus: (s) => set({ prePhaseStatus: s }),
 
@@ -341,7 +353,11 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
 
   hydrateConfig: () => {
     const saved = _loadConfig()
-    if (!saved?.length) return
+    const selectedEngine = loadSelectedEngineEndpoint()
+    if (!saved?.length) {
+      if (selectedEngine) set({ selectedEngine })
+      return
+    }
     // Merge saved pairs with defaults to handle any new fields added since last save
     const merged = saved.map((sp) => ({
       ...makePair(0),
@@ -349,7 +365,7 @@ export const useTrafficStore = create<TrafficStore>((set, get) => ({
       uac: { ...makeDefaultConfig(sp.uac?.vm_id ?? 'traffic-local', sp.uac?.metrics_port ?? 8082), ...sp.uac },
       advancedSettings: { ...DEFAULT_ADVANCED_SETTINGS, ...(sp.advancedSettings ?? {}) },
     }))
-    set({ pairs: merged })
+    set({ pairs: merged, selectedEngine })
   },
 
   reset: () => {

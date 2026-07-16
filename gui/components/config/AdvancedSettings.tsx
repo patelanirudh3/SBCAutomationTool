@@ -153,8 +153,6 @@ function TokenRow({ s, tab = 'all' }: { s: AdvancedSettingsType; tab?: AdvancedT
   // Signaling-side tokens (REGISTER batching, retries, SUBSCRIBE concurrency,
   // TCP keepalive, 100rel toggle).
   const signalingTokens = [
-    `batch_size: ${s.register_batch_size}`,
-    `batch_delay: ${s.register_batch_delay_ms}ms`,
     `connect_timeout: ${s.connect_timeout}s`,
     `timeout: ${s.register_timeout}s`,
     `retry: ${s.register_retry}`,
@@ -279,7 +277,6 @@ export function AdvancedSettings({
 
   const handleSave = () => {
     const ALLOW_ZERO: Set<string> = new Set([
-      'register_batch_delay_ms',
       // TCP keepalive: 0 explicitly disables; non-zero range checked below.
       'tcp_keepalive_seconds',
     ])
@@ -453,28 +450,6 @@ export function AdvancedSettings({
                     Pre-Phase Settings
                     <span className="h-px flex-1 bg-blue-400/30" />
                   </h3>
-                  <div className="space-y-1">
-                    <AdvancedField
-                      label="Batch Size"
-                      value={draft.register_batch_size}
-                      disabled={disabled}
-                      error={errors.register_batch_size}
-                      tooltip="Number of extensions per batch for TCP socket creation and concurrent REGISTER operations."
-                      onChange={set('register_batch_size')}
-                    />
-                    <p className="font-mono text-xs text-slate-300">
-                      Batch size: <span className="font-bold text-emerald-400">{draft.register_batch_size}</span> ext/batch
-                    </p>
-                  </div>
-                  <AdvancedField
-                    label="Batch Delay (ms)"
-                    value={draft.register_batch_delay_ms}
-                    disabled={disabled}
-                    min={0}
-                    error={errors.register_batch_delay_ms}
-                    tooltip="Delay in milliseconds between TCP socket creation and REGISTER batches."
-                    onChange={set('register_batch_delay_ms')}
-                  />
                   <AdvancedField
                     label="Connect Timeout (s)"
                     value={draft.connect_timeout}

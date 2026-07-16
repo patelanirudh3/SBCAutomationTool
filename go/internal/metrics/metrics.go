@@ -44,6 +44,7 @@ type TrafficMetrics struct {
 	Phase                              string                            `json:"phase"`
 	CPSActual                          float64                           `json:"cps_actual"`
 	TargetCPS                          int                               `json:"target_cps"`
+	PairingPolicy                      string                            `json:"pairing_policy"`
 	ConcurrentCalls                    int                               `json:"concurrent_calls"`
 	CallsInviteSent                    int                               `json:"calls_invite_sent"`
 	CallsAttempted                     int                               `json:"calls_attempted"`
@@ -51,6 +52,7 @@ type TrafficMetrics struct {
 	CallsAcknowledged                  int                               `json:"calls_acknowledged"`
 	CallsCompleted                     int                               `json:"calls_completed"`
 	CallsFailed                        int                               `json:"calls_failed"`
+	CallsByController                  map[string]ControllerCallStats    `json:"calls_by_controller,omitempty"`
 	ASR                                float64                           `json:"asr"`
 	CSR                                float64                           `json:"csr"`
 	AvgPDDMs                           float64                           `json:"avg_pdd_ms"`
@@ -176,6 +178,16 @@ type TrafficMetrics struct {
 	Memory             MemoryDiagnostics `json:"memory"`
 }
 
+type ControllerCallStats struct {
+	Controller            string `json:"controller"`
+	UACCalls              int    `json:"uac_calls"`
+	UASCalls              int    `json:"uas_calls"`
+	Completed             int    `json:"completed"`
+	Failed                int    `json:"failed"`
+	FailedAsUACController int    `json:"failed_as_uac_controller"`
+	FailedAsUASController int    `json:"failed_as_uas_controller"`
+}
+
 type MemoryDiagnostics struct {
 	HeapAllocBytes  uint64 `json:"heap_alloc_bytes"`
 	HeapSysBytes    uint64 `json:"heap_sys_bytes"`
@@ -288,49 +300,60 @@ type CallResultData struct {
 	// was received from the caller. A call can be Answered=true and
 	// Success=false if the call was answered but media or BYE handshake
 	// failed afterwards.
-	Answered            bool
-	FailureReason       string
-	PDDMs               float64
-	HoldMs              float64
-	TotalMs             float64
-	RTPTxPkts           int
-	RTPRxPkts           int
-	SIPLocalIP          string
-	SIPLocalPort        int
-	SIPRemoteIP         string
-	SIPRemotePort       int
-	SIPCode             int
-	SIPServerHeader     string
-	SIPUserAgentHeader  string
-	MediaVerified       bool
-	RTPLocalPort        int
-	MediaSecurity       string
-	RTPCodec            string
-	RTPPayloadType      int
-	RTPPayloadMarkers   bool
-	MOSCodec            string
-	SRTPCryptoSuite     string
-	SRTPDecryptFailures int
-	SRTPAuthFailures    int
-	SRTPReplayFailures  int
-	PoolWrapIndex       int
-	PeerExt             string
-	TsUTC               string
-	Direction           string
-	SBCRTPRelayIP       string
-	SBCRTPRelayPort     int
-	RTPRxFromSBCPkts    int
-	RTPRxOtherPkts      int
-	RTCPRxPkts          int
-	RTPAsymmetryFlag    string
-	MarkersSent         int
-	MarkersReceived     int
-	RTPExpectedPkts     int
-	RTPSSRCCount        int
-	Scenario            string
-	ActiveController    string
-	AgentGroupID        string
-	SipMilestones       json.RawMessage
+	Answered              bool
+	FailureReason         string
+	PDDMs                 float64
+	HoldMs                float64
+	TotalMs               float64
+	RTPTxPkts             int
+	RTPRxPkts             int
+	SIPLocalIP            string
+	SIPLocalPort          int
+	SIPRemoteIP           string
+	SIPRemotePort         int
+	SIPCode               int
+	SIPServerHeader       string
+	SIPUserAgentHeader    string
+	MediaVerified         bool
+	RTPLocalPort          int
+	MediaSecurity         string
+	RTPCodec              string
+	RTPPayloadType        int
+	RTPPayloadMarkers     bool
+	MOSCodec              string
+	SRTPCryptoSuite       string
+	SRTPDecryptFailures   int
+	SRTPAuthFailures      int
+	SRTPReplayFailures    int
+	PoolWrapIndex         int
+	PeerExt               string
+	TsUTC                 string
+	Direction             string
+	SBCRTPRelayIP         string
+	SBCRTPRelayPort       int
+	RTPRxFromSBCPkts      int
+	RTPRxOtherPkts        int
+	RTCPRxPkts            int
+	RTPAsymmetryFlag      string
+	MarkersSent           int
+	MarkersReceived       int
+	RTPExpectedPkts       int
+	RTPSSRCCount          int
+	Scenario              string
+	ActiveController      string
+	AgentGroupID          string
+	UACControllerHost     string
+	UACControllerPort     int
+	UACAgentGroupID       string
+	UACZoneID             string
+	UASControllerHost     string
+	UASControllerPort     int
+	UASAgentGroupID       string
+	UASZoneID             string
+	FailureControllerRole string
+	FailureControllerHost string
+	FailureControllerPort int
+	SipMilestones         json.RawMessage
 
 	// QoS / Media metrics (Phase 1, mirrors engine.CallResult).
 	JitterMs         float64
@@ -422,6 +445,7 @@ type MetricsCollector struct {
 	lastMemoryLog         time.Time
 	concurrentProvider    func() int
 	targetCPSProvider     func() int
+	pairingPolicy         string
 	poolCountsProvider    func() (idle, nonIdle, regOnly int)
 	roleCountsProvider    func() (uacIdle, uasIdle, nonIdle, regOnly, uacAssigned, uasAssigned, regSubReady, requiredReady int)
 	hostHealth            *HostHealthCollector
@@ -570,6 +594,7 @@ func NewMetricsCollector(vmID string, metricsIntervalSec int) *MetricsCollector 
 		callMilestones:            make(map[string]*callMilestoneState),
 		hostHealth:                NewHostHealthCollector(),
 		wsClients:                 make(map[*websocket.Conn]struct{}),
+		pairingPolicy:             "random",
 	}
 }
 
@@ -1211,6 +1236,12 @@ func (c *MetricsCollector) SetTargetCPSProvider(fn func() int) {
 	c.mu.Unlock()
 }
 
+func (c *MetricsCollector) SetPairingPolicy(policy string) {
+	c.mu.Lock()
+	c.pairingPolicy = policy
+	c.mu.Unlock()
+}
+
 // SetPoolCountsProvider sets a callable that returns the current pool counts
 // (idle, non-idle, reg-only). Called from buildSnapshotLocked to populate the
 // idle_count / non_idle_count / reg_only_count fields in TrafficMetrics.
@@ -1362,52 +1393,63 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 	out := make([]map[string]any, 0, len(c.callResults))
 	for _, r := range c.callResults {
 		m := map[string]any{
-			"call_id":               r.CallID,
-			"caller":                r.Caller,
-			"callee":                r.Callee,
-			"success":               r.Success,
-			"answered":              r.Answered,
-			"acknowledged":          r.Answered,
-			"failure_reason":        r.FailureReason,
-			"pdd_ms":                r.PDDMs,
-			"hold_ms":               r.HoldMs,
-			"total_ms":              r.TotalMs,
-			"rtp_tx_pkts":           r.RTPTxPkts,
-			"rtp_rx_pkts":           r.RTPRxPkts,
-			"sip_local_ip":          r.SIPLocalIP,
-			"sip_local_port":        r.SIPLocalPort,
-			"sip_remote_ip":         r.SIPRemoteIP,
-			"sip_remote_port":       r.SIPRemotePort,
-			"sip_code":              r.SIPCode,
-			"sip_server_header":     r.SIPServerHeader,
-			"sip_user_agent_header": r.SIPUserAgentHeader,
-			"media_verified":        r.MediaVerified,
-			"rtp_local_port":        r.RTPLocalPort,
-			"media_security":        r.MediaSecurity,
-			"srtp_crypto_suite":     r.SRTPCryptoSuite,
-			"srtp_decrypt_failures": r.SRTPDecryptFailures,
-			"srtp_auth_failures":    r.SRTPAuthFailures,
-			"srtp_replay_failures":  r.SRTPReplayFailures,
-			"pool_wrap_index":       r.PoolWrapIndex,
-			"peer_ext":              r.PeerExt,
-			"ts_utc":                r.TsUTC,
-			"direction":             r.Direction,
-			"sbc_rtp_relay_ip":      r.SBCRTPRelayIP,
-			"sbc_rtp_relay_port":    r.SBCRTPRelayPort,
-			"rtp_rx_from_sbc_pkts":  r.RTPRxFromSBCPkts,
-			"rtp_rx_other_pkts":     r.RTPRxOtherPkts,
-			"rtcp_rx_pkts":          r.RTCPRxPkts,
-			"rtp_asymmetry_flag":    r.RTPAsymmetryFlag,
-			"rtp_codec":             r.RTPCodec,
-			"rtp_payload_type":      r.RTPPayloadType,
-			"rtp_payload_markers":   r.RTPPayloadMarkers,
-			"markers_sent":          r.MarkersSent,
-			"markers_received":      r.MarkersReceived,
-			"rtp_expected_pkts":     r.RTPExpectedPkts,
-			"rtp_ssrc_count":        r.RTPSSRCCount,
-			"scenario":              r.Scenario,
-			"active_controller":     r.ActiveController,
-			"agent_group_id":        r.AgentGroupID,
+			"call_id":                 r.CallID,
+			"caller":                  r.Caller,
+			"callee":                  r.Callee,
+			"success":                 r.Success,
+			"answered":                r.Answered,
+			"acknowledged":            r.Answered,
+			"failure_reason":          r.FailureReason,
+			"pdd_ms":                  r.PDDMs,
+			"hold_ms":                 r.HoldMs,
+			"total_ms":                r.TotalMs,
+			"rtp_tx_pkts":             r.RTPTxPkts,
+			"rtp_rx_pkts":             r.RTPRxPkts,
+			"sip_local_ip":            r.SIPLocalIP,
+			"sip_local_port":          r.SIPLocalPort,
+			"sip_remote_ip":           r.SIPRemoteIP,
+			"sip_remote_port":         r.SIPRemotePort,
+			"sip_code":                r.SIPCode,
+			"sip_server_header":       r.SIPServerHeader,
+			"sip_user_agent_header":   r.SIPUserAgentHeader,
+			"media_verified":          r.MediaVerified,
+			"rtp_local_port":          r.RTPLocalPort,
+			"media_security":          r.MediaSecurity,
+			"srtp_crypto_suite":       r.SRTPCryptoSuite,
+			"srtp_decrypt_failures":   r.SRTPDecryptFailures,
+			"srtp_auth_failures":      r.SRTPAuthFailures,
+			"srtp_replay_failures":    r.SRTPReplayFailures,
+			"pool_wrap_index":         r.PoolWrapIndex,
+			"peer_ext":                r.PeerExt,
+			"ts_utc":                  r.TsUTC,
+			"direction":               r.Direction,
+			"sbc_rtp_relay_ip":        r.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":      r.SBCRTPRelayPort,
+			"rtp_rx_from_sbc_pkts":    r.RTPRxFromSBCPkts,
+			"rtp_rx_other_pkts":       r.RTPRxOtherPkts,
+			"rtcp_rx_pkts":            r.RTCPRxPkts,
+			"rtp_asymmetry_flag":      r.RTPAsymmetryFlag,
+			"rtp_codec":               r.RTPCodec,
+			"rtp_payload_type":        r.RTPPayloadType,
+			"rtp_payload_markers":     r.RTPPayloadMarkers,
+			"markers_sent":            r.MarkersSent,
+			"markers_received":        r.MarkersReceived,
+			"rtp_expected_pkts":       r.RTPExpectedPkts,
+			"rtp_ssrc_count":          r.RTPSSRCCount,
+			"scenario":                r.Scenario,
+			"active_controller":       r.ActiveController,
+			"agent_group_id":          r.AgentGroupID,
+			"uac_controller_host":     r.UACControllerHost,
+			"uac_controller_port":     r.UACControllerPort,
+			"uac_agent_group_id":      r.UACAgentGroupID,
+			"uac_zone_id":             r.UACZoneID,
+			"uas_controller_host":     r.UASControllerHost,
+			"uas_controller_port":     r.UASControllerPort,
+			"uas_agent_group_id":      r.UASAgentGroupID,
+			"uas_zone_id":             r.UASZoneID,
+			"failure_controller_role": r.FailureControllerRole,
+			"failure_controller_host": r.FailureControllerHost,
+			"failure_controller_port": r.FailureControllerPort,
 			// Phase-1 QoS fields
 			"jitter_ms":          r.JitterMs,
 			"packet_loss_pct":    r.PacketLossPct,
@@ -1434,71 +1476,122 @@ func (c *MetricsCollector) GetCallResultsAsDicts() []map[string]any {
 
 func callResultToDetailMap(r CallResultData) map[string]any {
 	m := map[string]any{
-		"call_id":               r.CallID,
-		"caller":                r.Caller,
-		"callee":                r.Callee,
-		"success":               r.Success,
-		"answered":              r.Answered,
-		"acknowledged":          r.Answered,
-		"failure_reason":        r.FailureReason,
-		"pdd_ms":                r.PDDMs,
-		"hold_ms":               r.HoldMs,
-		"total_ms":              r.TotalMs,
-		"rtp_tx_pkts":           r.RTPTxPkts,
-		"rtp_rx_pkts":           r.RTPRxPkts,
-		"sip_local_ip":          r.SIPLocalIP,
-		"sip_local_port":        r.SIPLocalPort,
-		"sip_remote_ip":         r.SIPRemoteIP,
-		"sip_remote_port":       r.SIPRemotePort,
-		"sip_code":              r.SIPCode,
-		"sip_server_header":     r.SIPServerHeader,
-		"sip_user_agent_header": r.SIPUserAgentHeader,
-		"media_verified":        r.MediaVerified,
-		"rtp_local_port":        r.RTPLocalPort,
-		"media_security":        r.MediaSecurity,
-		"rtp_codec":             r.RTPCodec,
-		"rtp_payload_type":      r.RTPPayloadType,
-		"rtp_payload_markers":   r.RTPPayloadMarkers,
-		"srtp_crypto_suite":     r.SRTPCryptoSuite,
-		"srtp_decrypt_failures": r.SRTPDecryptFailures,
-		"srtp_auth_failures":    r.SRTPAuthFailures,
-		"srtp_replay_failures":  r.SRTPReplayFailures,
-		"pool_wrap_index":       r.PoolWrapIndex,
-		"peer_ext":              r.PeerExt,
-		"ts_utc":                r.TsUTC,
-		"direction":             r.Direction,
-		"sbc_rtp_relay_ip":      r.SBCRTPRelayIP,
-		"sbc_rtp_relay_port":    r.SBCRTPRelayPort,
-		"rtp_rx_from_sbc_pkts":  r.RTPRxFromSBCPkts,
-		"rtp_rx_other_pkts":     r.RTPRxOtherPkts,
-		"rtcp_rx_pkts":          r.RTCPRxPkts,
-		"rtp_asymmetry_flag":    r.RTPAsymmetryFlag,
-		"markers_sent":          r.MarkersSent,
-		"markers_received":      r.MarkersReceived,
-		"rtp_expected_pkts":     r.RTPExpectedPkts,
-		"rtp_ssrc_count":        r.RTPSSRCCount,
-		"scenario":              r.Scenario,
-		"active_controller":     r.ActiveController,
-		"agent_group_id":        r.AgentGroupID,
-		"jitter_ms":             r.JitterMs,
-		"packet_loss_pct":       r.PacketLossPct,
-		"lost_packets":          r.LostPackets,
-		"ooo_packets":           r.OOOPackets,
-		"rtt_ms":                r.RTTMs,
-		"remote_jitter_ms":      r.RemoteJitterMs,
-		"remote_loss_pct":       r.RemoteLossPct,
-		"mos_score":             r.MOSScore,
-		"mos_codec":             r.MOSCodec,
-		"media_quality_flag":    r.MediaQualityFlag,
-		"call_setup_ms":         r.CallSetupMs,
-		"prack_rtt_ms":          r.PrackRTTMs,
-		"sip_txn_rtt_ms":        r.SipTransactionRTTMs,
-		"bye_completion_ms":     r.ByeCompletionMs,
+		"call_id":                 r.CallID,
+		"caller":                  r.Caller,
+		"callee":                  r.Callee,
+		"success":                 r.Success,
+		"answered":                r.Answered,
+		"acknowledged":            r.Answered,
+		"failure_reason":          r.FailureReason,
+		"pdd_ms":                  r.PDDMs,
+		"hold_ms":                 r.HoldMs,
+		"total_ms":                r.TotalMs,
+		"rtp_tx_pkts":             r.RTPTxPkts,
+		"rtp_rx_pkts":             r.RTPRxPkts,
+		"sip_local_ip":            r.SIPLocalIP,
+		"sip_local_port":          r.SIPLocalPort,
+		"sip_remote_ip":           r.SIPRemoteIP,
+		"sip_remote_port":         r.SIPRemotePort,
+		"sip_code":                r.SIPCode,
+		"sip_server_header":       r.SIPServerHeader,
+		"sip_user_agent_header":   r.SIPUserAgentHeader,
+		"media_verified":          r.MediaVerified,
+		"rtp_local_port":          r.RTPLocalPort,
+		"media_security":          r.MediaSecurity,
+		"rtp_codec":               r.RTPCodec,
+		"rtp_payload_type":        r.RTPPayloadType,
+		"rtp_payload_markers":     r.RTPPayloadMarkers,
+		"srtp_crypto_suite":       r.SRTPCryptoSuite,
+		"srtp_decrypt_failures":   r.SRTPDecryptFailures,
+		"srtp_auth_failures":      r.SRTPAuthFailures,
+		"srtp_replay_failures":    r.SRTPReplayFailures,
+		"pool_wrap_index":         r.PoolWrapIndex,
+		"peer_ext":                r.PeerExt,
+		"ts_utc":                  r.TsUTC,
+		"direction":               r.Direction,
+		"sbc_rtp_relay_ip":        r.SBCRTPRelayIP,
+		"sbc_rtp_relay_port":      r.SBCRTPRelayPort,
+		"rtp_rx_from_sbc_pkts":    r.RTPRxFromSBCPkts,
+		"rtp_rx_other_pkts":       r.RTPRxOtherPkts,
+		"rtcp_rx_pkts":            r.RTCPRxPkts,
+		"rtp_asymmetry_flag":      r.RTPAsymmetryFlag,
+		"markers_sent":            r.MarkersSent,
+		"markers_received":        r.MarkersReceived,
+		"rtp_expected_pkts":       r.RTPExpectedPkts,
+		"rtp_ssrc_count":          r.RTPSSRCCount,
+		"scenario":                r.Scenario,
+		"active_controller":       r.ActiveController,
+		"agent_group_id":          r.AgentGroupID,
+		"uac_controller_host":     r.UACControllerHost,
+		"uac_controller_port":     r.UACControllerPort,
+		"uac_agent_group_id":      r.UACAgentGroupID,
+		"uac_zone_id":             r.UACZoneID,
+		"uas_controller_host":     r.UASControllerHost,
+		"uas_controller_port":     r.UASControllerPort,
+		"uas_agent_group_id":      r.UASAgentGroupID,
+		"uas_zone_id":             r.UASZoneID,
+		"failure_controller_role": r.FailureControllerRole,
+		"failure_controller_host": r.FailureControllerHost,
+		"failure_controller_port": r.FailureControllerPort,
+		"jitter_ms":               r.JitterMs,
+		"packet_loss_pct":         r.PacketLossPct,
+		"lost_packets":            r.LostPackets,
+		"ooo_packets":             r.OOOPackets,
+		"rtt_ms":                  r.RTTMs,
+		"remote_jitter_ms":        r.RemoteJitterMs,
+		"remote_loss_pct":         r.RemoteLossPct,
+		"mos_score":               r.MOSScore,
+		"mos_codec":               r.MOSCodec,
+		"media_quality_flag":      r.MediaQualityFlag,
+		"call_setup_ms":           r.CallSetupMs,
+		"prack_rtt_ms":            r.PrackRTTMs,
+		"sip_txn_rtt_ms":          r.SipTransactionRTTMs,
+		"bye_completion_ms":       r.ByeCompletionMs,
 	}
 	if len(r.SipMilestones) > 0 {
 		m["sip_milestones"] = r.SipMilestones
 	}
 	return m
+}
+
+func buildControllerCallStats(results []CallResultData) map[string]ControllerCallStats {
+	stats := make(map[string]ControllerCallStats)
+	upsert := func(host string, port int, mutate func(*ControllerCallStats)) {
+		if strings.TrimSpace(host) == "" {
+			return
+		}
+		controller := host
+		if port > 0 {
+			controller = fmt.Sprintf("%s:%d", host, port)
+		}
+		s := stats[controller]
+		s.Controller = controller
+		mutate(&s)
+		stats[controller] = s
+	}
+	for _, r := range results {
+		if r.Direction == "uas" {
+			continue
+		}
+		upsert(r.UACControllerHost, r.UACControllerPort, func(s *ControllerCallStats) {
+			s.UACCalls++
+			if r.Success {
+				s.Completed++
+			} else {
+				s.Failed++
+			}
+			if r.FailureControllerRole == "uac" {
+				s.FailedAsUACController++
+			}
+		})
+		upsert(r.UASControllerHost, r.UASControllerPort, func(s *ControllerCallStats) {
+			s.UASCalls++
+			if !r.Success && r.FailureControllerRole == "uas" {
+				s.FailedAsUASController++
+			}
+		})
+	}
+	return stats
 }
 
 // GetCallEvents returns call results in the formatted call-events style (same as GET /api/calls).
@@ -1538,50 +1631,61 @@ func (c *MetricsCollector) GetCallEvents() []map[string]any {
 		}
 
 		m := map[string]any{
-			"call_id":               callID,
-			"uac_ext":               caller,
-			"uas_ext":               callee,
-			"ext":                   ext,
-			"peer_ext":              cr.PeerExt,
-			"direction":             direction,
-			"result":                ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-			"answered":              cr.Answered,
-			"acknowledged":          cr.Answered,
-			"failure_reason":        nilIfEmpty(cr.FailureReason),
-			"pdd_ms":                cr.PDDMs,
-			"hold_ms":               cr.HoldMs,
-			"media_status":          media,
-			"media_security":        cr.MediaSecurity,
-			"rtp_codec":             cr.RTPCodec,
-			"rtp_payload_type":      cr.RTPPayloadType,
-			"rtp_payload_markers":   cr.RTPPayloadMarkers,
-			"sip_local_ip":          cr.SIPLocalIP,
-			"sip_local_port":        cr.SIPLocalPort,
-			"sip_remote_ip":         cr.SIPRemoteIP,
-			"sip_remote_port":       cr.SIPRemotePort,
-			"sip_code":              cr.SIPCode,
-			"sip_server_header":     cr.SIPServerHeader,
-			"sip_user_agent_header": cr.SIPUserAgentHeader,
-			"srtp_crypto_suite":     cr.SRTPCryptoSuite,
-			"srtp_decrypt_failures": cr.SRTPDecryptFailures,
-			"srtp_auth_failures":    cr.SRTPAuthFailures,
-			"srtp_replay_failures":  cr.SRTPReplayFailures,
-			"rtp_tx_pkts":           cr.RTPTxPkts,
-			"rtp_rx_pkts":           cr.RTPRxPkts,
-			"rtp_rx_from_sbc_pkts":  cr.RTPRxFromSBCPkts,
-			"rtp_rx_other_pkts":     cr.RTPRxOtherPkts,
-			"rtp_asymmetry_flag":    cr.RTPAsymmetryFlag,
-			"rtcp_rx_pkts":          cr.RTCPRxPkts,
-			"markers_sent":          cr.MarkersSent,
-			"markers_received":      cr.MarkersReceived,
-			"rtp_expected_pkts":     cr.RTPExpectedPkts,
-			"rtp_ssrc_count":        cr.RTPSSRCCount,
-			"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
-			"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
-			"active_controller":     cr.ActiveController,
-			"agent_group_id":        cr.AgentGroupID,
-			"ts_utc":                ts,
-			"timestamp":             ts,
+			"call_id":                 callID,
+			"uac_ext":                 caller,
+			"uas_ext":                 callee,
+			"ext":                     ext,
+			"peer_ext":                cr.PeerExt,
+			"direction":               direction,
+			"result":                  ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+			"answered":                cr.Answered,
+			"acknowledged":            cr.Answered,
+			"failure_reason":          nilIfEmpty(cr.FailureReason),
+			"pdd_ms":                  cr.PDDMs,
+			"hold_ms":                 cr.HoldMs,
+			"media_status":            media,
+			"media_security":          cr.MediaSecurity,
+			"rtp_codec":               cr.RTPCodec,
+			"rtp_payload_type":        cr.RTPPayloadType,
+			"rtp_payload_markers":     cr.RTPPayloadMarkers,
+			"sip_local_ip":            cr.SIPLocalIP,
+			"sip_local_port":          cr.SIPLocalPort,
+			"sip_remote_ip":           cr.SIPRemoteIP,
+			"sip_remote_port":         cr.SIPRemotePort,
+			"sip_code":                cr.SIPCode,
+			"sip_server_header":       cr.SIPServerHeader,
+			"sip_user_agent_header":   cr.SIPUserAgentHeader,
+			"srtp_crypto_suite":       cr.SRTPCryptoSuite,
+			"srtp_decrypt_failures":   cr.SRTPDecryptFailures,
+			"srtp_auth_failures":      cr.SRTPAuthFailures,
+			"srtp_replay_failures":    cr.SRTPReplayFailures,
+			"rtp_tx_pkts":             cr.RTPTxPkts,
+			"rtp_rx_pkts":             cr.RTPRxPkts,
+			"rtp_rx_from_sbc_pkts":    cr.RTPRxFromSBCPkts,
+			"rtp_rx_other_pkts":       cr.RTPRxOtherPkts,
+			"rtp_asymmetry_flag":      cr.RTPAsymmetryFlag,
+			"rtcp_rx_pkts":            cr.RTCPRxPkts,
+			"markers_sent":            cr.MarkersSent,
+			"markers_received":        cr.MarkersReceived,
+			"rtp_expected_pkts":       cr.RTPExpectedPkts,
+			"rtp_ssrc_count":          cr.RTPSSRCCount,
+			"sbc_rtp_relay_ip":        cr.SBCRTPRelayIP,
+			"sbc_rtp_relay_port":      cr.SBCRTPRelayPort,
+			"active_controller":       cr.ActiveController,
+			"agent_group_id":          cr.AgentGroupID,
+			"uac_controller_host":     cr.UACControllerHost,
+			"uac_controller_port":     cr.UACControllerPort,
+			"uac_agent_group_id":      cr.UACAgentGroupID,
+			"uac_zone_id":             cr.UACZoneID,
+			"uas_controller_host":     cr.UASControllerHost,
+			"uas_controller_port":     cr.UASControllerPort,
+			"uas_agent_group_id":      cr.UASAgentGroupID,
+			"uas_zone_id":             cr.UASZoneID,
+			"failure_controller_role": cr.FailureControllerRole,
+			"failure_controller_host": cr.FailureControllerHost,
+			"failure_controller_port": cr.FailureControllerPort,
+			"ts_utc":                  ts,
+			"timestamp":               ts,
 			// Phase-1 QoS fields
 			"jitter_ms":          cr.JitterMs,
 			"packet_loss_pct":    cr.PacketLossPct,
@@ -1749,6 +1853,7 @@ func (c *MetricsCollector) Reset() {
 	c.callDetailDropped = 0
 	c.concurrentProvider = nil
 	c.targetCPSProvider = nil
+	c.pairingPolicy = "random"
 	c.poolCountsProvider = nil
 	c.roleCountsProvider = nil
 	c.rtpHealthCounts = map[string]int{"OK": 0, "WARNING": 0, "CRITICAL": 0}
@@ -1971,6 +2076,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		Phase:                              c.phase,
 		CPSActual:                          math.Round(cpsActual*1000) / 1000,
 		TargetCPS:                          targetCPS,
+		PairingPolicy:                      c.pairingPolicy,
 		ConcurrentCalls:                    concurrent,
 		CallsInviteSent:                    c.callsInviteSent,
 		CallsAttempted:                     c.callsAttempted,
@@ -1978,6 +2084,7 @@ func (c *MetricsCollector) buildSnapshotLocked() TrafficMetrics {
 		CallsAcknowledged:                  c.callsAcknowledged,
 		CallsCompleted:                     c.callsCompleted,
 		CallsFailed:                        c.callsFailed,
+		CallsByController:                  buildControllerCallStats(c.callResults),
 		ASR:                                math.Round(asr*100) / 100,
 		CSR:                                math.Round(csr*100) / 100,
 		AvgPDDMs:                           roundAvg(c.pddSamples),
@@ -2309,8 +2416,9 @@ type ProcessContext struct {
 
 	// OnHAMoveSubscription is invoked by POST /api/ha/move-subscription.
 	// It is wired by main.go when a GUI-driven lifecycle is active.
-	OnHAMoveSubscription func(target string) error
-	OnCPSChange          func(cps int) (int, error)
+	OnHAMoveSubscription  func(target string) error
+	OnCPSChange           func(cps int) (int, error)
+	OnPairingPolicyChange func(policy string) (string, error)
 
 	// OnConfigReceived is called by PUT /api/config to validate the JSON body,
 	// convert it to a VMConfig, and write a YAML file. Returns (vmID, role, yamlPath, err).
@@ -2587,6 +2695,54 @@ func readJSONBody(r *http.Request) (map[string]any, error) {
 	return m, nil
 }
 
+func cloneMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneJSONValue(v)
+	}
+	return out
+}
+
+func cloneJSONValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return cloneMap(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, item := range t {
+			out[i] = cloneJSONValue(item)
+		}
+		return out
+	default:
+		return t
+	}
+}
+
+func maskConfigSecrets(m map[string]any) {
+	for key, val := range m {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
+			if s, ok := val.(string); ok && s != "" {
+				m[key] = "********"
+			}
+			continue
+		}
+		switch nested := val.(type) {
+		case map[string]any:
+			maskConfigSecrets(nested)
+		case []any:
+			for _, item := range nested {
+				if child, ok := item.(map[string]any); ok {
+					maskConfigSecrets(child)
+				}
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // HTTP handler builder
 // ---------------------------------------------------------------------------
@@ -2676,12 +2832,15 @@ func BuildMux(
 	// GET /api/ping
 	mux.HandleFunc("GET /api/ping", func(w http.ResponseWriter, r *http.Request) {
 		latest := collector.Latest()
+		now := time.Now().UTC()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"reachable": true,
-			"vm_id":     effectiveVMID(),
-			"role":      effectiveRole(),
-			"phase":     latest.Phase,
-			"state":     stateStr(),
+			"reachable":       true,
+			"vm_id":           effectiveVMID(),
+			"role":            effectiveRole(),
+			"phase":           latest.Phase,
+			"state":           stateStr(),
+			"server_time_utc": now.Format(time.RFC3339Nano),
+			"server_unix_ms":  now.UnixMilli(),
 		})
 	})
 
@@ -2741,6 +2900,31 @@ func BuildMux(
 			"elapsed_seconds": latest.RunElapsedSec,
 			"vm_id":           effectiveVMID(),
 			"state":           stateStr(),
+		})
+	})
+
+	// GET /api/config — read-only snapshot of the accepted GUI config.
+	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "config snapshot unavailable in CLI mode"})
+			return
+		}
+		processCtx.Mu.Lock()
+		raw := cloneMap(processCtx.RawConfig)
+		state := processCtx.State
+		vmID := processCtx.VMID
+		yamlPath := processCtx.YAMLPath
+		processCtx.Mu.Unlock()
+		if len(raw) == 0 {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no config has been accepted"})
+			return
+		}
+		maskConfigSecrets(raw)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"config":    raw,
+			"state":     state,
+			"vm_id":     vmID,
+			"yaml_path": yamlPath,
 		})
 	})
 
@@ -3021,6 +3205,55 @@ func BuildMux(
 		})
 	})
 
+	// POST /api/test/force-reset — emergency GUI escape hatch for pre-traffic
+	// states where cleanup signalling may be stale or unavailable. This does
+	// not attempt SIP cleanup; it clears in-memory GUI/backend state so the
+	// operator can return home and push a fresh config. It is intentionally
+	// rejected during active traffic.
+	mux.HandleFunc("POST /api/test/force-reset", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		processCtx.Mu.Lock()
+		prevState := processCtx.State
+		latestPhase := collector.BuildSnapshot().Phase
+		if latestPhase == "TRAFFIC" || latestPhase == "STOPPING" {
+			processCtx.Mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "force reset is not allowed while traffic is active"})
+			return
+		}
+		processCtx.PrePhaseStartCh = make(chan struct{}, 1)
+		processCtx.RegSubStartCh = make(chan struct{}, 1)
+		processCtx.RegSubAbortCh = make(chan struct{}, 1)
+		processCtx.TrafficStartCh = make(chan struct{}, 1)
+		processCtx.RestartTrafficCh = make(chan struct{}, 1)
+		processCtx.CleanupStartCh = make(chan struct{}, 1)
+		processCtx.GracefulStopCh = make(chan struct{}, 1)
+		processCtx.InterruptStopCh = make(chan struct{}, 1)
+		processCtx.StopEvent = make(chan struct{}, 1)
+		processCtx.Config = nil
+		processCtx.RawConfig = nil
+		processCtx.VMID = ""
+		processCtx.Role = ""
+		processCtx.YAMLPath = ""
+		processCtx.RunID = ""
+		processCtx.PairID = ""
+		processCtx.RegSubStartRequested = false
+		processCtx.CleanupStartRequested = false
+		processCtx.State = "IDLE"
+		processCtx.Mu.Unlock()
+
+		collector.Reset()
+		slog.Warn("Force reset completed", "prev_state", prevState, "prev_phase", latestPhase)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "force_reset",
+			"prev_state": prevState,
+			"prev_phase": latestPhase,
+			"state":      "IDLE",
+		})
+	})
+
 	// POST /api/run/new — clear run-only state while preserving the current config.
 	// If the lifecycle is waiting at CLEANUP_READY, this first triggers cleanup;
 	// callers should poll until DONE/COMPLETE and invoke this endpoint again to reset.
@@ -3164,50 +3397,61 @@ func BuildMux(
 			}
 
 			out = append(out, map[string]any{
-				"call_id":               callID,
-				"uac_ext":               caller,
-				"uas_ext":               callee,
-				"ext":                   ext,
-				"peer_ext":              cr.PeerExt,
-				"direction":             direction,
-				"result":                ternaryStr(cr.Success, "COMPLETED", "FAILED"),
-				"answered":              cr.Answered,
-				"acknowledged":          cr.Answered,
-				"failure_reason":        nilIfEmpty(cr.FailureReason),
-				"pdd_ms":                cr.PDDMs,
-				"hold_ms":               cr.HoldMs,
-				"media_status":          media,
-				"media_security":        cr.MediaSecurity,
-				"rtp_codec":             cr.RTPCodec,
-				"rtp_payload_type":      cr.RTPPayloadType,
-				"rtp_payload_markers":   cr.RTPPayloadMarkers,
-				"sip_local_ip":          cr.SIPLocalIP,
-				"sip_local_port":        cr.SIPLocalPort,
-				"sip_remote_ip":         cr.SIPRemoteIP,
-				"sip_remote_port":       cr.SIPRemotePort,
-				"sip_code":              cr.SIPCode,
-				"sip_server_header":     cr.SIPServerHeader,
-				"sip_user_agent_header": cr.SIPUserAgentHeader,
-				"srtp_crypto_suite":     cr.SRTPCryptoSuite,
-				"srtp_decrypt_failures": cr.SRTPDecryptFailures,
-				"srtp_auth_failures":    cr.SRTPAuthFailures,
-				"srtp_replay_failures":  cr.SRTPReplayFailures,
-				"rtp_tx_pkts":           cr.RTPTxPkts,
-				"rtp_rx_pkts":           cr.RTPRxPkts,
-				"rtp_rx_from_sbc_pkts":  cr.RTPRxFromSBCPkts,
-				"rtp_rx_other_pkts":     cr.RTPRxOtherPkts,
-				"rtp_asymmetry_flag":    cr.RTPAsymmetryFlag,
-				"rtcp_rx_pkts":          cr.RTCPRxPkts,
-				"markers_sent":          cr.MarkersSent,
-				"markers_received":      cr.MarkersReceived,
-				"rtp_expected_pkts":     cr.RTPExpectedPkts,
-				"rtp_ssrc_count":        cr.RTPSSRCCount,
-				"sbc_rtp_relay_ip":      cr.SBCRTPRelayIP,
-				"sbc_rtp_relay_port":    cr.SBCRTPRelayPort,
-				"active_controller":     cr.ActiveController,
-				"agent_group_id":        cr.AgentGroupID,
-				"ts_utc":                ts,
-				"timestamp":             ts,
+				"call_id":                 callID,
+				"uac_ext":                 caller,
+				"uas_ext":                 callee,
+				"ext":                     ext,
+				"peer_ext":                cr.PeerExt,
+				"direction":               direction,
+				"result":                  ternaryStr(cr.Success, "COMPLETED", "FAILED"),
+				"answered":                cr.Answered,
+				"acknowledged":            cr.Answered,
+				"failure_reason":          nilIfEmpty(cr.FailureReason),
+				"pdd_ms":                  cr.PDDMs,
+				"hold_ms":                 cr.HoldMs,
+				"media_status":            media,
+				"media_security":          cr.MediaSecurity,
+				"rtp_codec":               cr.RTPCodec,
+				"rtp_payload_type":        cr.RTPPayloadType,
+				"rtp_payload_markers":     cr.RTPPayloadMarkers,
+				"sip_local_ip":            cr.SIPLocalIP,
+				"sip_local_port":          cr.SIPLocalPort,
+				"sip_remote_ip":           cr.SIPRemoteIP,
+				"sip_remote_port":         cr.SIPRemotePort,
+				"sip_code":                cr.SIPCode,
+				"sip_server_header":       cr.SIPServerHeader,
+				"sip_user_agent_header":   cr.SIPUserAgentHeader,
+				"srtp_crypto_suite":       cr.SRTPCryptoSuite,
+				"srtp_decrypt_failures":   cr.SRTPDecryptFailures,
+				"srtp_auth_failures":      cr.SRTPAuthFailures,
+				"srtp_replay_failures":    cr.SRTPReplayFailures,
+				"rtp_tx_pkts":             cr.RTPTxPkts,
+				"rtp_rx_pkts":             cr.RTPRxPkts,
+				"rtp_rx_from_sbc_pkts":    cr.RTPRxFromSBCPkts,
+				"rtp_rx_other_pkts":       cr.RTPRxOtherPkts,
+				"rtp_asymmetry_flag":      cr.RTPAsymmetryFlag,
+				"rtcp_rx_pkts":            cr.RTCPRxPkts,
+				"markers_sent":            cr.MarkersSent,
+				"markers_received":        cr.MarkersReceived,
+				"rtp_expected_pkts":       cr.RTPExpectedPkts,
+				"rtp_ssrc_count":          cr.RTPSSRCCount,
+				"sbc_rtp_relay_ip":        cr.SBCRTPRelayIP,
+				"sbc_rtp_relay_port":      cr.SBCRTPRelayPort,
+				"active_controller":       cr.ActiveController,
+				"agent_group_id":          cr.AgentGroupID,
+				"uac_controller_host":     cr.UACControllerHost,
+				"uac_controller_port":     cr.UACControllerPort,
+				"uac_agent_group_id":      cr.UACAgentGroupID,
+				"uac_zone_id":             cr.UACZoneID,
+				"uas_controller_host":     cr.UASControllerHost,
+				"uas_controller_port":     cr.UASControllerPort,
+				"uas_agent_group_id":      cr.UASAgentGroupID,
+				"uas_zone_id":             cr.UASZoneID,
+				"failure_controller_role": cr.FailureControllerRole,
+				"failure_controller_host": cr.FailureControllerHost,
+				"failure_controller_port": cr.FailureControllerPort,
+				"ts_utc":                  ts,
+				"timestamp":               ts,
 				// Phase-1 QoS fields
 				"jitter_ms":          cr.JitterMs,
 				"packet_loss_pct":    cr.PacketLossPct,
@@ -3388,7 +3632,7 @@ func BuildMux(
 	// collector.PrepStatus() to "running" → "done" / "failed". The HTTP
 	// response only confirms the async kick-off, not completion.
 	//
-	// OnPrepStart is wired inside runLifecycle after connectTransportsBatched
+	// OnPrepStart is wired inside runLifecycle after connectTransportsRateLimited
 	// completes (can take a few seconds with many extensions). If the GUI
 	// races and calls this endpoint before the wiring is done we wait up
 	// to 10 s for it to appear instead of returning 500 immediately.
@@ -3474,6 +3718,33 @@ func BuildMux(
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "cps_updated", "target_cps": applied})
+	})
+
+	mux.HandleFunc("POST /api/traffic/pairing-policy", func(w http.ResponseWriter, r *http.Request) {
+		if processCtx == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not in GUI mode"})
+			return
+		}
+		body, err := readJSONBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		policy, _ := body["policy"].(string)
+		policy = strings.ToLower(strings.TrimSpace(policy))
+		processCtx.Mu.Lock()
+		fn := processCtx.OnPairingPolicyChange
+		processCtx.Mu.Unlock()
+		if fn == nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "pairing policy changes are not available yet"})
+			return
+		}
+		applied, err := fn(policy)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "pairing_policy_updated", "pairing_policy": applied})
 	})
 
 	// POST /api/restart-traffic — re-enter the traffic loop after Complete,

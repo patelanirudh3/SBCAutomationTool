@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -291,5 +292,44 @@ func TestRegSubStartPersistsRequestEvenWhenSignalAlreadyQueued(t *testing.T) {
 	case <-pctx.RegSubStartCh:
 	default:
 		t.Fatal("regsub/start did not signal RegSubStartCh")
+	}
+}
+
+func TestConfigSnapshotEndpointMasksSecrets(t *testing.T) {
+	c := NewMetricsCollector("traffic-local", 1)
+	pctx := NewProcessContext(c, 8082)
+	pctx.RawConfig = map[string]any{
+		"vm_id":        "traffic-local",
+		"sip_password": "supersecret",
+		"tls_key_path": "/tmp/client.key",
+		"sbc_host":     "10.0.0.1",
+	}
+	pctx.State = "RUNNING"
+	pctx.VMID = "traffic-local"
+	pctx.YAMLPath = "config_traffic-local.yaml"
+	mux := BuildMux(c, "traffic-local", "", pctx)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	cfg, ok := body["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("config missing/wrong type: %#v", body["config"])
+	}
+	if cfg["sip_password"] != "********" {
+		t.Fatalf("sip_password not masked: %#v", cfg["sip_password"])
+	}
+	if cfg["tls_key_path"] != "********" {
+		t.Fatalf("tls_key_path not masked: %#v", cfg["tls_key_path"])
+	}
+	if cfg["sbc_host"] != "10.0.0.1" {
+		t.Fatalf("sbc_host changed: %#v", cfg["sbc_host"])
 	}
 }

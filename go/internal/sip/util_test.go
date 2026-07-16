@@ -31,6 +31,20 @@ func TestCreateBranchIDUsesRFC3261CookieAndStrongSuffix(t *testing.T) {
 	}
 }
 
+func TestBuildInitialRegisterWithCustomRegID(t *testing.T) {
+	msg := BuildInitialRegisterWithSchemeAndRegID("6000000", "avaya.com", "sips", "TLS", "127.0.0.1", 5061, 3600, 2)
+	contact := msg.GetHeader(HdrContact)
+	if len(contact) != 1 {
+		t.Fatalf("Contact count=%d, want 1", len(contact))
+	}
+	if !strings.Contains(contact[0], "reg-id=2") {
+		t.Fatalf("Contact missing reg-id=2: %s", contact[0])
+	}
+	if !strings.Contains(contact[0], `+sip.instance="<urn:uuid:`) {
+		t.Fatalf("Contact missing sip.instance: %s", contact[0])
+	}
+}
+
 func TestCreateCallIDAndBranchAreUniqueAcrossSample(t *testing.T) {
 	const n = 10000
 	callIDs := make(map[string]struct{}, n)

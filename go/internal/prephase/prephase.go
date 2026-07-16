@@ -92,8 +92,8 @@ func (r *PrePhaseResult) AllReady() bool {
 	return len(r.FailedRegister) == 0 && len(r.FailedSubscribe) == 0
 }
 
-// RegisterAll registers extensions in sequential batches of cfg.RegisterBatchSize.
-// Each batch fires concurrently; batches are separated by RegisterBatchDelayMs.
+// RegisterAll registers extensions using cfg.AgentRegSubCPS pacing. Internal
+// worker concurrency is derived from the rate and timeout.
 //
 // agentCb is called for each agent after its registration attempt:
 //
@@ -105,7 +105,7 @@ func (r *PrePhaseResult) AllReady() bool {
 // MetricsCollector — callee just increments a counter; total is set by caller
 // before invocation via SetRegisterTotal.
 //
-// If stopNew is non-nil and becomes true, no further batches are started.
+// If stopNew is non-nil and becomes true, no further agents are started.
 // Returns the list of extensions that failed to register.
 func RegisterAll(
 	ctx context.Context,
@@ -116,11 +116,8 @@ func RegisterAll(
 	stopNew *atomic.Bool,
 ) []string {
 	total := len(agents)
-	batchSize := cfg.RegisterBatchSize
-	if batchSize <= 0 {
-		batchSize = 10
-	}
-	batchDelay := cfg.BatchDelay()
+	rate := cfg.EffectiveAgentRegSubCPS()
+	workerCount := derivedWorkerCount(rate, cfg.RegisterTimeout, total)
 
 	var (
 		mu     sync.Mutex
@@ -128,36 +125,17 @@ func RegisterAll(
 	)
 
 	slog.Info("Pre-phase: registering extensions",
-		"total", total, "batch_size", batchSize,
-		"batch_delay_ms", batchDelay.Milliseconds())
+		"total", total, "agent_regsub_cps", rate, "workers", workerCount)
 
 	start := time.Now()
+	jobs := make(chan *agent.ExtensionAgent)
+	var wg sync.WaitGroup
 
-	for batchStart := 0; batchStart < total; batchStart += batchSize {
-		if stopNew != nil && stopNew.Load() {
-			slog.Info("RegisterAll: stopNew requested — halting new batches",
-				"completed", batchStart, "total", total)
-			break
-		}
-
-		batchEnd := batchStart + batchSize
-		if batchEnd > total {
-			batchEnd = total
-		}
-		batch := agents[batchStart:batchEnd]
-		batchNum := batchStart/batchSize + 1
-
-		slog.Info("REGISTER batch",
-			"batch", batchNum,
-			"from", batchMinExt(batch), "to", batchMaxExt(batch),
-			"count", len(batch))
-
-		var wg sync.WaitGroup
-		wg.Add(len(batch))
-
-		for _, a := range batch {
-			go func(ag *agent.ExtensionAgent) {
-				defer wg.Done()
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ag := range jobs {
 				ok := registerOne(ctx, ag, cfg)
 				if !ok {
 					mu.Lock()
@@ -170,35 +148,12 @@ func RegisterAll(
 				if ok && onProgress != nil {
 					onProgress()
 				}
-			}(a)
-		}
-
-		wg.Wait()
-
-		mu.Lock()
-		batchFailCount := 0
-		for _, ext := range failed {
-			for _, a := range batch {
-				if a.Ext == ext {
-					batchFailCount++
-				}
 			}
-		}
-		mu.Unlock()
-
-		slog.Info("REGISTER batch complete",
-			"batch", batchNum, "ok", len(batch)-batchFailCount, "total", len(batch))
-
-		if batchEnd < total {
-			select {
-			case <-ctx.Done():
-				goto done
-			case <-time.After(batchDelay):
-			}
-		}
+		}()
 	}
+	enqueueAgentsWithRate(ctx, agents, rate, stopNew, jobs)
+	wg.Wait()
 
-done:
 	elapsed := time.Since(start).Seconds()
 	mu.Lock()
 	failedCopy := make([]string, len(failed))
@@ -210,6 +165,54 @@ done:
 		"total", total, "elapsed_s", fmt.Sprintf("%.1f", elapsed))
 
 	return failedCopy
+}
+
+func derivedWorkerCount(rate, timeoutSeconds, total int) int {
+	if rate <= 0 {
+		rate = 30
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 5
+	}
+	workers := rate * timeoutSeconds
+	if workers < rate {
+		workers = rate
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if total > 0 && workers > total {
+		workers = total
+	}
+	return workers
+}
+
+func enqueueAgentsWithRate(ctx context.Context, agents []*agent.ExtensionAgent, rate int, stopNew *atomic.Bool, jobs chan<- *agent.ExtensionAgent) {
+	defer close(jobs)
+	if rate <= 0 {
+		rate = 30
+	}
+	interval := time.Second / time.Duration(rate)
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for _, ag := range agents {
+		if stopNew != nil && stopNew.Load() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- ag:
+		}
+	}
 }
 
 // registerOne attempts to register a single agent with retries.
@@ -392,7 +395,7 @@ func StartRegisterRefreshLoop(
 	agents []*agent.ExtensionAgent,
 	cfg *config.VMConfig,
 ) func() {
-	concurrency := cfg.RegisterBatchSize
+	concurrency := cfg.EffectiveAgentRegSubCPS()
 	if concurrency <= 0 {
 		concurrency = 10
 	}
@@ -1069,12 +1072,9 @@ func RunRegSubPipeline(
 			done <- result
 			close(done)
 		}()
-		batchSize := cfg.RegisterBatchSize
-		if batchSize <= 0 {
-			batchSize = 10
-		}
-		batchDelay := cfg.BatchDelay()
-		slog.Info("REG/SUB pipelined pre-phase starting", "total", total, "register_batch_size", batchSize, "subscribe_concurrency", subConcurrency)
+		batchSize := cfg.EffectiveAgentRegSubCPS()
+		batchDelay := time.Second
+		slog.Info("REG/SUB pipelined pre-phase starting", "total", total, "agent_regsub_cps", batchSize, "subscribe_concurrency", subConcurrency)
 		for batchStart := 0; batchStart < total; batchStart += batchSize {
 			if stopNew.Load() || ctx.Err() != nil {
 				slog.Info("Reg/Sub pipeline stopped before next register batch", "completed", batchStart, "total", total)
@@ -1217,12 +1217,10 @@ func RunConnectRegSubPipeline(
 	if subConcurrency <= 0 {
 		subConcurrency = 10
 	}
-	connectBatchSize := cfg.RegisterBatchSize
-	if connectBatchSize <= 0 {
-		connectBatchSize = 10
-	}
+	connectBatchSize := cfg.EffectiveAgentConnectionCPS()
+	regWorkerCount := derivedWorkerCount(cfg.EffectiveAgentRegSubCPS(), cfg.RegisterTimeout, total)
 	subQueue := make(chan *agent.ExtensionAgent, subConcurrency*2+1)
-	regQueue := make(chan *agent.ExtensionAgent, connectBatchSize*2+1)
+	regQueue := make(chan *agent.ExtensionAgent, regWorkerCount*2+1)
 	enqueueRegister := func(ag *agent.ExtensionAgent) {
 		if ag == nil {
 			return
@@ -1285,7 +1283,7 @@ func RunConnectRegSubPipeline(
 		}()
 	}
 	var regWG sync.WaitGroup
-	for i := 0; i < connectBatchSize; i++ {
+	for i := 0; i < regWorkerCount; i++ {
 		regWG.Add(1)
 		go func() {
 			defer regWG.Done()
@@ -1383,12 +1381,12 @@ func RunConnectRegSubPipeline(
 			}
 		}()
 
-		batchDelay := cfg.BatchDelay()
+		batchDelay := time.Second
 		connectTimeout := connectTimeoutFromConfig(cfg)
 		slog.Info("Connect/Register/Subscribe streaming pre-phase starting",
 			"total", total,
-			"connect_batch_size", connectBatchSize,
-			"register_concurrency", connectBatchSize,
+			"agent_connection_cps", connectBatchSize,
+			"agent_regsub_cps", cfg.EffectiveAgentRegSubCPS(),
 			"subscribe_concurrency", subConcurrency,
 			"connect_timeout_ms", connectTimeout.Milliseconds())
 
