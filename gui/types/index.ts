@@ -167,6 +167,7 @@ export interface VMConfig {
     }>
     zone_distribution_pct: number
   }
+  static_agent_assignments?: StaticAgentAssignment[]
   dns_servers?: string
 
   // Registration / Subscription
@@ -244,6 +245,16 @@ export interface VMConfig {
   rtcp_sr_enabled?: boolean
   rtcp_sr_interval_seconds?: number
   rtcp_mux_enabled?: boolean
+}
+
+export interface StaticAgentAssignment {
+  ext_start: number
+  ext_end: number
+  ext_count?: number
+  primary_zone_id: string
+  primary_controller: { host: string; port: number }
+  secondary_zone_id?: string
+  secondary_controller?: { host: string; port: number }
 }
 
 export interface VMPair {

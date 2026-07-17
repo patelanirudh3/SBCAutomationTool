@@ -48,6 +48,7 @@ const DEFAULTS: RawVMFormValues = {
   ext_start: '4001000',
   ext_end: '4001009',
   ext_count: '10',
+  static_agent_assignments_json: '',
   register_expires: '3600',
   subscribe_expires: '3600',
   subscribe_events: ['dialog'],
@@ -108,7 +109,7 @@ const UA_FIELDS = [
   'local_ip_mode',
   'sbc_host', 'sbc_port', 'sip_transport', 'domain', 'sip_password',
   'cps', 'hold_time_seconds', 'metrics_port', 'traffic_mode', 'call_count',
-  'duration_hours', 'pairing_policy',
+  'duration_hours', 'pairing_policy', 'static_agent_assignments_json',
 ]
 
 // ---------------------------------------------------------------------------
@@ -136,6 +137,7 @@ function pairToRaw(p: VMPair): RawVMFormValues {
     ext_start:          String(extStart),
     ext_end:            String(extEnd),
     ext_count:          String(Math.max(extEnd - extStart + 1, 0)),
+    static_agent_assignments_json: u.static_agent_assignments?.length ? JSON.stringify(u.static_agent_assignments) : '',
     register_expires:   String(u.register_expires   ?? parseInt(DEFAULTS.register_expires)),
     subscribe_expires:  String(u.subscribe_expires  ?? parseInt(DEFAULTS.subscribe_expires)),
     subscribe_events:   u.subscribe_events?.length ? u.subscribe_events : (u.subscribe_event ? [u.subscribe_event] : ['dialog']),
@@ -218,6 +220,7 @@ function parseRaw(raw: RawVMFormValues): Partial<VMConfig> {
     vip_sanity_target_ip: raw.local_ip_mode !== 'single' ? (raw.vip_sanity_target_ip || undefined) : undefined,
     ext_start: parseInt(raw.ext_start) || 0,
     ext_end: extEnd,
+    static_agent_assignments: raw.ha_mode === 'multi_zone' && raw.static_agent_assignments_json ? (() => { try { return JSON.parse(raw.static_agent_assignments_json) } catch { return undefined } })() : undefined,
     sbc_host: raw.sbc_host,
     sbc_port: parseInt(raw.sbc_port) || 0,
     ha_mode: raw.ha_mode !== 'single' ? raw.ha_mode : undefined,

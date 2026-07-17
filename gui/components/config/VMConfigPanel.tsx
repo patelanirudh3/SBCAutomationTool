@@ -40,6 +40,7 @@ export type RawVMFormValues = {
   ext_start: string
   ext_end: string
   ext_count: string
+  static_agent_assignments_json: string
   // Registration / subscription
   register_expires: string
   subscribe_expires: string
@@ -150,7 +151,7 @@ export const TAB_FIELDS: Record<Exclude<VMConfigTab, 'all'>, ReadonlyArray<keyof
     't1_ms', 'timer_b_seconds',
   ],
   traffic: [
-    'ext_start', 'ext_count',
+    'ext_start', 'ext_count', 'static_agent_assignments_json',
     'agent_connection_cps', 'agent_regsub_cps',
     'cps', 'hold_time_seconds', 'ramp_up_seconds',
     'pairing_policy', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso',
@@ -178,7 +179,7 @@ const SECTION_FIELDS = {
                    'dual_registration_enabled', 'secondary_host', 'secondary_port', 'failover_mode', 'auto_failback_enabled', 'failback_delay_seconds',
                    'failover_trigger', 'failover_trigger_count', 'failover_trigger_pct', 'failover_trigger_window_ms', 'dns_servers',
                   'tls_mode', 'tls_ca_path', 'tls_cert_path', 'tls_key_path', 'tls_server_name', 'tls_min_version', 'tls_max_version'] as (keyof RawVMFormValues)[],
-  extension_pool: ['ext_start', 'ext_count'] as (keyof RawVMFormValues)[],
+  extension_pool: ['ext_start', 'ext_count', 'static_agent_assignments_json'] as (keyof RawVMFormValues)[],
   registration:   ['register_expires', 'subscribe_expires', 'subscribe_events', 'subscribe_refresh_events', 'subscribe_unsubscribe_events', 't1_ms', 'timer_b_seconds'] as (keyof RawVMFormValues)[],
   register_traffic: ['agent_connection_cps', 'agent_regsub_cps'] as (keyof RawVMFormValues)[],
   call_traffic:   ['cps', 'hold_time_seconds', 'ramp_up_seconds', 'pairing_policy', 'traffic_mode', 'call_count', 'duration_hours', 'start_time_iso'] as (keyof RawVMFormValues)[],
@@ -1223,6 +1224,101 @@ export function VMConfigPanel({
   const isLiteralIP = (h: string) =>
     /^\d{1,3}(\.\d{1,3}){3}$/.test(h) || /^[0-9a-fA-F:]+$/.test(h)
   const showDNSField = !isLiteralIP(raw.sbc_host || '') || !!raw.dns_servers
+  const effectiveHAMode: 'single' | 'dual' | 'multi_zone' =
+    raw.ha_mode || (raw.dual_registration_enabled ? 'dual' : 'single')
+
+  const assignmentZoneConfig = (() => {
+    try {
+      if (raw.zone_config_json) return JSON.parse(raw.zone_config_json)
+    } catch { /* ignore */ }
+    return { zones: [], zone_distribution_pct: 50 }
+  })()
+  type StaticAssignmentRow = {
+    ext_start: number
+    ext_end: number
+    ext_count?: number
+    primary_zone_id: string
+    primary_controller: { host: string; port: number }
+    secondary_zone_id?: string
+    secondary_controller?: { host: string; port: number }
+  }
+  type ControllerOption = {
+    value: string
+    label: string
+    zone_id: string
+    controller: { host: string; port: number }
+  }
+  const staticRows: StaticAssignmentRow[] = (() => {
+    try {
+      const parsed = raw.static_agent_assignments_json ? JSON.parse(raw.static_agent_assignments_json) : []
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  })()
+  const controllerOptions: ControllerOption[] = (assignmentZoneConfig.zones ?? []).flatMap((zone: { zone_id?: string; controllers?: Array<{ host: string; port: number }> }) =>
+    (zone.controllers ?? []).map((ctrl) => ({
+      value: `${zone.zone_id ?? ''}|${ctrl.host}|${ctrl.port}`,
+      label: `${zone.zone_id ?? 'zone'} / ${ctrl.host}:${ctrl.port}`,
+      zone_id: zone.zone_id ?? '',
+      controller: { host: ctrl.host, port: ctrl.port },
+    })),
+  )
+  const controllerValue = (zoneID?: string, ctrl?: { host?: string; port?: number }) =>
+    ctrl?.host ? `${zoneID ?? ''}|${ctrl.host}|${ctrl.port ?? 5060}` : ''
+  const serializeStaticRows = (rows: StaticAssignmentRow[]) => {
+    const normalized = rows
+      .map((row) => {
+        const start = Number(row.ext_start) || 0
+        const end = Number(row.ext_end) || (start > 0 && row.ext_count ? start + Number(row.ext_count) - 1 : 0)
+        const count = start > 0 && end >= start ? end - start + 1 : (Number(row.ext_count) || 0)
+        return { ...row, ext_start: start, ext_end: end, ext_count: count }
+      })
+      .filter((row) => row.ext_start > 0 || row.ext_end > 0 || row.primary_controller?.host)
+    onChange('static_agent_assignments_json', normalized.length ? JSON.stringify(normalized) : '')
+    if (normalized.length > 0) {
+      const starts = normalized.map((row) => row.ext_start).filter((v) => v > 0)
+      const ends = normalized.map((row) => row.ext_end).filter((v) => v > 0)
+      const total = normalized.reduce((sum, row) => sum + (row.ext_count || Math.max(0, row.ext_end - row.ext_start + 1)), 0)
+      if (starts.length > 0 && ends.length > 0) {
+        onChange('ext_start', String(Math.min(...starts)))
+        onChange('ext_count', String(total))
+      }
+    }
+  }
+  const updateStaticRow = (idx: number, patch: Partial<StaticAssignmentRow>) => {
+    const rows = staticRows.map((row, i) => i === idx ? { ...row, ...patch } : row)
+    serializeStaticRows(rows)
+  }
+  const applyControllerSelection = (idx: number, role: 'primary' | 'secondary', value: string) => {
+    const option = controllerOptions.find((opt) => opt.value === value)
+    if (!option) {
+      if (role === 'secondary') {
+        updateStaticRow(idx, { secondary_zone_id: '', secondary_controller: undefined })
+      }
+      return
+    }
+    if (role === 'primary') {
+      updateStaticRow(idx, { primary_zone_id: option.zone_id, primary_controller: option.controller })
+    } else {
+      updateStaticRow(idx, { secondary_zone_id: option.zone_id, secondary_controller: option.controller })
+    }
+  }
+  const addStaticRow = () => {
+    const start = staticRows.length > 0 ? Math.max(...staticRows.map((row) => row.ext_end || row.ext_start || 0)) + 1 : (parseInt(raw.ext_start) || 4001000)
+    const count = parseInt(raw.ext_count) || 10
+    serializeStaticRows([
+      ...staticRows,
+      {
+        ext_start: start,
+        ext_count: count,
+        ext_end: start + count - 1,
+        primary_zone_id: controllerOptions[0]?.zone_id ?? '',
+        primary_controller: controllerOptions[0]?.controller ?? { host: '', port: 5060 },
+      },
+    ])
+  }
+  const removeStaticRow = (idx: number) => serializeStaticRows(staticRows.filter((_, i) => i !== idx))
 
   return (
     <div className="space-y-4 px-4 py-4">
@@ -1584,6 +1680,118 @@ export function VMConfigPanel({
             {e('ext_start') && <FieldError error={e('ext_start')} />}
             {e('ext_count') && <FieldError error={e('ext_count')} />}
             {e('ext_end')   && <FieldError error={e('ext_end')} />}
+          </div>
+        )}
+        {effectiveHAMode === 'multi_zone' && (
+          <div className="rounded-lg border border-violet-500/25 bg-violet-950/10 p-3">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-violet-300">
+                  Static Extension-to-Controller Assignment
+                </div>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Optional. When rows are present, the engine uses these ranges instead of zone percentage distribution.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={addStaticRow}
+                disabled={controllerOptions.length === 0}
+                className="rounded border border-violet-500/40 px-2.5 py-1 text-xs text-violet-200 hover:bg-violet-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                + Add Range
+              </button>
+            </div>
+            {staticRows.length > 0 ? (
+              <div className="space-y-2">
+                <div className="grid grid-cols-[110px_100px_110px_1fr_1fr_44px] gap-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+                  <span>Start Ext</span>
+                  <span># Ext</span>
+                  <span>End Ext</span>
+                  <span>Primary Controller</span>
+                  <span>Secondary Controller</span>
+                  <span />
+                </div>
+                {staticRows.map((row, idx) => (
+                  <div key={idx} className="grid grid-cols-[110px_100px_110px_1fr_1fr_44px] items-center gap-2">
+                    <Input
+                      type="number"
+                      value={row.ext_start || ''}
+                      onChange={(ev) => {
+                        const start = parseInt(ev.target.value) || 0
+                        const count = row.ext_count || (row.ext_end >= row.ext_start ? row.ext_end - row.ext_start + 1 : 0)
+                        updateStaticRow(idx, { ext_start: start, ext_count: count, ext_end: start > 0 && count > 0 ? start + count - 1 : row.ext_end })
+                      }}
+                      className="font-mono text-xs"
+                    />
+                    <Input
+                      type="number"
+                      min={1}
+                      value={row.ext_count || ''}
+                      onChange={(ev) => {
+                        const count = parseInt(ev.target.value) || 0
+                        updateStaticRow(idx, { ext_count: count, ext_end: row.ext_start > 0 && count > 0 ? row.ext_start + count - 1 : row.ext_end })
+                      }}
+                      className="font-mono text-xs"
+                    />
+                    <Input
+                      type="number"
+                      value={row.ext_end || ''}
+                      onChange={(ev) => {
+                        const end = parseInt(ev.target.value) || 0
+                        updateStaticRow(idx, { ext_end: end, ext_count: row.ext_start > 0 && end >= row.ext_start ? end - row.ext_start + 1 : row.ext_count })
+                      }}
+                      className="font-mono text-xs"
+                    />
+                    <Select
+                      value={controllerValue(row.primary_zone_id, row.primary_controller)}
+                      onValueChange={(value) => applyControllerSelection(idx, 'primary', value)}
+                    >
+                      <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Primary zone/controller" /></SelectTrigger>
+                      <SelectContent>
+                        {controllerOptions.map((opt) => (
+                          <SelectItem key={`p-${opt.value}`} value={opt.value}>{opt.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Select
+                      value={controllerValue(row.secondary_zone_id, row.secondary_controller)}
+                      onValueChange={(value) => applyControllerSelection(idx, 'secondary', value)}
+                    >
+                      <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Optional secondary" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">No secondary</SelectItem>
+                        {controllerOptions.map((opt) => (
+                          <SelectItem key={`s-${opt.value}`} value={opt.value}>{opt.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <button
+                      type="button"
+                      onClick={() => removeStaticRow(idx)}
+                      className="rounded border border-rose-500/30 px-2 py-1 text-xs text-rose-300 hover:bg-rose-500/10"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                No static ranges configured. The current zone distribution logic will be used.
+              </p>
+            )}
+            {(e('static_agent_assignments') || e('static_agent_assignments_json')) && (
+              <div className="mt-2">
+                {e('static_agent_assignments') && <FieldError error={e('static_agent_assignments')} />}
+                {e('static_agent_assignments_json') && <FieldError error={e('static_agent_assignments_json')} />}
+              </div>
+            )}
+            {!e('static_agent_assignments_json') && w('static_agent_assignments_json') && (
+              <div className="mt-2">
+                <FieldSoftWarning warning={w('static_agent_assignments_json')} />
+              </div>
+            )}
           </div>
         )}
         <FormRow

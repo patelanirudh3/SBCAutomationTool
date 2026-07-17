@@ -35,6 +35,19 @@ type ZoneConfig struct {
 	ZoneDistributionPct int    `yaml:"zone_distribution_pct" json:"zone_distribution_pct"`
 }
 
+// StaticAgentAssignment pins an extension range to explicit primary and
+// optional secondary controllers. It is converted into AgentGroupAssignment so
+// the existing multi-zone registration/subscription lifecycle remains unchanged.
+type StaticAgentAssignment struct {
+	ExtStart            int            `yaml:"ext_start" json:"ext_start"`
+	ExtEnd              int            `yaml:"ext_end" json:"ext_end"`
+	ExtCount            int            `yaml:"ext_count,omitempty" json:"ext_count,omitempty"`
+	PrimaryZoneID       string         `yaml:"primary_zone_id" json:"primary_zone_id"`
+	PrimaryController   ZoneController `yaml:"primary_controller" json:"primary_controller"`
+	SecondaryZoneID     string         `yaml:"secondary_zone_id,omitempty" json:"secondary_zone_id,omitempty"`
+	SecondaryController ZoneController `yaml:"secondary_controller,omitempty" json:"secondary_controller,omitempty"`
+}
+
 // VMConfig holds all configuration for a single-pool traffic run.
 // The dual UAC/UAS role model has been replaced with a unified user pool.
 type VMConfig struct {
@@ -46,24 +59,25 @@ type VMConfig struct {
 	// Dual-registration HA: REGISTER on both primary and secondary during
 	// pre-phase, SUBSCRIBE only on primary, re-SUBSCRIBE to secondary on
 	// primary failure (no re-REGISTER needed). See HAMode for multi-zone.
-	SecondaryHost           string      `yaml:"secondary_host" json:"secondary_host"`
-	SecondaryPort           int         `yaml:"secondary_port" json:"secondary_port"`
-	FailoverEnabled         bool        `yaml:"failover_enabled" json:"failover_enabled"`
-	DualRegistrationEnabled bool        `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
-	FailoverMode            string      `yaml:"failover_mode" json:"failover_mode"`
-	AutoFailbackEnabled     bool        `yaml:"auto_failback_enabled" json:"auto_failback_enabled"`
-	FailbackDelaySeconds    int         `yaml:"failback_delay_seconds" json:"failback_delay_seconds"`
-	FailoverTrigger         string      `yaml:"failover_trigger" json:"failover_trigger"`
-	FailoverTriggerCount    int         `yaml:"failover_trigger_count" json:"failover_trigger_count"`
-	FailoverTriggerPct      int         `yaml:"failover_trigger_pct" json:"failover_trigger_pct"`
-	FailoverTriggerWindowMs int         `yaml:"failover_trigger_window_ms" json:"failover_trigger_window_ms"`
-	HAMode                  string      `yaml:"ha_mode" json:"ha_mode"`
-	ZoneConfig              *ZoneConfig `yaml:"zone_config,omitempty" json:"zone_config,omitempty"`
-	DNSServers              string      `yaml:"dns_servers" json:"dns_servers"`
-	SIPTransport            string      `yaml:"sip_transport" json:"sip_transport"`
-	SIPScheme               string      `yaml:"sip_scheme" json:"sip_scheme"`
-	Domain                  string      `yaml:"domain" json:"domain"`
-	SIPPassword             string      `yaml:"sip_password" json:"sip_password"`
+	SecondaryHost           string                  `yaml:"secondary_host" json:"secondary_host"`
+	SecondaryPort           int                     `yaml:"secondary_port" json:"secondary_port"`
+	FailoverEnabled         bool                    `yaml:"failover_enabled" json:"failover_enabled"`
+	DualRegistrationEnabled bool                    `yaml:"dual_registration_enabled" json:"dual_registration_enabled"`
+	FailoverMode            string                  `yaml:"failover_mode" json:"failover_mode"`
+	AutoFailbackEnabled     bool                    `yaml:"auto_failback_enabled" json:"auto_failback_enabled"`
+	FailbackDelaySeconds    int                     `yaml:"failback_delay_seconds" json:"failback_delay_seconds"`
+	FailoverTrigger         string                  `yaml:"failover_trigger" json:"failover_trigger"`
+	FailoverTriggerCount    int                     `yaml:"failover_trigger_count" json:"failover_trigger_count"`
+	FailoverTriggerPct      int                     `yaml:"failover_trigger_pct" json:"failover_trigger_pct"`
+	FailoverTriggerWindowMs int                     `yaml:"failover_trigger_window_ms" json:"failover_trigger_window_ms"`
+	HAMode                  string                  `yaml:"ha_mode" json:"ha_mode"`
+	ZoneConfig              *ZoneConfig             `yaml:"zone_config,omitempty" json:"zone_config,omitempty"`
+	StaticAgentAssignments  []StaticAgentAssignment `yaml:"static_agent_assignments,omitempty" json:"static_agent_assignments,omitempty"`
+	DNSServers              string                  `yaml:"dns_servers" json:"dns_servers"`
+	SIPTransport            string                  `yaml:"sip_transport" json:"sip_transport"`
+	SIPScheme               string                  `yaml:"sip_scheme" json:"sip_scheme"`
+	Domain                  string                  `yaml:"domain" json:"domain"`
+	SIPPassword             string                  `yaml:"sip_password" json:"sip_password"`
 
 	// TLS settings — only consulted when SIPTransport == "TLS".
 	// TLSMode controls verification policy and which other fields are required:
@@ -234,6 +248,16 @@ func (c *VMConfig) EffectiveMaxConcurrent() int {
 
 // ExtCount returns the number of configured extensions in the unified pool.
 func (c *VMConfig) ExtCount() int {
+	if len(c.StaticAgentAssignments) > 0 {
+		total := 0
+		for _, row := range c.StaticAgentAssignments {
+			start, end := normalizedAssignmentRange(row)
+			if start > 0 && end >= start {
+				total += end - start + 1
+			}
+		}
+		return total
+	}
 	if c.ExtEnd < c.ExtStart {
 		return 0
 	}
@@ -282,7 +306,7 @@ func (c *VMConfig) LocalHostForExtension(ext string) string {
 	if err != nil {
 		return vips[0]
 	}
-	idx := extNum - c.ExtStart
+	idx := c.extensionPosition(extNum)
 	if idx < 0 {
 		idx = 0
 	}
@@ -293,6 +317,32 @@ func (c *VMConfig) LocalHostForExtension(ext string) string {
 		return vips[idx]
 	}
 	return vips[idx%len(vips)]
+}
+
+func (c *VMConfig) extensionPosition(extNum int) int {
+	if len(c.StaticAgentAssignments) == 0 {
+		return extNum - c.ExtStart
+	}
+	pos := 0
+	for _, row := range c.StaticAgentAssignments {
+		start, end := normalizedAssignmentRange(row)
+		if start <= 0 || end < start {
+			continue
+		}
+		if extNum >= start && extNum <= end {
+			return pos + (extNum - start)
+		}
+		pos += end - start + 1
+	}
+	return -1
+}
+
+func normalizedAssignmentRange(row StaticAgentAssignment) (int, int) {
+	end := row.ExtEnd
+	if end == 0 && row.ExtCount > 0 {
+		end = row.ExtStart + row.ExtCount - 1
+	}
+	return row.ExtStart, end
 }
 
 func ipv4ToUint32(ip net.IP) uint32 {
@@ -920,7 +970,9 @@ func Validate(cfg *VMConfig) error {
 			for _, z := range cfg.ZoneConfig.Zones {
 				totalControllers += len(z.Controllers)
 			}
-			if totalAgents < totalControllers*2 {
+			if len(cfg.StaticAgentAssignments) > 0 {
+				errs = append(errs, cfg.validateStaticAgentAssignments()...)
+			} else if totalAgents < totalControllers*2 {
 				errs = append(errs, fmt.Sprintf("need at least %d agents for %d controllers (2 per controller minimum), got %d", totalControllers*2, totalControllers, totalAgents))
 			}
 		}
@@ -935,6 +987,9 @@ func Validate(cfg *VMConfig) error {
 			"sbc_port", cfg.SBCPort,
 			"secondary_host", cfg.SecondaryHost,
 			"secondary_port", cfg.SecondaryPort)
+	}
+	if len(cfg.StaticAgentAssignments) > 0 {
+		cfg.deriveGlobalExtensionBoundsFromStaticAssignments()
 	}
 
 	if cfg.ExtStart > cfg.ExtEnd {
@@ -1253,6 +1308,9 @@ func (cfg *VMConfig) ComputeAgentGroups() []AgentGroupAssignment {
 	if cfg.HAMode != "multi_zone" || cfg.ZoneConfig == nil || len(cfg.ZoneConfig.Zones) == 0 {
 		return nil
 	}
+	if len(cfg.StaticAgentAssignments) > 0 {
+		return cfg.computeStaticAgentGroups()
+	}
 	zoneA := cfg.ZoneConfig.Zones[0]
 	totalAgents := cfg.ExtCount()
 	if len(cfg.ZoneConfig.Zones) == 1 {
@@ -1272,6 +1330,33 @@ func (cfg *VMConfig) ComputeAgentGroups() []AgentGroupAssignment {
 	}
 	groups = append(groups, computeZoneAssignments(zoneB, zoneA.Controllers, zoneBCount, extCursor)...)
 
+	return groups
+}
+
+func (cfg *VMConfig) computeStaticAgentGroups() []AgentGroupAssignment {
+	groups := make([]AgentGroupAssignment, 0, len(cfg.StaticAgentAssignments))
+	for i, row := range cfg.StaticAgentAssignments {
+		if row.ExtEnd == 0 && row.ExtCount > 0 {
+			row.ExtEnd = row.ExtStart + row.ExtCount - 1
+		}
+		groupID := fmt.Sprintf("static-%s-%s-range-%d-%d",
+			safeID(row.PrimaryZoneID),
+			strings.ReplaceAll(controllerKey(row.PrimaryController), ":", "-"),
+			row.ExtStart,
+			row.ExtEnd,
+		)
+		if groupID == "static---range-0-0" {
+			groupID = fmt.Sprintf("static-assignment-%d", i+1)
+		}
+		groups = append(groups, AgentGroupAssignment{
+			GroupID:             groupID,
+			ZoneID:              row.PrimaryZoneID,
+			PrimaryController:   row.PrimaryController,
+			SecondaryController: row.SecondaryController,
+			ExtStart:            row.ExtStart,
+			ExtEnd:              row.ExtEnd,
+		})
+	}
 	return groups
 }
 
@@ -1305,6 +1390,130 @@ func computeZoneAssignments(zone Zone, secondaryControllers []ZoneController, co
 		extCursor += count
 	}
 	return groups
+}
+
+func (cfg *VMConfig) validateStaticAgentAssignments() []string {
+	var errs []string
+	if cfg.ZoneConfig == nil {
+		return []string{"static_agent_assignments requires zone_config"}
+	}
+	controllerZones := make(map[string]string)
+	for _, zone := range cfg.ZoneConfig.Zones {
+		for _, ctrl := range zone.Controllers {
+			controllerZones[controllerKey(ctrl)] = zone.ZoneID
+		}
+	}
+
+	type extRange struct {
+		start int
+		end   int
+		row   int
+	}
+	ranges := make([]extRange, 0, len(cfg.StaticAgentAssignments))
+	for i := range cfg.StaticAgentAssignments {
+		row := &cfg.StaticAgentAssignments[i]
+		if row.ExtStart <= 0 {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].ext_start must be > 0", i))
+		}
+		if row.ExtEnd == 0 && row.ExtCount > 0 {
+			row.ExtEnd = row.ExtStart + row.ExtCount - 1
+		}
+		if row.ExtCount == 0 && row.ExtEnd >= row.ExtStart && row.ExtStart > 0 {
+			row.ExtCount = row.ExtEnd - row.ExtStart + 1
+		}
+		if row.ExtEnd < row.ExtStart {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].ext_end must be >= ext_start", i))
+		}
+		if row.ExtCount <= 0 {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].ext_count must be > 0", i))
+		}
+		if strings.TrimSpace(row.PrimaryController.Host) == "" {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].primary_controller.host is required", i))
+		}
+		if row.PrimaryController.Port <= 0 || row.PrimaryController.Port > 65535 {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].primary_controller.port out of range: %d", i, row.PrimaryController.Port))
+		}
+		if zoneID, ok := controllerZones[controllerKey(row.PrimaryController)]; ok {
+			if strings.TrimSpace(row.PrimaryZoneID) == "" {
+				row.PrimaryZoneID = zoneID
+			} else if row.PrimaryZoneID != zoneID {
+				errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].primary_zone_id=%q does not match controller zone %q", i, row.PrimaryZoneID, zoneID))
+			}
+		} else if strings.TrimSpace(row.PrimaryController.Host) != "" {
+			errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].primary_controller %s is not present in zone_config", i, controllerKey(row.PrimaryController)))
+		}
+		if strings.TrimSpace(row.SecondaryController.Host) != "" {
+			if row.SecondaryController.Port <= 0 || row.SecondaryController.Port > 65535 {
+				errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].secondary_controller.port out of range: %d", i, row.SecondaryController.Port))
+			}
+			if controllerKey(row.SecondaryController) == controllerKey(row.PrimaryController) {
+				errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].secondary_controller must differ from primary_controller", i))
+			}
+			if zoneID, ok := controllerZones[controllerKey(row.SecondaryController)]; ok {
+				if strings.TrimSpace(row.SecondaryZoneID) == "" {
+					row.SecondaryZoneID = zoneID
+				} else if row.SecondaryZoneID != zoneID {
+					errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].secondary_zone_id=%q does not match controller zone %q", i, row.SecondaryZoneID, zoneID))
+				}
+			} else {
+				errs = append(errs, fmt.Sprintf("static_agent_assignments[%d].secondary_controller %s is not present in zone_config", i, controllerKey(row.SecondaryController)))
+			}
+		}
+		if row.ExtStart > 0 && row.ExtEnd >= row.ExtStart {
+			ranges = append(ranges, extRange{start: row.ExtStart, end: row.ExtEnd, row: i})
+		}
+	}
+	for i := 0; i < len(ranges); i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if ranges[i].start <= ranges[j].end && ranges[j].start <= ranges[i].end {
+				errs = append(errs, fmt.Sprintf("static_agent_assignments[%d] range overlaps static_agent_assignments[%d]", ranges[i].row, ranges[j].row))
+			}
+		}
+	}
+	return errs
+}
+
+func (cfg *VMConfig) deriveGlobalExtensionBoundsFromStaticAssignments() {
+	minExt, maxExt := 0, 0
+	for _, row := range cfg.StaticAgentAssignments {
+		start, end := normalizedAssignmentRange(row)
+		if start <= 0 || end < start {
+			continue
+		}
+		if minExt == 0 || start < minExt {
+			minExt = start
+		}
+		if end > maxExt {
+			maxExt = end
+		}
+	}
+	if minExt > 0 && maxExt >= minExt {
+		cfg.ExtStart = minExt
+		cfg.ExtEnd = maxExt
+	}
+}
+
+func controllerKey(c ZoneController) string {
+	if strings.TrimSpace(c.Host) == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(c.Host), c.Port)
+}
+
+func safeID(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // EffectiveHAMode returns the resolved HA mode. When ha_mode is empty,

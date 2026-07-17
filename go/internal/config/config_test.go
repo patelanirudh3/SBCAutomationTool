@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,6 +278,88 @@ func TestVIPConfigValidationAndMapping(t *testing.T) {
 	}
 }
 
+func TestStaticAssignmentsExtCountAndVIPMappingUseAssignmentPosition(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:            "traffic-local",
+		ExtStart:        100,
+		ExtEnd:          549,
+		SBCHost:         "10.0.0.1",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		LocalIPMode:     "unique_vip",
+		VIPInterface:    "eth0",
+		VIPCIDR:         "10.71.16.0/21",
+		VIPFirstIP:      "10.71.17.101",
+		VIPCount:        100,
+		StaticAgentAssignments: []StaticAgentAssignment{
+			{ExtStart: 100, ExtEnd: 149},
+			{ExtStart: 500, ExtEnd: 549},
+		},
+	}
+	ApplyDefaults(cfg)
+	if got := cfg.ExtCount(); got != 100 {
+		t.Fatalf("ExtCount=%d, want 100", got)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed for non-contiguous static VIP config: %v", err)
+	}
+	tests := map[string]string{
+		"100": "10.71.17.101",
+		"149": "10.71.17.150",
+		"500": "10.71.17.151",
+		"549": "10.71.17.200",
+	}
+	for ext, want := range tests {
+		if got := cfg.LocalHostForExtension(ext); got != want {
+			t.Fatalf("LocalHostForExtension(%s)=%q, want %q", ext, got, want)
+		}
+	}
+}
+
+func TestStaticAssignmentsDeriveGlobalExtensionBounds(t *testing.T) {
+	cfg := &VMConfig{
+		VMID:     "traffic-local",
+		ExtStart: 0,
+		ExtEnd:   0,
+		SBCHost:  "10.0.0.1",
+		SBCPort:  5060,
+		HAMode:   "multi_zone",
+		ZoneConfig: twoZoneConfig(50,
+			[]ZoneController{{Host: "a1", Port: 5061}},
+			[]ZoneController{{Host: "b1", Port: 5061}},
+		),
+		StaticAgentAssignments: []StaticAgentAssignment{
+			{ExtStart: 55000, ExtEnd: 55499, PrimaryController: ZoneController{Host: "a1", Port: 5061}, SecondaryController: ZoneController{Host: "b1", Port: 5061}},
+			{ExtStart: 880000, ExtEnd: 880199, PrimaryController: ZoneController{Host: "b1", Port: 5061}, SecondaryController: ZoneController{Host: "a1", Port: 5061}},
+		},
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if cfg.ExtStart != 55000 || cfg.ExtEnd != 880199 {
+		t.Fatalf("derived bounds=%d-%d, want 55000-880199", cfg.ExtStart, cfg.ExtEnd)
+	}
+	if got := cfg.ExtCount(); got != 700 {
+		t.Fatalf("ExtCount=%d, want 700", got)
+	}
+}
+
 func TestDualRegistrationValidation(t *testing.T) {
 	cfg := &VMConfig{
 		VMID:                    "traffic-local",
@@ -365,6 +448,89 @@ func TestComputeAgentGroupsSingleZoneNoSecondary(t *testing.T) {
 	assertGroup(t, groups[0], "zone-a-ctrl-1", "zone-a", "a1", "", 7000, 7003)
 	if groups[0].SecondaryController.Port != 0 {
 		t.Fatalf("secondary port=%d, want 0", groups[0].SecondaryController.Port)
+	}
+}
+
+func TestComputeAgentGroupsStaticAssignments(t *testing.T) {
+	cfg := &VMConfig{
+		HAMode:   "multi_zone",
+		ExtStart: 1000,
+		ExtEnd:   1099,
+		ZoneConfig: twoZoneConfig(50,
+			[]ZoneController{{Host: "a1", Port: 5061}, {Host: "a2", Port: 5061}},
+			[]ZoneController{{Host: "b1", Port: 5061}, {Host: "b2", Port: 5061}},
+		),
+		StaticAgentAssignments: []StaticAgentAssignment{
+			{
+				ExtStart:            1000,
+				ExtCount:            50,
+				PrimaryController:   ZoneController{Host: "a1", Port: 5061},
+				SecondaryController: ZoneController{Host: "b1", Port: 5061},
+			},
+			{
+				ExtStart:            1050,
+				ExtEnd:              1099,
+				PrimaryZoneID:       "zone-b",
+				PrimaryController:   ZoneController{Host: "b2", Port: 5061},
+				SecondaryZoneID:     "zone-a",
+				SecondaryController: ZoneController{Host: "a2", Port: 5061},
+			},
+		},
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		SBCHost:         "ignored.example",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+	}
+	ApplyDefaults(cfg)
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	groups := cfg.ComputeAgentGroups()
+	if len(groups) != 2 {
+		t.Fatalf("groups=%d, want 2: %#v", len(groups), groups)
+	}
+	assertGroup(t, groups[0], "static-zone-a-a1-5061-range-1000-1049", "zone-a", "a1", "b1", 1000, 1049)
+	assertGroup(t, groups[1], "static-zone-b-b2-5061-range-1050-1099", "zone-b", "b2", "a2", 1050, 1099)
+}
+
+func TestStaticAgentAssignmentsRejectOverlapAndUnknownController(t *testing.T) {
+	cfg := &VMConfig{
+		HAMode:   "multi_zone",
+		ExtStart: 1000,
+		ExtEnd:   1009,
+		ZoneConfig: twoZoneConfig(50,
+			[]ZoneController{{Host: "a1", Port: 5061}},
+			[]ZoneController{{Host: "b1", Port: 5061}},
+		),
+		StaticAgentAssignments: []StaticAgentAssignment{
+			{ExtStart: 1000, ExtEnd: 1005, PrimaryController: ZoneController{Host: "a1", Port: 5061}},
+			{ExtStart: 1004, ExtEnd: 1009, PrimaryController: ZoneController{Host: "missing", Port: 5061}},
+		},
+		CPS:             1,
+		HoldTimeSeconds: 1,
+		RTPBurstPPS:     50,
+		RTPPtime:        20,
+		RTPMode:         "3phase",
+		TrafficMode:     "unlimited",
+		SBCHost:         "ignored.example",
+		SBCPort:         5060,
+		SIPTransport:    "TCP",
+		Domain:          "avaya.com",
+	}
+	ApplyDefaults(cfg)
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate succeeded with overlap and unknown controller")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "overlaps") || !strings.Contains(msg, "not present in zone_config") {
+		t.Fatalf("Validate error=%q, want overlap and unknown controller", msg)
 	}
 }
 

@@ -94,6 +94,21 @@ export const VMConfigSchema = z
       })).min(1, 'At least 1 zone required').max(2, 'At most 2 zones supported'),
       zone_distribution_pct: z.number().int().min(1).max(99),
     }).optional(),
+    static_agent_assignments: z.array(z.object({
+      ext_start: z.number().int().positive(),
+      ext_end: z.number().int().positive(),
+      ext_count: z.number().int().positive().optional(),
+      primary_zone_id: z.string().min(1),
+      primary_controller: z.object({
+        host: z.string().min(1).refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
+        port: z.number().int().min(1).max(65535),
+      }),
+      secondary_zone_id: z.string().optional(),
+      secondary_controller: z.object({
+        host: z.string().min(1).refine(isValidIpOrHostname, 'Must be a valid IPv4 address or hostname'),
+        port: z.number().int().min(1).max(65535),
+      }).optional(),
+    })).optional(),
     failover_enabled: z.boolean().optional(),
     failover_mode: z.enum(['graceful', 'force']).optional(),
     auto_failback_enabled: z.boolean().optional(),
@@ -256,6 +271,27 @@ export const VMConfigSchema = z
           })
         }
       }
+      const rows = data.static_agent_assignments ?? []
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.ext_end < row.ext_start) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['static_agent_assignments'],
+            message: `Static range ${i + 1}: end extension must be >= start extension`,
+          })
+        }
+        for (let j = i + 1; j < rows.length; j++) {
+          const other = rows[j]
+          if (row.ext_start <= other.ext_end && other.ext_start <= row.ext_end) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['static_agent_assignments'],
+              message: `Static ranges ${i + 1} and ${j + 1} overlap`,
+            })
+          }
+        }
+      }
     }
 
     if (data.failover_trigger === 'min_agents') {
@@ -394,6 +430,7 @@ export function getFieldWarnings(raw: {
   traffic_mode: string
   agent_connection_cps?: string
   agent_regsub_cps?: string
+  static_agent_assignments_json?: string
 }): FieldWarnings {
   const w: FieldWarnings = {}
 
@@ -421,6 +458,24 @@ export function getFieldWarnings(raw: {
   if (raw.traffic_mode === 'timed' && duration > 24) {
     w.duration_hours = 'Long run — ensure system stability for multi-day tests'
   }
+
+  try {
+    const rows = raw.static_agent_assignments_json ? JSON.parse(raw.static_agent_assignments_json) : []
+    if (Array.isArray(rows)) {
+      const sameZoneRows = rows
+        .map((row, idx) => ({ row, idx }))
+        .filter(({ row }) =>
+          row?.secondary_controller?.host &&
+          row?.primary_zone_id &&
+          row?.secondary_zone_id &&
+          row.primary_zone_id === row.secondary_zone_id,
+        )
+      if (sameZoneRows.length > 0) {
+        const labels = sameZoneRows.map(({ idx }) => idx + 1).join(', ')
+        w.static_agent_assignments_json = `Static assignment row(s) ${labels}: secondary controller is in the same zone as primary. This is allowed, but does not provide cross-zone HA protection.`
+      }
+    }
+  } catch { /* invalid JSON is handled by schema validation */ }
 
   return w
 }

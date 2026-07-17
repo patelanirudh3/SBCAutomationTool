@@ -11,7 +11,7 @@ import type { RunPhase } from '@/types'
 import { cn } from '@/lib/utils'
 import { engineBaseUrl, selectedEngineEndpoint } from '@/lib/engine-endpoint'
 
-const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || '1.15.1'
+const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || '1.16.1'
 
 const PHASE_LABEL: Record<RunPhase, string> = {
   IDLE: 'Idle',
